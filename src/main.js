@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "0.3.11";
+const APP_VERSION = "0.3.12";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -978,11 +978,11 @@ function pixivSyncModal() {
   const author = state.activeAuthor;
   showModal(modal("作品同步", `
     <form id="pixiv-sync-form" class="form-stack">
-      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${author.homepage ? "将下载新小说正文、封面与标签到预览版目录。" : "请先在作者设置中填写 Pixiv 作者主页。"}</p></div></div>
+      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!author.homepage ? "请先在作者设置中填写 Pixiv 作者主页。" : !author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : !author.purchasedDir ? "请先在作者设置中绑定完整版文件夹。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
       <div class="date-range"><label>开始日期 <input name="startDate" type="date"></label><label>结束日期 <input name="endDate" type="date"></label></div>
       <small>投稿时间以 Pixiv 原始投稿时间为准，不受后续编辑影响。不填日期时，仅检查上次成功同步后的新投稿；填写日期后，按指定投稿时间范围重新检查。已有作品会先按 Pixiv 小说 ID、再按关联相似度跳过。</small>
       <div class="sync-progress is-hidden" id="sync-progress"><div><strong id="sync-progress-label">准备同步</strong><span id="sync-progress-count">0 / 0</span></div><progress id="sync-progress-bar" value="0" max="1"></progress><p id="sync-progress-title"></p></div>
-    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="danger-button" data-action="cancel-pixiv-sync" disabled>终止同步</button><button class="primary-button" data-action="confirm-pixiv-sync" ${author.homepage && author.previewDir ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
+    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="danger-button" data-action="cancel-pixiv-sync" disabled>终止同步</button><button class="primary-button" data-action="confirm-pixiv-sync" ${author.homepage && author.previewDir && author.purchasedDir ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
 }
 
 async function syncPixivWorks() {

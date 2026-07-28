@@ -199,6 +199,7 @@ struct PixivDownloadCandidate {
     series_id: String,
     series_title: String,
     series_order: i64,
+    is_preview: bool,
 }
 
 #[derive(Serialize)]
@@ -1045,6 +1046,14 @@ fn pixiv_published_at(value: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn synopsis_indicates_preview(description: &str) -> bool {
+    let compact: String = description
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.contains("全文") && !compact.contains("全文放出")
+}
+
 fn parse_date_bound(value: &str, label: &str) -> Result<Option<NaiveDate>, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1165,15 +1174,20 @@ fn pixiv_sync_impl(
         .filter(|tag| !tag.is_empty())
         .map(|tag| tag.to_lowercase())
         .collect();
-    let (homepage, preview_dir, threshold, last_sync, cookie): (String, String, i64, String, String) = conn.query_row(
-        "SELECT a.homepage, a.preview_dir, a.match_threshold, a.pixiv_last_sync_at, COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), '') FROM authors a WHERE a.id=?1",
-        [author_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+    let (homepage, preview_dir, purchased_dir, threshold, last_sync, cookie): (String, String, String, i64, String, String) = conn.query_row(
+        "SELECT a.homepage, a.preview_dir, a.purchased_dir, a.match_threshold, a.pixiv_last_sync_at, COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), '') FROM authors a WHERE a.id=?1",
+        [author_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
     ).map_err(|e| e.to_string())?;
     if preview_dir.trim().is_empty() {
         return Err("请先在作者设置中绑定预览版文件夹。".into());
     }
+    if purchased_dir.trim().is_empty() {
+        return Err("同步作品前，请先在作者设置中绑定完整版文件夹。".into());
+    }
     let preview_dir = PathBuf::from(preview_dir);
     fs::create_dir_all(&preview_dir).map_err(|e| format!("无法创建预览版文件夹：{e}"))?;
+    let purchased_dir = PathBuf::from(purchased_dir);
+    fs::create_dir_all(&purchased_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
     let user_id = pixiv_user_id(&homepage)?;
     let start = parse_date_bound(&start_date, "开始日期")?;
     let end = parse_date_bound(&end_date, "结束日期")?;
@@ -1327,6 +1341,7 @@ fn pixiv_sync_impl(
         let body = detail.get("body").unwrap_or(&Value::Null);
         let title = json_string(body, "title");
         let content = json_string(body, "content");
+        let description = json_string(body, "description");
         let cover_url = json_string(body, "coverUrl");
         let series = body.get("seriesNavData").unwrap_or(&Value::Null);
         let series_id = ["seriesId", "id"]
@@ -1404,6 +1419,7 @@ fn pixiv_sync_impl(
             series_id,
             series_title,
             series_order,
+            is_preview: synopsis_indicates_preview(&description),
         });
     }
     const COVER_CONCURRENCY: usize = 4;
@@ -1456,7 +1472,38 @@ fn pixiv_sync_impl(
                 result.failed_count += 1;
                 continue;
             }
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, tags, pixiv_novel_id, series_id, series_title, series_order, is_new) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)", params![author_id, work.title, work.release_date, text_path.to_string_lossy(), cover_path.to_string_lossy(), work.tags, work.novel_id, work.series_id, work.series_title, work.series_order]).is_err() {
+            let purchased_path = if work.is_preview {
+                String::new()
+            } else {
+                let Some(text_name) = text_path.file_name() else {
+                    result.failed_count += 1;
+                    continue;
+                };
+                let Some(cover_name) = cover_path.file_name() else {
+                    result.failed_count += 1;
+                    continue;
+                };
+                let purchased_text = purchased_dir.join(text_name);
+                let purchased_cover = purchased_dir.join(cover_name);
+                let copy_result = if !purchased_text.exists() {
+                    fs::copy(&text_path, &purchased_text).map(|_| ())
+                } else {
+                    Ok(())
+                }
+                .and_then(|_| {
+                    if !purchased_cover.exists() {
+                        fs::copy(&cover_path, &purchased_cover).map(|_| ())
+                    } else {
+                        Ok(())
+                    }
+                });
+                if copy_result.is_err() {
+                    result.failed_count += 1;
+                    continue;
+                }
+                purchased_text.to_string_lossy().to_string()
+            };
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, is_new) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)", params![author_id, work.title, work.release_date, text_path.to_string_lossy(), cover_path.to_string_lossy(), purchased_path, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order]).is_err() {
             result.failed_count += 1;
             continue;
         }
@@ -2346,6 +2393,7 @@ mod tests {
     use super::{
         file_name, is_after_last_sync, is_within_date_range, name_key, normalize_pixiv_cookie,
         pixiv_published_at, should_import_folder_entry, similarity_percent,
+        synopsis_indicates_preview,
     };
     use chrono::{DateTime, NaiveDate, Utc};
     use serde_json::json;
@@ -2448,5 +2496,13 @@ mod tests {
             pixiv_published_at(&json!({ "uploadDate": "2025-04-10T11:00:00+00:00" })),
             "2025-04-10T11:00:00+00:00"
         );
+    }
+
+    #[test]
+    fn synopsis_marks_previews_except_full_release_phrase() {
+        assert!(synopsis_indicates_preview("这里是全文的前半部分"));
+        assert!(synopsis_indicates_preview("全文 \n 将在其他平台发布"));
+        assert!(!synopsis_indicates_preview("全文放出，感谢支持"));
+        assert!(!synopsis_indicates_preview("完整内容已经发布"));
     }
 }
