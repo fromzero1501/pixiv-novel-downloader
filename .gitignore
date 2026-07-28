@@ -1,0 +1,20 @@
+# JavaScript dependencies and build output
+node_modules/
+dist/
+.npm-cache/
+
+# Rust dependencies and build output
+.cargo-home/
+src-tauri/target/
+
+# Portable application data and local releases
+data/
+发布/
+*.exe
+
+# Local development artifacts
+*.log
+tmp-*.zip
+qa-*.png
+ui-*.png
+design/qa-*.png

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Pixiv小说下载管理器",
+  "version": "0.3.11",
+  "identifier": "com.local.collectionlibrary",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "label": "main", "title": "Pixiv小说下载管理器", "width": 1240, "height": 820, "minWidth": 1080, "minHeight": 680 }],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:1420 ws://localhost:1420",
+      "assetProtocol": { "enable": true, "scope": ["**"] }
+    }
+  },
+  "bundle": { "active": true, "targets": ["nsis"], "icon": ["icons/icon.ico"], "windows": { "wix": null, "nsis": { "installMode": "currentUser" } } }
+}
