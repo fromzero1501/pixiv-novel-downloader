@@ -19,7 +19,8 @@ Windows 本地作品管理软件，用于按作者管理 Pixiv 小说预览版�
 
 ## 操作指南
 
-![作者作品库界面](docs/images/author-library.png)
+
+<img width="2480" height="1640" alt="2026-07-29_12-57-17" src="https://github.com/user-attachments/assets/f6bcf976-61b2-472b-a605-56c69c77b448" />
 
 ### 1. 首次设置
 
