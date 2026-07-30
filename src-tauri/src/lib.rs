@@ -1,5 +1,6 @@
 use calamine::{open_workbook_auto, Reader};
 use chrono::{DateTime, NaiveDate, Utc};
+use encoding_rs::{GBK, UTF_16BE, UTF_16LE};
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,7 @@ struct Work {
     is_new: bool,
     author_name: String,
     word_count: Option<usize>,
+    file_format: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -181,6 +183,7 @@ struct PixivSyncProgress {
 #[serde(rename_all = "camelCase")]
 struct PixivSyncResult {
     downloaded_count: usize,
+    reused_preview_count: usize,
     skipped_existing_count: usize,
     skipped_date_count: usize,
     skipped_size_count: usize,
@@ -199,6 +202,13 @@ struct PixivDownloadCandidate {
     series_id: String,
     series_title: String,
     series_order: i64,
+    is_preview: bool,
+}
+
+#[derive(Clone)]
+struct SyncPreviewEntry {
+    path: PathBuf,
+    name: String,
     is_preview: bool,
 }
 
@@ -408,19 +418,86 @@ fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
         is_new: row.get::<_, i64>(13)? == 1,
         author_name: row.get(14)?,
         word_count: None,
+        file_format: None,
     })
 }
 
-fn text_word_count(path: &str) -> Option<usize> {
-    if path.trim().is_empty() {
-        return None;
-    }
-    fs::read_to_string(path).ok().map(|content| {
+fn text_file_word_count(path: &Path) -> Option<usize> {
+    let bytes = fs::read(path).ok()?;
+    let content = if bytes.starts_with(&[0xFF, 0xFE]) {
+        UTF_16LE.decode(&bytes[2..]).0
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        UTF_16BE.decode(&bytes[2..]).0
+    } else if let Ok(content) = std::str::from_utf8(&bytes) {
+        content.into()
+    } else {
+        GBK.decode(&bytes).0
+    };
+    Some(
         content
             .chars()
             .filter(|character| !character.is_whitespace())
-            .count()
-    })
+            .count(),
+    )
+}
+
+fn text_word_count_at(path: &Path) -> Option<usize> {
+    if path.is_file() {
+        return text_file_word_count(path);
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let mut total = 0;
+    let mut found = false;
+    for entry in fs::read_dir(path).ok()?.flatten() {
+        let entry_path = entry.path();
+        let is_text = entry_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("txt"))
+            .unwrap_or(false);
+        let count = if entry_path.is_dir() || is_text {
+            text_word_count_at(&entry_path)
+        } else {
+            None
+        };
+        if let Some(count) = count {
+            total += count;
+            found = true;
+        }
+    }
+    found.then_some(total)
+}
+
+fn text_word_count(path: &str) -> Option<usize> {
+    (!path.trim().is_empty())
+        .then(|| text_word_count_at(Path::new(path)))
+        .flatten()
+}
+
+fn populate_work_display_info(work: &mut Work) {
+    work.word_count = None;
+    work.file_format = None;
+    if work.purchased_path.is_empty() {
+        work.word_count = text_word_count(&work.preview_path);
+        return;
+    }
+    let purchased_path = Path::new(&work.purchased_path);
+    if purchased_path.is_file() {
+        let extension = purchased_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::trim)
+            .filter(|extension| !extension.is_empty())
+            .map(str::to_ascii_uppercase)
+            .unwrap_or_else(|| "文件".into());
+        if extension != "TXT" {
+            work.file_format = Some(extension);
+            return;
+        }
+    }
+    work.word_count = text_word_count(&work.purchased_path);
 }
 
 fn works_for_author(conn: &Connection, author_id: i64) -> Result<Vec<(i64, String)>, String> {
@@ -663,11 +740,7 @@ fn list_works(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     for work in &mut works {
-        work.word_count = if !work.purchased_path.is_empty() {
-            text_word_count(&work.purchased_path)
-        } else {
-            text_word_count(&work.preview_path)
-        };
+        populate_work_display_info(work);
     }
     Ok(works)
 }
@@ -709,11 +782,7 @@ fn list_all_works(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     for work in &mut works {
-        work.word_count = if !work.purchased_path.is_empty() {
-            text_word_count(&work.purchased_path)
-        } else {
-            text_word_count(&work.preview_path)
-        };
+        populate_work_display_info(work);
     }
     Ok(works)
 }
@@ -731,11 +800,7 @@ fn list_series_works(author_id: i64, series_id: String) -> Result<Vec<Work>, Str
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     for work in &mut works {
-        work.word_count = if !work.purchased_path.is_empty() {
-            text_word_count(&work.purchased_path)
-        } else {
-            text_word_count(&work.preview_path)
-        };
+        populate_work_display_info(work);
     }
     Ok(works)
 }
@@ -921,6 +986,28 @@ fn pixiv_user_id(homepage: &str) -> Result<String, String> {
     Err("请先在作者设置中填写有效的 Pixiv 作者主页链接。".into())
 }
 
+fn pixiv_novel_id_from_url(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let value = value.split('#').next().unwrap_or(value);
+    let Some((base, query)) = value.split_once('?') else {
+        return Err("单篇同步请输入有效的 Pixiv 小说链接。".into());
+    };
+    if base != "https://www.pixiv.net/novel/show.php" {
+        return Err("单篇同步请输入有效的 Pixiv 小说链接。".into());
+    }
+    let novel_id = query
+        .split('&')
+        .find_map(|item| item.strip_prefix("id="))
+        .unwrap_or_default();
+    if novel_id.is_empty() || !novel_id.chars().all(|character| character.is_ascii_digit()) {
+        return Err("单篇同步请输入有效的 Pixiv 小说链接。".into());
+    }
+    Ok(Some(novel_id.to_string()))
+}
+
 fn normalize_pixiv_cookie(raw: &str) -> Result<String, String> {
     if raw.trim().is_empty() {
         return Ok(String::new());
@@ -1064,6 +1151,10 @@ fn parse_date_bound(value: &str, label: &str) -> Result<Option<NaiveDate>, Strin
         .map_err(|_| format!("{label}必须是 YYYY-MM-DD 格式。"))
 }
 
+fn has_invalid_date_range(start: Option<NaiveDate>, end: Option<NaiveDate>) -> bool {
+    matches!((start, end), (Some(start), Some(end)) if start > end)
+}
+
 fn safe_sync_stem(title: &str) -> String {
     let value: String = title
         .chars()
@@ -1102,6 +1193,95 @@ fn sync_paths(preview_dir: &Path, title: &str, novel_id: &str) -> (PathBuf, Path
         preview_dir.join(format!("{base}-{novel_id}.txt")),
         preview_dir.join(format!("{base}-{novel_id}.jpg")),
     )
+}
+
+fn sync_preview_entries(
+    preview_dir: &Path,
+    minimum_file_size_bytes: u64,
+) -> Result<Vec<SyncPreviewEntry>, String> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(preview_dir).map_err(|e| format!("无法读取预览版文件夹：{e}"))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let is_cover = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| {
+                extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg")
+            })
+            .unwrap_or(false);
+        let is_preview = path.is_dir()
+            || path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.eq_ignore_ascii_case("txt"))
+                .unwrap_or(false);
+        if !is_cover && !is_preview {
+            continue;
+        }
+        if path.is_file()
+            && is_preview
+            && entry.metadata().map_err(|e| e.to_string())?.len() < minimum_file_size_bytes
+        {
+            continue;
+        }
+        let name = stem(&path);
+        if !name.is_empty() {
+            entries.push(SyncPreviewEntry {
+                path,
+                name,
+                is_preview,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn matched_sync_preview(
+    entries: &[SyncPreviewEntry],
+    title: &str,
+    threshold: i64,
+) -> Option<(PathBuf, Option<PathBuf>)> {
+    let mut matches: Vec<(&SyncPreviewEntry, i64)> = entries
+        .iter()
+        .filter(|entry| entry.is_preview)
+        .map(|entry| (entry, similarity_percent(&entry.name, title)))
+        .filter(|(_, score)| *score >= threshold)
+        .collect();
+    matches.sort_by(|left, right| right.1.cmp(&left.1));
+    let (preview, best_score) = matches.first()?;
+    if matches
+        .iter()
+        .filter(|(_, score)| *score == *best_score)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let cover = entries
+        .iter()
+        .find(|entry| !entry.is_preview && name_key(&entry.name) == name_key(&preview.name))
+        .map(|entry| entry.path.clone());
+    Some((preview.path.clone(), cover))
+}
+
+fn copy_sync_preview_to_purchased(
+    preview_path: &Path,
+    purchased_dir: &Path,
+) -> Result<String, String> {
+    let name = preview_path
+        .file_name()
+        .ok_or_else(|| "预览版文件名称无效".to_string())?;
+    let purchased_preview = purchased_dir.join(name);
+    if !purchased_preview.exists() {
+        if preview_path.is_dir() {
+            copy_text_files(preview_path, &purchased_preview)?;
+        } else {
+            fs::copy(preview_path, &purchased_preview).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(purchased_preview.to_string_lossy().to_string())
 }
 
 fn fetch_pixiv_novel_detail(client: &Client, novel_id: &str) -> Result<Value, String> {
@@ -1156,6 +1336,7 @@ fn pixiv_sync_impl(
     author_id: i64,
     start_date: String,
     end_date: String,
+    novel_url: String,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     let conn = db()?;
@@ -1188,13 +1369,15 @@ fn pixiv_sync_impl(
     fs::create_dir_all(&preview_dir).map_err(|e| format!("无法创建预览版文件夹：{e}"))?;
     let purchased_dir = PathBuf::from(purchased_dir);
     fs::create_dir_all(&purchased_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
-    let user_id = pixiv_user_id(&homepage)?;
+    let preview_entries = sync_preview_entries(&preview_dir, minimum_file_size_bytes)?;
+    let single_novel_id = pixiv_novel_id_from_url(&novel_url)?;
+    let is_single_sync = single_novel_id.is_some();
     let start = parse_date_bound(&start_date, "开始日期")?;
     let end = parse_date_bound(&end_date, "结束日期")?;
-    if start > end {
+    if !is_single_sync && has_invalid_date_range(start, end) {
         return Err("开始日期不能晚于结束日期。".into());
     }
-    let use_incremental_filter = start.is_none() && end.is_none();
+    let use_incremental_filter = !is_single_sync && start.is_none() && end.is_none();
     let last_sync = DateTime::parse_from_rfc3339(&last_sync)
         .ok()
         .map(|date| date.with_timezone(&Utc));
@@ -1204,23 +1387,28 @@ fn pixiv_sync_impl(
         Some(normalize_pixiv_cookie(&cookie)?)
     };
     let client = pixiv_client(cookie)?;
-    let list_url = format!("https://www.pixiv.net/ajax/user/{user_id}/profile/all");
-    let listing: Value = client
-        .get(list_url)
-        .send()
-        .map_err(|e| format!("无法读取 Pixiv 作者作品列表：{e}"))?
-        .error_for_status()
-        .map_err(|e| format!("读取 Pixiv 作者作品列表失败：{e}"))?
-        .json()
-        .map_err(|e| format!("Pixiv 作者作品列表格式异常：{e}"))?;
-    if listing.get("error").and_then(Value::as_bool) == Some(true) {
-        return Err("Pixiv 拒绝了作者作品列表请求；请检查作者链接或 Cookie。".into());
-    }
-    let mut novels: Vec<String> = listing
-        .pointer("/body/novels")
-        .and_then(Value::as_object)
-        .map(|items| items.keys().cloned().collect())
-        .unwrap_or_default();
+    let mut novels: Vec<String> = if let Some(novel_id) = single_novel_id {
+        vec![novel_id]
+    } else {
+        let user_id = pixiv_user_id(&homepage)?;
+        let list_url = format!("https://www.pixiv.net/ajax/user/{user_id}/profile/all");
+        let listing: Value = client
+            .get(list_url)
+            .send()
+            .map_err(|e| format!("无法读取 Pixiv 作者作品列表：{e}"))?
+            .error_for_status()
+            .map_err(|e| format!("读取 Pixiv 作者作品列表失败：{e}"))?
+            .json()
+            .map_err(|e| format!("Pixiv 作者作品列表格式异常：{e}"))?;
+        if listing.get("error").and_then(Value::as_bool) == Some(true) {
+            return Err("Pixiv 拒绝了作者作品列表请求；请检查作者链接或 Cookie。".into());
+        }
+        listing
+            .pointer("/body/novels")
+            .and_then(Value::as_object)
+            .map(|items| items.keys().cloned().collect())
+            .unwrap_or_default()
+    };
     // profile/all intentionally only contains IDs for novels. Process newer IDs
     // first; the submission-time filter is applied after loading each detail.
     novels.sort_by(|left, right| right.cmp(left));
@@ -1233,6 +1421,7 @@ fn pixiv_sync_impl(
         .map_err(|e| e.to_string())?;
     let mut result = PixivSyncResult {
         downloaded_count: 0,
+        reused_preview_count: 0,
         skipped_existing_count: 0,
         skipped_date_count: 0,
         skipped_size_count: 0,
@@ -1363,7 +1552,7 @@ fn pixiv_sync_impl(
             .map_err(|e| e.to_string())?;
         }
         let published_at = pixiv_published_at(body);
-        if !is_within_date_range(&published_at, start, end) {
+        if !is_single_sync && !is_within_date_range(&published_at, start, end) {
             result.skipped_date_count += 1;
             continue;
         }
@@ -1374,12 +1563,8 @@ fn pixiv_sync_impl(
         let date = release_date(&published_at)
             .map(|date| date.format("%Y-%m-%d").to_string())
             .unwrap_or_default();
-        if title.is_empty() || content.is_empty() || cover_url.is_empty() {
+        if title.is_empty() {
             result.failed_count += 1;
-            continue;
-        }
-        if (content.len() as u64) < minimum_file_size_bytes {
-            result.skipped_size_count += 1;
             continue;
         }
         if let Some(existing_id) =
@@ -1409,6 +1594,40 @@ fn pixiv_sync_impl(
                     .join("| ")
             })
             .unwrap_or_default();
+        let is_preview = synopsis_indicates_preview(&description);
+        if let Some((preview_path, cover_path)) =
+            matched_sync_preview(&preview_entries, &title, threshold)
+        {
+            let purchased_path = if is_preview {
+                String::new()
+            } else {
+                match copy_sync_preview_to_purchased(&preview_path, &purchased_dir) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        result.failed_count += 1;
+                        continue;
+                    }
+                }
+            };
+            let cover_path = cover_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, is_new) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)", params![author_id, title, date, preview_path.to_string_lossy(), cover_path, purchased_path, tags, novel_id, series_id, series_title, series_order]).is_err() {
+                result.failed_count += 1;
+                continue;
+            }
+            result.reused_preview_count += 1;
+            continue;
+        }
+        if content.is_empty() || cover_url.is_empty() {
+            result.failed_count += 1;
+            continue;
+        }
+        if (content.len() as u64) < minimum_file_size_bytes {
+            result.skipped_size_count += 1;
+            continue;
+        }
         downloads.push(PixivDownloadCandidate {
             novel_id,
             title,
@@ -1419,7 +1638,7 @@ fn pixiv_sync_impl(
             series_id,
             series_title,
             series_order,
-            is_preview: synopsis_indicates_preview(&description),
+            is_preview,
         });
     }
     const COVER_CONCURRENCY: usize = 4;
@@ -1479,24 +1698,12 @@ fn pixiv_sync_impl(
                     result.failed_count += 1;
                     continue;
                 };
-                let Some(cover_name) = cover_path.file_name() else {
-                    result.failed_count += 1;
-                    continue;
-                };
                 let purchased_text = purchased_dir.join(text_name);
-                let purchased_cover = purchased_dir.join(cover_name);
                 let copy_result = if !purchased_text.exists() {
                     fs::copy(&text_path, &purchased_text).map(|_| ())
                 } else {
                     Ok(())
-                }
-                .and_then(|_| {
-                    if !purchased_cover.exists() {
-                        fs::copy(&cover_path, &purchased_cover).map(|_| ())
-                    } else {
-                        Ok(())
-                    }
-                });
+                };
                 if copy_result.is_err() {
                     result.failed_count += 1;
                     continue;
@@ -1519,7 +1726,7 @@ fn pixiv_sync_impl(
             },
         );
     }
-    if !result.cancelled && result.failed_count == 0 {
+    if !is_single_sync && !result.cancelled && result.failed_count == 0 {
         result.last_sync_at = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE authors SET pixiv_last_sync_at=?1 WHERE id=?2",
@@ -1535,11 +1742,12 @@ async fn sync_pixiv_novels(
     author_id: i64,
     start_date: String,
     end_date: String,
+    novel_url: String,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     clear_pixiv_sync_cancel(author_id);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        pixiv_sync_impl(author_id, start_date, end_date, app)
+        pixiv_sync_impl(author_id, start_date, end_date, novel_url, app)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -1991,6 +2199,26 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn copy_text_files(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_text_files(&source_path, &destination_path)?;
+        } else if source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("txt"))
+            .unwrap_or(false)
+        {
+            fs::copy(&source_path, &destination_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn copy_previews_to_purchased(
     author_id: i64,
@@ -2140,6 +2368,28 @@ fn open_work(work_id: i64) -> Result<(), String> {
     conn.execute("UPDATE works SET is_new=0 WHERE id=?1", [work_id])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("仅支持打开 HTTP 或 HTTPS 链接".into());
+    }
+    open::that(url).map_err(|e| format!("无法打开系统浏览器：{e}"))
+}
+
+#[tauri::command]
+fn open_help_document() -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|e| format!("无法定位程序目录：{e}"))?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| "无法定位程序目录".to_string())?;
+    let document = directory.join("help.html");
+    if !document.is_file() {
+        return Err("未找到同目录的 help.html，请确认它与程序 exe 位于同一文件夹".into());
+    }
+    open::that(&document).map_err(|e| format!("无法打开帮助文档：{e}"))
 }
 
 fn parse_line(line: &str) -> Option<(String, String)> {
@@ -2373,6 +2623,8 @@ pub fn run() {
             delete_works,
             toggle_favorite,
             open_work,
+            open_external_url,
+            open_help_document,
             preview_import,
             commit_import,
             read_import_file,
@@ -2391,13 +2643,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        file_name, is_after_last_sync, is_within_date_range, name_key, normalize_pixiv_cookie,
-        pixiv_published_at, should_import_folder_entry, similarity_percent,
-        synopsis_indicates_preview,
+        copy_text_files, file_name, has_invalid_date_range, is_after_last_sync,
+        is_within_date_range, matched_sync_preview, name_key, normalize_pixiv_cookie,
+        pixiv_novel_id_from_url, pixiv_published_at, populate_work_display_info,
+        should_import_folder_entry, similarity_percent, synopsis_indicates_preview,
+        text_word_count, SyncPreviewEntry, Work,
     };
     use chrono::{DateTime, NaiveDate, Utc};
     use serde_json::json;
-    use std::path::Path;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn preview_matching_ignores_known_extensions() {
@@ -2462,6 +2720,113 @@ mod tests {
             start,
             end
         ));
+    }
+
+    #[test]
+    fn sync_allows_an_open_ended_date_range() {
+        let start = NaiveDate::from_ymd_opt(2025, 1, 1);
+        let end = NaiveDate::from_ymd_opt(2025, 1, 31);
+        assert!(!has_invalid_date_range(start, None));
+        assert!(!has_invalid_date_range(None, end));
+        assert!(has_invalid_date_range(end, start));
+    }
+
+    #[test]
+    fn sync_reuses_a_unique_matching_preview_file() {
+        let entries = vec![
+            SyncPreviewEntry {
+                path: PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.txt"),
+                name: "2025-10-05 希儿与布洛妮娅".into(),
+                is_preview: true,
+            },
+            SyncPreviewEntry {
+                path: PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.jpg"),
+                name: "2025-10-05 希儿与布洛妮娅".into(),
+                is_preview: false,
+            },
+        ];
+        let (preview, cover) = matched_sync_preview(&entries, "希儿与布洛妮娅", 70).unwrap();
+        assert_eq!(
+            preview,
+            PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.txt")
+        );
+        assert_eq!(
+            cover,
+            Some(PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.jpg"))
+        );
+    }
+
+    #[test]
+    fn sync_full_copy_keeps_only_text_and_counts_text_inside_a_folder() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("collection-library-test-{suffix}"));
+        let source = root.join("preview");
+        let destination = root.join("full");
+        fs::create_dir_all(source.join("chapters")).unwrap();
+        fs::write(source.join("novel.txt"), "第一章 文字").unwrap();
+        fs::write(source.join("chapters").join("part.txt"), "第二章").unwrap();
+        fs::write(source.join("cover.jpg"), [1_u8, 2, 3]).unwrap();
+
+        copy_text_files(&source, &destination).unwrap();
+
+        assert!(destination.join("novel.txt").is_file());
+        assert!(destination.join("chapters").join("part.txt").is_file());
+        assert!(!destination.join("cover.jpg").exists());
+        assert_eq!(text_word_count(&destination.to_string_lossy()), Some(8));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn purchased_non_text_file_shows_its_format_instead_of_a_word_count() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("collection-library-test-{suffix}.epub"));
+        fs::write(&path, [1_u8, 2, 3]).unwrap();
+        let mut work = Work {
+            author_id: 1,
+            id: 1,
+            title: String::new(),
+            release_date: String::new(),
+            preview_path: String::new(),
+            cover_path: String::new(),
+            purchased_path: path.to_string_lossy().to_string(),
+            favorite: false,
+            tags: String::new(),
+            pixiv_novel_id: String::new(),
+            series_id: String::new(),
+            series_title: String::new(),
+            series_order: 0,
+            is_new: false,
+            author_name: String::new(),
+            word_count: None,
+            file_format: None,
+        };
+
+        populate_work_display_info(&mut work);
+
+        assert_eq!(work.word_count, None);
+        assert_eq!(work.file_format.as_deref(), Some("EPUB"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn single_sync_accepts_only_a_pixiv_novel_url() {
+        assert_eq!(
+            pixiv_novel_id_from_url("https://www.pixiv.net/novel/show.php?id=28563270").unwrap(),
+            Some("28563270".into())
+        );
+        assert_eq!(
+            pixiv_novel_id_from_url("https://www.pixiv.net/novel/show.php?foo=bar&id=42#part")
+                .unwrap(),
+            Some("42".into())
+        );
+        assert!(pixiv_novel_id_from_url("https://www.pixiv.net/novel/show.php?id=abc").is_err());
+        assert!(pixiv_novel_id_from_url("https://www.pixiv.net/users/123").is_err());
     }
 
     #[test]

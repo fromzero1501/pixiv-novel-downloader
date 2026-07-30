@@ -1,6 +1,6 @@
 [package]
 name = "collection-library"
-version = "0.3.12"
+version = "0.3.21"
 description = "Local collection library"
 authors = ["you"]
 edition = "2021"
@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 calamine = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1.3"
+encoding_rs = "0.8"
 open = "5.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

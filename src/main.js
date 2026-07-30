@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "0.3.12";
+const APP_VERSION = "0.3.21";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -13,7 +13,8 @@ const state = {
   workQuery: "",
   searchField: "title",
   status: "all",
-  favoritesOnly: false,
+  authorFavoritesOnly: false,
+  allWorksFavoritesOnly: false,
   sort: "date_desc",
   bulkMode: false,
   selectedWorkIds: new Set(),
@@ -58,8 +59,10 @@ async function invoke(command, args = {}) {
   if (command === "sync_pixiv_author_profile") return { id: args.authorId ?? null, name: "Pixiv 作者", homepage: args.homepage, avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, pixivLastSyncAt: "", avatarManaged: false };
   if (command === "update_work_tags") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.tags = args.tags.join("|"); return; }
   if (command === "copy_previews_to_purchased") return { copiedCount: args.workIds.length, boundCount: args.workIds.length, skippedCount: 0 };
-  if (command === "sync_pixiv_novels") return { downloadedCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, lastSyncAt: new Date().toISOString() };
+  if (command === "sync_pixiv_novels") return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, lastSyncAt: new Date().toISOString() };
   if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.isNew = false; return; }
+  if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
+  if (command === "open_help_document") { window.open("./help.html", "_blank", "noopener,noreferrer"); return; }
   throw new Error("普通浏览器预览仅展示界面；本地文件功能请在 Tauri 程序中使用。");
 }
 
@@ -83,6 +86,7 @@ const icon = (name, size = 18) => {
     tag: '<path d="M20 13.5 13.5 20a2.1 2.1 0 0 1-3 0L4 13.5V4h9.5L20 10.5a2.1 2.1 0 0 1 0 3Z"/><circle cx="8.5" cy="8.5" r="1"/>',
     series: '<rect x="4" y="5" width="16" height="14" rx="1"/><path d="M8 3v4M16 3v4M8 11h8M8 15h5"/>',
     file: '<path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5M10 13h5M10 16h5"/>',
+    help: '<circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.3 2.3 0 1 1 3.8 1.7c-.9.7-1.6 1.2-1.6 2.5"/><path d="M12 16h.01"/>',
   };
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name]}</svg>`;
 };
@@ -118,12 +122,25 @@ function wordCountLabel(value) {
   return `${new Intl.NumberFormat("zh-CN").format(value)} 字`;
 }
 
+function workContentMeta(work) {
+  if (work.wordCount) return `<span class="work-word-count">${wordCountLabel(work.wordCount)}</span>`;
+  if (work.fileFormat) return `<span class="work-word-count">${escapeHtml(work.fileFormat)}</span>`;
+  return "";
+}
+
 function syncLabel(value) {
   return value ? `上次同步 ${value.replace("T", " ").slice(0, 16)}` : "尚未同步";
 }
 
 async function refreshAuthors() {
   state.authors = await invoke("list_authors");
+}
+
+async function refreshActiveAuthor() {
+  await refreshAuthors();
+  if (state.activeAuthor) {
+    state.activeAuthor = state.authors.find((author) => author.id === state.activeAuthor.id) || state.activeAuthor;
+  }
 }
 
 async function refreshWorks() {
@@ -133,7 +150,7 @@ async function refreshWorks() {
     query: state.workQuery,
     searchField: state.searchField,
     status: state.status,
-    favoritesOnly: state.favoritesOnly,
+    favoritesOnly: state.authorFavoritesOnly,
     sort: state.sort,
   });
 }
@@ -143,13 +160,15 @@ async function refreshAllWorks() {
     query: state.workQuery,
     searchField: state.searchField,
     status: state.status,
-    favoritesOnly: state.favoritesOnly,
+    favoritesOnly: state.allWorksFavoritesOnly,
     sort: state.sort,
   });
 }
 
 function render() {
-  app.innerHTML = state.activeAuthor ? (state.seriesView ? renderSeriesView() : renderWorks()) : (state.homeView === "allWorks" ? renderAllWorks() : renderAuthors());
+  app.innerHTML = state.activeAuthor
+    ? (state.seriesView ? renderSeriesView() : renderWorks())
+    : (state.homeView === "allWorks" ? renderAllWorks() : state.homeView === "help" ? renderHelp() : renderAuthors());
   bindEvents();
 }
 
@@ -167,8 +186,8 @@ function findWork(workId) {
   return [...state.works, ...state.seriesItems, ...state.allWorks].find((work) => work.id === workId);
 }
 
-async function openSeriesDetail(seriesId, seriesTitle) {
-  state.seriesView = { kind: "detail", id: seriesId, title: seriesTitle };
+async function openSeriesDetail(seriesId, seriesTitle, returnTo = "works") {
+  state.seriesView = { kind: "detail", id: seriesId, title: seriesTitle, returnTo };
   state.seriesItems = await invoke("list_series_works", { authorId: state.activeAuthor.id, seriesId });
   render();
 }
@@ -177,8 +196,8 @@ async function openAllWorksSeries(authorId, seriesId, seriesTitle) {
   const author = state.authors.find((item) => item.id === Number(authorId));
   if (!author) throw new Error("未找到该系列所属作者");
   state.activeAuthor = author;
-  state.homeView = "authors";
-  await openSeriesDetail(seriesId, seriesTitle);
+  state.homeView = "allWorks";
+  await openSeriesDetail(seriesId, seriesTitle, "allWorks");
 }
 
 async function openSeriesLibrary() {
@@ -189,7 +208,21 @@ async function openSeriesLibrary() {
 
 async function closeSeriesView() {
   if (state.seriesView?.kind === "detail") {
-    await openSeriesLibrary();
+    const returnTo = state.seriesView.returnTo;
+    if (returnTo === "overview") {
+      await openSeriesLibrary();
+      return;
+    }
+    state.seriesView = null;
+    state.seriesItems = [];
+    if (returnTo === "allWorks") {
+      state.activeAuthor = null;
+      state.homeView = "allWorks";
+      await refreshAllWorks();
+    } else {
+      await refreshWorks();
+    }
+    render();
     return;
   }
   state.seriesView = null;
@@ -198,7 +231,7 @@ async function closeSeriesView() {
 }
 
 function renderShell(content) {
-  const authorLibraryActive = state.homeView !== "allWorks" || Boolean(state.activeAuthor);
+  const authorLibraryActive = state.homeView === "authors" || Boolean(state.activeAuthor);
   return `<div class="app-shell">
     <aside class="side-rail">
       <div class="brand-mark" title="Pixiv小说下载管理器" aria-label="Pixiv小说下载管理器">${appLogo(44)}</div>
@@ -207,6 +240,7 @@ function renderShell(content) {
       </nav>
       <nav class="rail-nav rail-nav-secondary">
         <button class="rail-button ${state.homeView === "allWorks" && !state.activeAuthor ? "is-active" : ""}" title="\u6240\u6709\u4f5c\u54c1" data-action="go-all-works">${icon("database", 20)}</button>
+        <button class="rail-button ${state.homeView === "help" && !state.activeAuthor ? "is-active" : ""}" title="帮助" aria-label="帮助" data-action="help">${icon("help", 20)}</button>
       </nav>
       <div class="rail-footer">
         <span class="app-version" title="当前版本">v${APP_VERSION}</span>
@@ -215,6 +249,32 @@ function renderShell(content) {
     </aside>
     <main class="workspace">${content}</main>
   </div>`;
+}
+
+function renderHelp() {
+  return renderShell(`
+    <section class="topbar help-topbar">
+      <div><p class="section-kicker">使用指南与项目资料</p><h1>帮助</h1></div>
+    </section>
+    <section class="help-content">
+      <div class="help-link-bar">
+        <span>项目主页</span>
+        <a href="https://github.com/fromzero1501/pixiv-novel-downloader" data-action="open-external-url" data-url="https://github.com/fromzero1501/pixiv-novel-downloader">fromzero1501/pixiv-novel-downloader</a>
+      </div>
+      <div class="help-link-bar">
+        <span>使用指南</span>
+        <a href="help.html" data-action="open-help-document">在浏览器中打开完整帮助文档</a>
+      </div>
+    </section>`);
+}
+
+async function openExternalUrl(url) {
+  if (!/^https?:\/\//i.test(url || "")) throw new Error("仅支持在浏览器中打开 HTTP 或 HTTPS 链接");
+  await invoke("open_external_url", { url });
+}
+
+async function openHelpDocument() {
+  await invoke("open_help_document");
 }
 
 function renderAuthors() {
@@ -279,7 +339,7 @@ function renderWorks() {
         </div>
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="work-menu" title="更多操作" data-action="work-menu" data-work-id="${work.id}">${icon("more", 18)}</button>`}
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${work.wordCount ? `<span class="work-word-count">${wordCountLabel(work.wordCount)}</span>` : ""}</div><h2 title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
     </article>`).join("");
 
   return renderShell(`
@@ -292,7 +352,7 @@ function renderWorks() {
         <label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${state.searchField === "tags" ? "搜索标签" : "搜索作品名称"}" value="${escapeHtml(state.workQuery)}" autocomplete="off"></label>
         <select class="sort-select search-mode-select" id="search-field" aria-label="搜索范围"><option value="title" ${state.searchField === "title" ? "selected" : ""}>标题</option><option value="tags" ${state.searchField === "tags" ? "selected" : ""}>标签</option></select>
         <div class="filter-group" role="group" aria-label="版本状态">${[ ["all", "全部"], ["purchased", "完整版"], ["unpurchased", "预览版"] ].map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
-        <button class="icon-text-button favorite-filter ${state.favoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
+        <button class="icon-text-button favorite-filter ${state.authorFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <select class="sort-select" id="sort-select" aria-label="排序"><option value="date_desc" ${state.sort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.sort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.sort === "title_asc" ? "selected" : ""}>名称 A-Z</option></select>
       </div>
       <div class="binding-bar"><div><strong>本地文件</strong><span>${author.previewDir ? "预览版目录已绑定" : "尚未绑定预览版目录"} · ${author.purchasedDir ? "完整版目录已绑定" : "尚未绑定完整版目录"}</span><em class="sync-status">Pixiv ${syncLabel(author.pixivLastSyncAt)}</em></div><div><button class="quiet-button" data-action="scan-preview">${icon("folder", 17)}关联预览版文件</button><button class="quiet-button" data-action="scan-purchased">${icon("upload", 17)}关联完整版文件</button></div></div>
@@ -307,7 +367,7 @@ function renderAllWorks() {
         ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         <div class="work-badges"><span class="status-badge ${work.purchasedPath ? "owned" : "unowned"}" title="${work.purchasedPath ? "完整版已绑定" : "预览版"}">${icon(work.purchasedPath ? "check" : "x", 17)}</span></div>
       </div>
-      <div class="work-copy"><p class="work-author">${escapeHtml(work.authorName || "")}</p><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${work.wordCount ? `<span class="work-word-count">${wordCountLabel(work.wordCount)}</span>` : ""}</div><h2 title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+      <div class="work-copy"><p class="work-author">${escapeHtml(work.authorName || "")}</p><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
     </article>`).join("");
   return renderShell(`
     <section class="topbar work-topbar"><div><p class="section-kicker">全部作者</p><h1>所有作品</h1></div></section>
@@ -316,7 +376,7 @@ function renderAllWorks() {
         <label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${state.searchField === "tags" ? "搜索标签" : "搜索作品名称"}" value="${escapeHtml(state.workQuery)}" autocomplete="off"></label>
         <select class="sort-select search-mode-select" id="search-field" aria-label="搜索范围"><option value="title" ${state.searchField === "title" ? "selected" : ""}>标题</option><option value="tags" ${state.searchField === "tags" ? "selected" : ""}>标签</option></select>
         <div class="filter-group" role="group" aria-label="版本状态">${[ ["all", "全部"], ["purchased", "完整版"], ["unpurchased", "预览版"] ].map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
-        <button class="icon-text-button favorite-filter ${state.favoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
+        <button class="icon-text-button favorite-filter ${state.allWorksFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <select class="sort-select" id="sort-select" aria-label="排序"><option value="date_desc" ${state.sort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.sort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.sort === "title_asc" ? "selected" : ""}>名称 A-Z</option></select>
       </div>
       <div class="read-only-note">所有作品仅供搜索、筛选与打开查看。</div>
@@ -334,7 +394,7 @@ function renderSeriesWorkCards(works) {
         </div>
         <button class="work-menu" title="更多操作" data-action="work-menu" data-work-id="${work.id}">${icon("more", 18)}</button>
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${work.wordCount ? `<span class="work-word-count">${wordCountLabel(work.wordCount)}</span>` : ""}</div><h2 title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
     </article>`).join("");
 }
 
@@ -396,10 +456,10 @@ function authorModal(author = {}) {
       <input type="hidden" name="avatarManaged" value="${author.avatarManaged ? "true" : "false"}">
       <label>作者名称 <input name="name" required maxlength="80" value="${escapeHtml(author.name || "")}" placeholder="例如：某位作者"></label>
       <label>关联相似度 <input name="matchThreshold" type="number" min="1" max="100" step="1" value="${author.matchThreshold || 70}"><small>用于关联预览版、封面和完整版文件。名称不完全一致时，达到此值才会作为自动关联候选。</small></label>
-      <label>Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>用于作品同步。请填写包含作者数字 ID 的 Pixiv 用户主页链接。</small></label>
+      <label>Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>填写有效主页后，点击“同步作者信息”会自动获取作者名称和头像。</small></label>
       <label>头像文件 <div class="path-input"><input name="avatarPath" value="${escapeHtml(author.avatarPath || "")}" readonly placeholder="尚未选择"><button type="button" class="quiet-button" data-action="pick-avatar">选择图片</button></div></label>
-      <label>预览版文件夹 <div class="path-input"><input name="previewDir" value="${escapeHtml(author.previewDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-preview-dir">选择文件夹</button></div></label>
-      <label>完整版文件夹 <div class="path-input"><input name="purchasedDir" value="${escapeHtml(author.purchasedDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-purchased-dir">选择文件夹</button></div></label>
+      <label>预览版文件夹 <div class="path-input"><input name="previewDir" value="${escapeHtml(author.previewDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-preview-dir">选择文件夹</button></div><small>在设置中配置默认目录并开启自动创建作者目录后，保存作者时会自动生成，无需手动选择。</small></label>
+      <label>完整版文件夹 <div class="path-input"><input name="purchasedDir" value="${escapeHtml(author.purchasedDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-purchased-dir">选择文件夹</button></div><small>在设置中配置默认目录并开启自动创建作者目录后，保存作者时会自动生成，无需手动选择。</small></label>
       <label>备注 <textarea name="notes" rows="3" placeholder="可记录来源、说明等">${escapeHtml(author.notes || "")}</textarea></label>
     </form>`, `${author.id ? `<button class="danger-button" data-action="delete-author" data-author-id="${author.id}">删除作者</button>` : ""}<span class="footer-spacer"></span><button class="quiet-button" data-action="sync-author-profile">同步作者信息</button><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" form="author-form" type="submit">保存作者</button>`));
 }
@@ -421,7 +481,7 @@ function importModal() {
 }
 
 function workMenu(work) {
-  showModal(modal(work.title, `<div class="menu-list"><button data-action="open-work" data-work-id="${work.id}">${icon("arrow", 18)}打开${work.purchasedPath ? "完整版" : "预览版"}</button><button data-action="bind-work-file" data-work-id="${work.id}">${icon("folder", 18)}绑定完整版文件</button><button data-action="bind-work-folder" data-work-id="${work.id}">${icon("folder", 18)}绑定完整版文件夹</button><button data-action="edit-tags" data-work-id="${work.id}">${icon("tag", 18)}编辑标签</button><button data-action="toggle-favorite" data-work-id="${work.id}">${icon("heart", 18)}${work.favorite ? "取消收藏" : "收藏"}</button><button class="menu-danger" data-action="delete-work" data-work-id="${work.id}">${icon("more", 18)}删除作品</button></div>`));
+  showModal(modal(work.title, `<div class="menu-list"><button data-action="open-work" data-work-id="${work.id}">${icon("arrow", 18)}打开${work.purchasedPath ? "完整版" : "预览版"}</button><button data-action="bind-work-file" data-work-id="${work.id}">${icon("folder", 18)}绑定完整版文件</button><button data-action="edit-tags" data-work-id="${work.id}">${icon("tag", 18)}编辑标签</button><button data-action="toggle-favorite" data-work-id="${work.id}">${icon("heart", 18)}${work.favorite ? "取消收藏" : "收藏"}</button><button class="menu-danger" data-action="delete-work" data-work-id="${work.id}">${icon("more", 18)}删除作品</button></div>`));
 }
 
 function editTagsModal(workId, tags = null) {
@@ -615,25 +675,28 @@ async function bindEvents() {
     element.dataset.bound = "true";
     element.addEventListener("click", async (event) => {
     event.stopPropagation();
-    const { action, authorId, workId, status } = element.dataset;
+    const { action, authorId, workId, status, url } = element.dataset;
     try {
       if (action === "go-home") { state.activeAuthor = null; state.homeView = "authors"; state.seriesView = null; state.seriesItems = []; state.authorQuery = ""; await refreshAuthors(); render(); }
       if (action === "go-all-works") { state.activeAuthor = null; state.homeView = "allWorks"; state.seriesView = null; state.seriesItems = []; state.workQuery = ""; await refreshAllWorks(); render(); }
+      if (action === "help") { state.activeAuthor = null; state.homeView = "help"; state.seriesView = null; state.seriesItems = []; render(); }
+      if (action === "open-external-url") { event.preventDefault(); await openExternalUrl(url); }
+      if (action === "open-help-document") { event.preventDefault(); await openHelpDocument(); }
       if (action === "new-author") authorModal();
       if (action === "edit-author") { const author = state.authors.find((item) => item.id === Number(authorId)) || state.activeAuthor; authorModal(author); }
       if (action === "sync-author-profile") await syncAuthorProfile();
       if (action === "close-modal") closeModal();
       if (action === "status") { state.status = status; if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); }
-      if (action === "favorites-only") { state.favoritesOnly = !state.favoritesOnly; if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); }
+      if (action === "favorites-only") { if (state.homeView === "allWorks" && !state.activeAuthor) { state.allWorksFavoritesOnly = !state.allWorksFavoritesOnly; await refreshAllWorks(); } else { state.authorFavoritesOnly = !state.authorFavoritesOnly; await refreshWorks(); } render(); }
       if (action === "import-works") importModal();
       if (action === "sync-pixiv") pixivSyncModal();
       if (action === "scan-preview") await scanPreview();
       if (action === "scan-purchased") await scanPurchased();
       if (action === "work-menu") workMenu(findWork(Number(workId)));
-      if (action === "open-series") await openSeriesDetail(element.dataset.seriesId, element.dataset.seriesTitle);
+      if (action === "open-series") await openSeriesDetail(element.dataset.seriesId, element.dataset.seriesTitle, state.seriesView?.returnTo || "works");
       if (action === "open-all-series") await openAllWorksSeries(Number(authorId), element.dataset.seriesId, element.dataset.seriesTitle);
       if (action === "open-series-library") await openSeriesLibrary();
-      if (action === "open-series-card") await openSeriesDetail(element.dataset.seriesId, element.dataset.seriesTitle);
+      if (action === "open-series-card") await openSeriesDetail(element.dataset.seriesId, element.dataset.seriesTitle, "overview");
       if (action === "close-series-view") await closeSeriesView();
       if (action === "edit-tags") { closeModal(); editTagsModal(Number(workId)); }
       if (action === "join-series") await chooseSeriesForWork(Number(workId));
@@ -655,7 +718,6 @@ async function bindEvents() {
       if (action === "delete-selected") await deleteSelectedWorks();
       if (action === "open-work") { await invoke("open_work", { workId: Number(workId) }); closeModal(); if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); }
       if (action === "bind-work-file") await bindWork(Number(workId), false);
-      if (action === "bind-work-folder") await bindWork(Number(workId), true);
       if (action === "pick-avatar") await pickPath("avatarPath", false, ["jpg", "jpeg", "png", "webp"]);
       if (action === "pick-preview-dir") await pickPath("previewDir", true);
       if (action === "pick-purchased-dir") await pickPath("purchasedDir", true);
@@ -684,6 +746,7 @@ async function bindEvents() {
     if (event.target.closest("button")) return;
     state.activeAuthor = state.authors.find((author) => author.id === Number(card.dataset.authorId));
     state.homeView = "authors";
+    state.authorFavoritesOnly = false;
     await refreshWorks(); render();
     });
   });
@@ -830,6 +893,7 @@ async function scanPreview() {
     toast(details.join("；"), result.ambiguousCount ? "info" : "success");
   }
   else toast("未找到可匹配的预览版内容或封面，请检查名称与目录第一层文件", "info");
+  await refreshActiveAuthor();
   render();
 }
 
@@ -842,14 +906,14 @@ async function scanPurchased() {
     toast(`已自动绑定 ${result.boundCount} 个作品，${result.selections.length} 个完整版文件待您选择`, "info");
     showPurchasedSelections(result.selections);
   } else toast(`已自动绑定 ${result.boundCount} 个完整版作品`, "success");
-  await refreshWorks(); await refreshAuthors(); render();
+  await refreshWorks(); await refreshActiveAuthor(); render();
 }
 
 async function bindWork(workId, directory) {
   const path = await open({ directory, multiple: false });
   if (!path) return;
   await invoke("bind_work", { workId, path });
-  closeModal(); await refreshWorks(); await refreshAuthors(); render();
+  closeModal(); await refreshWorks(); await refreshActiveAuthor(); render();
   toast("已绑定本地完整版内容", "success");
 }
 
@@ -877,7 +941,7 @@ async function deleteWork(workId) {
   if (!work) return;
   confirmAction("确认删除作品", `删除“${work.title}”只会移除软件记录和路径绑定，不会删除磁盘中的原始文件。`, "删除作品", async () => {
     await invoke("delete_work", { workId });
-    await refreshWorks(); await refreshAuthors(); render();
+    await refreshWorks(); await refreshActiveAuthor(); render();
     toast("作品记录已删除，原始文件未受影响", "success");
   });
 }
@@ -888,7 +952,7 @@ async function deleteSelectedWorks() {
   confirmAction("确认批量删除", `将删除 ${workIds.length} 条作品记录和路径绑定，不会删除磁盘中的原始文件。`, "删除已选作品", async () => {
     await invoke("delete_works", { workIds });
     state.bulkMode = false; state.selectedWorkIds.clear();
-    await refreshWorks(); await refreshAuthors(); render();
+    await refreshWorks(); await refreshActiveAuthor(); render();
     toast(`已删除 ${workIds.length} 条作品记录，原始文件未受影响`, "success");
   });
 }
@@ -898,7 +962,7 @@ async function copySelectedToFull() {
   if (!workIds.length) return;
   const result = await invoke("copy_previews_to_purchased", { authorId: state.activeAuthor.id, workIds });
   state.bulkMode = false; state.selectedWorkIds.clear();
-  await refreshWorks(); await refreshAuthors(); render();
+  await refreshWorks(); await refreshActiveAuthor(); render();
   const skipped = result.skippedCount ? `；${result.skippedCount} 条没有可用预览版，已跳过` : "";
   toast(`已复制 ${result.copiedCount} 条预览版并绑定 ${result.boundCount} 条完整版${skipped}`, result.skippedCount ? "info" : "success");
 }
@@ -911,7 +975,7 @@ function showPurchasedSelections(selections) {
 async function confirmMatches() {
   const selections = [...document.querySelectorAll("[data-purchased-path]")].map((select) => ({ workId: Number(select.value), path: select.dataset.purchasedPath })).filter((item) => item.workId);
   for (const item of selections) await invoke("bind_work", item);
-  closeModal(); await refreshWorks(); await refreshAuthors(); render();
+  closeModal(); await refreshWorks(); await refreshActiveAuthor(); render();
   toast(`已确认绑定 ${selections.length} 个完整版作品`, "success");
 }
 
@@ -974,15 +1038,31 @@ async function submitImport() {
   }));
 }
 
+function isPixivNovelUrl(value) {
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "https:" && url.hostname === "www.pixiv.net" && url.pathname === "/novel/show.php" && /^\d+$/.test(url.searchParams.get("id") || "");
+  } catch {
+    return false;
+  }
+}
+
 function pixivSyncModal() {
   const author = state.activeAuthor;
   showModal(modal("作品同步", `
     <form id="pixiv-sync-form" class="form-stack">
-      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!author.homepage ? "请先在作者设置中填写 Pixiv 作者主页。" : !author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : !author.purchasedDir ? "请先在作者设置中绑定完整版文件夹。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
+      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : !author.purchasedDir ? "请先在作者设置中绑定完整版文件夹。" : !author.homepage ? "填写单篇小说地址可直接同步；批量同步则需先填写作者主页。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
+      <label>单篇小说地址 <input name="novelUrl" type="url" placeholder="https://www.pixiv.net/novel/show.php?id=28686066"><small>填写有效地址后只同步该作品，不更新上次成功同步时间，也不使用日期范围。</small></label>
       <div class="date-range"><label>开始日期 <input name="startDate" type="date"></label><label>结束日期 <input name="endDate" type="date"></label></div>
-      <small>投稿时间以 Pixiv 原始投稿时间为准，不受后续编辑影响。不填日期时，仅检查上次成功同步后的新投稿；填写日期后，按指定投稿时间范围重新检查。已有作品会先按 Pixiv 小说 ID、再按关联相似度跳过。</small>
+      <small>批量同步时，投稿时间以 Pixiv 原始投稿时间为准。不填日期时，仅检查上次成功同步后的新投稿；填写日期后，按指定投稿时间范围重新检查。已有作品会先按 Pixiv 小说 ID、再按关联相似度跳过。</small>
       <div class="sync-progress is-hidden" id="sync-progress"><div><strong id="sync-progress-label">准备同步</strong><span id="sync-progress-count">0 / 0</span></div><progress id="sync-progress-bar" value="0" max="1"></progress><p id="sync-progress-title"></p></div>
     </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="danger-button" data-action="cancel-pixiv-sync" disabled>终止同步</button><button class="primary-button" data-action="confirm-pixiv-sync" ${author.homepage && author.previewDir && author.purchasedDir ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
+  const novelUrlInput = document.querySelector('[name="novelUrl"]');
+  const syncButton = document.querySelector('[data-action="confirm-pixiv-sync"]');
+  novelUrlInput?.addEventListener("input", () => {
+    const canSync = Boolean(author.previewDir && author.purchasedDir && (author.homepage || isPixivNovelUrl(novelUrlInput.value)));
+    syncButton.disabled = !canSync;
+  });
 }
 
 async function syncPixivWorks() {
@@ -990,7 +1070,7 @@ async function syncPixivWorks() {
   if (!form) return;
   const button = document.querySelector('[data-action="confirm-pixiv-sync"]');
   const cancelButton = document.querySelector('[data-action="cancel-pixiv-sync"]');
-  const { startDate = "", endDate = "" } = Object.fromEntries(new FormData(form).entries());
+  const { startDate = "", endDate = "", novelUrl = "" } = Object.fromEntries(new FormData(form).entries());
   button.disabled = true;
   button.textContent = "正在同步...";
   cancelButton.disabled = false;
@@ -1004,13 +1084,23 @@ async function syncPixivWorks() {
     document.querySelector("#sync-progress-title").textContent = title || "正在读取作品列表...";
   });
   let result;
-  try { result = await invoke("sync_pixiv_novels", { authorId: state.activeAuthor.id, startDate, endDate }); } finally { unlisten(); }
+  try {
+    result = await invoke("sync_pixiv_novels", { authorId: state.activeAuthor.id, startDate, endDate, novelUrl });
+  } catch (error) {
+    button.disabled = false;
+    button.innerHTML = `${icon("sync", 17)}开始同步`;
+    cancelButton.disabled = true;
+    progress.classList.add("is-hidden");
+    throw error;
+  } finally {
+    unlisten();
+  }
   await refreshAuthors();
   state.activeAuthor = state.authors.find((author) => author.id === state.activeAuthor.id) || state.activeAuthor;
   await refreshWorks();
   closeModal();
   render();
-  const summary = `已下载 ${result.downloadedCount} 篇；已跳过 ${result.skippedExistingCount} 篇已有作品；日期筛除 ${result.skippedDateCount} 篇；大小筛除 ${result.skippedSizeCount || 0} 篇`;
+  const summary = `已下载 ${result.downloadedCount} 篇；已关联 ${result.reusedPreviewCount || 0} 篇已有预览版；已跳过 ${result.skippedExistingCount} 篇已有作品；日期筛除 ${result.skippedDateCount} 篇；大小筛除 ${result.skippedSizeCount || 0} 篇`;
   toast(result.cancelled ? `同步已终止；${summary}` : (result.failedCount ? `${summary}；${result.failedCount} 篇失败，将在下次同步时重试` : summary), result.cancelled || result.failedCount ? "info" : "success");
 }
 
