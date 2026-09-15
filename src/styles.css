@@ -438,8 +438,14 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 /* 更新弹窗 */
 .update-versions { margin: 0 0 10px; color: #35435a; font-size: 15px; }
 .update-versions strong { color: #176bd3; }
-.update-note { margin: 0 0 12px; color: #5c7590; font-size: 13px; line-height: 1.7; }
-.update-source { margin: 0; padding: 9px 11px; color: #5c7590; background: #f4f7fb; border: 1px solid #e2eaf3; border-radius: 6px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.update-note { margin: 12px 0 0; color: #5c7590; font-size: 13px; line-height: 1.7; }
+.update-source { margin: 12px 0 0; padding: 9px 11px; color: #5c7590; background: #f4f7fb; border: 1px solid #e2eaf3; border-radius: 6px; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.update-notes { padding: 10px 12px; background: #f4f7fb; border: 1px solid #e2eaf3; border-radius: 6px; }
+.update-notes.is-loading,
+.update-notes.is-empty { color: #7c8ea3; font-size: 12.5px; line-height: 1.7; }
+.update-notes-title { margin: 0 0 8px; color: #35435a; font-size: 13.5px; font-weight: 700; overflow-wrap: anywhere; }
+.update-notes-text { max-height: 220px; margin: 0; padding: 0; color: #44576f; font-family: inherit; font-size: 12.5px; line-height: 1.75; white-space: pre-wrap; overflow: auto; overflow-wrap: anywhere; }
+.update-notes-source { margin: 8px 0 0; color: #8698ad; font-size: 11.5px; }
 .update-panel .note-warn { margin: 12px 0 0; padding: 9px 11px; color: #8a5a12; background: #fdf4e3; border: 1px solid #f0dcb4; border-radius: 6px; font-size: 12.5px; line-height: 1.7; }
 .update-progress { display: grid; gap: 6px; margin-top: 14px; }
 .update-progress.is-hidden { display: none; }

@@ -69,12 +69,13 @@ const hostBlock = `  :host {
 css = hostBlock + css;
 
 // --- HTML 改写 -------------------------------------------------------------
-// 1. 版本号写成占位符，运行时用 APP_VERSION 替换（页眉徽标 + 页脚两处）
+// 1. 版本号写成占位符，运行时用 APP_VERSION 替换（页眉徽标 + 页脚 + 安装包名）
+//    正文里「↑ v1.0.1」是示意文案，靠前面的箭头排除掉，不参与替换
 // 2. 配图路径加 help/ 前缀（生成物在 public/help/images/ 下）
 // 3. 图片懒加载：正文很长，没必要一打开就解码全部截图
 const referenced = new Set();
 let html = inner
-  .replace(/v1\.0\.0/g, "__APP_VERSION__")
+  .replace(/(?<!↑ )v\d+\.\d+\.\d+/g, "__APP_VERSION__")
   .replace(/src="images\/([^"]+)"/g, (_, name) => {
     referenced.add(name);
     return `src="help/images/${name}"`;
@@ -82,6 +83,9 @@ let html = inner
   .replace(/<img /g, '<img loading="lazy" decoding="async" ');
 
 if (!referenced.size) fail("正文里没有解析到任何配图，请检查 docs/index.html 的图片路径");
+if ((html.match(/__APP_VERSION__/g) || []).length < 2) {
+  fail("没解析到版本号占位符，请检查 docs/index.html 的页眉徽标与页脚是否写了 vX.Y.Z");
+}
 
 // --- 输出 JS 模块 ----------------------------------------------------------
 const banner = `// 本文件由 scripts/build-help-doc.mjs 从 docs/index.html 自动生成，请勿手改。\n// 改帮助内容请改 docs/index.html，然后重新构建（npm run build / npm run portable）。\n`;

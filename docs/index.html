@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header class="page">
-  <span class="eyebrow">v1.0.0 · Windows</span>
+  <span class="eyebrow">v1.0.1 · Windows</span>
   <h1>Pixiv小说下载管理器</h1>
   <p class="lede">Windows 本地作品管理软件：按作者管理 Pixiv 小说的预览版与完整版文件，记录购买状态、封面、标签、系列和收藏。</p>
   <div class="links">
@@ -438,6 +438,10 @@
   <p class="hint">查版本、下新版、换掉旧的 —— 都在程序里做完。</p>
   <p>程序每次启动都会去发布页问一句「现在最新是哪个版本」。有新的会在左下角把版本号变成 <strong>↑ v1.0.1</strong> 这样的按钮并弹一条提示，<strong>不会自己偷偷下载或替换</strong>。点那个按钮，或者「设置 → 6 维护与数据 → 软件更新 → 检查更新」，就能打开更新弹窗。</p>
 
+  <h3>更新弹窗里直接显示这一版改了什么</h3>
+  <p>打开更新弹窗时会顺手把发布页上的更新说明抓回来，<strong>直接显示在弹窗里</strong>（可滚动，不用再自己开浏览器）。说明是从发布页的公开订阅源取的，不占用 GitHub 接口额度，也只在你确实查到新版时才去取一次 —— 平时启动查版本不会多带这个请求。</p>
+  <p>如果那一版没写更新说明、或者当下取不到，弹窗会直说取不到，下面留着「打开发布页」按钮，点一下就能在浏览器里看。</p>
+
   <h3>点「立即更新」之后发生什么</h3>
   <ol>
     <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.0.1.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
@@ -506,10 +510,14 @@
     <summary>更新失败怎么办？</summary>
     <p>看它提示哪一句：<strong>「程序所在文件夹不能写入」</strong>就把程序挪到桌面或文档这类位置再更新（便携版放哪儿都能跑）；<strong>「所有下载源都失败了」</strong>说明内置镜像这会儿都不通，去「设置 → 6 维护与数据 → 更新加速镜像」换几条，或者点弹窗里的「打开发布页」手动下载替换。详见 <a class="inline" href="#update">第 12 节</a>。</p>
   </details>
+  <details class="faq">
+    <summary>更新弹窗里没显示更新说明？</summary>
+    <p>两种可能：那一版发布时确实没写更新说明，或者说明这会儿取不回来（网络 / 镜像的问题）。都不影响更新本身，点弹窗里的「打开发布页」在浏览器里就能看到这一版改了什么。详见 <a class="inline" href="#update">第 12 节</a>。</p>
+  </details>
 </section>
 
 <footer class="page">
-  <span>Pixiv小说下载管理器 v1.0.0 · 本文档随版本更新</span>
+  <span>Pixiv小说下载管理器 v1.0.1 · 本文档随版本更新</span>
   <span><a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader">GitHub</a> · <a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader/issues">反馈</a></span>
 </footer>
 

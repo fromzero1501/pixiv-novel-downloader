@@ -5,7 +5,7 @@ import { HELP_DOC_CSS, HELP_DOC_HTML } from "./help-doc.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "1.0.0";
+const APP_VERSION = "1.0.1";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -56,6 +56,11 @@ const state = {
   update: null,
   updateProgress: null,
   updateDownloading: false,
+  /**
+   * 更新说明（Release 正文）的取回状态：`{ version, state: "loading"|"ready"|"error", title, notes, source, error }`。
+   * 只在真的有新版时才去取 —— 没新版时一次请求都不发。
+   */
+  updateNotes: null,
   /** 卡片按下时的坐标：用来区分「点击」和「按住拖动选中文字」 */
   cardPressPoint: null,
   /** 单击打开文件前的短定时器句柄：双击选中标题里的词时会把它取消掉 */
@@ -129,6 +134,16 @@ async function invoke(command, args = {}) {
     return `D:\\示例\\程序目录\\${String(args.assetName || "").replace(/\.zip$/i, ".exe")}`;
   }
   if (command === "apply_update") { window.__mockUpdateApplied = args.path; return; }
+  // 更新说明：默认给一段像样的示例；要看「取不到」的样子就设 window.__mockReleaseNotesError
+  if (command === "fetch_release_notes") {
+    if (window.__mockReleaseNotesError) throw new Error(window.__mockReleaseNotesError);
+    return window.__mockReleaseNotes || {
+      version: args.version,
+      title: `v${args.version} —— 自动更新 + 内置图文帮助`,
+      notes: "软件自动更新（可配置加速镜像）\n- 版本识别走发布页跳转解析，不调用 GitHub API\n- 内置 4 条国内镜像，查版本与下载都自动回退\n\n帮助文档不再外置\n- 应用内帮助页用 Shadow DOM 装载，截图不再变形\n- 删除外置 help.html（文件取不到时不影响使用）",
+      source: "直连 GitHub",
+    };
+  }
   if (command === "cleanup_old_portable_builds") return { removed: [], failed: [] };
   if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"];
   if (command === "refresh_reading_image_counts") return { scannedCount: 0, updatedCount: 0 };
@@ -3279,9 +3294,13 @@ async function checkForUpdate({ silent = false } = {}) {
     state.update = result;
     render();
     if (!result.hasUpdate) {
+      state.updateNotes = null;
       if (!silent) toast(`已经是最新版（v${result.currentVersion}）`, "success");
       return result;
     }
+    // 有新版才顺带去取更新说明（异步，不挡提示）；被忽略的版本也取，
+    // 因为左下角角标还在，用户随时可能点开看
+    void loadUpdateNotes(result.latestVersion);
     if (silent && ignoredUpdateVersion() === result.latestVersion) return result;
     toast(`发现新版本 v${result.latestVersion}，点左下角版本号查看`, "success");
     return result;
@@ -3311,6 +3330,62 @@ function updateProgressPercent() {
   return Math.min(100, Math.round((progress.received / progress.total) * 100));
 }
 
+/**
+ * 更新说明只在「确实查到新版」时才去取一次，取回后填进更新弹窗，
+ * 用户不用为了看更新内容再开一次浏览器。
+ */
+async function loadUpdateNotes(version) {
+  if (!version) return;
+  const cached = state.updateNotes;
+  if (cached?.version === version && cached.state === "ready") return;
+  if (cached?.version === version && cached.state === "loading") return;
+  state.updateNotes = { version, state: "loading" };
+  refreshUpdateNotesDom();
+  try {
+    const result = await invoke("fetch_release_notes", { version });
+    // 期间又检查出别的版本了就别覆盖
+    if (state.updateNotes?.version !== version) return;
+    state.updateNotes = {
+      version,
+      state: "ready",
+      title: result?.title || "",
+      notes: result?.notes || "",
+      source: result?.source || "",
+    };
+  } catch (error) {
+    if (state.updateNotes?.version !== version) return;
+    state.updateNotes = { version, state: "error", error: String(error) };
+  }
+  refreshUpdateNotesDom();
+}
+
+/** 更新说明那一块。取不到就老实说取不到，别留个空白框 */
+function updateNotesSection() {
+  const info = state.updateNotes;
+  const latest = state.update?.latestVersion;
+  if (!info || info.version !== latest) {
+    return `<div class="update-notes is-loading">正在获取更新说明…</div>`;
+  }
+  if (info.state === "loading") {
+    return `<div class="update-notes is-loading">正在获取更新说明…</div>`;
+  }
+  if (info.state === "ready") {
+    return `<div class="update-notes">
+        <p class="update-notes-title">${escapeHtml(info.title || `v${info.version}`)}</p>
+        <pre class="update-notes-text">${escapeHtml(info.notes)}</pre>
+        <p class="update-notes-source">更新说明来自发布页${info.source ? `（${escapeHtml(info.source)}）` : ""}</p>
+      </div>`;
+  }
+  return `<div class="update-notes is-empty">没能取到更新说明，点下面的「打开发布页」可以在网页上看。</div>`;
+}
+
+/** 说明是异步到的，只替换这一块，不重开弹窗（重开会闪、也会丢掉下载进度） */
+function refreshUpdateNotesDom() {
+  const holder = document.querySelector("#update-notes-holder");
+  if (!holder) return;
+  holder.innerHTML = updateNotesSection();
+}
+
 function updateModal() {
   const info = state.update || {};
   const asset = info.asset;
@@ -3320,7 +3395,8 @@ function updateModal() {
   const body = `
     <div class="update-panel">
       <p class="update-versions">当前 <strong>v${escapeHtml(info.currentVersion || APP_VERSION)}</strong> → 最新 <strong>v${escapeHtml(info.latestVersion || "?")}</strong></p>
-      <p class="update-note">更新内容请到发布页查看。升级包会下载到程序所在的文件夹，下载完自动重启到新版本；<strong>旧版本文件在下次启动时移入回收站</strong>（可还原）。你的作品文件和数据库都在旁边，不受影响。</p>
+      <div id="update-notes-holder">${updateNotesSection()}</div>
+      <p class="update-note">升级包会下载到程序所在的文件夹，下载完自动重启到新版本；<strong>旧版本文件在下次启动时移入回收站</strong>（可还原）。你的作品文件和数据库都在旁边，不受影响。</p>
       ${asset ? `<p class="update-source">安装包：${escapeHtml(asset.name)}（${humanSize(asset.size)}）<br>下载顺序：直连 GitHub${asset.urls.length > 1 ? ` → ${asset.urls.length - 1} 个加速镜像` : ""}，一个失败自动换下一个<br>版本号探测来源：${escapeHtml(info.source || "未知")}</p>` : ""}
       ${missingAsset ? `<div class="note-warn">这次发布里没有找到可自动下载的安装包，请点下面的「打开发布页」手动下载。</div>` : ""}
       <div class="update-progress ${downloading ? "" : "is-hidden"}" id="update-progress-box">
@@ -3339,6 +3415,8 @@ function updateModal() {
 }
 
 function openUpdateModal() {
+  // 兜底：不管从哪条路进来的，没取过更新说明就现取一份
+  if (state.update?.latestVersion) void loadUpdateNotes(state.update.latestVersion);
   showModal(updateModal());
 }
 

@@ -7056,6 +7056,269 @@ fn probe_update_asset(client: &Client, version: &str, mirrors: &[String]) -> Opt
     None
 }
 
+// ------------------------- 更新说明（Release 正文） -------------------------
+
+/// 更新说明太长就把弹窗撑爆了，只留前面一段，后面让用户去发布页看。
+const MAX_RELEASE_NOTES_CHARS: usize = 4000;
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseNotes {
+    version: String,
+    /// 发布标题（tag 之外那句名字），没写就是空串
+    title: String,
+    /// 纯文本更新说明，HTML 标签已经剥掉
+    notes: String,
+    /// 说明是从哪个源取到的：「直连 GitHub」或某个镜像前缀
+    source: String,
+}
+
+/// 把 HTML / XML 实体还原成字符。atom 的正文是「转义过的 HTML」，
+/// 所以要先用它解一次 XML 转义、剥完标签后再解一次 HTML 转义。
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0usize;
+    while index < text.len() {
+        if text.as_bytes()[index] != b'&' {
+            // 按字符推进，别把多字节汉字切成半个
+            let character = text[index..].chars().next().unwrap_or(' ');
+            out.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+        let rest = &text[index + 1..];
+        // 实体名最长也就十几个字符，找不到分号就当普通 & 处理
+        let end = match rest.find(';') {
+            Some(position) if position <= 12 => position,
+            _ => {
+                out.push('&');
+                index += 1;
+                continue;
+            }
+        };
+        let name = &rest[..end];
+        let decoded = match name {
+            "amp" => Some("&".to_string()),
+            "lt" => Some("<".to_string()),
+            "gt" => Some(">".to_string()),
+            "quot" => Some("\"".to_string()),
+            "apos" => Some("'".to_string()),
+            "nbsp" => Some(" ".to_string()),
+            "hellip" => Some("…".to_string()),
+            "mdash" => Some("—".to_string()),
+            "ndash" => Some("–".to_string()),
+            "middot" => Some("·".to_string()),
+            "times" => Some("×".to_string()),
+            "rarr" => Some("→".to_string()),
+            "laquo" => Some("«".to_string()),
+            "raquo" => Some("»".to_string()),
+            _ => name.strip_prefix('#').and_then(|digits| {
+                let hex = digits
+                    .strip_prefix('x')
+                    .or_else(|| digits.strip_prefix('X'));
+                let code = match hex {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => digits.parse::<u32>().ok(),
+                };
+                code.and_then(char::from_u32)
+            })
+            .map(|character| character.to_string()),
+        };
+        match decoded {
+            Some(value) => {
+                out.push_str(&value);
+                index += 1 + end + 1;
+            }
+            None => {
+                out.push('&');
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 断行只在「上一行还没断过」时插，免得连续块元素攒出一堆空行。
+fn push_line_break(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// 把一小段 HTML 变成能直接塞进弹窗的纯文本。只求可读：
+/// 段落/列表/标题各占一行，`<li>` 前面补「- 」。
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut index = 0usize;
+    while index < html.len() {
+        if html.as_bytes()[index] != b'<' {
+            let character = html[index..].chars().next().unwrap_or(' ');
+            out.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+        let Some(offset) = html[index..].find('>') else {
+            break;
+        };
+        let tag = &html[index + 1..index + offset];
+        let closing = tag.starts_with('/');
+        let name = tag
+            .trim_start_matches('/')
+            .split(|character: char| character.is_whitespace() || character == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "br" | "p" | "div" | "li" | "ul" | "ol" | "tr" | "td" | "blockquote" | "pre" | "h1" | "h2"
+                | "h3" | "h4" | "h5" | "h6" | "table"
+        ) {
+            if name == "ul" || name == "ol" || name == "table" {
+                // 容器标签不自己占行，靠里面的 li / tr 断行
+            } else if name == "li" && !closing {
+                push_line_break(&mut out);
+                out.push_str("- ");
+            } else {
+                push_line_break(&mut out);
+            }
+        }
+        index += offset + 1;
+    }
+    out
+}
+
+/// 收尾：去掉行尾空白、合并连续空行、砍掉超长部分。
+fn tidy_release_notes(text: &str) -> String {
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        // 空行只在前面已经有内容、且上一行不是空行时才留一个
+        if line.trim().is_empty() {
+            if lines.last().is_some_and(|last| last.trim().is_empty()) {
+                continue;
+            }
+            if lines.is_empty() {
+                continue;
+            }
+        }
+        lines.push(line);
+    }
+    while lines.last().is_some_and(|last| last.trim().is_empty()) {
+        lines.pop();
+    }
+    let joined = lines.join("\n");
+    if joined.chars().count() <= MAX_RELEASE_NOTES_CHARS {
+        return joined;
+    }
+    let mut truncated: String = joined.chars().take(MAX_RELEASE_NOTES_CHARS).collect();
+    truncated.push_str("\n…（更新说明较长，完整内容见发布页）");
+    truncated
+}
+
+/// 从 atom feed 里切出每条 `<entry>`。没有 XML 库，纯字符串扫描就够用了。
+fn atom_entries(feed: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut search = feed;
+    while let Some(start) = search.find("<entry") {
+        let rest = &search[start..];
+        match rest.find("</entry>") {
+            Some(end) => {
+                let close = "</entry>".len();
+                entries.push(&rest[..end + close]);
+                search = &rest[end + close..];
+            }
+            None => break,
+        }
+    }
+    entries
+}
+
+/// 取一条 entry 里某个标签的原始文本（`<content type="html">` 这种带属性的也认）。
+fn atom_field<'a>(entry: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}");
+    let start = entry.find(&open)?;
+    let after_open = &entry[start + open.len()..];
+    let content_start = start + open.len() + after_open.find('>')? + 1;
+    let rest = &entry[content_start..];
+    let end = rest.find(&format!("</{tag}>"))?;
+    Some(&rest[..end])
+}
+
+/// 取发布说明：走 `releases.atom` 这个公开 feed。
+/// 用它而不是 `api.github.com`，是因为 API 对匿名请求有每小时限流，而 feed 没有。
+/// 返回 `(标题, 说明正文, 来源说明)`。
+fn probe_release_notes(
+    client: &Client,
+    version: &str,
+    mirrors: &[String],
+) -> Result<(String, String, String), String> {
+    let feed_url = format!("https://github.com/{RELEASE_REPO}/releases.atom");
+    let mut last_error = String::from("没有可用的更新源");
+    for (label, prefix) in update_sources(mirrors) {
+        let url = if prefix.is_empty() {
+            feed_url.clone()
+        } else {
+            join_mirror(&prefix, &feed_url)
+        };
+        let response = match client.get(&url).send() {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("{label}：{error}");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!("{label}：HTTP {}", response.status().as_u16());
+            continue;
+        }
+        let Ok(feed) = response.text() else {
+            last_error = format!("{label}：响应读不出来");
+            continue;
+        };
+        let entries = atom_entries(&feed);
+        // feed 按时间倒序，第一条就是最新那版；能按 tag 对上就用对上的那条
+        let picked = entries
+            .iter()
+            .find(|entry| version_from_tag_text(entry).as_deref() == Some(version))
+            .or_else(|| entries.first());
+        let Some(entry) = picked else {
+            last_error = format!("{label}：feed 是空的");
+            continue;
+        };
+        let raw = atom_field(entry, "content")
+            .map(|content| decode_entities(content))
+            .unwrap_or_default();
+        let notes = tidy_release_notes(&html_to_text(&raw));
+        if notes.trim().is_empty() {
+            return Err("这版发布没有填写更新说明，点「打开发布页」可以看发布页".into());
+        }
+        let title = atom_field(entry, "title")
+            .map(|title| tidy_release_notes(&decode_entities(title)))
+            .unwrap_or_default();
+        return Ok((title, notes, label));
+    }
+    Err(last_error)
+}
+
+/// 取指定版本的更新说明，给更新弹窗显示用（只在真的有新版时才调用）。
+#[tauri::command]
+async fn fetch_release_notes(version: String) -> Result<ReleaseNotes, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db()?;
+        let mirrors = read_update_mirrors(&conn)?;
+        let client = update_client(Duration::from_secs(20))?;
+        let (title, notes, source) = probe_release_notes(&client, &version, &mirrors)?;
+        Ok(ReleaseNotes {
+            version,
+            title,
+            notes,
+            source,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn executable_directory() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|e| format!("无法定位程序目录：{e}"))?;
     executable
@@ -7644,6 +7907,7 @@ pub fn run() {
             export_backup,
             restore_backup,
             check_for_update,
+            fetch_release_notes,
             download_update,
             apply_update,
             cleanup_old_portable_builds,
@@ -7684,6 +7948,7 @@ mod tests {
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
         probe_latest_version, probe_update_asset, update_asset_names, update_client,
         version_from_tag_text,
+        atom_entries, atom_field, decode_entities, html_to_text, probe_release_notes, tidy_release_notes,
         synopsis_indicates_preview,
         text_word_count, title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
@@ -9423,14 +9688,9 @@ mod tests {
         let mirrors = default_update_mirrors();
         let client = update_client(std::time::Duration::from_secs(30)).unwrap();
         let (version, source) = probe_latest_version(&client, &mirrors).unwrap();
-        assert_eq!(
-            parse_version(&version).map(|v| v.0),
-            Some(0),
-            "仓库里最新是 v0.3.x：{version}"
-        );
         println!("最新版本 {version}（来源 {source}）");
 
-        // v0.3.21 那次发的是 zip，正好用来验证「exe 找不到就退到 zip」这条回退
+        // 探测出来的这版必须真的能下到安装包（历史上发过 zip，所以两种后缀都接受）
         let asset = probe_update_asset(&client, &version, &mirrors).expect("应该探测到安装包");
         println!(
             "安装包 {}（{} 字节）可用地址 {} 个，首选 {}",
@@ -9441,5 +9701,85 @@ mod tests {
         );
         assert!(asset.name.ends_with(".zip") || asset.name.ends_with(".exe"));
         assert!(asset.size > 1_000_000);
+    }
+
+    /// 真机联网验证更新说明能从 `releases.atom` 取回来。v1.0.0 的说明是写全了的，
+    /// 取回来必须是有内容的中文，而不是一堆没剥干净的 HTML 标签。
+    #[test]
+    #[ignore]
+    fn release_notes_are_fetched_from_the_real_repository() {
+        let mirrors = default_update_mirrors();
+        let client = update_client(std::time::Duration::from_secs(30)).unwrap();
+        let (title, notes, source) = probe_release_notes(&client, "1.0.0", &mirrors).unwrap();
+        println!("标题：{title}\n来源：{source}\n--- 说明 ---\n{notes}");
+        assert!(!notes.trim().is_empty());
+        assert!(notes.contains("自动更新"), "说明里应该有这版的更新内容");
+        assert!(!notes.contains("<p>"), "HTML 标签应该已经剥掉");
+        assert!(!notes.contains("&lt;"), "实体应该已经还原");
+    }
+
+    #[test]
+    fn release_body_is_read_from_the_atom_feed() {
+        // 精简过的真实 feed 结构：正文是「转义过的 HTML」，还带属性和 XML 实体
+        let feed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Release notes from pixiv-novel-downloader</title>
+  <entry>
+    <id>tag:github.com,2008:Repository/1/v1.0.1</id>
+    <title>v1.0.1 &amp; 小修</title>
+    <content type="html">&lt;p&gt;修了三个问题&lt;/p&gt;&lt;ul&gt;&lt;li&gt;图片变形&lt;/li&gt;&lt;li&gt;镜像失效&lt;/li&gt;&lt;/ul&gt;</content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/1/v1.0.0</id>
+    <title>v1.0.0</title>
+    <link rel="alternate" type="text/html" href="https://github.com/fromzero1501/pixiv-novel-downloader/releases/tag/v1.0.0"/>
+    <content type="html">&lt;p&gt;自动更新上线&lt;/p&gt;</content>
+  </entry>
+</feed>"#;
+        let entries = atom_entries(feed);
+        assert_eq!(entries.len(), 2, "只应该切出 entry，不该把 feed 头部算进来");
+
+        // 按 tag 挑：要 v1.0.0 就得给 v1.0.0 那条，而不是最新的 v1.0.1
+        let picked = entries
+            .iter()
+            .find(|entry| version_from_tag_text(entry).as_deref() == Some("1.0.0"))
+            .expect("应该能按 tag 对上 v1.0.0");
+        let raw = decode_entities(&atom_field(picked, "content").unwrap());
+        assert_eq!(raw, "<p>自动更新上线</p>");
+        assert_eq!(tidy_release_notes(&html_to_text(&raw)), "自动更新上线");
+
+        // 正文里的 &amp; 只解一次：还原成 & 之后不该再被当成实体
+        let title = decode_entities(&atom_field(&entries[0], "title").unwrap());
+        assert_eq!(title, "v1.0.1 & 小修");
+    }
+
+    #[test]
+    fn release_body_keeps_bullets_and_paragraphs_on_their_own_lines() {
+        let html = "<h2>新增</h2><ul><li>自动更新</li><li>内置帮助</li></ul><p>另一段<br>换行后</p>";
+        assert_eq!(
+            tidy_release_notes(&html_to_text(html)),
+            "新增\n- 自动更新\n- 内置帮助\n另一段\n换行后"
+        );
+    }
+
+    #[test]
+    fn release_body_entities_are_decoded_once_per_layer() {
+        // atom 里写的 `&amp;lt;` → 解一层得到 `&lt;` → 剥标签后是纯文本 → 再解一层得到 `<`
+        assert_eq!(decode_entities("&lt;p&gt;a &amp;amp; b&lt;/p&gt;"), "<p>a &amp; b</p>");
+        assert_eq!(decode_entities("a &amp;amp; b"), "a &amp; b");
+        assert_eq!(decode_entities("中文&#65292;加&#x27;引号"), "中文，加'引号");
+        // 不是实体的裸 & 要原样留着，别把后面的文字吞掉
+        assert_eq!(decode_entities("A & B"), "A & B");
+        assert_eq!(decode_entities("5 & 6 是数字"), "5 & 6 是数字");
+    }
+
+    #[test]
+    fn release_body_is_cut_short_when_it_is_too_long() {
+        let long = format!("<p>{}</p>", "很长的一行".repeat(2000));
+        let text = tidy_release_notes(&html_to_text(&long));
+        assert!(text.chars().count() < 4200, "超长说明要被截断");
+        assert!(text.ends_with("…（更新说明较长，完整内容见发布页）"));
+        // 短说明不该被动
+        assert_eq!(tidy_release_notes("就一行"), "就一行");
     }
 }
