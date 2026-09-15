@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pixiv小说下载管理器 · 使用帮助</title>
+<meta name="description" content="Windows 本地作品管理软件：按作者管理 Pixiv 小说预览版与完整版文件，记录购买状态、封面、标签、系列和收藏。">
+<style>
+  :root {
+    --ink: #16202e;
+    --ink-soft: #4a586b;
+    --ink-faint: #76839a;
+    --line: #e2e8f0;
+    --line-soft: #eef2f7;
+    --bg: #f6f8fb;
+    --card: #ffffff;
+    --blue: #0096fa;
+    --blue-deep: #0b6bbd;
+    --blue-tint: #eaf5fe;
+    --amber-tint: #fff8e8;
+    --amber-line: #f0d9a0;
+    --radius: 12px;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", sans-serif;
+    font-size: 15.5px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 48px 24px 96px; }
+
+  header.page { padding-bottom: 28px; border-bottom: 1px solid var(--line); }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12.5px; font-weight: 600; letter-spacing: .04em;
+    color: var(--blue-deep); background: var(--blue-tint);
+    border: 1px solid #cfe8fd; border-radius: 999px; padding: 3px 12px;
+  }
+  h1 { font-size: 34px; line-height: 1.3; margin: 16px 0 8px; letter-spacing: -.01em; }
+  .lede { margin: 0; color: var(--ink-soft); font-size: 16px; }
+  .links { margin-top: 20px; display: flex; flex-wrap: wrap; gap: 10px; }
+  .links a {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 14px; border-radius: 8px; font-size: 14px; text-decoration: none;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink-soft);
+    transition: border-color .15s, color .15s;
+  }
+  .links a:hover { border-color: #bcd3e8; color: var(--blue-deep); }
+  .links a.is-primary { background: var(--blue); border-color: var(--blue); color: #fff; font-weight: 600; }
+  .links a.is-primary:hover { background: #0086e2; border-color: #0086e2; color: #fff; }
+
+  nav.toc {
+    margin: 32px 0 8px; padding: 20px 24px;
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+  }
+  nav.toc h2 { font-size: 13px; letter-spacing: .06em; color: var(--ink-faint); margin: 0 0 12px; text-transform: uppercase; }
+  nav.toc ol {
+    margin: 0; padding: 0; list-style: none;
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 24px;
+    counter-reset: toc;
+  }
+  nav.toc li { counter-increment: toc; }
+  nav.toc a {
+    display: block; padding: 3px 0; text-decoration: none; color: var(--ink-soft); font-size: 14.5px;
+  }
+  nav.toc a::before { content: counter(toc, decimal-leading-zero) "  "; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+  nav.toc a:hover { color: var(--blue-deep); }
+  @media (max-width: 640px) { nav.toc ol { grid-template-columns: 1fr; } }
+
+  section { margin-top: 52px; }
+  section > h2 {
+    font-size: 22px; margin: 0 0 4px; letter-spacing: -.01em;
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  section > h2 .no {
+    font-size: 13px; color: var(--blue); font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  section > p.hint { margin: 0 0 18px; color: var(--ink-faint); font-size: 14px; }
+
+  h3 { font-size: 16px; margin: 28px 0 8px; }
+  h4 { font-size: 14.5px; margin: 20px 0 6px; color: var(--ink-soft); }
+  p { margin: 0 0 12px; }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; }
+  li { margin: 5px 0; }
+  li > ul, li > ol { margin: 5px 0; }
+  code {
+    font-family: "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, monospace;
+    font-size: .88em; background: #eef2f7; border: 1px solid #e2e8f0;
+    border-radius: 5px; padding: 1px 5px; color: #35435a;
+  }
+  kbd {
+    font-family: inherit; font-size: .85em; background: #fff; border: 1px solid #ccd6e2;
+    border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; color: #35435a;
+  }
+  a.inline { color: var(--blue-deep); text-underline-offset: 2px; }
+  strong { color: #0f1a28; }
+
+  figure { margin: 20px 0 8px; }
+  figure img {
+    display: block; width: 100%; height: auto;
+    border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: 0 2px 10px rgba(22, 32, 46, .06);
+    background: #fff;
+  }
+  figure figcaption { margin-top: 8px; font-size: 13.5px; color: var(--ink-faint); }
+  figure.is-half { max-width: 560px; }
+
+  .note, .warn {
+    margin: 18px 0; padding: 14px 18px; border-radius: 10px; font-size: 14.5px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink-soft);
+  }
+  .note { border-left: 3px solid var(--blue); }
+  .warn { border-left: 3px solid #d98324; background: var(--amber-tint); border-color: var(--amber-line); }
+  .note p:last-child, .warn p:last-child { margin-bottom: 0; }
+
+  .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+  @media (max-width: 640px) { .cards { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card h4 { margin: 0 0 6px; font-size: 14.5px; }
+  .card p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+
+  .badge-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 14px; padding: 0; list-style: none; }
+  .badge-row li {
+    margin: 0; padding: 4px 11px; font-size: 13.5px; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--line); color: var(--ink-soft);
+  }
+
+  details.faq {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 0 16px; margin: 10px 0;
+  }
+  details.faq summary {
+    cursor: pointer; padding: 13px 0; font-weight: 600; font-size: 15px; list-style: none;
+  }
+  details.faq summary::-webkit-details-marker { display: none; }
+  details.faq summary::before { content: "？ "; color: var(--blue); font-weight: 700; }
+  details.faq[open] summary { border-bottom: 1px solid var(--line-soft); margin-bottom: 12px; }
+  details.faq > :last-child { margin-bottom: 14px; }
+
+  footer.page {
+    margin-top: 72px; padding-top: 24px; border-top: 1px solid var(--line);
+    font-size: 13.5px; color: var(--ink-faint); display: flex; flex-wrap: wrap; gap: 6px 16px;
+    justify-content: space-between; align-items: center;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="page">
+  <span class="eyebrow">v1.0.0 · Windows</span>
+  <h1>Pixiv小说下载管理器</h1>
+  <p class="lede">Windows 本地作品管理软件：按作者管理 Pixiv 小说的预览版与完整版文件，记录购买状态、封面、标签、系列和收藏。</p>
+  <div class="links">
+    <a class="is-primary" href="https://github.com/fromzero1501/pixiv-novel-downloader/releases">下载最新版</a>
+    <a href="https://github.com/fromzero1501/pixiv-novel-downloader">GitHub 仓库</a>
+    <a href="https://github.com/fromzero1501/pixiv-novel-downloader/issues">问题反馈</a>
+  </div>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#install">安装与启动</a></li>
+    <li><a href="#settings">首次设置</a></li>
+    <li><a href="#cookie">获取 Pixiv Cookie</a></li>
+    <li><a href="#author">作者库</a></li>
+    <li><a href="#sync">同步 Pixiv 小说</a></li>
+    <li><a href="#bind">关联本地文件</a></li>
+    <li><a href="#card">作品卡与右键菜单</a></li>
+    <li><a href="#browse">浏览、搜索与排序</a></li>
+    <li><a href="#series">系列作品</a></li>
+    <li><a href="#cleanup">清理多余预览版</a></li>
+    <li><a href="#backup">备份与迁移</a></li>
+    <li><a href="#update">软件自动更新</a></li>
+    <li><a href="#faq">常见问题</a></li>
+  </ol>
+</nav>
+
+<section id="install">
+  <h2><span class="no">01</span>安装与启动</h2>
+  <p class="hint">免安装，绿色便携。</p>
+  <ol>
+    <li>到 <a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader/releases">Releases</a> 下载最新版 exe，放到一个固定的文件夹里（别放桌面，容易误删）。</li>
+    <li>双击 exe 就能用。首次启动会在 exe 同级目录创建 <code>data</code> 文件夹，数据库和封面都存在里面。</li>
+    <li>整份迁移到别的电脑时，<strong>把 exe 所在的整个文件夹一起复制</strong>过去，数据跟着走。</li>
+  </ol>
+  <p>系统要求：Windows 10 / 11，需要 <strong>Microsoft Edge WebView2 Runtime</strong>（Windows 11 通常自带；缺了程序会提示）。</p>
+  <div class="note">
+    <p>软件不会碰你原来的小说文件 —— 它只记录「哪个作品对应磁盘上哪个文件」，导出、清理这类会动磁盘的操作都有二次确认。</p>
+    <p><strong>装好后第一件事是填 Pixiv Cookie</strong>（见 <a class="inline" href="#cookie">第 3 节</a>）—— 没有它什么都同步不下来。</p>
+  </div>
+</section>
+
+<section id="settings">
+  <h2><span class="no">02</span>首次设置</h2>
+  <p class="hint">左下角齿轮进入；改完自动保存，没有保存按钮。</p>
+  <figure>
+    <img src="images/07-settings.png" alt="设置面板：Pixiv 账号、文件与目录两个分组">
+    <figcaption>设置按用途分成 6 块，每块左边有一条自己的色带，标题前有序号。</figcaption>
+  </figure>
+  <ul class="badge-row">
+    <li>1 · Pixiv 账号</li>
+    <li>2 · 文件与目录</li>
+    <li>3 · 匹配与关联</li>
+    <li>4 · 下载与图文</li>
+    <li>5 · 搜索网站</li>
+    <li>6 · 维护与数据</li>
+  </ul>
+  <p>最少要填这几项：</p>
+  <ol>
+    <li><strong>预览版 / 完整版默认目录</strong>：新建作者时用来生成作者目录。打开「自动创建作者目录」后，保存作者就会按作者名自动建目录并绑定。</li>
+    <li><strong>Pixiv Cookie（必填）</strong>：没填就同步不了，导出方法见下一节。程序只保存 Pixiv 接口需要的 <code>PHPSESSID</code>。</li>
+    <li><strong>最小文件大小</strong>：导入文件夹和同步时，小于这个值的 txt 会被跳过，防止把空文件当成作品。</li>
+    <li><strong>关联相似度</strong>：文件名和作品标题不完全相同时，达到这个分数才自动关联。默认 70，嫌严就调低。</li>
+  </ol>
+  <div class="note">
+    <p><strong>设置没有保存按钮。</strong>停手半秒就自动写进数据库，页脚会显示「已自动保存 21:35:02」。填到一半、通不过校验的值不会存进去，页脚会红字写明原因（例如网址少了 <code>=</code>），改对就自动存。</p>
+  </div>
+</section>
+
+<section id="cookie">
+  <h2><span class="no">03</span>获取 Pixiv Cookie</h2>
+  <p class="hint">最要紧的一步 —— 没有 Cookie，同步基本跑不起来。</p>
+  <div class="warn">
+    <p><strong>Cookie 等同于登录凭据，必须先有它才能同步。</strong>作品列表、正文、封面、R-18 内容全都得凭登录身份去取：没填或已失效时，同步会失败，或者只拿到一小部分作品。</p>
+    <p>它通常 <strong>1–2 周后过期</strong>，同步失败时重新导出一份换上即可。另外 —— <strong>不要发给别人，也别把 Cookie 截图公开</strong>。</p>
+  </div>
+
+  <h3>方法</h3>
+  <ol>
+    <li>用 Chrome / Edge 打开 <a class="inline" href="https://www.pixiv.net">www.pixiv.net</a>，<strong>登录你自己的账号</strong>（要取 R-18 内容必须是登录状态）。</li>
+    <li>装一个能导出 Cookie 的浏览器扩展。下图用的是「<a class="inline" href="https://chromewebstore.google.com/detail/import-cookies/iglhfgmnhldgoogomfjljbdgkgdgmedn">导入cookie</a>」，其他同类扩展（Cookie-Editor、EditThisCookie 等）操作也差不多。</li>
+    <li>点扩展图标打开 Cookie 列表，找到 <code>www.pixiv.net</code> 那一组。</li>
+    <li>点<strong>导出</strong>按钮，弹出来的 <strong>Export As</strong> 里选 <strong>JSON</strong>。</li>
+    <li>把导出的全部文本粘进「设置 → 1 · Pixiv 账号 → Pixiv Cookie」；也可以点旁边的「从文件导入」直接选那个 <code>.json</code> 文件。改完自动保存，没有保存按钮。</li>
+  </ol>
+
+  <figure>
+    <img src="images/03-cookie-export.png" alt="浏览器扩展里导出 www.pixiv.net 的 Cookie：红框依次标出扩展图标、导出按钮、Export As 里的 JSON 选项">
+    <figcaption>三个红框就是要点的地方：<strong>扩展图标</strong> → <strong>导出按钮</strong> → <strong>Export As 选 JSON</strong>。图里那排 <code>__cf_bm</code>、<code>__utma</code> 之类的条目不用管，导出的是整组。</figcaption>
+  </figure>
+
+  <h4>粘贴格式：JSON 和 Header String 都收，别选 Netscape</h4>
+  <ul>
+    <li><strong>推荐 JSON</strong>：扩展导出的原始数组，程序按 <code>domain</code> / <code>name</code> / <code>value</code> 三个字段解析。</li>
+    <li><strong>Header String 也能用</strong>：就是 <code>PHPSESSID=xxxx; other=yyyy</code> 那种一行文本，从浏览器开发者工具 <em>Network → 请求头 → Cookie</em> 直接复制的那串也属于这种。</li>
+    <li><strong>不要选 Netscape</strong>：那是制表符分隔的格式，程序认不出来。</li>
+  </ul>
+  <div class="note">
+    <p><strong>整段内容都粘进去没关系</strong>，程序只挑出 Pixiv 登录要用的 <code>PHPSESSID</code> 存进数据库，其余读完即弃，不会外传。要是整段里找不到 <code>PHPSESSID</code>（比如贴错了别的站点的 Cookie），会直接报「Cookie 中未找到 Pixiv 登录所需的 PHPSESSID」并且不保存。</p>
+    <p>程序每次启动都会自动验一次 Cookie，失效或没填会弹窗提示（列明「无法同步敏感作品 / 拿不到完整作品列表 / 同步可能失败」），点「前往设置」直接跳到填写处。</p>
+  </div>
+</section>
+
+<section id="author">
+  <h2><span class="no">04</span>作者库</h2>
+  <p class="hint">一切从这里开始 —— 作品是按作者归档的。</p>
+  <figure>
+    <img src="images/01-authors.png" alt="作者库：作者卡片网格，每张卡显示作品数、完整版数、带图版数、收藏数">
+    <figcaption>每张作者卡显示作品 / 完整版 / 带图版 / 收藏的统计，点卡片进入该作者的作品库。</figcaption>
+  </figure>
+  <ul>
+    <li><strong>新增作者</strong>：填 Pixiv 作者主页后点「同步作者信息」，会自动读取作者名和头像。配好默认目录并打开「自动创建作者目录」时，保存就会自动建好预览版、完整版两个目录。</li>
+    <li><strong>只看特别关注</strong>：把常看的作者点星星标上，一键筛出来。</li>
+    <li><strong>拖动排序</strong>：每张卡名字右边有一个六点<strong>拖动按钮</strong>，按住约 0.2 秒卡片会被「拿起来」——一张跟着鼠标走的浮层卡片出现在最上层（微微倾斜、带投影），原位置留下半透明虚位；挪到别处时其余卡片会顺势滑开让位，松手放下就排好了，顺序会存进库里。<br>轻轻点一下（不到 0.2 秒）不会触发拖动，也不会误进作品库。没拖过的作者按名字排，并一律排在拖过的作者后面。</li>
+  </ul>
+</section>
+
+<section id="sync">
+  <h2><span class="no">05</span>同步 Pixiv 小说</h2>
+  <p class="hint">正文、封面、投稿日期、标签、系列一次拿下来。</p>
+  <figure>
+    <img src="images/05-sync.png" alt="作品同步窗口：单篇小说地址、开始日期、结束日期、开始同步按钮">
+    <figcaption>在作者作品库点「作品同步」打开。填日期可以按原始投稿时间限定范围。</figcaption>
+  </figure>
+  <ul>
+    <li><strong>批量同步</strong>：填开始 / 结束日期时按 Pixiv 原始投稿日期筛选；两个日期都留空则只检查上次成功同步之后的新投稿。同步会显示进度，可以随时「终止同步」。</li>
+    <li><strong>同步单篇</strong>：在「单篇小说地址」里填 <code>https://www.pixiv.net/novel/show.php?id=28686066</code> 这样的地址，就只同步这一篇，不读作者主页列表，也不更新「上次成功同步」时间。</li>
+    <li><strong>已有文件不会重下</strong>：同步时如果预览版目录里已经有对应文件，会直接关联上，不重复下载。</li>
+    <li><strong>限速</strong>：「设置 → Pixiv 抓取间隔」默认是同步超过 150 篇时每篇间隔 1 秒，可按需调整。</li>
+  </ul>
+
+  <h3>预览版还是完整版？</h3>
+  <p>同步时读作品简介来判定：简介里含「<strong>全文</strong>」（「全文放出」除外）或含「<strong>购买</strong>」的，判为<strong>预览版</strong>；其余判为<strong>完整版</strong>。判定只在同步那一刻做一次，之后改规则不会回溯老作品。</p>
+  <div class="note">
+    <p><strong>一个作品只占一边。</strong>判为完整版的，正文、封面、配图和图文版整份放进完整版目录；判为预览版的整份留在预览版目录。软件不会在两边各放一份副本。</p>
+  </div>
+
+  <h3>图文小说（正文带插画）</h3>
+  <p>有些小说把插画直接插在正文里。同步这类作品时，配图会一起下载到正文同名的 <code>{标题}_images</code> 文件夹并按顺序编号，正文里的占位符也会被替换成「<code>[插图 3：标题_images/003.jpg]</code>」这样的指引；同时另外生成一份排好版的<strong>阅读版</strong>（封面、章节、注音、插图都在），直接看就行。</p>
+  <ul>
+    <li>阅读版格式在「设置 → 同步作品时图文小说自动保存为」里选：<strong>HTML</strong>（默认，双击用浏览器打开）或 <strong>EPUB</strong>（适合推到手机 / 阅读器）。只生成选中的那一种。</li>
+    <li>配图画质在「设置 → 配图画质」里选：默认 1200 宽（每张约 1 MB），也可以要作者上传的原图。</li>
+    <li>作品卡右下角三个点菜单里有两个下载入口：「<strong>重新下载 HTML 版并绑定</strong>」「<strong>重新下载 EPUB 版并绑定</strong>」——点哪个出哪种，跟设置无关。它会重抓一次最新正文、补齐没下过的配图、重新打包，然后<strong>把作品绑定到这份阅读版上</strong>。重复点也安全，配图不会重复下载。</li>
+    <li>进入「批量操作」勾选作品后，可以批量「补下配图」或「重新下载 EPUB 版并绑定」，带进度条。</li>
+  </ul>
+</section>
+
+<section id="bind">
+  <h2><span class="no">06</span>关联本地文件</h2>
+  <p class="hint">把磁盘上已有的文件跟作品对上号。</p>
+  <figure>
+    <img src="images/06-match.png" alt="关联完整版文件的弹窗：候选作品下拉框、作者不在库里的分组">
+    <figcaption>需要手动选择时，默认不勾选任何作品 —— 相似度达标只标「推荐」，勾哪几个由你决定。</figcaption>
+  </figure>
+  <ul>
+    <li><strong>关联预览版文件</strong>：扫描预览版目录第一层。已有作品未关联会自动绑定；库里没有的预览版文件会新增为作品并绑定。</li>
+    <li><strong>关联完整版文件</strong>：先选匹配方式（见下），然后扫描完整版目录第一层。<strong>已经关联过的文件直接跳过</strong>，封面图和配图文件夹不参与。</li>
+    <li><strong>手动绑定</strong>：点作品卡右下角三个点 →「绑定完整版文件」，直接指定一个本地文件。</li>
+    <li><strong>批量设为完整版</strong>：进「批量操作」勾选作品，把预览版文件（含配图文件夹和图文版）移到完整版目录并自动绑定，预览版目录不再保留副本。</li>
+    <li>能参与关联的只有<strong>文本（txt / md）、电子书（epub / mobi / azw3 / pdf…）和 HTML</strong>；封面图与 <code>{标题}_images</code> 配图文件夹一律不参与。</li>
+  </ul>
+
+  <h3>匹配角色 / 匹配标题</h3>
+  <p>点「关联完整版文件」或「完整版自动分组」后，先让你选这次用哪种方式：</p>
+  <div class="cards">
+    <div class="card">
+      <h4>匹配角色</h4>
+      <p>从文件名里抽角色名，和作品标题里的角色名取交集。只要有一个对得上就算候选，<strong>不管标题像不像、也不看相似度阈值</strong>。适合文件名只有「作者名 + 角色名」的情况。这个模式下不会自动绑定。</p>
+    </div>
+    <div class="card">
+      <h4>匹配标题</h4>
+      <p>按文件名与作品标题的相似度匹配，达到「关联相似度」就自动绑定。两者的相似度算法见下方。</p>
+    </div>
+  </div>
+  <p>两种方式都遵守同一条规则：<strong>文件名里写明了作者（例如 <code>【作者：AAA】甘雨同人.txt</code>），就只在这位作者的作品里匹配。</strong>如果写的作者还没进作者库，这些文件会按作者名分组列在弹窗最下方，方便你先去把作者加进来再回来匹配。</p>
+
+  <h3>相似度是怎么算的</h3>
+  <p>一侧是<strong>作品标题</strong>，另一侧是<strong>本地文件名</strong>。两边各自归一化（去掉扩展名、去掉开头的日期、只留字母数字并小写）后，取<strong>最长的一段连续相同文字</strong>，再除以<strong>两边里更长的那一边的字数</strong>：</p>
+  <ul>
+    <li>标题 <code>ABCD</code>、文件名 <code>AB</code> → <code>2 ÷ 4 = 50%</code></li>
+    <li>标题 <code>ABCD</code>、文件名 <code>CD</code> → 也是 <code>50%</code>（跳字的 <code>AD</code> 不算连续，只有 <code>25%</code>）</li>
+    <li>标题 <code>ABC</code>、文件名 <code>ABCDEF</code> → <code>3 ÷ 6 = 50%</code>，文件名多出来的字同样扣分</li>
+  </ul>
+  <p>谁的名字长就按谁算，两边多出来的内容都会拉低分数。所以文件名里带日期、「完整版」这类前后缀时会掉分，掉到阈值以下就不会自动关联 —— 想宽松些，把「关联相似度」调低一点。</p>
+  <div class="note">
+    <p>设置里的「<strong>匹配作品名长度</strong>」只在<strong>标题比文件名长</strong>时有用：填十几二十个字就只拿标题开头那一截去比，分母跟着变小、分数上来。文件名比标题长时，分母恒为文件名长度，这个设置不起作用。</p>
+  </div>
+</section>
+
+<section id="card">
+  <h2><span class="no">07</span>作品卡与右键菜单</h2>
+  <p class="hint">日常操作基本都在这张卡上。</p>
+  <figure>
+    <img src="images/02-works.png" alt="作者作品库：作品卡片网格，封面上有状态、收藏、带图版徽标">
+    <figcaption>封面第一排是状态 / 收藏 / 带图版三个徽标，第二排右边是「打开作品网址」；右下角三个点是「更多操作」。</figcaption>
+  </figure>
+  <ul>
+    <li><strong>只有封面图和标题能打开文件</strong>，卡片其他位置（日期、标签）点了没反应。所以标题可以放心用鼠标拖动选中、双击选词，再 <kbd>Ctrl</kbd>+<kbd>C</kbd> 复制，不会误触打开。</li>
+    <li>作品卡右上角的<strong>带图角标</strong>显示这个作品有几张配图。下载过配图就是实际张数；作品绑定的是 EPUB / HTML 时软件会直接数文件里的插图（封面不算），所以外面带进来的电子书也有角标。老作品可以到「设置 → 维护与数据 → 阅读版图片数」点「立即重算」补一遍。</li>
+    <li><strong>链接徽标</strong>（第二排）只在作品有 Pixiv 作品 ID 时出现，点它用默认浏览器打开这篇作品的 Pixiv 页面，回去看原帖、看评论都方便。</li>
+  </ul>
+
+  <h3>三个点菜单</h3>
+  <figure>
+    <img src="images/03-work-menu.png" alt="作品卡的三个点菜单：打开、打开本地目录、打开阅读版、三个重新下载并绑定、绑定完整版文件、设为预览版、编辑标签、取消收藏、取消带图版、删除作品">
+    <figcaption>打开阅读版、三个「重新下载并绑定」、绑定 / 改绑文件、编辑标签、删除都在这里。</figcaption>
+  </figure>
+  <ul>
+    <li>「<strong>打开本地目录</strong>」会在资源管理器里打开作品所在目录，并<strong>顺手把这份作品文件选中</strong>（绑的是目录就直接打开目录），不用自己在一堆文件里找。</li>
+    <li>三个「重新下载 … 版并绑定」都会从 Pixiv 重抓一次正文，然后<strong>把作品绑定到新文件上</strong>。原来在预览版还是完整版那一侧，绑完还留在那一侧。TXT 版会把正文里的插图写成 <code>[插图 N：{正文名}_images/001.jpg]</code> 的指引。没有 Pixiv 作品 ID 的作品抓不到，会提示先同步。</li>
+  </ul>
+
+  <h3>右键：两种菜单</h3>
+  <figure>
+    <img src="images/04-search-menu.png" alt="选中标题文字后右键弹出的搜索菜单，列出配置好的搜索网站">
+    <figcaption>在卡片上选中文字再右键，弹出的是一份搜索菜单，把你选中的那截文字丢到配好的网站上搜。</figcaption>
+  </figure>
+  <ul>
+    <li><strong>选中文字后右键</strong> → 搜索菜单。菜单顶上先亮一行「搜这段文字：xxx」，下面按配置顺序列出「在 <code>书香</code> 搜索选中文字」这样的入口，点一下就用默认浏览器打开那个站的搜索页。</li>
+    <li><strong>没选中文字时右键</strong> → 直接开「编辑标签」弹窗；它底部的「打开本地目录」同上。</li>
+  </ul>
+
+  <h3>配置搜索网站</h3>
+  <ol>
+    <li>打开「设置 → 搜索网站」，点「添加网站」。</li>
+    <li>左边填网站名（比如 <code>书香</code>），右边填它的搜索页网址。规矩很简单：<strong>最后一个 <code>=</code> 后面就是搜索词的位置</strong>。</li>
+    <li>网址填得不对也没关系，程序会自动清洗并在那一行下面写明改了什么：去掉 <code>searchid</code>（那是某一次搜索的缓存编号，换了关键词结果也不会变）、把关键词参数挪到最末一位，<strong>其余参数一个都不动</strong>。</li>
+  </ol>
+  <p>搜索词会自动做 URL 编码，中文、空格、<code>&amp;</code> 都能正确带过去。</p>
+</section>
+
+<section id="browse">
+  <h2><span class="no">08</span>浏览、搜索与排序</h2>
+  <p class="hint">「所有作品」汇总全部作者，作者作品库只管一位作者。</p>
+  <figure>
+    <img src="images/08-all-works.png" alt="所有作品页面：汇总全部作者的作品卡片，卡片上带作者名">
+    <figcaption>「所有作品」把全部作者的作品汇总在一起，卡片上带作者名，作者名可以直接点。</figcaption>
+  </figure>
+  <ul>
+    <li><strong>点作者名</strong>直接跳到那位作者的作品库（会清掉当前的搜索词和筛选，落到干净的列表）；跳进去以后左上角返回箭头会回到「所有作品」，并把离开前的搜索词原样还原。</li>
+    <li>封面第一排的<strong>状态 / 收藏 / 带图版</strong>徽标在这里也能点，和作者作品库共用同一份数据 —— 在这里收藏完，用作者作品库的「仅看收藏」就能筛出来。</li>
+    <li><strong>「仅看收藏」</strong>在作者作品库和「所有作品」里分别保存，互不影响。</li>
+    <li>搜索范围可以切成<strong>标题</strong>或<strong>标签</strong>。</li>
+    <li><strong>排序</strong>可选：日期从新到旧 / 从旧到新、名称 A-Z、<strong>字数从多到少</strong>。字数这条把 <strong>EPUB、HTML 这类阅读版按配图张数</strong>排，并且<strong>整体排在 TXT 前面</strong>（图文作品通常就是最想先看的），TXT 之间再按字数排。</li>
+    <li><strong>批量操作</strong>支持全选、删除、设为完整版、设为带图版、补下配图；所有删除都有二次确认。</li>
+  </ul>
+</section>
+
+<section id="series">
+  <h2><span class="no">09</span>系列作品</h2>
+  <p>点「系列作品」查看当前作者的系列卡片，进入系列后按 Pixiv 系列序号显示作品，序号不可重复。右键作品卡可以加入已有系列、退出系列或修改系列序号。</p>
+  <p>从作者作品库、所有作品或系列总览进入系列详情时，返回按钮都会回到你原来那一页。</p>
+</section>
+
+<section id="cleanup">
+  <h2><span class="no">10</span>清理多余预览版</h2>
+  <p class="hint">「设置 → 维护与数据 → 清理多余预览版」</p>
+  <p>同一篇作品一旦拿到完整版，预览版就没必要留着了（一个作品只占一边）。这个功能<strong>先给你看数量再动手</strong>：先只扫不删，报出「有几篇同时挂着预览版和完整版」「其中几篇的完整版文件确认在磁盘上、可以安全清」，你确认后才真清。完整版文件找不到的作品一律跳过，绝不冒险。</p>
+  <p>清理时不会暴力删文件：</p>
+  <ul>
+    <li>预览版正文与它的阅读版（<code>.html</code> / <code>.epub</code>）<strong>送进 Windows 回收站</strong>，和资源管理器里按 <kbd>Delete</kbd> 一个效果，右键能还原；</li>
+    <li>预览版目录里的配图目录，完整版目录下<strong>还没有</strong>就搬到完整版目录去（否则清掉会断图），已经有了就一起送回收站；</li>
+    <li><strong>封面跟着搬到完整版目录</strong>并更新记录，避免老目录清掉后封面整片失效。</li>
+  </ul>
+  <p>个别文件送回收站失败（比如正被别的程序占用）会原样留着，这类作品的库记录也不改，下次还能再清一次。</p>
+</section>
+
+<section id="backup">
+  <h2><span class="no">11</span>备份与迁移</h2>
+  <ul>
+    <li>「设置 → 维护与数据」里可以<strong>导出 / 恢复数据库备份</strong>。</li>
+    <li>便携版的数据在 exe 同级的 <code>data</code> 文件夹。<strong>迁移到另一台电脑时，请一并备份该目录以及预览版、完整版文件目录。</strong></li>
+    <li>数据库备份<strong>不等于</strong>文件备份 —— 只还原数据库不会把小说文件带回来。</li>
+  </ul>
+</section>
+
+<section id="update">
+  <h2><span class="no">12</span>软件自动更新</h2>
+  <p class="hint">查版本、下新版、换掉旧的 —— 都在程序里做完。</p>
+  <p>程序每次启动都会去发布页问一句「现在最新是哪个版本」。有新的会在左下角把版本号变成 <strong>↑ v1.0.1</strong> 这样的按钮并弹一条提示，<strong>不会自己偷偷下载或替换</strong>。点那个按钮，或者「设置 → 6 维护与数据 → 软件更新 → 检查更新」，就能打开更新弹窗。</p>
+
+  <h3>点「立即更新」之后发生什么</h3>
+  <ol>
+    <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.0.1.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
+    <li>下载完自动启动新版，程序重启。</li>
+    <li>新版启动时发现上一个版本的 exe 还躺在旁边，把它<strong>移进 Windows 回收站</strong>（可以还原），并提示一句「已把旧版本文件移入回收站」。</li>
+  </ol>
+  <div class="note">
+    <p><strong>你的作品和数据库都不在 exe 里。</strong>数据在同级的 <code>data</code> 文件夹，换 exe 不碰它 —— 更新完作者、作品、收藏、设置全都在。</p>
+  </div>
+
+  <h3>打不开 GitHub 怎么办</h3>
+  <p>国内直连 <code>github.com</code> 常常不通，所以程序会<strong>自动换加速镜像重试</strong>：先直连，失败后按顺序试内置镜像（<code>ghproxy.net</code>、<code>gh-proxy.com</code>、<code>ghfast.top</code>、<code>gh.xxooo.cf</code>），哪条通就用哪条。查版本和下载<strong>整条链路都走这套回退</strong>，不需要你操作。</p>
+  <p>镜像失效是常事。万一全都不通，去「设置 → 6 维护与数据 → 更新加速镜像」自己换一批 —— 一行一个，地址会直接接在 <code>https://github.com/...</code> 前面，改完自动保存、立刻生效，<strong>不用等出新版本</strong>。点「恢复默认」可以填回内置的那几条。</p>
+
+  <h3>几个常见情况</h3>
+  <ul>
+    <li><strong>下载慢</strong>：进度条会显示当前走的是哪条线路，耐心等或者换个镜像。</li>
+    <li><strong>不想让它联网查版本</strong>：把「启动时自动检查新版本」的勾去掉，之后只在你手动点「检查更新」时才查。</li>
+    <li><strong>不想被某个版本反复提醒</strong>：更新弹窗里点「忽略此版本」，同一个版本不再提示，出了新的照旧提醒。</li>
+    <li><strong>自动下载失败</strong>：弹窗里有「打开发布页」和「镜像打开发布页」，手动下来放进程序文件夹替换掉旧 exe 也一样，下次启动照样会把旧的收进回收站。</li>
+  </ul>
+  <div class="warn">
+    <p><strong>程序所在的文件夹要能写入。</strong>放在 <code>C:\Program Files</code> 里会被系统挡下来，这时程序会直接提示你把程序挪到桌面、文档这类有写入权限的位置 —— 本来就是免安装的便携版，放哪儿都行。</p>
+  </div>
+</section>
+
+<section id="faq">
+  <h2><span class="no">13</span>常见问题</h2>
+  <details class="faq" open>
+    <summary>同步失败 / 提示未登录</summary>
+    <p>先看有没有 Cookie —— <strong>没有 Cookie 是同步不了任何东西的</strong>，第一次用必须先去 <a class="inline" href="#cookie">第 3 节</a> 导一份填上。已经填过还失败，基本是过期了：Pixiv 的 Cookie 通常 1–2 周失效，按同一套步骤重新导一份覆盖掉即可。下载 R-18 内容必须用已登录账号的 Cookie。</p>
+  </details>
+  <details class="faq">
+    <summary>Cookie 粘进去了，却提示「未找到 PHPSESSID」</summary>
+    <p>说明这段内容里确实没有 Pixiv 的登录凭据，常见两种原因：导出时格式选了 <strong>Netscape</strong>（制表符分隔，程序认不出）——改选 JSON 或 Header String；或者打开 <code>www.pixiv.net</code> 时<strong>没登录</strong>，导出的 Cookie 里自然没有 <code>PHPSESSID</code>。登录后重导一次就好。</p>
+  </details>
+  <details class="faq">
+    <summary>点了作品没反应</summary>
+    <p>这是有意的：只有<strong>封面图</strong>和<strong>标题</strong>能打开文件，卡片其他位置点了不会响应，这样标题才能放心拖选复制。另外作品如果既没绑预览版也没绑完整版文件，也没有可打开的目标。</p>
+  </details>
+  <details class="faq">
+    <summary>「关联完整版文件」扫不到我那些文件</summary>
+    <p>几个常见原因：只扫<strong>目录第一层</strong>，放在子文件夹里的不会被扫到；封面图和 <code>{标题}_images</code> 配图文件夹<strong>不参与</strong>关联；已经关联过的文件会被跳过。都不对的话，用作品卡三个点里的「绑定完整版文件」手动指定。</p>
+  </details>
+  <details class="faq">
+    <summary>文件名和标题差不多，为什么没自动关联上？</summary>
+    <p>相似度的分母取「标题和文件名里更长的那一边」，所以文件名带日期、带「完整版」「第二部」这类前后缀时会明显掉分。要么把「关联相似度」调低一点，要么把文件名改干净些。也可以直接用「匹配角色」或手动绑定。</p>
+  </details>
+  <details class="faq">
+    <summary>为什么「匹配作品名长度」调了没效果？</summary>
+    <p>它只在<strong>标题比文件名长</strong>时生效。文件名更长时，分母恒等于文件名长度，截短标题只会让分子变小、分数不变。</p>
+  </details>
+  <details class="faq">
+    <summary>字数排序里，电子书怎么跑到 TXT 前面了？</summary>
+    <p>「字数从多到少」对 EPUB / HTML 这类阅读版是按<strong>配图张数</strong>排的（它们没法简单数正文汉字），并且整体排在 TXT 前面 —— 图文作品通常最想先看。TXT 之间才按字数排。</p>
+  </details>
+  <details class="faq">
+    <summary>换电脑 / 重装系统后数据还在吗？</summary>
+    <p>把 exe 所在的<strong>整个文件夹</strong>复制过去就在。数据在 exe 同级的 <code>data</code> 文件夹里，不写注册表、不写系统目录，卸载就是删文件夹。</p>
+  </details>
+  <details class="faq">
+    <summary>软件会自动删我的文件吗？</summary>
+    <p>不会。清除类操作都要你点确认，而且「清理多余预览版」是送进<strong>Windows 回收站</strong>而不是直接删除，误清了可以从回收站还原。</p>
+  </details>
+  <details class="faq">
+    <summary>更新失败怎么办？</summary>
+    <p>看它提示哪一句：<strong>「程序所在文件夹不能写入」</strong>就把程序挪到桌面或文档这类位置再更新（便携版放哪儿都能跑）；<strong>「所有下载源都失败了」</strong>说明内置镜像这会儿都不通，去「设置 → 6 维护与数据 → 更新加速镜像」换几条，或者点弹窗里的「打开发布页」手动下载替换。详见 <a class="inline" href="#update">第 12 节</a>。</p>
+  </details>
+</section>
+
+<footer class="page">
+  <span>Pixiv小说下载管理器 v1.0.0 · 本文档随版本更新</span>
+  <span><a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader">GitHub</a> · <a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader/issues">反馈</a></span>
+</footer>
+
+</div>
+</body>
+</html>

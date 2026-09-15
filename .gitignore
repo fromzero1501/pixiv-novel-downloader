@@ -3,6 +3,10 @@ node_modules/
 dist/
 .npm-cache/
 
+# Help page generated from docs/index.html (see scripts/build-help-doc.mjs)
+src/help-doc.js
+public/help/
+
 # Rust dependencies and build output
 .cargo-home/
 src-tauri/target/
@@ -11,6 +15,22 @@ src-tauri/target/
 data/
 发布/
 *.exe
+
+# Epub samples used for format evaluation, not part of the app
+epub-eval/
+
+# Local agent workspace: memory, trash, dist graveyard, UI check scripts
+.workbuddy/
+
+# Internal handoff notes (absolute local paths, kept out of the public repo)
+AI_HANDOFF.md
+
+# Scratch backups
+*.bak
+
+# Python bytecode
+__pycache__/
+*.pyc
 
 # Local development artifacts
 *.log

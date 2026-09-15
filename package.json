@@ -1,12 +1,13 @@
 {
   "name": "local-collection-library",
   "private": true,
-  "version": "0.3.21",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "tauri": "tauri"
+    "dev": "node scripts/build-help-doc.mjs && vite",
+    "build": "node scripts/build-help-doc.mjs && node scripts/reset-dist.mjs && vite build",
+    "tauri": "tauri",
+    "portable": "tauri build && node scripts/pack-portable.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
