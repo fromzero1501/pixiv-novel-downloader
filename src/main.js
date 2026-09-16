@@ -5,7 +5,7 @@ import { HELP_DOC_CSS, HELP_DOC_HTML } from "./help-doc.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -83,12 +83,21 @@ const state = {
   /** 「浏览历史」页：`{ work, viewedAt, viewCount }` 列表 + 搜索词 */
   history: [],
   historyQuery: "",
+  /**
+   * 已读筛选（v1.2.0）：`all` / `unread`（未读） / `reading`（在读，＝「继续读」清单） / `unrated`（未评分）。
+   * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
+   */
+  readFilter: "all",
+  /** 作品详情弹窗正在展示的作品 id（null = 没开） */
+  workDetailId: null,
+  /** 详情弹窗里那篇作品当前所在的收藏夹 id（打开时查一次，改完刷新） */
+  detailCollectionIds: [],
 };
 
-const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
+const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
 const previewWorks = [{ id: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", releaseDate: "2025-10-05", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\希儿.epub", wordCount: 12680, favorite: true }, { id: 2, title: "夏日短篇集", releaseDate: "2025-09-20", previewPath: "", coverPath: "", purchasedPath: "", wordCount: 4380, favorite: false }, { id: 3, title: "旧城的信", releaseDate: "2025-08-18", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\旧城的信", wordCount: 20750, favorite: false }, { id: 4, title: "月色图文辑", releaseDate: "2025-07-09", previewPath: "", coverPath: "", purchasedPath: "", favorite: true }];
 
-previewWorks.forEach((work, index) => { work.tags = ["Pixiv|小说", "短篇|日常", "小说", "插画|图文"][index]; work.pixivNovelId = ["26410188", "", "", ""][index]; work.imageCount = [4, 0, 0, 0][index]; });
+previewWorks.forEach((work, index) => { work.tags = ["Pixiv|小说", "短篇|日常", "小说|悬疑|长篇|都市|完结", "插画|图文"][index]; work.pixivNovelId = ["26410188", "", "", ""][index]; work.imageCount = [4, 0, 0, 0][index]; });
 // 「我的收藏」与「浏览历史」在浏览器预览里的假数据（真数据是 SQL 出来的）
 const previewCollections = [
   { id: 1, name: "我的收藏", createdAt: "2026-09-01T00:00:00+00:00" },
@@ -108,8 +117,27 @@ const previewHistory = [
   { workId: 4, viewedAt: previewDayAt(-3, 17, 40), viewCount: 1 },
 ];
 previewWorks.forEach((work, index) => { work.seriesId = index < 2 ? "demo-series-1" : ""; work.seriesTitle = index < 2 ? "雾海档案短篇系列" : ""; });
+// 作者卡上的「上次同步」也要有值（真数据由 SQL 聚合，mock 里按相对日期造，标签才稳定）
+previewAuthors[0].pixivLastSyncAt = previewDayAt(0, 8, 40);
+previewAuthors[2].pixivLastSyncAt = previewDayAt(-2, 19, 10);
 // 「所有作品」卡片要显示作者名、点作者名跳作品库，mock 里也得带上（真数据由 SQL JOIN 出来）
 previewWorks.forEach((work, index) => { work.authorId = [1, 1, 2, 3][index]; work.authorName = ["雾海档案", "雾海档案", "Mori", "远野"][index]; });
+// 作品详情弹窗的个人字段（v1.2.0）：简介 / 阅读状态（0未读 1在读 2已读）/ 评分 / 笔记
+previewWorks.forEach((work, index) => {
+  work.synopsis = [
+    "本篇是布洛妮娅与希儿的日常向短篇。\n\n正文配有 4 张插画，阅读版会一并打包。\n\n※ 完整版已在自己的平台放出，感谢支持。",
+    "夏天、海边、以及一点没说出口的话。四段可以分开读的小故事。",
+    "写给旧城的一封信，从邮局拆到落款。全文约两万字。",
+    "月色下的图文辑，配图较多，建议用 EPUB 阅读。",
+  ][index];
+  work.readState = [2, 0, 1, 0][index];
+  work.rating = [5, 0, 4, 0][index];
+  work.note = ["重读第三遍了，插画加分。", "", "后半段有点赶，但氛围很好。", ""][index];
+});
+previewAuthors.forEach((author, index) => {
+  author.newCount = [3, 0, 1][index];
+  author.pixivLastSyncAt = ["2026-09-14T12:30:00+00:00", "", "2026-08-02T09:05:00+00:00"][index];
+});
 
 previewWorks.forEach((work, index) => {
   work.seriesOrder = index < 2 ? index + 1 : 0;
@@ -174,6 +202,68 @@ async function invoke(command, args = {}) {
   if (command === "clear_history") { previewHistory.length = 0; return; }
   if (command === "remove_history") { const index = previewHistory.findIndex((entry) => entry.workId === args.workId); if (index >= 0) previewHistory.splice(index, 1); return; }
   if (command === "toggle_has_images") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.hasImages = !work.hasImages; return; }
+  // 作品个人元数据（v1.2.0）：评分 / 阅读状态 / 笔记
+  if (command === "set_work_meta") {
+    const work = previewWorks.find((item) => item.id === args.workId);
+    if (work) {
+      if (args.readState !== null && args.readState !== undefined) work.readState = args.readState;
+      if (args.rating !== null && args.rating !== undefined) work.rating = args.rating;
+      if (args.note !== null && args.note !== undefined) work.note = String(args.note).trim();
+    }
+    return;
+  }
+  if (command === "set_works_read_state") {
+    let changed = 0;
+    for (const workId of args.workIds || []) { const work = previewWorks.find((item) => item.id === workId); if (work) { work.readState = args.readState; changed += 1; } }
+    return changed;
+  }
+  if (command === "add_works_to_collections") {
+    // 并集插入：不会把作品从别的收藏夹里踢出去
+    for (const workId of args.workIds || []) {
+      const work = previewWorks.find((item) => item.id === workId);
+      if (!work) continue;
+      const current = new Set(work.collectionIds || []);
+      for (const collectionId of args.collectionIds || []) current.add(collectionId);
+      work.collectionIds = [...current];
+      work.favorite = work.collectionIds.length > 0;
+    }
+    return (args.workIds || []).length;
+  }
+  if (command === "update_works_tags") {
+    const split = (raw) => String(raw || "").split("|").map((tag) => tag.trim()).filter(Boolean);
+    const add = split(args.add);
+    const remove = split(args.remove);
+    let changed = 0;
+    for (const workId of args.workIds || []) {
+      const work = previewWorks.find((item) => item.id === workId);
+      if (!work) continue;
+      const before = split(work.tags);
+      const tags = before.slice();
+      for (const tag of add) if (!tags.some((existing) => existing.toLowerCase() === tag.toLowerCase())) tags.push(tag);
+      const kept = tags.filter((tag) => !remove.some((tag2) => tag2.toLowerCase() === tag.toLowerCase()));
+      if (kept.join("|") !== before.join("|")) { work.tags = kept.join("| "); changed += 1; }
+    }
+    return changed;
+  }
+  if (command === "backfill_synopses") {
+    const targets = previewWorks.filter((work) => work.pixivNovelId && !work.synopsis);
+    targets.forEach((work) => { work.synopsis = "（补抓到的简介示例）"; });
+    return { total: targets.length, updated: targets.length, failed: 0, cancelled: false };
+  }
+  if (command === "scan_work_files") {
+    // mock 里只造「完整版目录下有一篇的文件被人挪走了」这一条失效
+    const missing = previewWorks.filter((work) => work.purchasedPath && work.id === 3).map((work) => ({ workId: work.id, title: work.title, kind: "purchased", path: work.purchasedPath }));
+    return { checked: previewWorks.filter((work) => work.purchasedPath || work.previewPath).length, missing, totalBytes: 187000000, totalFiles: 41, authors: [{ authorId: 1, authorName: "雾海档案", bytes: 121000000, fileCount: 22 }, { authorId: 2, authorName: "Mori", bytes: 66000000, fileCount: 19 }] };
+  }
+  if (command === "clear_missing_bindings") {
+    const targets = previewWorks.filter((work) => work.purchasedPath && work.id === 3);
+    targets.forEach((work) => { work.purchasedPath = ""; });
+    return targets.length;
+  }
+  if (command === "export_work_list") {
+    const count = args.scope === "collection" ? previewWorks.filter((work) => (work.collectionIds || []).includes(args.scopeId)).length : args.scope === "ids" ? (args.workIds || []).length : previewWorks.length;
+    return { written: count, path: args.path };
+  }
   if (command === "delete_work") { const index = previewWorks.findIndex((item) => item.id === args.workId); if (index >= 0) previewWorks.splice(index, 1); return; }
   if (command === "delete_works") { for (const workId of args.workIds) { const index = previewWorks.findIndex((item) => item.id === workId); if (index >= 0) previewWorks.splice(index, 1); } return; }
   if (command === "set_match_threshold") { const author = previewAuthors.find((item) => item.id === args.authorId); if (author) author.matchThreshold = args.threshold; return author; }
@@ -314,7 +404,7 @@ async function invoke(command, args = {}) {
   }
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, lastSyncAt: new Date().toISOString() };
-  if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.isNew = false; return; }
+  if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.isNew = false; if (work.readState === 0) work.readState = 1; } return; }
   if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
   if (command === "open_search_site") {
     // 和 Rust 侧同一条规则：最后一个 = 后面的内容清掉，填进编码后的搜索词
@@ -356,6 +446,9 @@ const icon = (name, size = 18) => {
     grip: '<circle cx="9.5" cy="6" r="1.5" fill="currentColor"/><circle cx="14.5" cy="6" r="1.5" fill="currentColor"/><circle cx="9.5" cy="12" r="1.5" fill="currentColor"/><circle cx="14.5" cy="12" r="1.5" fill="currentColor"/><circle cx="9.5" cy="18" r="1.5" fill="currentColor"/><circle cx="14.5" cy="18" r="1.5" fill="currentColor"/>',
     layers: '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5.2l3.2 1.9"/>',
+    info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5.6"/><path d="M12 7.7h.01"/>',
+    download: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M5 20h14"/>',
+    archive: '<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/>',
     folderHeart: '<path d="M3 6.7A1.7 1.7 0 0 1 4.7 5H10l2 2h7.3A1.7 1.7 0 0 1 21 8.7v9.6a1.7 1.7 0 0 1-1.7 1.7H4.7A1.7 1.7 0 0 1 3 18.3Z"/><path d="M12 16.4c-1.8-1.2-2.8-2.4-2.8-3.6a1.5 1.5 0 0 1 2.8-.6 1.5 1.5 0 0 1 2.8.6c0 1.2-1 2.4-2.8 3.6Z"/>',
   };
   // 名字以 Filled 结尾的图标用实心填充（如 starFilled）
@@ -962,9 +1055,10 @@ function renderAuthors() {
         ${author.avatarPath ? `<img src="${asset(author.avatarPath)}" alt="${escapeHtml(author.name)} 的头像">` : `<span>${escapeHtml(initials(author.name))}</span>`}
       </div>
       <div class="author-card-body">
-        <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2><div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="${author.starred ? "取消特别关注" : "设为特别关注"}" data-action="toggle-author-starred" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>
+        <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2>${author.newCount > 0 ? `<span class="author-new-badge" title="上次同步之后新收进来、还没点开看过的作品">新增 ${author.newCount} 篇</span>` : ""}<div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="${author.starred ? "取消特别关注" : "设为特别关注"}" data-action="toggle-author-starred" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>
         ${authorAliasList(author.aliases)}
         <dl class="author-stats"><div><dt>作品</dt><dd>${author.workCount}</dd></div><div><dt>完整版</dt><dd>${author.purchasedCount}</dd></div><div><dt>带图版</dt><dd>${author.imagesCount || 0}</dd></div><div><dt>收藏</dt><dd>${author.favoriteCount}</dd></div></dl>
+        <p class="author-sync-note" title="${author.pixivLastSyncAt ? escapeHtml(author.pixivLastSyncAt) : "还没有同步记录"}">Pixiv ${escapeHtml(syncLabel(author.pixivLastSyncAt))}</p>
       </div>
       <div class="card-enter">${icon("arrow", 18)}</div>
     </article>`).join("");
@@ -1098,9 +1192,63 @@ function workBadges(work) {
         </div>`;
 }
 
+const READ_STATE_LABELS = ["未读", "在读", "已读"];
+
+function readStateLabel(readState) {
+  return READ_STATE_LABELS[Number(readState) || 0] || "未读";
+}
+
+/**
+ * 阅读状态（v1.2.0）：0 未读 / 1 在读 / 2 已读。
+ * 打开作品会自动推进到「在读」，只有「已读」是手动点的 —— 所以这里做成按钮，点一下循环切换。
+ */
+function workReadDot(work) {
+  const readState = Number(work.readState) || 0;
+  return `<button class="read-dot read-${readState}" title="阅读状态：${readStateLabel(readState)}（点击切换）" data-action="cycle-read-state" data-work-id="${work.id}"><span>${readStateLabel(readState)}</span></button>`;
+}
+
+/** 卡片上的评分：没打过分就不显示，免得一排空星星白占地方。 */
+function workRatingMark(work) {
+  const rating = Number(work.rating) || 0;
+  if (!rating) return "";
+  return `<span class="work-rating" title="我的评分：${rating} 星">${icon("starFilled", 13)}<span>${rating}</span></span>`;
+}
+
+/** 标签最多显示 3 个，其余收成「+N」——完整标签在详情弹窗里看（卡片以前被这一整行撑得很臃肿）。 */
+function workTags(work) {
+  const tags = String(work.tags || "").split("|").map((tag) => tag.trim()).filter(Boolean);
+  if (!tags.length) return "";
+  const shown = tags.slice(0, 3);
+  const rest = tags.length - shown.length;
+  return `<div class="work-tags">${shown.map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag)}</span>`).join("")}${rest > 0 ? `<span class="work-tags-more" title="${escapeHtml(tags.slice(3).join("、"))}">+${rest}</span>` : ""}</div>`;
+}
+
+/**
+ * 已读筛选（v1.2.0）：`all` / `unread` / `reading` / `unrated`。
+ * 「reading（在读）」这一档其实就是「继续读」清单 —— 打开过但还没读完的书。
+ */
+function matchesReadFilter(work) {
+  const readState = Number(work.readState) || 0;
+  const rating = Number(work.rating) || 0;
+  if (state.readFilter === "unread") return readState === 0;
+  if (state.readFilter === "reading") return readState === 1;
+  if (state.readFilter === "unrated") return rating === 0;
+  return true;
+}
+
+/** 三个列表页共用的一组「已读 / 评分」筛选按钮 */
+function readFilterButtons() {
+  return `<div class="filter-group" role="group" aria-label="阅读状态">${[["all", "全部"], ["unread", "未读"], ["reading", "在读"], ["unrated", "未评分"]].map(([value, label]) => `<button class="filter-button ${state.readFilter === value ? "is-active" : ""}" data-action="read-filter" data-read-filter="${value}">${label}</button>`).join("")}</div>`;
+}
+
+/** 排序下拉（三处共用）：作者库 / 所有作品 / 收藏夹各用各的排序状态字段 */
+function sortSelect(current) {
+  return `<select class="sort-select" id="sort-select" aria-label="排序"><option value="date_desc" ${current === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${current === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${current === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${current === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="rating_desc" ${current === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>`;
+}
+
 function renderWorks() {
   const author = state.activeAuthor;
-  const works = collapseSerialWorks(state.works);
+  const works = collapseSerialWorks(state.works).filter(matchesReadFilter);
   const cards = works.map((work) => `
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
@@ -1108,13 +1256,13 @@ function renderWorks() {
         <div class="work-links">${workLinkBadge(work)}</div>
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="work-menu" title="更多操作" data-action="work-menu" data-work-id="${work.id}">${icon("more", 18)}</button>`}
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
 
   return renderShell(`
     <section class="topbar work-topbar">
       <div class="crumb-heading"><button class="back-button" title="${state.authorReturnTo === "allWorks" ? "返回所有作品" : "返回作者库"}" data-action="${state.authorReturnTo === "allWorks" ? "back-to-all-works" : "go-home"}">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库${author.homepage ? `<button class="homepage-link" title="打开作者主页：${escapeHtml(author.homepage)}" data-action="open-external-url" data-url="${escapeHtml(author.homepage)}">${icon("link", 13)}<span>作者主页</span></button>` : ""}</p><h1>${escapeHtml(author.name)}</h1></div></div>
-      <div class="topbar-actions">${state.bulkMode ? `<button class="quiet-button" data-action="bulk-mode">取消</button><button class="quiet-button" data-action="select-all" ${works.length ? "" : "disabled"}>${works.length && works.every((work) => state.selectedWorkIds.has(work.id)) ? "取消全选" : "全选"}</button><button class="quiet-button" data-count-target data-count-label="设为完整版" data-action="copy-selected-full" ${state.selectedWorkIds.size ? "" : "disabled"}>设为完整版（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="设为带图版" data-action="set-images-selected" ${state.selectedWorkIds.size ? "" : "disabled"}>设为带图版（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="补下配图" data-action="backfill-images" title="按设置里选的格式，给勾选的作品重新下载阅读版并绑定" ${state.selectedWorkIds.size ? "" : "disabled"}>补下配图（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="重新下载 EPUB 版并绑定" data-action="download-selected-reading" data-format="epub" ${state.selectedWorkIds.size ? "" : "disabled"}>重新下载 EPUB 版并绑定（${state.selectedWorkIds.size}）</button><button class="danger-button" data-count-target data-count-label="删除已选" data-action="delete-selected" ${state.selectedWorkIds.size ? "" : "disabled"}>删除已选（${state.selectedWorkIds.size}）</button>` : `<button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button><button class="icon-text-button" data-action="edit-author" data-author-id="${author.id}">${icon("settings", 18)}<span>作者设置</span></button><button class="icon-text-button" data-action="import-works">${icon("plus", 18)}<span>导入作品</span></button><button class="primary-button" data-action="sync-pixiv">${icon("sync", 18)}<span>作品同步</span></button>`}</div>
+      <div class="topbar-actions">${state.bulkMode ? `<button class="quiet-button" data-action="bulk-mode">取消</button><button class="quiet-button" data-action="select-all" ${works.length ? "" : "disabled"}>${works.length && works.every((work) => state.selectedWorkIds.has(work.id)) ? "取消全选" : "全选"}</button><button class="quiet-button" data-count-target data-count-label="设为完整版" data-action="copy-selected-full" ${state.selectedWorkIds.size ? "" : "disabled"}>设为完整版（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="设为带图版" data-action="set-images-selected" ${state.selectedWorkIds.size ? "" : "disabled"}>设为带图版（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="设已读" data-action="bulk-read-state" data-read-state="2" ${state.selectedWorkIds.size ? "" : "disabled"}>设已读（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="设未读" data-action="bulk-read-state" data-read-state="0" ${state.selectedWorkIds.size ? "" : "disabled"}>设未读（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="加入收藏夹" data-action="bulk-add-collection" ${state.selectedWorkIds.size ? "" : "disabled"}>加入收藏夹（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="改标签" data-action="bulk-tag-modal" ${state.selectedWorkIds.size ? "" : "disabled"}>改标签（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="导出已选清单" data-action="export-selected" ${state.selectedWorkIds.size ? "" : "disabled"}>导出清单（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="补下配图" data-action="backfill-images" title="按设置里选的格式，给勾选的作品重新下载阅读版并绑定" ${state.selectedWorkIds.size ? "" : "disabled"}>补下配图（${state.selectedWorkIds.size}）</button><button class="quiet-button" data-count-target data-count-label="重新下载 EPUB 版并绑定" data-action="download-selected-reading" data-format="epub" ${state.selectedWorkIds.size ? "" : "disabled"}>重新下载 EPUB 版并绑定（${state.selectedWorkIds.size}）</button><button class="danger-button" data-count-target data-count-label="删除已选" data-action="delete-selected" ${state.selectedWorkIds.size ? "" : "disabled"}>删除已选（${state.selectedWorkIds.size}）</button>` : `<button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button><button class="icon-text-button" data-action="edit-author" data-author-id="${author.id}">${icon("settings", 18)}<span>作者设置</span></button><button class="icon-text-button" data-action="import-works">${icon("plus", 18)}<span>导入作品</span></button><button class="primary-button" data-action="sync-pixiv">${icon("sync", 18)}<span>作品同步</span></button>`}</div>
     </section>
     <section class="library-content">
       <div class="library-tools">
@@ -1123,8 +1271,9 @@ function renderWorks() {
         <div class="filter-group" role="group" aria-label="版本状态">${[ ["all", "全部"], ["purchased", "完整版"], ["unpurchased", "预览版"] ].map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button favorite-filter ${state.authorFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <button class="icon-text-button favorite-filter images-filter ${state.authorImagesOnly ? "is-active" : ""}" data-action="images-only">${icon("image", 17)}<span>仅看带图版</span></button>
+        ${readFilterButtons()}
         ${serialFilterButton(state.works)}
-        <select class="sort-select" id="sort-select" aria-label="排序"><option value="date_desc" ${state.sort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.sort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.sort === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${state.sort === "words_desc" ? "selected" : ""}>字数从多到少</option></select>
+        ${sortSelect(state.sort)}
       </div>
       <div class="binding-bar"><div><strong>本地文件</strong><span>${author.previewDir ? "预览版目录已绑定" : "尚未绑定预览版目录"} · ${author.purchasedDir ? "完整版目录已绑定" : "尚未绑定完整版目录"}</span><em class="sync-status">Pixiv ${syncLabel(author.pixivLastSyncAt)}</em></div><div><button class="quiet-button" data-action="scan-preview">${icon("folder", 17)}关联预览版文件</button><button class="quiet-button" data-action="scan-purchased">${icon("upload", 17)}关联完整版文件</button></div></div>
       <div class="works-grid">${cards || renderEmptyWorks()}</div>
@@ -1132,7 +1281,7 @@ function renderWorks() {
 }
 
 function renderAllWorks() {
-  const works = collapseSerialWorks(state.allWorks);
+  const works = collapseSerialWorks(state.allWorks).filter(matchesReadFilter);
   const cards = works.map((work) => `
     <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}
@@ -1140,10 +1289,10 @@ function renderAllWorks() {
         ${workBadges(work)}
         <div class="work-links">${workLinkBadge(work)}</div>
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`).join("");
   return renderShell(`
-    <section class="topbar work-topbar"><div><p class="section-kicker">全部作者</p><h1>所有作品</h1></div></section>
+    <section class="topbar work-topbar"><div><p class="section-kicker">全部作者</p><h1>所有作品</h1></div><div class="topbar-actions"><button class="icon-text-button" data-action="export-all">${icon("download", 18)}<span>导出清单</span></button></div></section>
     <section class="library-content">
       <div class="library-tools">
         <label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${state.searchField === "tags" ? "搜索标签" : "搜索作品名称"}" value="${escapeHtml(state.allWorksQuery)}" autocomplete="off"></label>
@@ -1151,8 +1300,9 @@ function renderAllWorks() {
         <div class="filter-group" role="group" aria-label="版本状态">${[ ["all", "全部"], ["purchased", "完整版"], ["unpurchased", "预览版"] ].map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button favorite-filter ${state.allWorksFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <button class="icon-text-button favorite-filter images-filter ${state.allWorksImagesOnly ? "is-active" : ""}" data-action="images-only">${icon("image", 17)}<span>仅看带图版</span></button>
+        ${readFilterButtons()}
         ${serialFilterButton(state.allWorks)}
-        <select class="sort-select" id="sort-select" aria-label="排序"><option value="date_desc" ${state.sort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.sort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.sort === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${state.sort === "words_desc" ? "selected" : ""}>字数从多到少</option></select>
+        ${sortSelect(state.sort)}
       </div>
       <div class="read-only-note">所有作品仅供搜索、筛选与打开查看。</div>
       <div class="works-grid">${cards || '<div class="empty-state works-empty"><h2>没有符合条件的作品</h2></div>'}</div>
@@ -1168,9 +1318,199 @@ function linkedWorkCard(work) {
         ${workBadges(work)}
         <div class="work-links">${workLinkBadge(work)}</div>
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`;
 }
+
+/* ============================ 作品详情弹窗（v1.2.0） ============================ */
+
+/**
+ * 作品详情弹窗：卡片上塞不下、或者只看一眼用不着的东西都放这儿 ——
+ * 简介、完整标签、系列、我的记录（评分 / 阅读状态 / 笔记）、收藏夹、三条文件路径。
+ */
+async function openWorkDetail(workId) {
+  const work = findWork(workId);
+  if (!work) { toast("没找到这篇作品，刷新一下", "error"); return; }
+  state.workDetailId = workId;
+  state.detailCollectionIds = await invoke("work_collections", { workId });
+  showModal(modal(work.title, `<div id="work-detail-body">${workDetailBody()}</div>`, '<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>', "is-wide"));
+  bindDetailExtras();
+}
+
+/**
+ * 重画详情弹窗内容（改完评分 / 阅读状态 / 标签 / 收藏夹之后）。
+ * **绝不重开弹窗** —— 重开会闪屏、丢滚动位置，和收藏夹选择器里踩过的是同一个坑。
+ */
+function refreshDetailDom() {
+  const holder = document.querySelector("#work-detail-body");
+  if (!holder || !state.workDetailId) return;
+  holder.innerHTML = workDetailBody();
+  bindEvents();
+  bindDetailExtras();
+}
+
+/** 笔记是文本框，靠 `change`（失焦）落盘，不能用 data-action 走点击委托 */
+function bindDetailExtras() {
+  const textarea = document.querySelector("#work-detail-note");
+  if (textarea) textarea.addEventListener("change", () => saveDetailNote());
+}
+
+/** 把笔记输入框里的内容收下来写库。返回是否有改动。 */
+function captureDetailNote() {
+  const textarea = document.querySelector("#work-detail-note");
+  if (!textarea || !state.workDetailId) return false;
+  const work = findWork(state.workDetailId);
+  const value = textarea.value.trim().slice(0, 200);
+  if (!work || (work.note || "") === value) return false;
+  work.note = value;
+  invoke("set_work_meta", { workId: state.workDetailId, readState: null, rating: null, note: value })
+    .catch((error) => toast(`笔记没保存：${error}`, "error"));
+  return true;
+}
+
+async function saveDetailNote() {
+  const textarea = document.querySelector("#work-detail-note");
+  if (!textarea || !state.workDetailId) return;
+  const work = findWork(state.workDetailId);
+  if (!work) return;
+  const value = textarea.value.trim().slice(0, 200);
+  if ((work.note || "") === value) return;
+  try {
+    await invoke("set_work_meta", { workId: state.workDetailId, readState: null, rating: null, note: value });
+    work.note = value;
+    toast("笔记已保存", "success");
+  } catch (error) {
+    toast(`笔记没保存：${error}`, "error");
+  }
+}
+
+/** 改阅读状态 / 评分：先把还压在输入框里的笔记收掉，避免重画时丢掉 */
+async function setDetailMeta(patch) {
+  if (!state.workDetailId) return;
+  captureDetailNote();
+  const work = findWork(state.workDetailId);
+  try {
+    await invoke("set_work_meta", { workId: state.workDetailId, readState: null, rating: null, note: null, ...patch });
+    if (work) Object.assign(work, patch);
+    refreshDetailDom();
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/** 卡片上的阅读状态点：点一下循环 未读 → 在读 → 已读 → 未读 */
+async function cycleReadState(workId) {
+  const work = findWork(workId);
+  if (!work) return;
+  const next = (Number(work.readState) + 1) % 3;
+  try {
+    await invoke("set_work_meta", { workId, readState: next, rating: null, note: null });
+    work.readState = next;
+    render();
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+function detailPathRow(label, path, extra = "") {
+  const value = String(path || "").trim();
+  if (!value) return `<div class="detail-path"><dt>${label}</dt><dd class="is-empty">未绑定</dd></div>`;
+  return `<div class="detail-path"><dt>${label}</dt><dd><span class="detail-path-text" title="${escapeHtml(value)}">${escapeHtml(value)}</span><span class="detail-path-actions"><button class="quiet-button" data-action="detail-open-path" data-path="${escapeHtml(value)}">打开</button><button class="quiet-button" data-action="detail-open-dir" data-path="${escapeHtml(value)}">所在目录</button>${extra}</span></dd></div>`;
+}
+
+function workDetailBody() {
+  const work = findWork(state.workDetailId);
+  if (!work) return '<p class="match-note">这篇作品已经不在了，关掉重新打开一次。</p>';
+  const rating = Number(work.rating) || 0;
+  const readState = Number(work.readState) || 0;
+  const collectionNames = (state.detailCollectionIds || [])
+    .map((id) => state.collections.find((item) => item.id === id)?.name)
+    .filter(Boolean);
+  const tags = String(work.tags || "").split("|").map((tag) => tag.trim()).filter(Boolean);
+  const stars = [1, 2, 3, 4, 5].map((value) => `<button class="detail-star ${value <= rating ? "is-on" : ""}" title="给 ${value} 星" data-action="detail-rate" data-rating="${value}">${icon(value <= rating ? "starFilled" : "star", 19)}</button>`).join("");
+  const seriesText = work.seriesId && work.seriesTitle
+    ? `${escapeHtml(work.seriesTitle)}${work.seriesOrder > 0 ? ` · 第 ${work.seriesOrder} 篇` : ""}`
+    : "未加入系列";
+  const cover = work.coverPath
+    ? `<img src="${asset(work.coverPath)}" alt="${escapeHtml(work.title)} 的封面" onerror="this.remove()">`
+    : `<span class="detail-cover-placeholder">${icon("image", 30)}</span>`;
+  const pixivUrl = work.pixivNovelId ? `https://www.pixiv.net/novel/show.php?id=${work.pixivNovelId}` : "";
+
+  return `
+    <div class="detail-head">
+      <div class="detail-cover">${cover}</div>
+      <div class="detail-head-copy">
+        <h3>${escapeHtml(work.title)}</h3>
+        <p class="detail-author">${work.authorName ? `<button class="work-author is-link" data-action="detail-open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : "未知作者"}<span class="detail-sep">·</span><span>${dateLabel(work.releaseDate)}</span><span class="detail-sep">·</span><span>${work.purchasedPath ? "完整版" : "预览版"}</span>${work.wordCount ? `<span class="detail-sep">·</span><span>${wordCountLabel(work.wordCount)}</span>` : work.fileFormat ? `<span class="detail-sep">·</span><span>${escapeHtml(work.fileFormat)}</span>` : ""}</p>
+        <div class="detail-quick">
+          <button class="primary-button" data-action="detail-open-work" data-work-id="${work.id}">${icon("arrow", 18)}<span>打开${work.purchasedPath ? "完整版" : "预览版"}</span></button>
+          <button class="quiet-button" data-action="detail-open-reading" data-work-id="${work.id}">${icon("file", 18)}<span>打开阅读版</span></button>
+        </div>
+      </div>
+    </div>
+
+    <section class="detail-block">
+      <h4>我的记录</h4>
+      <div class="detail-row">
+        <span class="detail-label">阅读状态</span>
+        <div class="filter-group" role="group" aria-label="阅读状态">${READ_STATE_LABELS.map((label, value) => `<button class="filter-button ${readState === value ? "is-active" : ""}" data-action="detail-read-state" data-read-state="${value}">${label}</button>`).join("")}</div>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">我的评分</span>
+        <div class="detail-stars">${stars}<button class="quiet-button detail-clear-rating ${rating ? "" : "is-hidden"}" data-action="detail-rate" data-rating="0">清除</button></div>
+      </div>
+      <div class="detail-row is-stacked">
+        <span class="detail-label">一句话笔记</span>
+        <textarea id="work-detail-note" maxlength="200" rows="3" placeholder="读完想说点什么？失焦即保存，最多 200 字">${escapeHtml(work.note || "")}</textarea>
+      </div>
+    </section>
+
+    <section class="detail-block">
+      <h4>简介</h4>
+      ${work.synopsis ? `<p class="detail-synopsis">${escapeHtml(work.synopsis).replace(/\n/g, "<br>")}</p>` : `<p class="match-note">这篇还没有简介。同步过的作品可以在设置里用「补抓简介」拉一次。</p>`}
+    </section>
+
+    <section class="detail-block">
+      <h4>标签 <button class="quiet-button" data-action="detail-edit-tags" data-work-id="${work.id}">编辑</button></h4>
+      ${tags.length ? `<div class="detail-tags">${tags.map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag)}</span>`).join("")}</div>` : '<p class="match-note">还没有标签。</p>'}
+    </section>
+
+    <section class="detail-block">
+      <h4>系列</h4>
+      <p class="detail-plain">${seriesText}</p>
+      ${state.activeAuthor ? `<button class="quiet-button" data-action="detail-series" data-work-id="${work.id}">${icon("series", 16)}调整系列</button>` : ""}
+    </section>
+
+    <section class="detail-block">
+      <h4>收藏夹 <button class="quiet-button" data-action="detail-pick-collection" data-work-id="${work.id}">调整</button></h4>
+      ${collectionNames.length ? `<div class="detail-tags">${collectionNames.map((name) => `<span>${icon("folderHeart", 12)}${escapeHtml(name)}</span>`).join("")}</div>` : '<p class="match-note">还没有收进任何收藏夹。</p>'}
+    </section>
+
+    <section class="detail-block">
+      <h4>文件</h4>
+      <dl class="detail-paths">
+        ${detailPathRow("完整版", work.purchasedPath)}
+        ${detailPathRow("预览版", work.previewPath)}
+        ${detailPathRow("封面", work.coverPath)}
+      </dl>
+    </section>
+
+    <section class="detail-block">
+      <h4>Pixiv</h4>
+      ${work.pixivNovelId ? `<p class="detail-plain">作品 ID：${escapeHtml(work.pixivNovelId)}</p><button class="quiet-button" data-action="detail-open-pixiv" data-url="${escapeHtml(pixivUrl)}">${icon("link", 16)}在浏览器里打开原页</button>` : '<p class="match-note">这篇没有记录 Pixiv 作品 ID。</p>'}
+    </section>`;
+}
+
+/**
+ * 从详情弹窗开二次弹窗（收藏夹 / 标签 / 系列）时**不关详情弹窗** ——
+ * 弹窗本来就能嵌套，关掉再开只会让人找不回来。
+ */
+async function openDetailPicker(workId) {
+  state.pickerWorkId = workId;
+  state.pickerSelected = await invoke("work_collections", { workId });
+  showModal(modal("收藏到…", `<div id="collection-picker-body">${collectionPickerBody()}</div>`, '<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="picker-save">确定</button>'));
+}
+
 
 /* ============================ 我的收藏（收藏夹） ============================ */
 
@@ -1198,20 +1538,21 @@ function renderCollections() {
 
 function renderCollectionWorks() {
   const collection = state.activeCollection;
-  const works = collapseSerialWorks(state.collectionWorks);
+  const works = collapseSerialWorks(state.collectionWorks).filter(matchesReadFilter);
   const cards = works.map(linkedWorkCard).join("");
   return renderShell(`
     <section class="topbar work-topbar">
       <div class="crumb-heading"><button class="back-button" title="返回收藏夹列表" data-action="back-to-collections">${icon("back", 20)}</button><div><p class="section-kicker">收藏夹</p><h1>${escapeHtml(collection.name)}</h1></div></div>
-      <div class="topbar-actions"><button class="icon-text-button" data-action="rename-collection" data-collection-id="${collection.id}">${icon("settings", 18)}<span>重命名</span></button><button class="quiet-button" data-action="delete-collection" data-collection-id="${collection.id}">删除收藏夹</button></div>
+      <div class="topbar-actions"><button class="icon-text-button" data-action="export-collection" data-collection-id="${collection.id}">${icon("download", 18)}<span>导出清单</span></button><button class="icon-text-button" data-action="rename-collection" data-collection-id="${collection.id}">${icon("settings", 18)}<span>重命名</span></button><button class="quiet-button" data-action="delete-collection" data-collection-id="${collection.id}">删除收藏夹</button></div>
     </section>
     <section class="library-content">
       <div class="library-tools">
         <label class="search-field"><span>${icon("search", 19)}</span><input id="collection-search" type="search" placeholder="搜索这个收藏夹里的作品名称" value="${escapeHtml(state.collectionQuery)}" autocomplete="off"></label>
         <div class="filter-group" role="group" aria-label="版本状态">${[ ["all", "全部"], ["purchased", "完整版"], ["unpurchased", "预览版"] ].map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button images-filter ${state.collectionImagesOnly ? "is-active" : ""}" data-action="collection-images-only">${icon("image", 17)}<span>仅看带图版</span></button>
+        ${readFilterButtons()}
         ${serialFilterButton(state.collectionWorks)}
-        <select class="sort-select" id="collection-sort" aria-label="排序"><option value="added_desc" ${state.collectionSort === "added_desc" ? "selected" : ""}>最近收藏</option><option value="date_desc" ${state.collectionSort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.collectionSort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.collectionSort === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${state.collectionSort === "words_desc" ? "selected" : ""}>字数从多到少</option></select>
+        <select class="sort-select" id="collection-sort" aria-label="排序"><option value="added_desc" ${state.collectionSort === "added_desc" ? "selected" : ""}>最近收藏</option><option value="date_desc" ${state.collectionSort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.collectionSort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.collectionSort === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${state.collectionSort === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="rating_desc" ${state.collectionSort === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>
       </div>
       <div class="works-grid">${cards || `<div class="empty-state works-empty"><h2>${state.collectionQuery || state.status !== "all" || state.collectionImagesOnly ? "没有符合条件的作品" : "这个收藏夹还是空的"}</h2><p>在任意作品卡上点心形图标，就能把它收进来。</p></div>`}</div>
     </section>`);
@@ -1368,7 +1709,7 @@ function renderSeriesWorkCards(works) {
         <div class="work-links">${workLinkBadge(work)}</div>
         <button class="work-menu" title="更多操作" data-action="work-menu" data-work-id="${work.id}">${icon("more", 18)}</button>
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
 }
 
@@ -1568,7 +1909,7 @@ function workMenu(work) {
   // 三个下载按钮都从 Pixiv 重抓最新正文，抓完都**把作品绑定到新文件上**（原来在哪一侧就还留在哪一侧）：
   // HTML / EPUB 出阅读版，txt 出纯文本（正文里的插图写成 `[插图 N：xxx_images/001.jpg]` 指引）
   const download = work.pixivNovelId ? `<button data-action="download-reading" data-work-id="${work.id}" data-format="html">${icon("file", 18)}重新下载 HTML 版并绑定</button><button data-action="download-reading" data-work-id="${work.id}" data-format="epub">${icon("file", 18)}重新下载 EPUB 版并绑定</button><button data-action="redownload-txt" data-work-id="${work.id}">${icon("file", 18)}重新下载 TXT 版并绑定</button>` : "";
-  showModal(modal(work.title, `<div class="menu-list"><button data-action="open-work" data-work-id="${work.id}">${icon("arrow", 18)}打开${work.purchasedPath ? "完整版" : "预览版"}</button><button data-action="open-work-directory" data-work-id="${work.id}">${icon("folder", 18)}打开本地目录</button>${reading}${download}<button data-action="bind-work-file" data-work-id="${work.id}">${icon("folder", 18)}绑定完整版文件</button><button data-action="set-work-version" data-work-id="${work.id}" data-as-full="${work.purchasedPath ? "0" : "1"}">${icon(work.purchasedPath ? "file" : "check", 18)}${work.purchasedPath ? "设为预览版" : "设为完整版"}</button><button data-action="edit-tags" data-work-id="${work.id}">${icon("tag", 18)}编辑标签</button><button data-action="pick-collection" data-work-id="${work.id}">${icon("heart", 18)}${work.favorite ? "调整收藏夹…" : "收藏到…"}</button><button data-action="toggle-has-images" data-work-id="${work.id}">${icon("image", 18)}${work.hasImages ? "取消带图版" : "设为带图版"}</button><button class="menu-danger" data-action="delete-work" data-work-id="${work.id}">${icon("more", 18)}删除作品</button></div>`));
+  showModal(modal(work.title, `<div class="menu-list"><button data-action="work-detail" data-work-id="${work.id}">${icon("info", 18)}查看详情</button><button data-action="open-work" data-work-id="${work.id}">${icon("arrow", 18)}打开${work.purchasedPath ? "完整版" : "预览版"}</button><button data-action="open-work-directory" data-work-id="${work.id}">${icon("folder", 18)}打开本地目录</button>${reading}${download}<button data-action="bind-work-file" data-work-id="${work.id}">${icon("folder", 18)}绑定完整版文件</button><button data-action="set-work-version" data-work-id="${work.id}" data-as-full="${work.purchasedPath ? "0" : "1"}">${icon(work.purchasedPath ? "file" : "check", 18)}${work.purchasedPath ? "设为预览版" : "设为完整版"}</button><button data-action="edit-tags" data-work-id="${work.id}">${icon("tag", 18)}编辑标签</button><button data-action="pick-collection" data-work-id="${work.id}">${icon("heart", 18)}${work.favorite ? "调整收藏夹…" : "收藏到…"}</button><button data-action="toggle-has-images" data-work-id="${work.id}">${icon("image", 18)}${work.hasImages ? "取消带图版" : "设为带图版"}</button><button class="menu-danger" data-action="delete-work" data-work-id="${work.id}">${icon("more", 18)}删除作品</button></div>`));
 }
 
 function editTagsModal(workId, tags = null) {
@@ -1843,6 +2184,8 @@ async function bindEvents() {
       if (action === "favorites-only") { if (state.homeView === "allWorks" && !state.activeAuthor) { state.allWorksFavoritesOnly = !state.allWorksFavoritesOnly; await refreshAllWorks(); } else { state.authorFavoritesOnly = !state.authorFavoritesOnly; await refreshWorks(); } render(); }
       if (action === "images-only") { if (state.homeView === "allWorks" && !state.activeAuthor) { state.allWorksImagesOnly = !state.allWorksImagesOnly; await refreshAllWorks(); } else { state.authorImagesOnly = !state.authorImagesOnly; await refreshWorks(); } render(); }
       if (action === "serial-latest") { state.serialLatestOnly = !state.serialLatestOnly; render(); }
+      // 已读 / 评分筛选是纯前端过滤（数据都在列表里了），不用回后端重查
+      if (action === "read-filter") { state.readFilter = element.dataset.readFilter; render(); }
       if (action === "toggle-author-starred") {
         const targetId = Number(authorId);
         const starred = await invoke("toggle_author_starred", { authorId: targetId });
@@ -1891,6 +2234,20 @@ async function bindEvents() {
       if (action === "remove-author-alias") removeAuthorAlias(Number(element.dataset.index));
       if (action === "save-tags") await saveTags(Number(workId));
       if (action === "pick-collection") { closeModal(); await openCollectionPicker(Number(workId)); }
+      // 作品详情弹窗（v1.2.0）
+      if (action === "work-detail") { closeModal(); await openWorkDetail(Number(workId)); }
+      if (action === "cycle-read-state") await cycleReadState(Number(workId));
+      if (action === "detail-read-state") await setDetailMeta({ readState: Number(element.dataset.readState) });
+      if (action === "detail-rate") await setDetailMeta({ rating: Number(element.dataset.rating) });
+      if (action === "detail-edit-tags") editTagsModal(Number(workId));
+      if (action === "detail-pick-collection") await openDetailPicker(Number(workId));
+      if (action === "detail-open-path") await invoke("open_local_path", { path: element.dataset.path, parent: false });
+      if (action === "detail-open-dir") await invoke("open_local_path", { path: element.dataset.path, parent: true });
+      if (action === "detail-open-author") { closeModal(); await openAuthorLibrary(Number(authorId)); }
+      if (action === "detail-open-work") { await invoke("open_work", { workId: Number(workId) }); if (findWork(Number(workId))) { findWork(Number(workId)).readState = 1; } refreshDetailDom(); }
+      if (action === "detail-open-reading") await openWorkReading(Number(workId));
+      if (action === "detail-open-pixiv") await openExternalUrl(element.dataset.url);
+      if (action === "detail-series") { closeModal(); await chooseSeriesForWork(Number(workId)); }
       if (action === "go-collections") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "collections"; state.seriesView = null; state.seriesItems = []; state.activeCollection = null; state.collectionQuery = ""; await refreshCollections(); render(); }
       if (action === "go-history") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "history"; state.seriesView = null; state.seriesItems = []; state.historyQuery = ""; await refreshHistory(); render(); }
       if (action === "open-collection") { const collection = state.collections.find((item) => item.id === Number(element.dataset.collectionId)); if (!collection) { toast("这个收藏夹已经不在了，刷新一下", "error"); return; } closeModal(); state.activeCollection = collection; state.collectionQuery = ""; await refreshCollectionWorks(); render(); }
@@ -1947,6 +2304,19 @@ async function bindEvents() {
       if (action === "set-images-selected") await setSelectedHasImages();
       if (action === "delete-work") await deleteWork(Number(workId));
       if (action === "delete-selected") await deleteSelectedWorks();
+      // 批量操作扩展（v1.2.0）
+      if (action === "bulk-read-state") await bulkSetReadState(Number(element.dataset.readState));
+      if (action === "bulk-add-collection") bulkCollectionPicker();
+      if (action === "bulk-collection-submit") await submitBulkCollection();
+      if (action === "bulk-tag-modal") bulkTagModal();
+      if (action === "bulk-tag-submit") await submitBulkTags();
+      if (action === "export-all") await runExport("all");
+      if (action === "export-collection") await runExport("collection", Number(state.activeCollection?.id));
+      if (action === "export-selected") await runExport("ids", null, [...state.selectedWorkIds]);
+      // 维护工具（v1.2.0）
+      if (action === "backfill-synopses") await backfillSynopses();
+      if (action === "scan-work-files") await scanWorkFiles();
+      if (action === "clear-missing-bindings") await clearMissingBindings();
       if (action === "open-work") { await invoke("open_work", { workId: Number(workId) }); closeModal(); if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); }
       if (action === "open-work-directory") { await invoke("open_work_directory", { workId: Number(workId) }); if (element.closest(".menu-list")) closeModal(); }
       if (action === "open-work-url") {
@@ -2599,6 +2969,197 @@ async function setSelectedHasImages() {
   toast(`已将 ${workIds.length} 个作品设为带图版`, "success");
 }
 
+/* ============================ 批量操作扩展（v1.2.0） ============================ */
+
+/** 批量设阅读状态。批量条只在作者作品库出现，所以刷新 refreshWorks 就够。 */
+async function bulkSetReadState(readState) {
+  const workIds = [...state.selectedWorkIds];
+  if (!workIds.length) return;
+  try {
+    await invoke("set_works_read_state", { workIds, readState });
+    state.bulkMode = false;
+    state.selectedWorkIds.clear();
+    await refreshWorks();
+    render();
+    toast(`已把 ${workIds.length} 个作品设为「${readStateLabel(readState)}」`, "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/** 批量加收藏夹：勾选式弹窗，确定时按「并集」插入（不会把作品从别的夹子里踢出来） */
+async function bulkCollectionPicker() {
+  if (!state.selectedWorkIds.size) return;
+  // 收藏夹列表平时只有进「我的收藏」页才拉；批量条在作者库上，先补齐免得弹窗里是空的
+  if (!state.collections.length) await refreshCollections();
+  const rows = state.collections.map((item) => `<label class="picker-row"><input type="checkbox" data-bulk-collection="${item.id}"><span class="picker-check"></span><span class="picker-name">${escapeHtml(item.name)}</span><em class="picker-count">${item.workCount} 篇</em></label>`).join("");
+  showModal(modal("加入收藏夹",
+    `<p class="match-note">把选中的 ${state.selectedWorkIds.size} 篇作品放进下面勾选的收藏夹。已经在里面的不会重复添加。</p><div class="picker-list">${rows || '<p class="match-note">还没有收藏夹，先到「我的收藏」里建一个。</p>'}</div>`,
+    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="bulk-collection-submit" ${state.collections.length ? "" : "disabled"}>确定</button>`));
+}
+
+async function submitBulkCollection() {
+  const workIds = [...state.selectedWorkIds];
+  const collectionIds = [...document.querySelectorAll("[data-bulk-collection]")].filter((box) => box.checked).map((box) => Number(box.dataset.bulkCollection));
+  if (!collectionIds.length) { toast("先勾一个收藏夹", "error"); return; }
+  try {
+    await invoke("add_works_to_collections", { workIds, collectionIds });
+    closeModal();
+    state.bulkMode = false;
+    state.selectedWorkIds.clear();
+    await refreshCollections();
+    await refreshWorks();
+    render();
+    toast(`已把 ${workIds.length} 篇作品加入 ${collectionIds.length} 个收藏夹`, "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/**
+ * 批量改标签：一个弹窗里同时给「追加」和「移除」两个框。
+ * 只做追加 / 移除，**不做整体替换** —— 整体替换手滑一次就毁一批标签，风险太大。
+ */
+function bulkTagModal() {
+  if (!state.selectedWorkIds.size) return;
+  showModal(modal("批量改标签",
+    `<div class="form-stack"><label>追加标签 <input id="bulk-tag-add" type="text" placeholder="多个标签用空格、逗号或竖线分隔" autocomplete="off"></label><label>移除标签 <input id="bulk-tag-remove" type="text" placeholder="留空表示不删任何标签" autocomplete="off"></label></div><p class="match-note">两个框可以只填一个。追加时已有的同名标签会跳过；移除只摘掉匹配上的标签，其他原样保留。作用于选中的 ${state.selectedWorkIds.size} 篇作品。</p>`,
+    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="bulk-tag-submit">确定</button>`));
+  window.requestAnimationFrame(() => document.querySelector("#bulk-tag-add")?.focus());
+}
+
+async function submitBulkTags() {
+  const workIds = [...state.selectedWorkIds];
+  const add = (document.querySelector("#bulk-tag-add")?.value || "").trim();
+  const remove = (document.querySelector("#bulk-tag-remove")?.value || "").trim();
+  if (!add && !remove) { toast("追加和移除至少填一个", "error"); return; }
+  try {
+    const changed = await invoke("update_works_tags", { workIds, add, remove });
+    closeModal();
+    state.bulkMode = false;
+    state.selectedWorkIds.clear();
+    await refreshWorks();
+    render();
+    toast(`已更新 ${changed} 篇作品的标签`, "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/**
+ * 导出作品清单。`scope` = all / collection / ids。
+ * 格式按用户选的扩展名判：.md / .markdown 走 Markdown，其余当 CSV（CSV 后端会写 UTF-8 BOM，Excel 打开不乱码）。
+ */
+async function runExport(scope, scopeId = null, workIds = null) {
+  const label = scope === "collection" ? "收藏夹" : scope === "ids" ? "已选" : "全部作品";
+  const path = await save({
+    defaultPath: `作品清单-${label}.csv`,
+    filters: [{ name: "CSV 表格", extensions: ["csv"] }, { name: "Markdown", extensions: ["md"] }],
+  });
+  if (!path) return;
+  const lower = path.toLowerCase();
+  const format = lower.endsWith(".md") || lower.endsWith(".markdown") ? "markdown" : "csv";
+  try {
+    const result = await invoke("export_work_list", { path, format, scope, scopeId, workIds });
+    toast(`已导出 ${result.written} 篇作品`, "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/* ======================= 维护工具：补抓简介 / 文件体检（v1.2.0） ======================= */
+
+/** 磁盘占用显示（到 GB 才换单位，几百 MB 时看 MB 更有感觉） */
+function diskSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(0)} KB`;
+  return `${value} B`;
+}
+
+/**
+ * 补抓简介：把同步时读到、但没落库的 Pixiv 简介补回来。
+ * 整库跑（`author_id = 0`），后端按 6 并发逐批抓，进度挂右下角浮层，可随时终止。
+ */
+async function backfillSynopses() {
+  confirmAction("补抓作品简介", "只给「记录了 Pixiv 作品 ID、但还没有简介」的作品各发一次请求。已经有简介的会跳过。篇数多时会跑一会儿，右下角有进度，随时可以终止。", "开始补抓", async () => {
+    state.syncTask = { authorId: 0, cancelAuthorId: 0, label: "正在补抓简介", title: "", current: 0, total: 0, cancelling: false };
+    render();
+    let unlisten = () => {};
+    try { unlisten = await listen("synopsis-backfill-progress", (event) => { const { total = 0, current = 0 } = event.payload || {}; if (!state.syncTask) return; state.syncTask.total = total; state.syncTask.current = current; updateSyncFloater(); }); } catch { unlisten = () => {}; }
+    try {
+      const result = await invoke("backfill_synopses", { authorId: 0 });
+      unlisten();
+      state.syncTask = null;
+      await refreshAuthors();
+      if (state.activeAuthor) await refreshWorks(); else if (state.homeView === "allWorks") await refreshAllWorks();
+      render();
+      if (result.cancelled) toast(`已终止：更新 ${result.updated} 篇，还有 ${result.total - result.updated - result.failed} 篇没抓`, "info");
+      else toast(`补抓完成：更新 ${result.updated} 篇${result.failed ? `，失败 ${result.failed} 篇` : ""}`, "success");
+    } catch (error) {
+      unlisten();
+      state.syncTask = null;
+      render();
+      toast(String(error), "error");
+    }
+  });
+}
+
+/** 文件体检：核对绑定的文件在不在，并统计磁盘占用 */
+async function scanWorkFiles() {
+  toast("正在核对文件…", "info");
+  let report;
+  try {
+    report = await invoke("scan_work_files");
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  const missing = report.missing || [];
+  const authors = report.authors || [];
+  const kindLabel = (kind) => (kind === "purchased" ? "完整版" : "预览版");
+  const missingRows = missing.map((item) => `
+    <div class="scan-row">
+      <div class="scan-row-main"><strong>${escapeHtml(item.title)}</strong><span class="scan-kind">${kindLabel(item.kind)}</span></div>
+      <div class="scan-path" title="${escapeHtml(item.path)}">${escapeHtml(item.path)}</div>
+    </div>`).join("");
+  const authorRows = authors.slice(0, 12).map((item) => `
+    <div class="scan-row is-compact"><div class="scan-row-main"><strong>${escapeHtml(item.authorName)}</strong><span class="scan-count">${item.fileCount} 个文件</span></div><div class="scan-size">${diskSize(item.bytes)}</div></div>`).join("");
+  const body = `
+    <div class="scan-summary">
+      <div class="scan-stat"><span>核对作品</span><strong>${report.checked}</strong></div>
+      <div class="scan-stat ${missing.length ? "is-warn" : ""}"><span>文件丢失</span><strong>${missing.length}</strong></div>
+      <div class="scan-stat"><span>占用文件</span><strong>${report.totalFiles}</strong></div>
+      <div class="scan-stat"><span>占用空间</span><strong>${diskSize(report.totalBytes)}</strong></div>
+    </div>
+    <section class="detail-block">
+      <h4>文件丢失${missing.length ? `（${missing.length}）` : ""}</h4>
+      ${missing.length ? `<p class="match-note">这些作品数据库里还绑着文件，但硬盘上已经找不到了（可能被你自己挪走或删了）。软件不会去动硬盘上的任何东西，这里只处理数据库里的绑定。</p><div class="scan-list">${missingRows}</div>` : '<p class="match-note">绑定的文件都还在，没有发现失效的关联。</p>'}
+    </section>
+    <section class="detail-block">
+      <h4>磁盘占用（按作者）</h4>
+      ${authorRows ? `<div class="scan-list">${authorRows}</div>` : '<p class="match-note">还没有可统计的文件。</p>'}
+    </section>`;
+  const footer = `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>${missing.length ? `<button class="danger-button" data-action="clear-missing-bindings">清理这 ${missing.length} 条失效绑定</button>` : ""}`;
+  showModal(modal("文件体检", body, footer, "is-wide"));
+}
+
+/** 清掉失效绑定。后端会重新扫一遍再清（不信任前端那份可能过期的清单），只改数据库、不碰硬盘。 */
+async function clearMissingBindings() {
+  try {
+    const cleared = await invoke("clear_missing_bindings");
+    closeModal();
+    await refreshAllWorks();
+    if (state.activeAuthor) await refreshWorks();
+    await refreshCollections();
+    render();
+    toast(`已清理 ${cleared} 条失效绑定，硬盘上的文件一律没动`, "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
 // 图文小说：打开同步时生成的阅读版（HTML 交给浏览器，EPUB 交给系统默认阅读器）
 async function openWorkReading(workId) {
   try {
@@ -3152,7 +3713,9 @@ async function cancelPixivSync() {
   state.syncTask.label = "正在终止同步";
   updateSyncFloater();
   // 批量同步时可能还没轮到任何作者，此时靠 cancelling 标记停止后续循环
-  if (state.syncTask.authorId) await invoke("cancel_pixiv_sync", { authorId: state.syncTask.authorId });
+  // cancelAuthorId 是给「整库补抓简介」这类没有具体作者的任务用的（后端用 0 当整库键）
+  const targetId = state.syncTask.cancelAuthorId !== undefined ? state.syncTask.cancelAuthorId : state.syncTask.authorId;
+  if (targetId || targetId === 0) await invoke("cancel_pixiv_sync", { authorId: targetId });
 }
 
 // 作者别名：就地增删（不像作品标签那样关掉重开弹窗，避免丢掉表单里其它未保存的修改）
@@ -3353,6 +3916,8 @@ async function settingsModal() {
       <div class="settings-slot" id="settings-slot-maintain"></div>
     </div>
     <div class="menu-list settings-actions">
+      <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的会跳过）</span></button>
+      <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
       <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>

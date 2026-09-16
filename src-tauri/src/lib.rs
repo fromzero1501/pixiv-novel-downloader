@@ -50,6 +50,8 @@ struct AuthorSummary {
     purchased_count: i64,
     favorite_count: i64,
     images_count: i64,
+    /// 上次同步之后新加进来、还没点开看过的作品数（作者卡上提示「新增 N 篇」用）。
+    new_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -89,6 +91,15 @@ struct Work {
     author_name: String,
     word_count: Option<usize>,
     file_format: Option<String>,
+    /// Pixiv 简介（同步时拿到的 description）。老库升级后是空的，可以用「补抓简介」填上。
+    synopsis: String,
+    /// 阅读状态：0 = 未读（从没打开过），1 = 在读（打开过），2 = 已读（手动标的）。
+    /// 注意：外部阅读器读完不会回调，所以只有「已读」是手动的。
+    read_state: i64,
+    /// 个人评分 0-5，0 = 未评。
+    rating: i64,
+    /// 一句话笔记，最多 200 字。
+    note: String,
 }
 
 #[derive(Serialize)]
@@ -381,6 +392,8 @@ struct PixivDownloadCandidate {
     series_title: String,
     series_order: i64,
     is_preview: bool,
+    /// Pixiv 简介，同步时顺手带上，落进 works.synopsis。
+    synopsis: String,
 }
 
 #[derive(Clone)]
@@ -476,6 +489,10 @@ fn db() -> Result<Connection, String> {
           series_title TEXT NOT NULL DEFAULT '',
           series_order INTEGER NOT NULL DEFAULT 0,
           is_new INTEGER NOT NULL DEFAULT 0,
+          synopsis TEXT NOT NULL DEFAULT '',
+          read_state INTEGER NOT NULL DEFAULT 0,
+          rating INTEGER NOT NULL DEFAULT 0,
+          note TEXT NOT NULL DEFAULT '',
           UNIQUE(author_id, title, release_date)
         );
         CREATE TABLE IF NOT EXISTS series_catalog (
@@ -560,6 +577,24 @@ fn db() -> Result<Connection, String> {
     );
     let _ = conn.execute(
         "ALTER TABLE works ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // 作品详情弹窗用到的四个个人字段（v1.2.0）：简介、阅读状态、评分、笔记。
+    // 简介同步时本来就抓到了（只拿去判断预览版），这里只是给它一个落盘的位置。
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN synopsis TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN read_state INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN rating INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN note TEXT NOT NULL DEFAULT ''",
         [],
     );
     let _ = conn.execute(
@@ -1192,13 +1227,19 @@ fn read_author(conn: &Connection, id: i64) -> Result<AuthorSummary, String> {
           (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1),
           a.aliases,
           (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1),
-          a.starred
+          a.starred,
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1)
         FROM authors a WHERE a.id = ?1",
         [id],
-        |row| Ok(AuthorSummary { id: row.get(0)?, name: row.get(1)?, homepage: row.get(2)?, avatar_path: row.get(3)?, notes: row.get(4)?, preview_dir: row.get(5)?, purchased_dir: row.get(6)?, match_threshold: row.get(7)?, pixiv_last_sync_at: row.get(8)?, avatar_managed: row.get::<_, i64>(9)? == 1, work_count: row.get(10)?, purchased_count: row.get(11)?, favorite_count: row.get(12)?, aliases: row.get(13)?, images_count: row.get(14)?, starred: row.get::<_, i64>(15)? == 1 })
+        |row| Ok(AuthorSummary { id: row.get(0)?, name: row.get(1)?, homepage: row.get(2)?, avatar_path: row.get(3)?, notes: row.get(4)?, preview_dir: row.get(5)?, purchased_dir: row.get(6)?, match_threshold: row.get(7)?, pixiv_last_sync_at: row.get(8)?, avatar_managed: row.get::<_, i64>(9)? == 1, work_count: row.get(10)?, purchased_count: row.get(11)?, favorite_count: row.get(12)?, aliases: row.get(13)?, images_count: row.get(14)?, starred: row.get::<_, i64>(15)? == 1, new_count: row.get(16)? })
     ).map_err(|e| e.to_string())
 }
 
+// 列号约定（五处 SELECT 必须完全一致）：0 author_id / 1 id / 2 title / 3 release_date /
+// 4 preview_path / 5 cover_path / 6 purchased_path / 7 favorite / 8 has_images / 9 tags /
+// 10 pixiv_novel_id / 11 series_id / 12 series_title / 13 series_order / 14 is_new /
+// 15 author_name / 16 image_count / 17 synopsis / 18 read_state / 19 rating / 20 note
+// （浏览历史在那之后再接 21 viewed_at、22 view_count）
 fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
     Ok(Work {
         author_id: row.get(0)?,
@@ -1220,8 +1261,16 @@ fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
         word_count: None,
         file_format: None,
         image_count: row.get::<_, i64>(16)?,
+        synopsis: row.get(17)?,
+        read_state: row.get(18)?,
+        rating: row.get(19)?,
+        note: row.get(20)?,
     })
 }
+
+/// 五处 SELECT 共用的作品列清单，避免手写列号时漏改一处。
+const WORK_COLUMNS: &str = "author_id, id, title, release_date, preview_path, cover_path, purchased_path, favorite, has_images, tags, pixiv_novel_id, series_id, series_title, series_order, is_new, '' AS author_name, image_count, synopsis, read_state, rating, note";
+const WORK_COLUMNS_W: &str = "w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count, w.synopsis, w.read_state, w.rating, w.note";
 
 fn text_file_word_count(path: &Path) -> Option<usize> {
     let bytes = fs::read(path).ok()?;
@@ -1383,7 +1432,8 @@ fn list_authors() -> Result<Vec<AuthorSummary>, String> {
           (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1),
           a.aliases,
           (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1),
-          a.starred
+          a.starred,
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1)
         FROM authors a{AUTHOR_ORDER_BY}"
     );
     let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -1406,6 +1456,7 @@ fn list_authors() -> Result<Vec<AuthorSummary>, String> {
                 aliases: row.get(13)?,
                 images_count: row.get(14)?,
                 starred: row.get::<_, i64>(15)? == 1,
+                new_count: row.get(16)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1673,7 +1724,7 @@ fn list_works(
     } else {
         "title"
     };
-    let mut sql = format!("SELECT author_id, id, title, release_date, preview_path, cover_path, purchased_path, favorite, has_images, tags, pixiv_novel_id, series_id, series_title, series_order, is_new, '' AS author_name, image_count FROM works WHERE author_id = ?1 AND (?2 = '' OR {field} LIKE ?3)");
+    let mut sql = format!("SELECT {WORK_COLUMNS} FROM works WHERE author_id = ?1 AND (?2 = '' OR {field} LIKE ?3)");
     match status.as_str() {
         "purchased" => sql.push_str(" AND purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND purchased_path = ''"),
@@ -1690,6 +1741,8 @@ fn list_works(
         "title_asc" => " ORDER BY title COLLATE NOCASE ASC",
         // 「字数从多到少」的字数要读文件才知道，SQL 排不了：先按日期打个底，取回数据后再在 Rust 里重排
         "words_desc" => " ORDER BY release_date DESC, id DESC",
+        // 评分从高到低，没打分的（0）自动沉底
+        "rating_desc" => " ORDER BY rating DESC, release_date DESC, id DESC",
         _ => " ORDER BY release_date DESC, id DESC",
     });
     let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -1727,7 +1780,7 @@ fn list_all_works(
     } else {
         "w.title"
     };
-    let mut sql = format!("SELECT w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count FROM works w JOIN authors a ON a.id=w.author_id WHERE (?1 = '' OR {field} LIKE ?2)");
+    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id WHERE (?1 = '' OR {field} LIKE ?2)");
     match status.as_str() {
         "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND w.purchased_path = ''"),
@@ -1744,6 +1797,7 @@ fn list_all_works(
         "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
         // 同 list_works：「字数从多到少」只在 SQL 里给个日期底序，最终顺序在 Rust 里排
         "words_desc" => " ORDER BY w.release_date DESC, w.id DESC",
+        "rating_desc" => " ORDER BY w.rating DESC, w.release_date DESC, w.id DESC",
         _ => " ORDER BY w.release_date DESC, w.id DESC",
     });
     let raw_query = query.trim();
@@ -1767,7 +1821,7 @@ fn list_all_works(
 fn list_series_works(author_id: i64, series_id: String) -> Result<Vec<Work>, String> {
     let conn = db()?;
     let mut statement = conn
-        .prepare("SELECT author_id, id, title, release_date, preview_path, cover_path, purchased_path, favorite, has_images, tags, pixiv_novel_id, series_id, series_title, series_order, is_new, '' AS author_name, image_count FROM works WHERE author_id=?1 AND series_id=?2 ORDER BY CASE WHEN series_order > 0 THEN 0 ELSE 1 END, series_order ASC, id ASC")
+        .prepare(&format!("SELECT {WORK_COLUMNS} FROM works WHERE author_id=?1 AND series_id=?2 ORDER BY CASE WHEN series_order > 0 THEN 0 ELSE 1 END, series_order ASC, id ASC"))
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map(params![author_id, series_id], map_work)
@@ -3969,8 +4023,8 @@ fn pixiv_sync_impl(
         if let Some(existing_id) = existing_sync_target(&conn, author_id, &novel_id, &title)? {
             // 标题命中「插画 / 图文」时补标记为带图版；未命中则保持原值，不会清掉已有标记
             conn.execute(
-                "UPDATE works SET pixiv_novel_id=CASE WHEN pixiv_novel_id='' THEN ?1 ELSE pixiv_novel_id END, series_id=?2, series_title=?3, series_order=?4, has_images=CASE WHEN ?6=1 THEN 1 ELSE has_images END WHERE id=?5",
-                params![novel_id, series_id, series_title, series_order, existing_id, title_indicates_images(&title) as i64],
+                "UPDATE works SET pixiv_novel_id=CASE WHEN pixiv_novel_id='' THEN ?1 ELSE pixiv_novel_id END, series_id=?2, series_title=?3, series_order=?4, has_images=CASE WHEN ?6=1 THEN 1 ELSE has_images END, synopsis=CASE WHEN ?7='' THEN synopsis ELSE ?7 END WHERE id=?5",
+                params![novel_id, series_id, series_title, series_order, existing_id, title_indicates_images(&title) as i64, description],
             )
             .map_err(|e| e.to_string())?;
             result.skipped_existing_count += 1;
@@ -4031,7 +4085,7 @@ fn pixiv_sync_impl(
                     }
                 }
             };
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, title_indicates_images(&title) as i64]).is_err() {
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, title_indicates_images(&title) as i64, description]).is_err() {
                 result.failed_count += 1;
                 continue;
             }
@@ -4061,6 +4115,7 @@ fn pixiv_sync_impl(
             series_title,
             series_order,
             is_preview,
+            synopsis: description,
         });
     }
     const COVER_CONCURRENCY: usize = 4;
@@ -4152,7 +4207,7 @@ fn pixiv_sync_impl(
             } else {
                 (String::new(), text_path.to_string_lossy().to_string())
             };
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, title_indicates_images(&work.title) as i64, image_saved as i64]).is_err() {
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, title_indicates_images(&work.title) as i64, image_saved as i64, work.synopsis]).is_err() {
             result.failed_count += 1;
             continue;
         }
@@ -4204,6 +4259,138 @@ fn cancel_pixiv_sync(author_id: i64) {
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .map(|mut cancelled| cancelled.insert(author_id));
+}
+
+// ==================== 补抓简介（v1.2.0） ====================
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SynopsisBackfillResult {
+    total: usize,
+    updated: usize,
+    failed: usize,
+    cancelled: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SynopsisBackfillProgress {
+    total: usize,
+    current: usize,
+    title: String,
+}
+
+/// 补抓简介时的并发数，和同步抓详情保持一致。
+const SYNOPSIS_CONCURRENCY: usize = 6;
+
+/// 给老作品补抓 Pixiv 简介。`author_id = 0` 表示整库。
+/// 取消标记复用同步那一套：整库补抓的键就是 0（前端调 `cancel_pixiv_sync(0)`）。
+#[tauri::command]
+async fn backfill_synopses(
+    author_id: i64,
+    app: tauri::AppHandle,
+) -> Result<SynopsisBackfillResult, String> {
+    clear_pixiv_sync_cancel(author_id);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        backfill_synopses_impl(author_id, app)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    clear_pixiv_sync_cancel(author_id);
+    result
+}
+
+fn backfill_synopses_impl(
+    author_id: i64,
+    app: tauri::AppHandle,
+) -> Result<SynopsisBackfillResult, String> {
+    let conn = db()?;
+    let cookie = setting(&conn, "pixiv_cookie")?;
+    let cookie = if cookie.trim().is_empty() {
+        None
+    } else {
+        Some(normalize_pixiv_cookie(&cookie)?)
+    };
+    let client = pixiv_client(cookie)?;
+    // author_id 是命令参数里的数字，直接拼进 SQL 不涉及注入；用参数化反而让
+    // 「0 = 全部」这个分支要写两遍 query，不值得。
+    let filter = if author_id > 0 {
+        format!(" AND author_id = {author_id}")
+    } else {
+        String::new()
+    };
+    let targets: Vec<(i64, String)> = {
+        let sql = format!(
+            "SELECT id, pixiv_novel_id FROM works WHERE pixiv_novel_id <> '' AND synopsis = ''{filter} ORDER BY id"
+        );
+        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    let total = targets.len();
+    let mut updated = 0usize;
+    let mut failed = 0usize;
+    let mut cancelled = false;
+    for (batch_index, batch) in targets.chunks(SYNOPSIS_CONCURRENCY).enumerate() {
+        if pixiv_sync_cancelled(author_id) {
+            cancelled = true;
+            break;
+        }
+        let fetched = std::thread::scope(|scope| {
+            let handles = batch
+                .iter()
+                .map(|(work_id, novel_id)| {
+                    let client = client.clone();
+                    let novel_id = novel_id.clone();
+                    let work_id = *work_id;
+                    scope.spawn(move || {
+                        let detail = fetch_pixiv_novel_detail(&client, &novel_id);
+                        (work_id, detail)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .collect::<Vec<_>>()
+        });
+        for (work_id, detail) in fetched {
+            match detail {
+                Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
+                    let body = detail.get("body").unwrap_or(&Value::Null);
+                    let description = json_string(body, "description");
+                    if description.trim().is_empty() {
+                        continue;
+                    }
+                    conn.execute(
+                        "UPDATE works SET synopsis=?1 WHERE id=?2",
+                        params![description, work_id],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    updated += 1;
+                }
+                _ => failed += 1,
+            }
+        }
+        let current = ((batch_index + 1) * SYNOPSIS_CONCURRENCY).min(total);
+        let _ = app.emit(
+            "synopsis-backfill-progress",
+            SynopsisBackfillProgress {
+                total,
+                current,
+                title: format!("正在补抓简介：{} / {}", current, total),
+            },
+        );
+    }
+    Ok(SynopsisBackfillResult {
+        total,
+        updated,
+        failed,
+        cancelled,
+    })
 }
 
 fn sync_pixiv_author_profile_impl(
@@ -6634,6 +6821,7 @@ fn open_work_reading(work_id: i64) -> Result<(), String> {
         }
         return match open::that(&candidate) {
             Ok(()) => {
+                let _ = mark_work_in_progress(&conn, work_id);
                 let _ = record_history(&conn, work_id);
                 Ok(())
             }
@@ -6857,6 +7045,41 @@ fn set_work_collections(work_id: i64, collection_ids: Vec<i64>) -> Result<(), St
     Ok(())
 }
 
+/// 批量把作品**加进**若干收藏夹（并集，不覆盖已有归属）——
+/// 批量操作里用。单篇的「一次性替换」走 set_work_collections。
+#[tauri::command]
+fn add_works_to_collections(work_ids: Vec<i64>, collection_ids: Vec<i64>) -> Result<usize, String> {
+    add_works_to_collections_impl(&mut db()?, &work_ids, &collection_ids)
+}
+
+fn add_works_to_collections_impl(
+    conn: &mut Connection,
+    work_ids: &[i64],
+    collection_ids: &[i64],
+) -> Result<usize, String> {
+    if work_ids.is_empty() || collection_ids.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    for work_id in work_ids {
+        for collection_id in collection_ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO collection_works (collection_id, work_id, added_at) VALUES (?1, ?2, ?3)",
+                params![collection_id, work_id, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "UPDATE works SET favorite = (SELECT COUNT(*) FROM collection_works WHERE work_id=?1) > 0 WHERE id=?1",
+            [work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(work_ids.len())
+}
+
 #[tauri::command]
 fn list_collection_works(
     collection_id: i64,
@@ -6872,7 +7095,7 @@ fn list_collection_works(
     } else {
         "w.title"
     };
-    let mut sql = format!("SELECT w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count FROM collection_works cw JOIN works w ON w.id=cw.work_id JOIN authors a ON a.id=w.author_id WHERE cw.collection_id=?1 AND (?2='' OR {field} LIKE ?3)");
+    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM collection_works cw JOIN works w ON w.id=cw.work_id JOIN authors a ON a.id=w.author_id WHERE cw.collection_id=?1 AND (?2='' OR {field} LIKE ?3)");
     match status.as_str() {
         "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND w.purchased_path = ''"),
@@ -6941,14 +7164,14 @@ fn list_history(query: String, limit: i64) -> Result<Vec<HistoryEntry>, String> 
         limit.min(HISTORY_LIMIT)
     };
     let mut statement = conn
-        .prepare("SELECT w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count, h.viewed_at, h.view_count FROM work_history h JOIN works w ON w.id=h.work_id JOIN authors a ON a.id=w.author_id WHERE (?1='' OR w.title LIKE ?2 OR w.tags LIKE ?2) ORDER BY h.viewed_at DESC LIMIT ?3")
+        .prepare(&format!("SELECT {WORK_COLUMNS_W}, h.viewed_at, h.view_count FROM work_history h JOIN works w ON w.id=h.work_id JOIN authors a ON a.id=w.author_id WHERE (?1='' OR w.title LIKE ?2 OR w.tags LIKE ?2) ORDER BY h.viewed_at DESC LIMIT ?3"))
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map(params![raw_query, format!("%{raw_query}%"), limit], |row| {
             Ok(HistoryEntry {
                 work: map_work(row)?,
-                viewed_at: row.get(17)?,
-                view_count: row.get(18)?,
+                viewed_at: row.get(21)?,
+                view_count: row.get(22)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -6986,6 +7209,565 @@ fn toggle_has_images(work_id: i64) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ============ 作品个人元数据：阅读状态 / 评分 / 笔记（v1.2.0） ============
+
+/// 阅读状态：0 = 未读，1 = 在读，2 = 已读。
+const READ_UNREAD: i64 = 0;
+const READ_IN_PROGRESS: i64 = 1;
+const READ_DONE: i64 = 2;
+/// 笔记长度上限：卡片和详情弹窗都放不下更长的东西，写长了也没人看。
+const NOTE_MAX_CHARS: usize = 200;
+
+/// 打开作品时把它从「未读」推进到「在读」。
+/// **绝不覆盖「已读」** —— 读过的好书再打开一次，不该又变回在读。
+fn mark_work_in_progress(conn: &Connection, work_id: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE works SET read_state=?1 WHERE id=?2 AND read_state=?3",
+        params![READ_IN_PROGRESS, work_id, READ_UNREAD],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 一次性写回评分 / 阅读状态 / 笔记。三个值都传 `None` 就什么都不改。
+/// 前端每次只改一项，另两项传当前值即可。
+#[tauri::command]
+fn set_work_meta(
+    work_id: i64,
+    read_state: Option<i64>,
+    rating: Option<i64>,
+    note: Option<String>,
+) -> Result<(), String> {
+    let conn = db()?;
+    if let Some(state) = read_state {
+        if !(READ_UNREAD..=READ_DONE).contains(&state) {
+            return Err("阅读状态只能是 0 / 1 / 2".into());
+        }
+        conn.execute(
+            "UPDATE works SET read_state=?1 WHERE id=?2",
+            params![state, work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(value) = rating {
+        if !(0..=5).contains(&value) {
+            return Err("评分只能是 0-5".into());
+        }
+        conn.execute(
+            "UPDATE works SET rating=?1 WHERE id=?2",
+            params![value, work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(text) = note {
+        let text = text.trim().to_string();
+        if text.chars().count() > NOTE_MAX_CHARS {
+            return Err(format!("笔记最多 {NOTE_MAX_CHARS} 个字"));
+        }
+        conn.execute(
+            "UPDATE works SET note=?1 WHERE id=?2",
+            params![text, work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 批量设置阅读状态（「设已读 / 设未读」用）。
+#[tauri::command]
+fn set_works_read_state(work_ids: Vec<i64>, read_state: i64) -> Result<usize, String> {
+    if !(READ_UNREAD..=READ_DONE).contains(&read_state) {
+        return Err("阅读状态只能是 0 / 1 / 2".into());
+    }
+    if work_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = db()?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for work_id in &work_ids {
+        tx.execute(
+            "UPDATE works SET read_state=?1 WHERE id=?2",
+            params![read_state, work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(work_ids.len())
+}
+
+/// 批量改标签：`add` 里的标签追加进去，`remove` 里的标签摘掉。
+/// **只做追加与移除，不做整体替换** —— 手滑一次就会毁掉一批作品的标签。
+#[tauri::command]
+fn update_works_tags(work_ids: Vec<i64>, add: String, remove: String) -> Result<usize, String> {
+    update_works_tags_impl(&mut db()?, &work_ids, &add, &remove)
+}
+
+fn update_works_tags_impl(
+    conn: &mut Connection,
+    work_ids: &[i64],
+    add: &str,
+    remove: &str,
+) -> Result<usize, String> {
+    let add_tags = split_tags(add);
+    let remove_tags = split_tags(remove);
+    if add_tags.is_empty() && remove_tags.is_empty() {
+        return Err("没填要追加或要移除的标签".into());
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut changed = 0;
+    for work_id in work_ids {
+        let current: String = tx
+            .query_row("SELECT tags FROM works WHERE id=?1", [work_id], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        let mut tags = split_tags(&current);
+        let before = tags.clone();
+        for tag in &add_tags {
+            if !tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)) {
+                tags.push(tag.clone());
+            }
+        }
+        tags.retain(|tag| {
+            !remove_tags
+                .iter()
+                .any(|remove| remove.eq_ignore_ascii_case(tag))
+        });
+        if tags != before {
+            tx.execute(
+                "UPDATE works SET tags=?1 WHERE id=?2",
+                params![tags.join("| "), work_id],
+            )
+            .map_err(|e| e.to_string())?;
+            changed += 1;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+/// 标签串（`|` 分隔）拆成单个标签，去空白、去空项。
+fn split_tags(raw: &str) -> Vec<String> {
+    raw.split('|')
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
+// ============ 文件体检：失效关联 + 磁盘占用（v1.2.0） ============
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MissingFileEntry {
+    work_id: i64,
+    title: String,
+    /// `preview` = 预览版绑定失效，`purchased` = 完整版绑定失效
+    kind: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AuthorDiskUsage {
+    author_id: i64,
+    author_name: String,
+    bytes: u64,
+    file_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkFileReport {
+    /// 检查了多少篇「有绑定文件」的作品
+    checked: usize,
+    missing: Vec<MissingFileEntry>,
+    total_bytes: u64,
+    total_files: usize,
+    authors: Vec<AuthorDiskUsage>,
+}
+
+/// 一篇作品实际占用的文件：绑定的正文 + 封面 + 已经生成好的阅读版。
+/// 去重过，避免正文和阅读版指向同一个文件时被算两次。
+fn work_file_paths(work: &Work) -> Vec<PathBuf> {
+    let mut candidates = vec![
+        work.purchased_path.clone(),
+        work.preview_path.clone(),
+        work.cover_path.clone(),
+    ];
+    let text_path = if work.purchased_path.trim().is_empty() {
+        &work.preview_path
+    } else {
+        &work.purchased_path
+    };
+    if !text_path.trim().is_empty() {
+        let text = Path::new(text_path);
+        for format in [ReadingFormat::Html, ReadingFormat::Epub] {
+            let candidate = reading_output_path(text, format, "");
+            if candidate.is_file() {
+                candidates.push(candidate.to_string_lossy().to_string());
+            }
+        }
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(trimmed);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// 整库的作品（带作者名），列顺序与 WORK_COLUMNS_W 一致。
+fn all_works(conn: &Connection) -> Result<Vec<Work>, String> {
+    let sql = format!(
+        "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id ORDER BY w.id"
+    );
+    let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = statement.query_map([], map_work).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 体检：逐个 stat 绑定的文件，找出「数据库里还指着、硬盘上已经没了」的关联；
+/// 顺便统计整库与各作者的磁盘占用。
+fn scan_work_files_impl(conn: &Connection) -> Result<WorkFileReport, String> {
+    let works = all_works(conn)?;
+    let mut missing: Vec<MissingFileEntry> = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut total_files = 0usize;
+    let mut per_author: HashMap<i64, (String, u64, usize)> = HashMap::new();
+    let mut checked = 0usize;
+    for work in &works {
+        let bound = [
+            ("preview", work.preview_path.as_str()),
+            ("purchased", work.purchased_path.as_str()),
+        ];
+        if bound.iter().any(|(_, path)| !path.trim().is_empty()) {
+            checked += 1;
+        }
+        for (kind, path) in bound {
+            if path.trim().is_empty() {
+                continue;
+            }
+            if !Path::new(path).exists() {
+                missing.push(MissingFileEntry {
+                    work_id: work.id,
+                    title: work.title.clone(),
+                    kind: kind.to_string(),
+                    path: path.to_string(),
+                });
+            }
+        }
+        for path in work_file_paths(work) {
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            total_bytes += meta.len();
+            total_files += 1;
+            let entry = per_author
+                .entry(work.author_id)
+                .or_insert_with(|| (work.author_name.clone(), 0, 0));
+            entry.1 += meta.len();
+            entry.2 += 1;
+        }
+    }
+    let mut authors: Vec<AuthorDiskUsage> = per_author
+        .into_iter()
+        .map(
+            |(author_id, (author_name, bytes, file_count))| AuthorDiskUsage {
+                author_id,
+                author_name,
+                bytes,
+                file_count,
+            },
+        )
+        .collect();
+    authors.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    Ok(WorkFileReport {
+        checked,
+        missing,
+        total_bytes,
+        total_files,
+        authors,
+    })
+}
+
+#[tauri::command]
+fn scan_work_files() -> Result<WorkFileReport, String> {
+    scan_work_files_impl(&db()?)
+}
+
+/// 把已经失效的绑定清掉，作品回到「未关联」状态。
+/// **只改数据库里的路径，绝不动硬盘上的任何文件** —— 你自己挪走的文件不该被这里删掉。
+/// 这里重新扫一遍再清（不用前端传来的清单），避免清单过期导致误清。
+#[tauri::command]
+fn clear_missing_bindings() -> Result<usize, String> {
+    let mut conn = db()?;
+    let report = scan_work_files_impl(&conn)?;
+    if report.missing.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut cleared = 0usize;
+    for entry in &report.missing {
+        // column 只可能是这两个写死的值，不来自外部输入
+        let column = if entry.kind == "purchased" {
+            "purchased_path"
+        } else {
+            "preview_path"
+        };
+        tx.execute(
+            &format!("UPDATE works SET {column}='' WHERE id=?1"),
+            [entry.work_id],
+        )
+        .map_err(|e| e.to_string())?;
+        cleared += 1;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(cleared)
+}
+
+// ============ 导出作品清单：CSV / Markdown（v1.2.0） ============
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportResult {
+    written: usize,
+    path: String,
+}
+
+/// 导出列（顺序即 CSV 列顺序，Markdown 也按这个取下标）。
+const EXPORT_HEADERS: [&str; 14] = [
+    "标题",
+    "作者",
+    "发布日期",
+    "字数",
+    "格式",
+    "标签",
+    "系列",
+    "版本状态",
+    "收藏夹",
+    "评分",
+    "阅读状态",
+    "笔记",
+    "Pixiv 链接",
+    "文件路径",
+];
+
+fn read_state_label(state: i64) -> &'static str {
+    match state {
+        READ_DONE => "已读",
+        READ_IN_PROGRESS => "在读",
+        _ => "未读",
+    }
+}
+
+/// work_id → 它所在的收藏夹名字列表（按收藏夹自己的顺序）。
+fn collection_names_by_work(conn: &Connection) -> Result<HashMap<i64, Vec<String>>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT cw.work_id, c.name FROM collection_works cw JOIN collections c ON c.id=cw.collection_id ORDER BY c.sort_order ASC, c.id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (work_id, name) = row.map_err(|e| e.to_string())?;
+        map.entry(work_id).or_default().push(name);
+    }
+    Ok(map)
+}
+
+fn export_rows(conn: &Connection, works: Vec<Work>) -> Result<Vec<Vec<String>>, String> {
+    let collections = collection_names_by_work(conn)?;
+    let mut rows = Vec::with_capacity(works.len());
+    for mut work in works {
+        populate_work_display_info(&mut work);
+        let series = if work.series_title.trim().is_empty() {
+            String::new()
+        } else if work.series_order > 0 {
+            format!("{}（第 {} 篇）", work.series_title, work.series_order)
+        } else {
+            work.series_title.clone()
+        };
+        let pixiv_url = if work.pixiv_novel_id.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "https://www.pixiv.net/novel/show.php?id={}",
+                work.pixiv_novel_id
+            )
+        };
+        rows.push(vec![
+            work.title.clone(),
+            work.author_name.clone(),
+            work.release_date.clone(),
+            work.word_count.map(|count| count.to_string()).unwrap_or_default(),
+            work.file_format.clone().unwrap_or_default(),
+            split_tags(&work.tags).join("、"),
+            series,
+            if work.purchased_path.trim().is_empty() {
+                "预览版".to_string()
+            } else {
+                "完整版".to_string()
+            },
+            collections
+                .get(&work.id)
+                .map(|names| names.join("、"))
+                .unwrap_or_default(),
+            if work.rating > 0 {
+                format!("{} 星", work.rating)
+            } else {
+                String::new()
+            },
+            read_state_label(work.read_state).to_string(),
+            work.note.replace('\n', " ").replace('\r', " "),
+            pixiv_url,
+            work.purchased_path.clone(),
+        ]);
+    }
+    Ok(rows)
+}
+
+fn write_export_csv(path: &str, rows: &[Vec<String>]) -> Result<(), String> {
+    // UTF-8 BOM：不加的话 Excel 打开中文全是乱码 —— 这是导 CSV 最容易漏的一步
+    let mut buffer: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+    {
+        let mut writer = csv::WriterBuilder::new()
+            .terminator(csv::Terminator::CRLF)
+            .from_writer(&mut buffer);
+        writer
+            .write_record(EXPORT_HEADERS)
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            writer.write_record(row).map_err(|e| e.to_string())?;
+        }
+        writer.flush().map_err(|e| e.to_string())?;
+    }
+    fs::write(path, buffer).map_err(|e| format!("写入 CSV 失败：{e}"))
+}
+
+fn write_export_markdown(path: &str, rows: &[Vec<String>]) -> Result<(), String> {
+    let mut text = format!(
+        "# 作品清单\n\n共 {} 篇 · 导出于 {}\n",
+        rows.len(),
+        Utc::now().format("%Y-%m-%d %H:%M")
+    );
+    for row in rows {
+        text.push_str(&format!("\n## {}\n\n", row[0]));
+        let mut facts: Vec<String> = Vec::new();
+        if !row[1].trim().is_empty() {
+            facts.push(format!("作者：{}", row[1]));
+        }
+        if !row[2].trim().is_empty() {
+            facts.push(format!("发布：{}", row[2]));
+        }
+        if !row[3].trim().is_empty() {
+            facts.push(format!("字数：{}", row[3]));
+        }
+        if !row[4].trim().is_empty() {
+            facts.push(format!("格式：{}", row[4]));
+        }
+        facts.push(row[7].clone());
+        if !row[6].trim().is_empty() {
+            facts.push(row[6].clone());
+        }
+        if !row[8].trim().is_empty() {
+            facts.push(format!("收藏夹：{}", row[8]));
+        }
+        if !row[9].trim().is_empty() {
+            facts.push(row[9].clone());
+        }
+        facts.push(row[10].clone());
+        text.push_str(&format!("{}\n", facts.join(" · ")));
+        if !row[5].trim().is_empty() {
+            text.push_str(&format!("\n标签：{}\n", row[5]));
+        }
+        if !row[11].trim().is_empty() {
+            text.push_str(&format!("\n> {}\n", row[11]));
+        }
+        if !row[12].trim().is_empty() {
+            text.push_str(&format!("\n[Pixiv 原页]({})\n", row[12]));
+        }
+    }
+    fs::write(path, text).map_err(|e| format!("写入 Markdown 失败：{e}"))
+}
+
+/// 导出作品清单。
+/// - `scope` = `all`（整库） / `collection`（某个收藏夹，配 `scope_id`） / `ids`（指定作品，按传入顺序）
+/// - `format` = `csv` 或 `markdown`
+#[tauri::command]
+fn export_work_list(
+    path: String,
+    format: String,
+    scope: String,
+    scope_id: Option<i64>,
+    work_ids: Option<Vec<i64>>,
+) -> Result<ExportResult, String> {
+    if path.trim().is_empty() {
+        return Err("请先选择导出位置".into());
+    }
+    let conn = db()?;
+    let works = match scope.as_str() {
+        "collection" => {
+            let id = scope_id.ok_or_else(|| "缺少收藏夹 ID".to_string())?;
+            let sql = format!(
+                "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id JOIN collection_works cw ON cw.work_id=w.id WHERE cw.collection_id={id} ORDER BY w.release_date DESC, w.id DESC"
+            );
+            query_works_with(&conn, &sql)?
+        }
+        "ids" => {
+            let ids = work_ids.unwrap_or_default();
+            if ids.is_empty() {
+                return Err("没有要导出的作品".into());
+            }
+            let list = ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id WHERE w.id IN ({list})"
+            );
+            let mut found = query_works_with(&conn, &sql)?;
+            // 按前端给的顺序排（＝列表里看到的顺序），而不是数据库的顺序
+            let mut by_id: HashMap<i64, Work> = found.drain(..).map(|work| (work.id, work)).collect();
+            ids.iter()
+                .filter_map(|id| by_id.remove(id))
+                .collect::<Vec<_>>()
+        }
+        _ => all_works(&conn)?,
+    };
+    let rows = export_rows(&conn, works)?;
+    match format.as_str() {
+        "markdown" | "md" => write_export_markdown(&path, &rows)?,
+        _ => write_export_csv(&path, &rows)?,
+    }
+    Ok(ExportResult {
+        written: rows.len(),
+        path,
+    })
+}
+
+fn query_works_with(conn: &Connection, sql: &str) -> Result<Vec<Work>, String> {
+    let mut statement = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = statement.query_map([], map_work).map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 // 特别关注：只翻转 authors.starred 标记，不动其他字段（保存作者、同步作者信息都不会覆盖它）
@@ -7138,6 +7920,8 @@ fn open_work(work_id: i64) -> Result<(), String> {
     open::that(&path).map_err(|e| format!("无法打开内容：{e}"))?;
     conn.execute("UPDATE works SET is_new=0 WHERE id=?1", [work_id])
         .map_err(|e| e.to_string())?;
+    // 打开过就算「在读」（不会覆盖手动标的「已读」）
+    let _ = mark_work_in_progress(&conn, work_id);
     // 记浏览历史失败不该影响「文件已经打开了」这件事
     let _ = record_history(&conn, work_id);
     Ok(())
@@ -8278,6 +9062,14 @@ pub fn run() {
             clear_history,
             remove_history,
             set_has_images,
+            set_work_meta,
+            set_works_read_state,
+            add_works_to_collections,
+            update_works_tags,
+            backfill_synopses,
+            scan_work_files,
+            clear_missing_bindings,
+            export_work_list,
             open_work,
             open_work_directory,
             download_reading_version,
@@ -8353,6 +9145,9 @@ mod tests {
         synopsis_indicates_preview,
         clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
         HISTORY_LIMIT, migrate_favorites_into_collections,
+        add_works_to_collections_impl, update_works_tags_impl,
+        mark_work_in_progress, read_state_label, split_tags, READ_DONE, READ_IN_PROGRESS,
+        READ_UNREAD,
         text_word_count, title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
@@ -9597,6 +10392,10 @@ mod tests {
             author_name: String::new(),
             word_count,
             file_format: file_format.map(str::to_string),
+            synopsis: String::new(),
+            read_state: 0,
+            rating: 0,
+            note: String::new(),
         }
     }
 
@@ -9628,6 +10427,10 @@ mod tests {
             author_name: String::new(),
             word_count: None,
             file_format: None,
+            synopsis: String::new(),
+            read_state: 0,
+            rating: 0,
+            note: String::new(),
         };
 
         populate_work_display_info(&mut work);
@@ -10194,7 +10997,12 @@ mod tests {
                id INTEGER PRIMARY KEY,
                author_id INTEGER NOT NULL DEFAULT 1,
                title TEXT NOT NULL DEFAULT '',
-               favorite INTEGER NOT NULL DEFAULT 0
+               favorite INTEGER NOT NULL DEFAULT 0,
+               read_state INTEGER NOT NULL DEFAULT 0,
+               rating INTEGER NOT NULL DEFAULT 0,
+               note TEXT NOT NULL DEFAULT '',
+               tags TEXT NOT NULL DEFAULT '',
+               synopsis TEXT NOT NULL DEFAULT ''
              );
              CREATE TABLE collections (
                id INTEGER PRIMARY KEY,
@@ -10359,5 +11167,132 @@ mod tests {
             .unwrap();
         assert_eq!(total, 1, "迁移只跑一次，升级后新收的作品不该被重复搬进默认夹");
         assert_eq!(setting(&conn, "collections_migrated").unwrap(), "1");
+    }
+
+    fn read_state_of(conn: &Connection, work_id: i64) -> i64 {
+        conn.query_row("SELECT read_state FROM works WHERE id=?1", [work_id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn opening_a_work_marks_it_reading_but_never_unreads_a_finished_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute("INSERT INTO works (id, title) VALUES (1, '甲'), (2, '乙')", [])
+            .unwrap();
+        // 未读 → 打开过 → 在读
+        mark_work_in_progress(&conn, 1).unwrap();
+        assert_eq!(read_state_of(&conn, 1), READ_IN_PROGRESS);
+        // 手动标了已读之后再打开，不该被打回「在读」
+        conn.execute("UPDATE works SET read_state=?1 WHERE id=1", [READ_DONE])
+            .unwrap();
+        mark_work_in_progress(&conn, 1).unwrap();
+        assert_eq!(read_state_of(&conn, 1), READ_DONE);
+        // 另一篇没被牵连
+        assert_eq!(read_state_of(&conn, 2), READ_UNREAD);
+    }
+
+    #[test]
+    fn read_state_labels_cover_all_three_states() {
+        assert_eq!(read_state_label(READ_UNREAD), "未读");
+        assert_eq!(read_state_label(READ_IN_PROGRESS), "在读");
+        assert_eq!(read_state_label(READ_DONE), "已读");
+        // 库里万一出现别的值，宁可显示「未读」也不要 panic
+        assert_eq!(read_state_label(99), "未读");
+    }
+
+    #[test]
+    fn tags_split_on_pipes_and_drop_empties() {
+        assert_eq!(
+            split_tags("原创 | 短篇 | 治愈 "),
+            vec!["原创", "短篇", "治愈"]
+        );
+        assert!(split_tags("").is_empty());
+        assert!(split_tags(" | | ").is_empty());
+        // 标签里夹了换行也不能带进导出结果
+        assert_eq!(split_tags("A|\nB|"), vec!["A", "B"]);
+    }
+
+    fn tags_of(conn: &Connection, work_id: i64) -> String {
+        conn.query_row("SELECT tags FROM works WHERE id=?1", [work_id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn bulk_tag_edit_appends_and_removes_but_keeps_the_rest() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute(
+            "INSERT INTO works (id, title, tags) VALUES (1, '甲', '原创|短篇|治愈'), (2, '乙', '短篇')",
+            [],
+        )
+        .unwrap();
+        // 追加：第一篇加「新坑」，第二篇加「新坑」
+        let changed =
+            update_works_tags_impl(&mut conn, &[1, 2], "新坑", "").expect("追加该成功");
+        assert_eq!(changed, 2);
+        assert_eq!(tags_of(&conn, 1), "原创| 短篇| 治愈| 新坑");
+        // 重复追加（含大小写差异）不该再变，也不该重复塞进同一个标签
+        let again = update_works_tags_impl(&mut conn, &[1, 2], "新坑|新坑", "").unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(tags_of(&conn, 1), "原创| 短篇| 治愈| 新坑");
+        // 移除只摘匹配上的，别的标签原样保留
+        let removed = update_works_tags_impl(&mut conn, &[1, 2], "", "短篇|治愈").unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(tags_of(&conn, 1), "原创| 新坑");
+        assert_eq!(tags_of(&conn, 2), "新坑");
+        // 两个框都空要报错，而不是把标签清空
+        assert!(update_works_tags_impl(&mut conn, &[1], "", "").is_err());
+        assert_eq!(tags_of(&conn, 1), "原创| 新坑");
+    }
+
+    #[test]
+    fn bulk_add_to_collections_is_union_not_replace() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute(
+            "INSERT INTO works (id, title) VALUES (1, '甲'), (2, '乙')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO collections (id, name) VALUES (1, '待读'), (2, '短篇向')",
+            [],
+        )
+        .unwrap();
+        // 第一篇本来就在「待读」里
+        conn.execute(
+            "INSERT INTO collection_works (collection_id, work_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+        let added =
+            add_works_to_collections_impl(&mut conn, &[1, 2], &[2]).expect("批量加夹该成功");
+        assert_eq!(added, 2);
+        // 并集：第一篇同时留在「待读」+ 进「短篇向」，绝不能被踢出「待读」
+        let first: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collection_works WHERE work_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first, 2);
+        // favorite 缓存位跟着回写
+        assert_eq!(favorite_of(&conn, 1), 1);
+        assert_eq!(favorite_of(&conn, 2), 1);
+        // 重复加同一个夹不会变成两行（PRIMARY KEY 挡住）
+        add_works_to_collections_impl(&mut conn, &[1, 2], &[2]).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collection_works", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 3);
+        // 空入参直接返回 0，不写库
+        assert_eq!(add_works_to_collections_impl(&mut conn, &[], &[1]).unwrap(), 0);
+        assert_eq!(add_works_to_collections_impl(&mut conn, &[1], &[]).unwrap(), 0);
     }
 }
