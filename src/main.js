@@ -137,7 +137,9 @@ previewWorks.forEach((work, index) => { work.authorId = [1, 1, 2, 3][index]; wor
 // 作品详情弹窗的个人字段（v1.2.0）：简介 / 阅读状态（0未读 1在读 2已读）/ 评分 / 笔记
 previewWorks.forEach((work, index) => {
   work.synopsis = [
-    "本篇是布洛妮娅与希儿的日常向短篇，时间线接在主线之后，当作独立的甜品读也完全没问题。\n\n正文一共四章，配了 4 张插画，阅读版会把图一并打包进 EPUB。每一章都以一段没说完的对话收尾，作者说这是故意留的口子，让读者自己把后半句补上。\n\n四章里我最喜欢第三章：两个人在便利店门口站了很久，谁都没先开口，最后是雨先停了。那种「什么都没发生，但什么都变了」的感觉写得很稳。\n\n※ 完整版已在自己的平台放出，感谢支持；转载前请先联系作者。",
+    // 1 号故意写成 Pixiv 那种 HTML 形态（`<br />` / `<strong>` / `<a href>` / `&amp;`）：
+    // 抓回来的简介都长这样，界面必须净化后显示、外链要能点，就靠这条守
+    "<br />本篇是布洛妮娅与希儿的日常向短篇，时间线接在主线之后，当作独立的甜品读也完全没问题。<br /><br />正文一共四章，配了 4 张插画，阅读版会把图一并打包进 EPUB。每一章都以一段没说完的对话收尾，作者说这是故意留的口子，让读者自己把后半句补上。<br /><br /><strong>四章里我最喜欢第三章：</strong>两个人在便利店门口站了很久，谁都没先开口，最后是雨先停了。那种「什么都没发生，但什么都变了」的感觉写得很稳。<br /><br />English/日本語版/한국어판：<a href=\"/jump.php?https%3A%2F%2Fallmylinks.com%2Fyunibobo\" target=\"_blank\">https://allmylinks.com/yunibobo</a><br />※ 完整版已在自己的平台放出 &amp; 感谢支持，转载前请先联系作者：<a href=\"https://example.com/contact\">点这里</a>",
     // 2 / 3 号留空，专门给「补抓简介」用：2 号当「作者没写简介」，3 号当「能补到」
     "",
     "",
@@ -492,6 +494,87 @@ const appLogo = (size = 44) => `<svg width="${size}" height="${size}" viewBox="0
 
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
+}
+
+/** 把 href 还原成能直接访问的地址。Pixiv 给站外链接套了一层跳转页：
+ *  `/jump.php?https%3A%2F%2Fallmylinks.com%2Fyunibobo` —— 问号后面是 urlencode 过的真地址。 */
+function pixivLinkTarget(href) {
+  const value = String(href || "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  const query = value.split("?").slice(1).join("?");
+  if (query) {
+    try {
+      const decoded = decodeURIComponent(query);
+      if (/^https?:\/\//i.test(decoded)) return decoded;
+    } catch { /* urlencode 坏了就按站内链接处理 */ }
+  }
+  return value.startsWith("/") ? `https://www.pixiv.net${value}` : "";
+}
+
+/**
+ * 把 Pixiv 简介切成「文字 / 链接」片段。
+ * Pixiv 的简介是 HTML（`<br />`、`<strong>`、`<a href="…">`），直接转义会把标签原样露在界面上。
+ * 净化放在**显示层**（库里仍存 Pixiv 原文）：可逆，已经补抓回来的老数据也能一起救，
+ * 不用为了这个再重抓一遍。
+ */
+function synopsisSegments(raw) {
+  const source = String(raw ?? "").trim();
+  if (!source) return [];
+  // 绝大多数简介是纯文本，没标签也没实体就别走解析，免得把 `<3` 这种当标签吃掉
+  if (!/[<&]/.test(source)) return [{ text: source.replace(/\r/g, "").replace(/\u00a0/g, " ") }];
+  // `<br>` / `</p>` 这类带换行语义的标签先变成真换行：textContent 不会替它们插换行
+  const prepared = source
+    .replace(/<\s*br\s*\/?\s*>/gi, "\n")
+    .replace(/<\s*\/\s*(?:p|div|section|li|tr|h[1-6])\s*>/gi, "\n");
+  const segments = [];
+  const pushText = (value) => { if (value) segments.push({ text: value.replace(/\r/g, "").replace(/\u00a0/g, " ") }); };
+  try {
+    const holder = new DOMParser().parseFromString(`<body>${prepared}</body>`, "text/html").body;
+    const walk = (node) => {
+      if (node.nodeType === 3) { pushText(node.nodeValue); return; }
+      if (node.nodeType !== 1) return;
+      if (node.tagName === "A") {
+        const label = (node.textContent || "").replace(/\s+/g, " ").trim();
+        const url = pixivLinkTarget(node.getAttribute("href"));
+        // 文字为空时直接拿地址当文字，别渲染出一个看不见的链接
+        if (url) segments.push({ text: label || url, url });
+        else pushText(label);
+        return;
+      }
+      if (node.tagName === "IMG") return; // 纯文本视图里图片没有落脚点，跳过
+      node.childNodes.forEach(walk);
+    };
+    holder.childNodes.forEach(walk);
+  } catch {
+    pushText(prepared.replace(/<[^>]*>/g, ""));
+  }
+  return segments;
+}
+
+/** 简介的纯文本（长度判断 / 提示语用），链接只留文字。 */
+function synopsisPlainText(raw) {
+  return synopsisSegments(raw)
+    .map((segment) => segment.text)
+    .join("")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/** 简介的显示用 HTML：文本照常转义，链接渲染成可点的 `<a>`（点了交给系统浏览器）。 */
+function synopsisHtml(raw) {
+  return synopsisSegments(raw)
+    .map((segment) => {
+      const body = escapeHtml(segment.text);
+      if (!segment.url) return body;
+      return `<a class="detail-link" href="${escapeHtml(segment.url)}" title="${escapeHtml(`在浏览器中打开：${segment.url}`)}" rel="noreferrer noopener">${body}</a>`;
+    })
+    .join("")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/\n/g, "<br>")
+    .replace(/^(?:<br>)+|(?:<br>)+$/g, "");
 }
 
 function asset(path) {
@@ -1667,7 +1750,8 @@ function workDetailBody() {
   const authorName = workAuthorName(work);
   // 副标题：日期 · 完整版/预览版 · 字数（或格式）· 配图数
   const meta = [dateLabel(work.releaseDate), work.purchasedPath ? "完整版" : "预览版", ...workFormatLabels(work)];
-  const synopsis = String(work.synopsis || "").trim();
+  // 简介在 Pixiv 那边是 HTML（`<br />`、`<a>`…），这里取纯文本判长度、取净化后的 HTML 去显示
+  const synopsis = synopsisPlainText(work.synopsis);
   // 只有长到会顶掉下面内容时才给「展开/收起」，短简介直接铺开
   const synopsisLong = synopsis.length > 140;
   const synopsisOpen = !synopsisLong || state.detailSynopsisOpen;
@@ -1676,7 +1760,7 @@ function workDetailBody() {
   // 有内容 / 问过 Pixiv 且确认作者没写 / 还没问过（点了「补抓简介」能拉）。
   // 混成一句「这篇还没有简介」的话，作者明明没写的作品会让用户一直去点补抓 —— 白等还喂风控。
   const synopsisBody = synopsis
-    ? `<p class="detail-synopsis ${synopsisOpen ? "" : "is-clamped"}">${escapeHtml(synopsis).replace(/\n/g, "<br>")}</p>${synopsisLong ? `<button class="quiet-button detail-more" data-action="detail-toggle-synopsis">${state.detailSynopsisOpen ? "收起简介" : "展开全文"}</button>` : ""}`
+    ? `<p class="detail-synopsis ${synopsisOpen ? "" : "is-clamped"}">${synopsisHtml(work.synopsis)}</p>${synopsisLong ? `<button class="quiet-button detail-more" data-action="detail-toggle-synopsis">${state.detailSynopsisOpen ? "收起简介" : "展开全文"}</button>` : ""}`
     : work.synopsisChecked
       ? '<p class="match-note">作者没写简介 —— 这篇已经向 Pixiv 问过了，那边本来就没有简介内容。</p>'
       : '<p class="match-note">这篇还没有简介。同步过的作品可以在设置里用「补抓简介」拉一次。</p>';
@@ -2280,6 +2364,18 @@ async function chooseSeriesForWork(workId) {
 }
 
 async function bindEvents() {
+  // 简介里的外链（Pixiv 简介本身是 HTML）：点了交给系统浏览器，
+  // 别让 webview 自己导航过去 —— 在应用窗口里跳走会把整个界面顶掉。捕获阶段拦，监听只绑一次。
+  if (!window.__detailLinksBound) {
+    window.__detailLinksBound = true;
+    document.addEventListener("click", (event) => {
+      const link = event.target?.closest?.("a.detail-link");
+      if (!link) return;
+      event.preventDefault();
+      openExternalUrl(link.getAttribute("href") || "").catch((error) => toast(String(error), "error"));
+    }, true);
+  }
+
   // 右下角「回到顶部 / 滚到底部」：滚动或窗口变化时刷新可用状态（监听只绑一次）
   if (!window.__scrollJumpBound) {
     window.__scrollJumpBound = true;
