@@ -218,17 +218,25 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .rail-nav-secondary { margin-top: 12px; }.new-badge { position: absolute; top: 10px; left: 10px; z-index: 1; padding: 3px 6px; color: #fff; background: #d84949; border-radius: 4px; font-size: 10px; font-weight: 800; line-height: 1.2; letter-spacing: 0; box-shadow: 0 2px 5px rgba(133,34,34,.24); }.work-author { overflow: hidden; margin: 0 0 4px; color: #875373; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }.read-only-note { margin: 18px 0 20px; color: #617a95; font-size: 13px; }
 
 /* v0.3.31 后台同步浮层：同步在后台跑，主界面右下角显示进度，不遮挡操作 */
-.sync-floater { position: fixed; right: 22px; bottom: 22px; z-index: 40; width: min(360px, calc(100vw - 44px)); display: grid; gap: 9px; padding: 14px 16px; background: #fff; border: 1px solid #d7e8fa; border-radius: 10px; box-shadow: 0 18px 42px rgba(24,54,86,.2); }
+/* 轨道必须写死成 minmax(0, 1fr)：默认 auto 轨道的最小尺寸＝各行自身的 min-content，
+   而行尾那个「终止同步」按钮 + 剩余时间的固有宽度会把它顶到 400px，卡片只有 360px —— 结果整块内容
+   （右上角计数、进度条、按钮）从卡片右边溢出去，被窗口边缘切掉。v1.2.3 修。 */
+.sync-floater { position: fixed; right: 22px; bottom: 22px; z-index: 40; width: min(360px, calc(100vw - 44px)); display: grid; grid-template-columns: minmax(0, 1fr); gap: 9px; padding: 14px 16px; background: #fff; border: 1px solid #d7e8fa; border-radius: 10px; box-shadow: 0 18px 42px rgba(24,54,86,.2); }
+.sync-floater > * { min-width: 0; }
 .sync-floater-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .sync-floater-head strong { display: inline-flex; align-items: center; gap: 7px; min-width: 0; color: #2b4665; font-size: 13px; font-weight: 700; }
+.sync-floater-head strong span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sync-floater-head strong svg { flex: none; color: #176bd3; animation: sync-spin 1.6s linear infinite; }
 .sync-floater-count { flex: none; color: #5d7893; font-size: 12px; font-weight: 700; }
 .sync-floater progress { width: 100%; height: 8px; appearance: none; border: 0; border-radius: 4px; overflow: hidden; background: #e8f0f9; }
 .sync-floater progress::-webkit-progress-bar { background: #e8f0f9; }
 .sync-floater progress::-webkit-progress-value { background: linear-gradient(90deg, #176bd3, #43a1f5); border-radius: 4px; transition: width .2s ease; }
-.sync-floater-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.sync-floater-foot p { flex: 1 1 auto; min-width: 0; margin: 0; overflow: hidden; color: #6f8599; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.sync-floater-foot button { flex: none; height: 30px; padding: 0 12px; font-size: 12px; }
+/* 说明文字单独占一行、允许折行 —— 原来和「剩余约 X」「终止同步」挤在同一行，
+   一整句话被压成「正在补抓简介：861 / 1028（每篇间…」，最要紧的间隔信息刚好被省略号吃掉 */
+.sync-floater-foot { display: grid; gap: 9px; }
+.sync-floater-foot p { min-width: 0; margin: 0; color: #6f8599; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.sync-floater-foot-row { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.sync-floater-foot-row button { flex: none; height: 30px; padding: 0 12px; font-size: 12px; }
 .sync-floater.is-batch { width: min(430px, calc(100vw - 44px)); }
 .sync-floater-rows { display: grid; gap: 11px; max-height: 330px; overflow-y: auto; padding-right: 3px; }
 .sync-floater-rows::-webkit-scrollbar { width: 7px; }
@@ -633,8 +641,8 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .bulk-bar .danger-button:disabled { opacity: .5; }
 .topbar-actions .bulk-count { margin-right: 4px; }
 
-/* 进度浮层里的「剩余约 X」 */
-.sync-floater-eta { flex: 0 0 auto; color: #6a8fb5; font-size: 12px; font-weight: 650; white-space: nowrap; }
+/* 进度浮层里的「剩余约 X」：自己占第二行的左边，按钮靠右；没剩余时间时按钮也不会跑到左边 */
+.sync-floater-eta { flex: 0 0 auto; margin-right: auto; color: #6a8fb5; font-size: 12px; font-weight: 650; white-space: nowrap; }
 
 /* 作者卡「新增」角标只留一个数字（v1.2.1）；v1.2.2 起挂到头像右上角，样式见上面 .author-new-badge */
 

@@ -5,7 +5,7 @@ import { HELP_DOC_CSS, HELP_DOC_HTML } from "./help-doc.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "1.2.2";
+const APP_VERSION = "1.2.3";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -771,8 +771,10 @@ function syncFloater() {
     <progress id="sync-progress-bar" value="${task.current}" max="${Math.max(task.total, 1)}"></progress>
     <div class="sync-floater-foot">
       <p id="sync-progress-title" title="${escapeHtml(task.title || "")}">${escapeHtml(task.title || "正在读取作品列表...")}</p>
-      <span class="sync-floater-eta" id="sync-progress-eta"></span>
-      ${floaterFootButton(task)}
+      <div class="sync-floater-foot-row">
+        <span class="sync-floater-eta" id="sync-progress-eta"></span>
+        ${floaterFootButton(task)}
+      </div>
     </div>
   </div>`;
 }
@@ -802,7 +804,9 @@ function batchSyncFloater(task) {
     <div class="sync-floater-rows">${rows}</div>
     <div class="sync-floater-foot">
       <p id="sync-progress-title">正在逐位同步作者，可随时终止</p>
-      <button class="quiet-button" data-action="cancel-pixiv-sync" data-floater-foot ${task.cancelling ? "disabled" : ""}>${task.cancelling ? "正在终止…" : "终止同步"}</button>
+      <div class="sync-floater-foot-row">
+        <button class="quiet-button" data-action="cancel-pixiv-sync" data-floater-foot ${task.cancelling ? "disabled" : ""}>${task.cancelling ? "正在终止…" : "终止同步"}</button>
+      </div>
     </div>
   </div>`;
 }

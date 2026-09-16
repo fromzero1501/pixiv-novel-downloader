@@ -4414,12 +4414,12 @@ fn backfill_synopses_impl(
                 SynopsisBackfillProgress {
                     total,
                     current,
+                    // 浮层顶上已经写着「正在补抓简介」和「861 / 1028」了，这里只报顶上没有的信息
+                    // （间隔 / 限流 / 真更新了几篇），否则一整句话在窄卡片里被省略号吃掉尾巴
                     title: if failed > 0 {
-                        format!(
-                            "正在补抓简介：{current} / {total}（失败 {failed} 篇，疑似限流，间隔已拉到 {delay_seconds} 秒）"
-                        )
+                        format!("失败 {failed} 篇，疑似限流，间隔已拉到 {delay_seconds} 秒")
                     } else {
-                        format!("正在补抓简介：{current} / {total}（每篇间隔 {delay_seconds} 秒）")
+                        format!("每篇间隔 {delay_seconds} 秒，已更新 {updated} 篇")
                     },
                     eta_seconds: remaining * delay_seconds,
                 },
@@ -4473,7 +4473,7 @@ fn backfill_synopses_impl(
                 SynopsisBackfillProgress {
                     total,
                     current,
-                    title: format!("正在并发补抓简介：{} / {}", current, total),
+                    title: format!("已更新 {updated} 篇"),
                     eta_seconds: 0,
                 },
             );
