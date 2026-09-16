@@ -597,6 +597,14 @@ fn db() -> Result<Connection, String> {
         "ALTER TABLE works ADD COLUMN note TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // 补抓简介（v1.2.4）：这一篇向 Pixiv 要过简介了、而且确认作者就是没写。
+    // 没有这一位的话，这些「永远补不出来」的作品每次补抓都要再请求一遍，
+    // 既白等又白喂风控 —— 而且头几十篇全是这种，浮层的「已更新」会一直停在 0，
+    // 看着像卡死（用户就是这么报的）。
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN synopsis_checked INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE authors ADD COLUMN aliases TEXT NOT NULL DEFAULT ''",
         [],
@@ -4268,10 +4276,23 @@ fn cancel_pixiv_sync(author_id: i64) {
 struct SynopsisBackfillResult {
     total: usize,
     updated: usize,
+    /// 请求成功、但作者就是没写简介 —— 这种永远补不出来，得跟「失败」分开报，
+    /// 否则整批都是这种人时「已更新 0 篇」看着像卡住了。
+    no_synopsis: usize,
     failed: usize,
     cancelled: bool,
     /// 连续失败太多，判定为被 Pixiv 限流、提前停下了
     throttled: bool,
+}
+
+/// 补抓前先问一下还有多少可抓的，省得「全是确认过没简介的」时白起一次浮层。
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SynopsisBackfillStatus {
+    /// 还没问过 Pixiv、可能补得出来的篇数
+    pending: usize,
+    /// 问过了、确认作者没写简介的篇数
+    checked_no_synopsis: usize,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -4299,16 +4320,64 @@ fn throttled_delay_seconds(current: u64) -> u64 {
     (current.max(1) * 2).min(SYNOPSIS_MAX_DELAY_SECONDS)
 }
 
+/// 浮层第二行的文案。顶上已经有「正在补抓简介」和「15 / 294」了，这里只报顶上没有的：
+/// 更新了几篇、其中多少篇是作者根本没写简介（这类永远补不出来，不单独报的话
+/// 整批都是这种人时「已更新 0 篇」看着就像卡死了）、以及当前间隔 / 失败数。
+fn synopsis_progress_title(
+    updated: usize,
+    no_synopsis: usize,
+    failed: usize,
+    delay_seconds: Option<u64>,
+) -> String {
+    let mut text = format!("已更新 {updated} 篇 · 作者没写简介 {no_synopsis} 篇");
+    if failed > 0 {
+        text.push_str(&format!(" · 失败 {failed} 篇"));
+    }
+    match delay_seconds {
+        Some(0) | None => text,
+        Some(delay) if failed > 0 => format!("{text}，间隔已拉到 {delay} 秒"),
+        Some(delay) => format!("{text} · 每篇间隔 {delay} 秒"),
+    }
+}
+
+/// 补抓简介的「待办体检」：没问过的有多少篇、问过确认没简介的有多少篇。
+/// 前端点按钮时先看一眼 —— 没得抓就别起浮层了。
+#[tauri::command]
+fn synopsis_backfill_status() -> Result<SynopsisBackfillStatus, String> {
+    let conn = db()?;
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM works WHERE pixiv_novel_id <> '' AND synopsis = '' AND synopsis_checked = 0",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let checked_no_synopsis: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM works WHERE synopsis = '' AND synopsis_checked = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(SynopsisBackfillStatus {
+        pending: pending.max(0) as usize,
+        checked_no_synopsis: checked_no_synopsis.max(0) as usize,
+    })
+}
+
 /// 给老作品补抓 Pixiv 简介。`author_id = 0` 表示整库。
+/// `recheck = true` 时连「上次问过、确认作者没写简介」的作品也再问一遍。
 /// 取消标记复用同步那一套：整库补抓的键就是 0（前端调 `cancel_pixiv_sync(0)`）。
 #[tauri::command]
 async fn backfill_synopses(
     author_id: i64,
+    recheck: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<SynopsisBackfillResult, String> {
     clear_pixiv_sync_cancel(author_id);
+    let recheck = recheck.unwrap_or(false);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        backfill_synopses_impl(author_id, app)
+        backfill_synopses_impl(author_id, recheck, app)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -4318,6 +4387,7 @@ async fn backfill_synopses(
 
 fn backfill_synopses_impl(
     author_id: i64,
+    recheck: bool,
     app: tauri::AppHandle,
 ) -> Result<SynopsisBackfillResult, String> {
     let conn = db()?;
@@ -4335,9 +4405,16 @@ fn backfill_synopses_impl(
     } else {
         String::new()
     };
+    // 默认跳过「上次问过、确认作者没写简介」的（synopsis_checked=1）：
+    // 那些再问一百遍也是空的，只会白等 + 白喂风控。
+    let checked_filter = if recheck {
+        ""
+    } else {
+        " AND synopsis_checked = 0"
+    };
     let targets: Vec<(i64, String)> = {
         let sql = format!(
-            "SELECT id, pixiv_novel_id FROM works WHERE pixiv_novel_id <> '' AND synopsis = ''{filter} ORDER BY id"
+            "SELECT id, pixiv_novel_id FROM works WHERE pixiv_novel_id <> '' AND synopsis = ''{checked_filter}{filter} ORDER BY id"
         );
         let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = statement
@@ -4359,6 +4436,7 @@ fn backfill_synopses_impl(
     let sequential = total > delay_threshold && base_delay > 0;
     let mut delay_seconds = base_delay;
     let mut updated = 0usize;
+    let mut no_synopsis = 0usize;
     let mut failed = 0usize;
     let mut cancelled = false;
     let mut throttled = false;
@@ -4378,11 +4456,18 @@ fn backfill_synopses_impl(
                     let body = detail.get("body").unwrap_or(&Value::Null);
                     let description = json_string(body, "description");
                     if description.trim().is_empty() {
-                        // 作者没写简介不算失败，也别让它把「连续失败」的计数冲掉
+                        // 作者没写简介不算失败，也别让它把「连续失败」的计数冲掉；
+                        // 但要把「问过了、就是没有」记下来，下次别再白跑这一篇。
+                        conn.execute(
+                            "UPDATE works SET synopsis_checked=1 WHERE id=?1",
+                            params![work_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        no_synopsis += 1;
                         true
                     } else {
                         conn.execute(
-                            "UPDATE works SET synopsis=?1 WHERE id=?2",
+                            "UPDATE works SET synopsis=?1, synopsis_checked=1 WHERE id=?2",
                             params![description, work_id],
                         )
                         .map_err(|e| e.to_string())?;
@@ -4390,7 +4475,8 @@ fn backfill_synopses_impl(
                         true
                     }
                 }
-                // 限流时 Pixiv 通常直接返回错误/403，全都归到失败里
+                // 限流时 Pixiv 通常直接返回错误/403，全都归到失败里。
+                // 失败不落 synopsis_checked —— 下次还得重试。
                 _ => false,
             };
             if ok {
@@ -4414,13 +4500,12 @@ fn backfill_synopses_impl(
                 SynopsisBackfillProgress {
                     total,
                     current,
-                    // 浮层顶上已经写着「正在补抓简介」和「861 / 1028」了，这里只报顶上没有的信息
-                    // （间隔 / 限流 / 真更新了几篇），否则一整句话在窄卡片里被省略号吃掉尾巴
-                    title: if failed > 0 {
-                        format!("失败 {failed} 篇，疑似限流，间隔已拉到 {delay_seconds} 秒")
-                    } else {
-                        format!("每篇间隔 {delay_seconds} 秒，已更新 {updated} 篇")
-                    },
+                    title: synopsis_progress_title(
+                        updated,
+                        no_synopsis,
+                        failed,
+                        Some(delay_seconds),
+                    ),
                     eta_seconds: remaining * delay_seconds,
                 },
             );
@@ -4455,10 +4540,16 @@ fn backfill_synopses_impl(
                         let body = detail.get("body").unwrap_or(&Value::Null);
                         let description = json_string(body, "description");
                         if description.trim().is_empty() {
+                            conn.execute(
+                                "UPDATE works SET synopsis_checked=1 WHERE id=?1",
+                                params![work_id],
+                            )
+                            .map_err(|e| e.to_string())?;
+                            no_synopsis += 1;
                             continue;
                         }
                         conn.execute(
-                            "UPDATE works SET synopsis=?1 WHERE id=?2",
+                            "UPDATE works SET synopsis=?1, synopsis_checked=1 WHERE id=?2",
                             params![description, work_id],
                         )
                         .map_err(|e| e.to_string())?;
@@ -4473,7 +4564,7 @@ fn backfill_synopses_impl(
                 SynopsisBackfillProgress {
                     total,
                     current,
-                    title: format!("已更新 {updated} 篇"),
+                    title: synopsis_progress_title(updated, no_synopsis, failed, None),
                     eta_seconds: 0,
                 },
             );
@@ -4482,6 +4573,7 @@ fn backfill_synopses_impl(
     Ok(SynopsisBackfillResult {
         total,
         updated,
+        no_synopsis,
         failed,
         cancelled,
         throttled,
@@ -9194,6 +9286,7 @@ pub fn run() {
             add_works_to_collections,
             update_works_tags,
             backfill_synopses,
+            synopsis_backfill_status,
             scan_work_files,
             clear_missing_bindings,
             export_work_list,
@@ -9276,7 +9369,8 @@ mod tests {
         add_works_to_collections_impl, update_works_tags_impl,
         mark_work_in_progress, read_state_label, split_tags, READ_DONE, READ_IN_PROGRESS,
         READ_UNREAD,
-        throttled_delay_seconds, SYNOPSIS_ABORT_STREAK, SYNOPSIS_MAX_DELAY_SECONDS,
+        throttled_delay_seconds, synopsis_progress_title,
+        SYNOPSIS_ABORT_STREAK, SYNOPSIS_MAX_DELAY_SECONDS,
         SYNOPSIS_THROTTLE_STREAK,
         text_word_count, title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
@@ -11446,5 +11540,29 @@ mod tests {
             delay = throttled_delay_seconds(delay);
         }
         assert!(delay <= SYNOPSIS_MAX_DELAY_SECONDS);
+    }
+
+    /// 补抓浮层第二行的文案：必须把「作者没写简介」单独报出来。
+    /// 用户的报障就是「一直在正常补抓，但一直显示已更新 0 篇」——
+    /// 头几十篇正好全是作者没写简介的，只报「已更新 0」看着就像卡死了。
+    #[test]
+    fn synopsis_progress_reports_works_without_description() {
+        let running = synopsis_progress_title(0, 15, 0, Some(1));
+        assert!(running.contains("作者没写简介 15 篇"), "{running}");
+        assert!(running.contains("每篇间隔 1 秒"), "{running}");
+
+        // 有失败时要说清是失败，并且间隔被拉大了也得报出来
+        let failing = synopsis_progress_title(2, 3, 8, Some(16));
+        assert!(failing.contains("已更新 2 篇"), "{failing}");
+        assert!(failing.contains("失败 8 篇"), "{failing}");
+        assert!(failing.contains("间隔已拉到 16 秒"), "{failing}");
+
+        // 并发分支没有间隔，别硬塞一句「每篇间隔 0 秒」
+        let concurrent = synopsis_progress_title(4, 2, 0, None);
+        assert_eq!(concurrent, "已更新 4 篇 · 作者没写简介 2 篇");
+        assert_eq!(
+            synopsis_progress_title(1, 0, 0, Some(0)),
+            "已更新 1 篇 · 作者没写简介 0 篇"
+        );
     }
 }

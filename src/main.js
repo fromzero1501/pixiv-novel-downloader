@@ -5,7 +5,7 @@ import { HELP_DOC_CSS, HELP_DOC_HTML } from "./help-doc.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "1.2.3";
+const APP_VERSION = "1.2.4";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -105,7 +105,9 @@ const state = {
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
 const previewWorks = [{ id: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", releaseDate: "2025-10-05", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\希儿.epub", wordCount: 12680, favorite: true }, { id: 2, title: "夏日短篇集", releaseDate: "2025-09-20", previewPath: "", coverPath: "", purchasedPath: "", wordCount: 4380, favorite: false }, { id: 3, title: "旧城的信", releaseDate: "2025-08-18", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\旧城的信", wordCount: 20750, favorite: false }, { id: 4, title: "月色图文辑", releaseDate: "2025-07-09", previewPath: "", coverPath: "", purchasedPath: "", favorite: true }];
 
-previewWorks.forEach((work, index) => { work.tags = ["Pixiv|小说", "短篇|日常", "小说|悬疑|长篇|都市|完结", "插画|图文"][index]; work.pixivNovelId = ["26410188", "", "", ""][index]; work.imageCount = [4, 0, 0, 0][index]; });
+previewWorks.forEach((work, index) => { work.tags = ["Pixiv|小说", "短篇|日常", "小说|悬疑|长篇|都市|完结", "插画|图文"][index]; work.pixivNovelId = ["26410188", "26521963", "26410189", ""][index]; work.imageCount = [4, 0, 0, 0][index]; });
+// mock 的「问过 Pixiv 了，作者就是没写简介」名单（对齐后端的 works.synopsis_checked=1）
+const mockNoSynopsis = new Set();
 // 「我的收藏」与「浏览历史」在浏览器预览里的假数据（真数据是 SQL 出来的）
 const previewCollections = [
   { id: 1, name: "我的收藏", createdAt: "2026-09-01T00:00:00+00:00" },
@@ -134,8 +136,9 @@ previewWorks.forEach((work, index) => { work.authorId = [1, 1, 2, 3][index]; wor
 previewWorks.forEach((work, index) => {
   work.synopsis = [
     "本篇是布洛妮娅与希儿的日常向短篇，时间线接在主线之后，当作独立的甜品读也完全没问题。\n\n正文一共四章，配了 4 张插画，阅读版会把图一并打包进 EPUB。每一章都以一段没说完的对话收尾，作者说这是故意留的口子，让读者自己把后半句补上。\n\n四章里我最喜欢第三章：两个人在便利店门口站了很久，谁都没先开口，最后是雨先停了。那种「什么都没发生，但什么都变了」的感觉写得很稳。\n\n※ 完整版已在自己的平台放出，感谢支持；转载前请先联系作者。",
-    "夏天、海边、以及一点没说出口的话。四段可以分开读的小故事。",
-    "写给旧城的一封信，从邮局拆到落款。全文约两万字。",
+    // 2 / 3 号留空，专门给「补抓简介」用：2 号当「作者没写简介」，3 号当「能补到」
+    "",
+    "",
     "月色下的图文辑，配图较多，建议用 EPUB 阅读。",
   ][index];
   work.readState = [2, 0, 1, 0][index];
@@ -255,10 +258,23 @@ async function invoke(command, args = {}) {
     }
     return changed;
   }
+  if (command === "synopsis_backfill_status") {
+    const empty = previewWorks.filter((work) => work.pixivNovelId && !work.synopsis);
+    const checked = empty.filter((work) => mockNoSynopsis.has(work.id)).length;
+    return { pending: empty.length - checked, checkedNoSynopsis: checked };
+  }
   if (command === "backfill_synopses") {
-    const targets = previewWorks.filter((work) => work.pixivNovelId && !work.synopsis);
-    targets.forEach((work) => { work.synopsis = "（补抓到的简介示例）"; });
-    return { total: targets.length, updated: targets.length, failed: 0, cancelled: false };
+    const empty = previewWorks.filter((work) => work.pixivNovelId && !work.synopsis);
+    const targets = args.recheck ? empty : empty.filter((work) => !mockNoSynopsis.has(work.id));
+    let updated = 0;
+    let noSynopsis = 0;
+    targets.forEach((work) => {
+      // 偶数 id 当「作者根本没写简介」：补抓永远补不出来，只能记下来别重复问
+      if (work.id % 2 === 0) { mockNoSynopsis.add(work.id); noSynopsis += 1; return; }
+      work.synopsis = "（补抓到的简介示例）";
+      updated += 1;
+    });
+    return { total: targets.length, updated, noSynopsis, failed: 0, cancelled: false, throttled: false };
   }
   if (command === "scan_work_files") {
     // mock 里只造「完整版目录下有一篇的文件被人挪走了」这一条失效
@@ -3362,41 +3378,66 @@ function diskSize(bytes) {
 
 /**
  * 补抓简介：把同步时读到、但没落库的 Pixiv 简介补回来。
- * 整库跑（`author_id = 0`），后端按 6 并发逐批抓，进度挂右下角浮层，可随时终止。
+ *
+ * 两段式：默认只抓「还没问过 Pixiv」的那些（问过、确认作者没写简介的会跳过，
+ * 再问也是空的，纯白等 + 白喂风控）；等全库都问过一遍之后，再点这个按钮就会
+ * 问一句要不要「重新检查一遍」（`recheck = true`，连确认过没简介的也再问一次）。
  */
-async function backfillSynopses() {
-  confirmAction("补抓作品简介", "只给「记录了 Pixiv 作品 ID、但还没有简介」的作品各发一次请求，已经有简介的会跳过。篇数超过设置里那个抓取阈值时会自动拉开请求间隔（防触发 Pixiv 风控），右下角浮层会显示预计剩余时间；连接着失败说明可能已被限流，会自动加大间隔、实在不行就提前停下，不会白跑。随时可以终止。", "开始补抓", async () => {
-    state.syncTask = { authorId: 0, cancelAuthorId: 0, label: "正在补抓简介", title: "", current: 0, total: 0, eta: 0, cancelling: false };
-    render();
-    let unlisten = () => {};
-    try {
-      unlisten = await listen("synopsis-backfill-progress", (event) => {
-        const { total = 0, current = 0, title = "", etaSeconds = 0 } = event.payload || {};
-        if (!state.syncTask) return;
-        state.syncTask.total = total;
-        state.syncTask.current = current;
-        if (title) state.syncTask.title = title;
-        state.syncTask.eta = etaSeconds;
-        updateSyncFloater();
-      });
-    } catch { unlisten = () => {}; }
-    try {
-      const result = await invoke("backfill_synopses", { authorId: 0 });
-      unlisten();
-      state.syncTask = null;
-      await refreshAuthors();
-      if (state.activeAuthor) await refreshWorks(); else if (state.homeView === "allWorks") await refreshAllWorks();
-      render();
-      if (result.throttled) toast(`疑似被 Pixiv 限流，已提前停止：更新 ${result.updated} 篇，失败 ${result.failed} 篇。建议过一会儿再试，或把设置里的抓取间隔调大。`, "error");
-      else if (result.cancelled) toast(`已终止：更新 ${result.updated} 篇，还有 ${result.total - result.updated - result.failed} 篇没抓`, "info");
-      else toast(`补抓完成：更新 ${result.updated} 篇${result.failed ? `，失败 ${result.failed} 篇` : ""}`, "success");
-    } catch (error) {
-      unlisten();
-      state.syncTask = null;
-      render();
-      toast(String(error), "error");
+async function backfillSynopses(recheck = false) {
+  if (!recheck) {
+    let status = { pending: 0, checkedNoSynopsis: 0 };
+    try { status = await invoke("synopsis_backfill_status"); } catch { /* 查询失败就当没得抓，下面按 0 处理 */ }
+    const pending = Number(status?.pending) || 0;
+    const checked = Number(status?.checkedNoSynopsis) || 0;
+    if (pending === 0) {
+      if (checked > 0) {
+        confirmAction("重新检查作品简介", `剩下 ${checked} 篇没有简介的作品，之前都问过 Pixiv 了 —— 那边作者就是没写。要再全部检查一遍吗？会按设置里的抓取间隔一篇篇请求。`, "重新检查一遍", () => runSynopsisBackfill(true));
+      } else {
+        toast("所有作品都已经有简介了", "info");
+      }
+      return;
     }
-  });
+    confirmAction("补抓作品简介", `还有 ${pending} 篇作品没有简介。只给「记录了 Pixiv 作品 ID、但还没问过」的作品各发一次请求，已经有简介的和上次确认过「作者没写简介」的都会跳过。篇数超过设置里那个抓取阈值时会自动拉开请求间隔（防触发 Pixiv 风控），右下角浮层会显示预计剩余时间；连接着失败说明可能已被限流，会自动加大间隔、实在不行就提前停下，不会白跑。随时可以终止。`, "开始补抓", () => runSynopsisBackfill(false));
+    return;
+  }
+  runSynopsisBackfill(true);
+}
+
+/** 真正的补抓流程：挂浮层 → 听进度 → 收尾报数。`recheck` 见 `backfillSynopses`。 */
+async function runSynopsisBackfill(recheck) {
+  state.syncTask = { authorId: 0, cancelAuthorId: 0, label: "正在补抓简介", title: "", current: 0, total: 0, eta: 0, cancelling: false };
+  render();
+  let unlisten = () => {};
+  try {
+    unlisten = await listen("synopsis-backfill-progress", (event) => {
+      const { total = 0, current = 0, title = "", etaSeconds = 0 } = event.payload || {};
+      if (!state.syncTask) return;
+      state.syncTask.total = total;
+      state.syncTask.current = current;
+      if (title) state.syncTask.title = title;
+      state.syncTask.eta = etaSeconds;
+      updateSyncFloater();
+    });
+  } catch { unlisten = () => {}; }
+  try {
+    const result = await invoke("backfill_synopses", { authorId: 0, recheck });
+    unlisten();
+    state.syncTask = null;
+    await refreshAuthors();
+    if (state.activeAuthor) await refreshWorks(); else if (state.homeView === "allWorks") await refreshAllWorks();
+    render();
+    const noSynopsis = Number(result.noSynopsis) || 0;
+    const more = noSynopsis ? `，另有 ${noSynopsis} 篇作者没写简介` : "";
+    if (result.throttled) toast(`疑似被 Pixiv 限流，已提前停止：更新 ${result.updated} 篇${more}，失败 ${result.failed} 篇。建议过一会儿再试，或把设置里的抓取间隔调大。`, "error");
+    else if (result.cancelled) toast(`已终止：更新 ${result.updated} 篇${more}，还有 ${result.total - result.updated - noSynopsis - result.failed} 篇没抓`, "info");
+    else if (result.updated === 0 && noSynopsis > 0) toast(`补抓完成：这 ${noSynopsis} 篇在 Pixiv 上作者都没写简介，没有能补的内容${result.failed ? `；另有 ${result.failed} 篇请求失败` : ""}。`, "info");
+    else toast(`补抓完成：更新 ${result.updated} 篇${more}${result.failed ? `，失败 ${result.failed} 篇` : ""}`, "success");
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(String(error), "error");
+  }
 }
 
 /** 文件体检：核对绑定的文件在不在，并统计磁盘占用 */
@@ -4204,7 +4245,7 @@ async function settingsModal() {
       <div class="settings-slot" id="settings-slot-maintain"></div>
     </div>
     <div class="menu-list settings-actions">
-      <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的会跳过）</span></button>
+      <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>
       <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
