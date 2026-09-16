@@ -1275,7 +1275,7 @@ function renderWorks() {
       <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
         <div class="work-links">${workLinkBadge(work)}</div>
-        ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="work-menu" title="更多操作" data-action="work-menu" data-work-id="${work.id}">${icon("more", 18)}</button>`}
+        ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workMenuButton(work)}`}
       </div>
       <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
@@ -1331,6 +1331,11 @@ function renderAllWorks() {
     </section>`);
 }
 
+/** 作品卡右下角的「更多操作」按钮（v1.2.1 起点它直接开详情弹窗） */
+function workMenuButton(work) {
+  return `<button class="work-menu" title="查看详情" data-action="work-menu" data-work-id="${work.id}">${icon("more", 18)}</button>`;
+}
+
 /** 跨作者的作品卡（收藏夹 / 浏览历史用）：作者名可以点，直接落到那位作者的作品库 */
 function linkedWorkCard(work) {
   return `
@@ -1339,6 +1344,7 @@ function linkedWorkCard(work) {
         ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
         <div class="work-links">${workLinkBadge(work)}</div>
+        ${workMenuButton(work)}
       </div>
       <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`;
@@ -1869,7 +1875,7 @@ function renderSeriesWorkCards(works) {
       <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
         <div class="work-links">${workLinkBadge(work)}</div>
-        <button class="work-menu" title="更多操作" data-action="work-menu" data-work-id="${work.id}">${icon("more", 18)}</button>
+        ${workMenuButton(work)}
       </div>
       <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
