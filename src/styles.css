@@ -190,7 +190,7 @@ body.is-bulk button { cursor: pointer; }
 .settings-actions { margin-top: 20px; border-top: 1px solid #e5edf5; }
 button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .check-row { grid-template-columns: auto 1fr; align-items: center; column-gap: 8px; }.check-row input { width: 16px; height: 16px; }.check-row small { grid-column: 1 / -1; }
-.tag-editor { display: grid; gap: 12px; }
+/* .tag-editor 随「编辑标签」弹窗一起删了（v1.2.2）：现在只剩作者别名的 .tag-editor-list */
 .alias-editor { display: grid; gap: 12px; }
 .author-aliases { display: flex; flex-wrap: wrap; gap: 5px; margin: 3px 0 0; max-height: 42px; overflow: hidden; }
 .author-aliases span { display: inline-flex; align-items: center; color: #5a7695; background: #eef5fc; border: 1px solid #d9e8f6; border-radius: 4px; padding: 2px 6px; font-size: 12px; line-height: 1.2; overflow-wrap: anywhere; }.tag-editor-list { display: flex; flex-wrap: wrap; gap: 8px; min-height: 38px; }.tag-editor-list > span { display: inline-flex; align-items: center; gap: 5px; color: #315b88; background: #eaf4ff; border: 1px solid #d0e5fa; border-radius: 5px; padding: 5px 6px 5px 9px; font-size: 13px; }.tag-editor-list button { width: 17px; height: 17px; display: grid; place-items: center; border: 0; border-radius: 50%; color: #51718e; background: #fff; line-height: 1; }.tag-editor-list button:hover { color: #a7374d; background: #fff1f3; }
@@ -553,6 +553,13 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .detail-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .detail-tags span { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; color: #5a7695; background: #eef5fc; border: 1px solid #d9e8f6; border-radius: 5px; font-size: 12px; }
 .detail-tags svg { flex: 0 0 auto; color: #4c82bc; }
+/* 详情页标签就地编辑（v1.2.2）：chip 里带 × 直接删，下面输入框回车就加 —— 不再有「编辑标签」弹窗 */
+.detail-tags.is-editable span { padding-right: 4px; }
+.detail-tag-remove { width: 17px; height: 17px; display: grid; place-items: center; flex: 0 0 auto; border: 0; border-radius: 50%; color: #51718e; background: #fff; }
+.detail-tag-remove:hover { color: #a7374d; background: #fff1f3; }
+.detail-tag-add { margin-top: 10px; max-width: 320px; }
+.detail-tag-add input { width: 100%; color: #263c57; background: #fff; border: 1px solid #d6e1ed; border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; }
+.detail-tag-add input:focus { border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; }
 .detail-plain { margin: 0 0 10px; color: #3d5570; font-size: 13px; overflow-wrap: anywhere; }
 .detail-paths { margin: 0; display: grid; gap: 10px; }
 .detail-path { display: flex; gap: 12px; align-items: flex-start; }
@@ -580,8 +587,11 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .scan-size { flex: 0 0 auto; color: #34618e; font-size: 13px; font-weight: 650; }
 .scan-path { color: #8698ad; font-family: Consolas, "Courier New", monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* ===== 作者卡：新增徽标与上次同步（v1.2.0）===== */
-.author-new-badge { flex: 0 0 auto; align-self: center; padding: 1px 8px; color: #b4650a; background: #fff4e3; border: 1px solid #f6d9ae; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+/* ===== 作者卡：新增角标与上次同步 =====
+   角标挂在头像右上角（v1.2.2）：.author-avatar 自己 overflow:hidden（用来裁圆头像），
+   角标不能住在它里面 —— 由 .author-avatar-wrap 当定位基准，头像和角标做兄弟。 */
+.author-avatar-wrap { position: relative; flex: 0 0 auto; align-self: flex-start; }
+.author-new-badge { position: absolute; top: -3px; right: -5px; z-index: 1; display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 5px; color: #fff; background: #ec8b1c; border: 2px solid #fff; border-radius: 999px; font-size: 11px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; box-shadow: 0 1px 3px rgba(150,92,12,.35); }
 .author-sync-note { margin: 8px 0 0; color: #9aa8b8; font-size: 11px; }
 
 /* 批量「加入收藏夹」弹窗自 v1.2.1 起复用单篇那套 .picker-row（button + .picker-check 对号），
@@ -626,8 +636,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 /* 进度浮层里的「剩余约 X」 */
 .sync-floater-eta { flex: 0 0 auto; color: #6a8fb5; font-size: 12px; font-weight: 650; white-space: nowrap; }
 
-/* 作者卡「新增」角标：只留一个数字，不再写「新增 N 篇」 */
-.author-new-badge { display: inline-flex; align-items: center; min-width: 22px; justify-content: center; padding: 1px 7px; font-variant-numeric: tabular-nums; }
+/* 作者卡「新增」角标只留一个数字（v1.2.1）；v1.2.2 起挂到头像右上角，样式见上面 .author-new-badge */
 
 @media (max-width: 900px) {
   .bulk-bar { gap: 10px 14px; }

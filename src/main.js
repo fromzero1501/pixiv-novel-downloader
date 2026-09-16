@@ -5,7 +5,7 @@ import { HELP_DOC_CSS, HELP_DOC_HTML } from "./help-doc.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "1.2.1";
+const APP_VERSION = "1.2.2";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -96,6 +96,8 @@ const state = {
   detailReadingPath: "",
   /** 详情弹窗的简介是不是展开着。默认折叠 —— 简介动辄上千字，全铺开把下面的内容顶没了 */
   detailSynopsisOpen: false,
+  /** 刚刚在详情里加过标签 → 重画后把焦点还给标签输入框，方便连着敲下一个 */
+  detailTagFocus: false,
   /** 批量「加入收藏夹」弹窗里勾中的收藏夹 id */
   bulkCollectionIds: [],
 };
@@ -1072,11 +1074,14 @@ function renderAuthors() {
   const authors = state.authors.filter((author) => (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
   const cards = authors.map((author) => `
     <article class="author-card${author.starred ? " is-starred" : ""}" data-author-id="${author.id}" tabindex="0">
-      <div class="author-avatar ${author.avatarPath ? "has-image" : ""}">
-        ${author.avatarPath ? `<img src="${asset(author.avatarPath)}" alt="${escapeHtml(author.name)} 的头像">` : `<span>${escapeHtml(initials(author.name))}</span>`}
+      <div class="author-avatar-wrap">
+        <div class="author-avatar ${author.avatarPath ? "has-image" : ""}">
+          ${author.avatarPath ? `<img src="${asset(author.avatarPath)}" alt="${escapeHtml(author.name)} 的头像">` : `<span>${escapeHtml(initials(author.name))}</span>`}
+        </div>
+        ${author.newCount > 0 ? `<span class="author-new-badge" title="上次同步之后新收进来、还没点开看过的 ${author.newCount} 篇作品">${author.newCount > 99 ? "99+" : author.newCount}</span>` : ""}
       </div>
       <div class="author-card-body">
-        <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2>${author.newCount > 0 ? `<span class="author-new-badge" title="上次同步之后新收进来、还没点开看过的 ${author.newCount} 篇作品">${author.newCount > 99 ? "99+" : author.newCount}</span>` : ""}<div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="${author.starred ? "取消特别关注" : "设为特别关注"}" data-action="toggle-author-starred" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>
+        <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2><div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="${author.starred ? "取消特别关注" : "设为特别关注"}" data-action="toggle-author-starred" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>
         ${authorAliasList(author.aliases)}
         <dl class="author-stats"><div><dt>作品</dt><dd>${author.workCount}</dd></div><div><dt>完整版</dt><dd>${author.purchasedCount}</dd></div><div><dt>带图版</dt><dd>${author.imagesCount || 0}</dd></div><div><dt>收藏</dt><dd>${author.favoriteCount}</dd></div></dl>
         <p class="author-sync-note" title="${author.pixivLastSyncAt ? escapeHtml(author.pixivLastSyncAt) : "还没有同步记录"}">Pixiv ${escapeHtml(syncLabel(author.pixivLastSyncAt))}</p>
@@ -1363,6 +1368,7 @@ async function openWorkDetail(workId) {
   if (!work) { toast("没找到这篇作品，刷新一下", "error"); return; }
   state.workDetailId = workId;
   state.detailSynopsisOpen = false;
+  state.detailTagFocus = false;
   // 阅读版路径拿不到（没生成过）不算错误，只是那一行不显示
   const [collectionIds, readingPath] = await Promise.all([
     invoke("work_collections", { workId }),
@@ -1412,10 +1418,18 @@ function refreshDetailDom() {
   bindDetailExtras();
 }
 
-/** 笔记是文本框，靠 `change`（失焦）落盘，不能用 data-action 走点击委托 */
+/** 笔记 / 标签是文本框，靠 `change`（失焦）和 Enter 落盘，不能用 data-action 走点击委托 */
 function bindDetailExtras() {
   const textarea = document.querySelector("#work-detail-note");
   if (textarea) textarea.addEventListener("change", () => saveDetailNote());
+  const tagInput = document.querySelector("#work-detail-tag-input");
+  if (tagInput) {
+    tagInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); addDetailTag(); } });
+    // 连着加好几个标签时，重画详情会把焦点抢走 —— 还站在标签框里就还它焦点
+    if (state.detailTagFocus) tagInput.focus();
+  } else {
+    state.detailTagFocus = false;
+  }
 }
 
 /** 把笔记输入框里的内容收下来写库。返回是否有改动。 */
@@ -1485,6 +1499,48 @@ function detailPathRow(label, path, extra = "") {
 function toggleDetailSynopsis() {
   state.detailSynopsisOpen = !state.detailSynopsisOpen;
   refreshDetailDom();
+}
+
+/**
+ * 详情里改标签（v1.2.2）：原来那个「编辑标签」弹窗整个并进来了 ——
+ * 加 / 删都当场落库，不再有「保存标签」按钮（弹窗那套要先攒着改再一次性存，手滑关掉就白改）。
+ */
+function detailTagList(work) {
+  return String(work?.tags || "").split("|").map((tag) => tag.trim()).filter(Boolean);
+}
+
+async function writeDetailTags(tags) {
+  const work = findWork(state.workDetailId);
+  if (!work) return;
+  captureDetailNote();
+  try {
+    await invoke("update_work_tags", { workId: state.workDetailId, tags });
+    work.tags = tags.join("|");
+    await refreshAfterDetailChange();
+    toast("标签已更新", "success");
+  } catch (error) {
+    toast(`标签没保存：${error}`, "error");
+  }
+}
+
+async function addDetailTag() {
+  const input = document.querySelector("#work-detail-tag-input");
+  const work = findWork(state.workDetailId);
+  if (!input || !work) return;
+  const value = input.value.trim();
+  if (!value) return;
+  const tags = detailTagList(work);
+  if (tags.includes(value)) { input.value = ""; toast("这个标签已经有了", "info"); return; }
+  state.detailTagFocus = true;
+  await writeDetailTags([...tags, value]);
+}
+
+async function removeDetailTag(index) {
+  const work = findWork(state.workDetailId);
+  if (!work) return;
+  const tags = detailTagList(work);
+  if (index < 0 || index >= tags.length) return;
+  await writeDetailTags(tags.filter((_, position) => position !== index));
 }
 
 /**
@@ -1611,8 +1667,9 @@ function workDetailBody() {
     </section>
 
     <section class="detail-block">
-      <h4>标签 <button class="quiet-button" data-action="detail-edit-tags" data-work-id="${work.id}">编辑</button></h4>
-      ${tags.length ? `<div class="detail-tags">${tags.map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag)}</span>`).join("")}</div>` : '<p class="match-note">还没有标签。</p>'}
+      <h4>标签</h4>
+      ${tags.length ? `<div class="detail-tags is-editable">${tags.map((tag, index) => `<span>${icon("tag", 12)}${escapeHtml(tag)}<button class="detail-tag-remove" title="删除标签「${escapeHtml(tag)}」" data-action="detail-remove-tag" data-index="${index}">${icon("x", 12)}</button></span>`).join("")}</div>` : '<p class="match-note">还没有标签。</p>'}
+      <div class="detail-tag-add"><input id="work-detail-tag-input" type="text" maxlength="40" placeholder="输入标签后按 Enter 添加" autocomplete="off"></div>
     </section>
 
     <section class="detail-block">
@@ -2075,12 +2132,10 @@ function cardSearchMenu(work, selectedText) {
 // 唯一没保留的是「打开阅读版」的旧判断条件（只在绑定文件是 html/epub 时才给）——
 // 现在改由后端 work_reading_path 查真实存在的阅读版文件，比按扩展名猜更准。
 
-function editTagsModal(workId, tags = null) {
-  const work = findWork(workId);
-  if (!work) return;
-  const values = tags || work.tags.split("|").filter(Boolean).map((tag) => tag.trim());
-  showModal(modal("编辑标签", `<div class="tag-editor" data-work-id="${workId}"><div class="tag-editor-list">${values.map((tag, index) => `<span>${escapeHtml(tag)}<button title="删除标签" data-action="remove-tag" data-index="${index}">×</button></span>`).join("")}</div><input id="tag-editor-input" placeholder="输入标签后按 Enter 添加" autocomplete="off"></div>`, `<button class="quiet-button" data-action="open-work-directory" data-work-id="${workId}">${icon("folder", 16)}打开本地目录</button><span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="save-tags" data-work-id="${workId}">保存标签</button>`, "is-roomy"));
-}
+// 原来这里的 editTagsModal（作品卡右键 →「编辑标签」弹窗）已删除（v1.2.2）：
+// 加 / 删标签改成详情页「标签」块里就地做（addDetailTag / removeDetailTag）；
+// 弹窗底部那个「打开本地目录」详情页「文件」块本来就有；「保存标签」按钮不再需要 ——
+// 现在是改一下存一下，不会有「攒着改完忘了保存」这种事。
 
 async function seriesModal(seriesId, seriesTitle) {
   const works = await invoke("list_series_works", { authorId: state.activeAuthor.id, seriesId });
@@ -2381,7 +2436,6 @@ async function bindEvents() {
       if (action === "open-series-library") await openSeriesLibrary();
       if (action === "open-series-card") await openSeriesDetail(element.dataset.seriesId, element.dataset.seriesTitle, "overview");
       if (action === "close-series-view") await closeSeriesView();
-      if (action === "edit-tags") { closeModal(); editTagsModal(Number(workId)); }
       if (action === "copy-selected-text") await copyAndClose(state.copyPayload?.text, "选中的文字");
       if (action === "copy-work-title") await copyAndClose(findWork(Number(workId))?.title, "标题");
       if (action === "copy-work-author") await copyAndClose(findWork(Number(workId))?.authorName, "作者名");
@@ -2394,16 +2448,14 @@ async function bindEvents() {
         await setWorkSeries(Number(workId), values.seriesId, Number(values.seriesOrder));
       }
       if (action === "leave-series") await leaveWorkSeries(Number(workId));
-      if (action === "remove-tag") removeEditingTag(Number(element.dataset.index));
       if (action === "remove-author-alias") removeAuthorAlias(Number(element.dataset.index));
-      if (action === "save-tags") await saveTags(Number(workId));
       if (action === "pick-collection") { closeModal(); await openCollectionPicker(Number(workId)); }
       // 作品详情弹窗（v1.2.0）
       if (action === "work-detail") { closeModal(); await openWorkDetail(Number(workId)); }
       if (action === "cycle-read-state") await cycleReadState(Number(workId));
       if (action === "detail-read-state") await setDetailMeta({ readState: Number(element.dataset.readState) });
       if (action === "detail-rate") await setDetailMeta({ rating: Number(element.dataset.rating) });
-      if (action === "detail-edit-tags") editTagsModal(Number(workId));
+      if (action === "detail-remove-tag") await removeDetailTag(Number(element.dataset.index));
       if (action === "detail-pick-collection") await openDetailPicker(Number(workId));
       if (action === "detail-open-path") await invoke("open_local_path", { path: element.dataset.path, parent: false });
       if (action === "detail-open-dir") await invoke("open_local_path", { path: element.dataset.path, parent: true });
@@ -2702,15 +2754,16 @@ async function bindEvents() {
     });
     card.addEventListener("contextmenu", (event) => {
       event.preventDefault();
-      // 选中了文字（标题、标签、日期都行）再右键 → 给「搜索」菜单；
-      // 没选中 → 老样子，直接开「编辑标签」，别在中间再垫一层操作菜单。
+      const work = findWork(Number(card.dataset.workId));
+      if (!work) return;
+      // 选中了文字（标题、标签、日期都行）再右键 → 还是给「搜索」菜单：那是它唯一的入口，
+      // 删掉就没法用了。没选中的那半边，v1.2.2 起和右下角「三个点」一样**直接开详情页** ——
+      // 原来的「编辑标签」弹窗已经并进详情页的标签块，右键不必再分一层。
       // 右键点偏了导致选区被清时，用按下时的快照兜住。
       const selected = cardSelectedText(card) || state.cardSelectionText;
       state.cardSelectionText = "";
-      const work = findWork(Number(card.dataset.workId));
-      if (selected && work) { cardSearchMenu(work, selected); return; }
-      if (card.classList.contains("is-read-only")) return;
-      if (work) editTagsModal(work.id);
+      if (selected) { cardSearchMenu(work, selected); return; }
+      openWorkDetail(work.id);
     });
   });
 
@@ -2779,30 +2832,11 @@ async function bindEvents() {
     settingsForm.addEventListener("submit", (event) => { event.preventDefault(); flushSettingsSave(settingsForm); });
   }
 
-  const tagInput = document.querySelector("#tag-editor-input");
-  if (tagInput && !tagInput.dataset.bound) {
-    tagInput.dataset.bound = "true";
-    tagInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); addEditingTag(); } });
-  }
-
   // 作者别名输入框：回车就地把别名加进去（不能重开弹窗，否则会丢掉表单里其它未保存的修改）
   const aliasInput = document.querySelector("#alias-editor-input");
   if (aliasInput && !aliasInput.dataset.bound) {
     aliasInput.dataset.bound = "true";
     aliasInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); addAuthorAlias(); } });
-  }
-
-  const tagEditor = document.querySelector(".tag-editor");
-  if (tagEditor && !tagEditor.dataset.seriesBound) {
-    tagEditor.dataset.seriesBound = "true";
-    const work = findWork(Number(tagEditor.dataset.workId));
-    const footer = document.querySelector(".modal-footer");
-    if (work && footer) {
-      footer.insertAdjacentHTML("afterbegin", work.seriesId
-        ? `<button class="quiet-button" data-action="change-series-order" data-work-id="${work.id}">更改系列序号</button><button class="quiet-button" data-action="leave-series" data-work-id="${work.id}">退出系列</button>`
-        : `<button class="quiet-button" data-action="join-series" data-work-id="${work.id}">加入系列</button>`);
-      bindEvents();
-    }
   }
 
   document.querySelectorAll("[data-tab]").forEach((button) => {
@@ -3999,11 +4033,6 @@ function removeAuthorAlias(index) {
   const chips = [...document.querySelectorAll("[data-author-alias] .tag-editor-list > span")];
   chips[index]?.remove();
 }
-
-function editingTags() { return [...document.querySelectorAll(".tag-editor .tag-editor-list > span")].map((item) => item.firstChild.textContent.trim()); }
-function addEditingTag() { const input = document.querySelector("#tag-editor-input"); const value = input?.value.trim(); if (!value) return; const workId = Number(document.querySelector(".tag-editor")?.dataset.workId); const tags = editingTags(); input.value = ""; closeModal(); editTagsModal(workId, [...tags, value]); }
-function removeEditingTag(index) { const workId = Number(document.querySelector(".tag-editor")?.dataset.workId); const tags = editingTags(); tags.splice(index, 1); closeModal(); editTagsModal(workId, tags); }
-async function saveTags(workId) { await invoke("update_work_tags", { workId, tags: editingTags() }); closeModal(); await refreshWorks(); render(); }
 
 async function importPixivCookie() {
   const path = await open({ multiple: false, directory: false, filters: [{ name: "Cookie", extensions: ["json", "txt"] }] });
