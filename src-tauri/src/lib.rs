@@ -93,6 +93,9 @@ struct Work {
     file_format: Option<String>,
     /// Pixiv 简介（同步时拿到的 description）。老库升级后是空的，可以用「补抓简介」填上。
     synopsis: String,
+    /// 向 Pixiv 要过简介、而且确认作者就是没写（`works.synopsis_checked = 1`）。
+    /// 前端靠它把「还没补抓」和「补了也没有」这两件事分开说 —— 两者 synopsis 都是空串。
+    synopsis_checked: bool,
     /// 阅读状态：0 = 未读（从没打开过），1 = 在读（打开过），2 = 已读（手动标的）。
     /// 注意：外部阅读器读完不会回调，所以只有「已读」是手动的。
     read_state: i64,
@@ -490,6 +493,7 @@ fn db() -> Result<Connection, String> {
           series_order INTEGER NOT NULL DEFAULT 0,
           is_new INTEGER NOT NULL DEFAULT 0,
           synopsis TEXT NOT NULL DEFAULT '',
+          synopsis_checked INTEGER NOT NULL DEFAULT 0,
           read_state INTEGER NOT NULL DEFAULT 0,
           rating INTEGER NOT NULL DEFAULT 0,
           note TEXT NOT NULL DEFAULT '',
@@ -1246,8 +1250,10 @@ fn read_author(conn: &Connection, id: i64) -> Result<AuthorSummary, String> {
 // 列号约定（五处 SELECT 必须完全一致）：0 author_id / 1 id / 2 title / 3 release_date /
 // 4 preview_path / 5 cover_path / 6 purchased_path / 7 favorite / 8 has_images / 9 tags /
 // 10 pixiv_novel_id / 11 series_id / 12 series_title / 13 series_order / 14 is_new /
-// 15 author_name / 16 image_count / 17 synopsis / 18 read_state / 19 rating / 20 note
-// （浏览历史在那之后再接 21 viewed_at、22 view_count）
+// 15 author_name / 16 image_count / 17 synopsis / 18 read_state / 19 rating / 20 note /
+// 21 synopsis_checked。**新列一律加在末尾** —— 插在中间会让所有列号整体后移，
+// 那种错编译器看不出来，只会静默读错列。
+// （浏览历史在那之后再接 viewed_at / view_count，行号见 HISTORY_VIEWED_AT_INDEX）
 fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
     Ok(Work {
         author_id: row.get(0)?,
@@ -1273,12 +1279,17 @@ fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
         read_state: row.get(18)?,
         rating: row.get(19)?,
         note: row.get(20)?,
+        synopsis_checked: row.get::<_, i64>(21)? == 1,
     })
 }
 
 /// 五处 SELECT 共用的作品列清单，避免手写列号时漏改一处。
-const WORK_COLUMNS: &str = "author_id, id, title, release_date, preview_path, cover_path, purchased_path, favorite, has_images, tags, pixiv_novel_id, series_id, series_title, series_order, is_new, '' AS author_name, image_count, synopsis, read_state, rating, note";
-const WORK_COLUMNS_W: &str = "w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count, w.synopsis, w.read_state, w.rating, w.note";
+const WORK_COLUMNS: &str = "author_id, id, title, release_date, preview_path, cover_path, purchased_path, favorite, has_images, tags, pixiv_novel_id, series_id, series_title, series_order, is_new, '' AS author_name, image_count, synopsis, read_state, rating, note, synopsis_checked";
+const WORK_COLUMNS_W: &str = "w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count, w.synopsis, w.read_state, w.rating, w.note, w.synopsis_checked";
+/// 接在 `WORK_COLUMNS` / `WORK_COLUMNS_W` 之后的第一列下标（浏览历史把 `h.viewed_at`
+/// 拼在作品列后面）。抽成常量是因为往列清单里加字段时最容易漏改这里：
+/// 数字写错编译器不会报错，只会静默读错列。
+const HISTORY_VIEWED_AT_INDEX: usize = 22;
 
 fn text_file_word_count(path: &Path) -> Option<usize> {
     let bytes = fs::read(path).ok()?;
@@ -7389,8 +7400,8 @@ fn list_history(query: String, limit: i64) -> Result<Vec<HistoryEntry>, String> 
         .query_map(params![raw_query, format!("%{raw_query}%"), limit], |row| {
             Ok(HistoryEntry {
                 work: map_work(row)?,
-                viewed_at: row.get(21)?,
-                view_count: row.get(22)?,
+                viewed_at: row.get(HISTORY_VIEWED_AT_INDEX)?,
+                view_count: row.get(HISTORY_VIEWED_AT_INDEX + 1)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -10620,6 +10631,7 @@ mod tests {
             read_state: 0,
             rating: 0,
             note: String::new(),
+            synopsis_checked: false,
         }
     }
 
@@ -10655,6 +10667,7 @@ mod tests {
             read_state: 0,
             rating: 0,
             note: String::new(),
+            synopsis_checked: false,
         };
 
         populate_work_display_info(&mut work);
@@ -11226,7 +11239,8 @@ mod tests {
                rating INTEGER NOT NULL DEFAULT 0,
                note TEXT NOT NULL DEFAULT '',
                tags TEXT NOT NULL DEFAULT '',
-               synopsis TEXT NOT NULL DEFAULT ''
+               synopsis TEXT NOT NULL DEFAULT '',
+               synopsis_checked INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE collections (
                id INTEGER PRIMARY KEY,

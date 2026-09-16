@@ -5,7 +5,9 @@ import { HELP_DOC_CSS, HELP_DOC_HTML } from "./help-doc.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "1.2.4";
+// 版本号唯一手改源是 package.json 的 "version"：vite.config.js 把它注入成 __APP_VERSION__。
+// 后面的兜底只在「没走 vite、直接拿源文件跑」时才会出现，正常情况下用不到。
+const APP_VERSION = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "0.0.0";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -139,7 +141,9 @@ previewWorks.forEach((work, index) => {
     // 2 / 3 号留空，专门给「补抓简介」用：2 号当「作者没写简介」，3 号当「能补到」
     "",
     "",
-    "月色下的图文辑，配图较多，建议用 EPUB 阅读。",
+    // 4 号没有 pixiv_novel_id（不是从 Pixiv 同步来的）→ 简介空、也从没问过 Pixiv，
+    // 详情页该说「还没有简介」而不是「作者没写简介」，正好和 2 号形成两态对照
+    "",
   ][index];
   work.readState = [2, 0, 1, 0][index];
   work.rating = [5, 0, 4, 0][index];
@@ -269,8 +273,10 @@ async function invoke(command, args = {}) {
     let updated = 0;
     let noSynopsis = 0;
     targets.forEach((work) => {
-      // 偶数 id 当「作者根本没写简介」：补抓永远补不出来，只能记下来别重复问
-      if (work.id % 2 === 0) { mockNoSynopsis.add(work.id); noSynopsis += 1; return; }
+      // 偶数 id 当「作者根本没写简介」：补抓永远补不出来，只能记下来别重复问。
+      // 同时打上 synopsisChecked（对齐后端 works.synopsis_checked=1），
+      // 详情页靠它把「作者没写」和「还没补抓」分开说。
+      if (work.id % 2 === 0) { mockNoSynopsis.add(work.id); work.synopsisChecked = true; noSynopsis += 1; return; }
       work.synopsis = "（补抓到的简介示例）";
       updated += 1;
     });
@@ -1666,6 +1672,14 @@ function workDetailBody() {
   const synopsisLong = synopsis.length > 140;
   const synopsisOpen = !synopsisLong || state.detailSynopsisOpen;
   const readingPath = String(state.detailReadingPath || "");
+  // 简介有三种状态，后两种 `synopsis` 都是空串，只能靠 synopsisChecked 分开说：
+  // 有内容 / 问过 Pixiv 且确认作者没写 / 还没问过（点了「补抓简介」能拉）。
+  // 混成一句「这篇还没有简介」的话，作者明明没写的作品会让用户一直去点补抓 —— 白等还喂风控。
+  const synopsisBody = synopsis
+    ? `<p class="detail-synopsis ${synopsisOpen ? "" : "is-clamped"}">${escapeHtml(synopsis).replace(/\n/g, "<br>")}</p>${synopsisLong ? `<button class="quiet-button detail-more" data-action="detail-toggle-synopsis">${state.detailSynopsisOpen ? "收起简介" : "展开全文"}</button>` : ""}`
+    : work.synopsisChecked
+      ? '<p class="match-note">作者没写简介 —— 这篇已经向 Pixiv 问过了，那边本来就没有简介内容。</p>'
+      : '<p class="match-note">这篇还没有简介。同步过的作品可以在设置里用「补抓简介」拉一次。</p>';
   // 阅读版和正文指向同一个文件时就不必单列一行
   const showReadingRow = Boolean(readingPath) && readingPath !== work.purchasedPath && readingPath !== work.previewPath;
 
@@ -1683,7 +1697,7 @@ function workDetailBody() {
 
     <section class="detail-block">
       <h4>简介</h4>
-      ${synopsis ? `<p class="detail-synopsis ${synopsisOpen ? "" : "is-clamped"}">${escapeHtml(synopsis).replace(/\n/g, "<br>")}</p>${synopsisLong ? `<button class="quiet-button detail-more" data-action="detail-toggle-synopsis">${state.detailSynopsisOpen ? "收起简介" : "展开全文"}</button>` : ""}` : `<p class="match-note">这篇还没有简介。同步过的作品可以在设置里用「补抓简介」拉一次。</p>`}
+      ${synopsisBody}
     </section>
 
     <section class="detail-block">

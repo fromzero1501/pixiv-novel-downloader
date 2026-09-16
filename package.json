@@ -1,10 +1,12 @@
 {
   "name": "local-collection-library",
   "private": true,
-  "version": "1.2.4",
+  "version": "1.2.5",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/sync-version.mjs",
     "dev": "node scripts/build-help-doc.mjs && vite",
+    "prebuild": "node scripts/sync-version.mjs",
     "build": "node scripts/build-help-doc.mjs && node scripts/reset-dist.mjs && vite build",
     "tauri": "tauri",
     "portable": "tauri build && node scripts/pack-portable.mjs"
