@@ -1,7 +1,7 @@
 {
   "name": "local-collection-library",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "scripts": {
     "dev": "node scripts/build-help-doc.mjs && vite",

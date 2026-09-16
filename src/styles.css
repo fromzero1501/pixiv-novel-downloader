@@ -584,15 +584,53 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .author-new-badge { flex: 0 0 auto; align-self: center; padding: 1px 8px; color: #b4650a; background: #fff4e3; border: 1px solid #f6d9ae; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
 .author-sync-note { margin: 8px 0 0; color: #9aa8b8; font-size: 11px; }
 
-/* ===== 批量加收藏夹的勾选行（v1.2.0）===== */
-.picker-row .picker-name { flex: 1; min-width: 0; }
-.picker-count { flex: 0 0 auto; color: #8698ad; font-size: 12px; font-style: normal; }
-.picker-row input[type="checkbox"] { position: absolute; width: 1px; height: 1px; opacity: 0; }
-.picker-row:has(input:checked) { color: #17539e; background: #eef6ff; border-color: #9cc6f2; }
+/* 批量「加入收藏夹」弹窗自 v1.2.1 起复用单篇那套 .picker-row（button + .picker-check 对号），
+   原来那套 checkbox + :has(input:checked) 的写法已删掉 */
 
 @media (max-width: 720px) {
   .scan-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .detail-head { flex-wrap: wrap; }
   .detail-label, .detail-path dt { flex-basis: 100%; }
   .detail-row { flex-wrap: wrap; }
+}
+
+/* ===== v1.2.1：详情页补齐、简介折叠、批量条分组、作者卡数字角标 ===== */
+
+/* 折叠的长简介：只露 3 行，点「展开全文」再看全（详情页第一屏不该被简介占满） */
+.detail-synopsis.is-clamped { max-height: 4.6rem; overflow: hidden; -webkit-mask-image: linear-gradient(#000 62%, transparent); mask-image: linear-gradient(#000 62%, transparent); }
+.detail-more { margin-top: 10px; min-height: 30px; padding: 0 12px; font-size: 12px; }
+
+/* 详情块里的动作按钮行（文件 / Pixiv 用） */
+.detail-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.detail-actions .quiet-button { min-height: 32px; padding: 0 11px; font-size: 12px; }
+.detail-actions .quiet-button svg { flex: 0 0 auto; }
+
+/* ===== 批量操作条（v1.2.1）=====
+   原来十几个按钮全塞进顶栏、每个还带「（N）」，挤成两行看不出分类。
+   现在独立成一条：左边报一次总数，右边按 版本/整理/文件/输出 分组，每组带小标题。 */
+.bulk-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin: 0 0 20px; padding: 14px 16px; background: #f7faff; border: 1px solid #e2eaf3; border-radius: 9px; }
+.bulk-bar-group { display: flex; align-items: center; gap: 7px; }
+.bulk-bar-group + .bulk-bar-group { padding-left: 18px; border-left: 1px solid #e2eaf3; }
+.bulk-bar-group.is-lead { margin-right: 2px; }
+.bulk-bar-group.is-danger { margin-left: auto; padding-left: 0; border-left: 0; }
+.bulk-bar-label { color: #8698ad; font-size: 12px; font-weight: 650; white-space: nowrap; }
+.bulk-count { color: #17539e; font-size: 13px; font-weight: 700; white-space: nowrap; }
+.bulk-bar .quiet-button, .bulk-button { min-height: 32px; padding: 0 11px; font-size: 12px; }
+.bulk-button { display: inline-flex; align-items: center; justify-content: center; color: #425b79; background: #fff; border: 1px solid #d9e3ef; border-radius: 7px; font-weight: 650; }
+.bulk-button:hover { color: #1764c5; border-color: #b8d3ef; background: #fafdff; }
+.bulk-button:disabled { color: #a9b6c6; background: #f4f7fb; border-color: #e4ebf3; }
+.bulk-bar .danger-button { min-height: 32px; padding: 0 12px; font-size: 12px; }
+.bulk-bar .danger-button:disabled { opacity: .5; }
+.topbar-actions .bulk-count { margin-right: 4px; }
+
+/* 进度浮层里的「剩余约 X」 */
+.sync-floater-eta { flex: 0 0 auto; color: #6a8fb5; font-size: 12px; font-weight: 650; white-space: nowrap; }
+
+/* 作者卡「新增」角标：只留一个数字，不再写「新增 N 篇」 */
+.author-new-badge { display: inline-flex; align-items: center; min-width: 22px; justify-content: center; padding: 1px 7px; font-variant-numeric: tabular-nums; }
+
+@media (max-width: 900px) {
+  .bulk-bar { gap: 10px 14px; }
+  .bulk-bar-group + .bulk-bar-group { padding-left: 14px; }
+  .bulk-bar-group.is-danger { margin-left: 0; }
 }

@@ -4270,6 +4270,8 @@ struct SynopsisBackfillResult {
     updated: usize,
     failed: usize,
     cancelled: bool,
+    /// 连续失败太多，判定为被 Pixiv 限流、提前停下了
+    throttled: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -4278,10 +4280,24 @@ struct SynopsisBackfillProgress {
     total: usize,
     current: usize,
     title: String,
+    /// 预计还要多少秒（按当前间隔 × 剩余篇数估）
+    eta_seconds: u64,
 }
 
-/// 补抓简介时的并发数，和同步抓详情保持一致。
+/// 补抓简介时的并发数，和同步抓详情保持一致（只在篇数没到阈值时才用并发）。
 const SYNOPSIS_CONCURRENCY: usize = 6;
+/// 连着失败这么多篇就先认为「可能被限流」，把间隔翻倍再说
+const SYNOPSIS_THROTTLE_STREAK: usize = 4;
+/// 连着失败到这个数就别硬撑了 —— 继续跑只是白白喂风控、白等
+const SYNOPSIS_ABORT_STREAK: usize = 10;
+/// 间隔翻倍的上限，别翻到天荒地老
+const SYNOPSIS_MAX_DELAY_SECONDS: u64 = 60;
+
+/// 连续失败之后的新间隔：翻倍，但封顶。
+/// 抽成函数是为了能单测 —— 这段决定了被限流时是「等一等再试」还是「干脆停下」。
+fn throttled_delay_seconds(current: u64) -> u64 {
+    (current.max(1) * 2).min(SYNOPSIS_MAX_DELAY_SECONDS)
+}
 
 /// 给老作品补抓 Pixiv 简介。`author_id = 0` 表示整库。
 /// 取消标记复用同步那一套：整库补抓的键就是 0（前端调 `cancel_pixiv_sync(0)`）。
@@ -4331,65 +4347,144 @@ fn backfill_synopses_impl(
             .map_err(|e| e.to_string())?
     };
     let total = targets.len();
+    // 和「作品同步」共用同一套间隔设置（设置 → 抓取间隔：超过 N 篇时每篇间隔 M 秒）。
+    // 全库补抓动辄上千篇，原来这边 6 并发一路猛冲、完全没吃设置，正是上次触发风控的原因。
+    let delay_threshold = setting(&conn, "pixiv_delay_threshold")?
+        .parse::<usize>()
+        .unwrap_or(150);
+    let base_delay = setting(&conn, "pixiv_delay_seconds")?
+        .parse::<u64>()
+        .unwrap_or(1);
+    // 篇数没到阈值（或者把间隔设成 0）才用并发；到了阈值就一篇一篇来，中间 sleep
+    let sequential = total > delay_threshold && base_delay > 0;
+    let mut delay_seconds = base_delay;
     let mut updated = 0usize;
     let mut failed = 0usize;
     let mut cancelled = false;
-    for (batch_index, batch) in targets.chunks(SYNOPSIS_CONCURRENCY).enumerate() {
-        if pixiv_sync_cancelled(author_id) {
-            cancelled = true;
-            break;
-        }
-        let fetched = std::thread::scope(|scope| {
-            let handles = batch
-                .iter()
-                .map(|(work_id, novel_id)| {
-                    let client = client.clone();
-                    let novel_id = novel_id.clone();
-                    let work_id = *work_id;
-                    scope.spawn(move || {
-                        let detail = fetch_pixiv_novel_detail(&client, &novel_id);
-                        (work_id, detail)
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .filter_map(|handle| handle.join().ok())
-                .collect::<Vec<_>>()
-        });
-        for (work_id, detail) in fetched {
-            match detail {
+    let mut throttled = false;
+    let mut streak = 0usize;
+
+    if sequential {
+        for (index, (work_id, novel_id)) in targets.iter().enumerate() {
+            if pixiv_sync_cancelled(author_id) {
+                cancelled = true;
+                break;
+            }
+            if index > 0 && delay_seconds > 0 {
+                std::thread::sleep(Duration::from_secs(delay_seconds));
+            }
+            let ok = match fetch_pixiv_novel_detail(&client, novel_id) {
                 Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
                     let body = detail.get("body").unwrap_or(&Value::Null);
                     let description = json_string(body, "description");
                     if description.trim().is_empty() {
-                        continue;
+                        // 作者没写简介不算失败，也别让它把「连续失败」的计数冲掉
+                        true
+                    } else {
+                        conn.execute(
+                            "UPDATE works SET synopsis=?1 WHERE id=?2",
+                            params![description, work_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        updated += 1;
+                        true
                     }
-                    conn.execute(
-                        "UPDATE works SET synopsis=?1 WHERE id=?2",
-                        params![description, work_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    updated += 1;
                 }
-                _ => failed += 1,
+                // 限流时 Pixiv 通常直接返回错误/403，全都归到失败里
+                _ => false,
+            };
+            if ok {
+                streak = 0;
+            } else {
+                failed += 1;
+                streak += 1;
+                if streak % SYNOPSIS_THROTTLE_STREAK == 0 {
+                    // 连着失败＝大概率被限流了：间隔翻倍；还继续失败就干脆停下
+                    delay_seconds = throttled_delay_seconds(delay_seconds);
+                    if streak >= SYNOPSIS_ABORT_STREAK {
+                        throttled = true;
+                        break;
+                    }
+                }
             }
+            let current = index + 1;
+            let remaining = total.saturating_sub(current) as u64;
+            let _ = app.emit(
+                "synopsis-backfill-progress",
+                SynopsisBackfillProgress {
+                    total,
+                    current,
+                    title: if failed > 0 {
+                        format!(
+                            "正在补抓简介：{current} / {total}（失败 {failed} 篇，疑似限流，间隔已拉到 {delay_seconds} 秒）"
+                        )
+                    } else {
+                        format!("正在补抓简介：{current} / {total}（每篇间隔 {delay_seconds} 秒）")
+                    },
+                    eta_seconds: remaining * delay_seconds,
+                },
+            );
         }
-        let current = ((batch_index + 1) * SYNOPSIS_CONCURRENCY).min(total);
-        let _ = app.emit(
-            "synopsis-backfill-progress",
-            SynopsisBackfillProgress {
-                total,
-                current,
-                title: format!("正在补抓简介：{} / {}", current, total),
-            },
-        );
+    } else {
+        for (batch_index, batch) in targets.chunks(SYNOPSIS_CONCURRENCY).enumerate() {
+            if pixiv_sync_cancelled(author_id) {
+                cancelled = true;
+                break;
+            }
+            let fetched = std::thread::scope(|scope| {
+                let handles = batch
+                    .iter()
+                    .map(|(work_id, novel_id)| {
+                        let client = client.clone();
+                        let novel_id = novel_id.clone();
+                        let work_id = *work_id;
+                        scope.spawn(move || {
+                            let detail = fetch_pixiv_novel_detail(&client, &novel_id);
+                            (work_id, detail)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .collect::<Vec<_>>()
+            });
+            for (work_id, detail) in fetched {
+                match detail {
+                    Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
+                        let body = detail.get("body").unwrap_or(&Value::Null);
+                        let description = json_string(body, "description");
+                        if description.trim().is_empty() {
+                            continue;
+                        }
+                        conn.execute(
+                            "UPDATE works SET synopsis=?1 WHERE id=?2",
+                            params![description, work_id],
+                        )
+                        .map_err(|e| e.to_string())?;
+                        updated += 1;
+                    }
+                    _ => failed += 1,
+                }
+            }
+            let current = ((batch_index + 1) * SYNOPSIS_CONCURRENCY).min(total);
+            let _ = app.emit(
+                "synopsis-backfill-progress",
+                SynopsisBackfillProgress {
+                    total,
+                    current,
+                    title: format!("正在并发补抓简介：{} / {}", current, total),
+                    eta_seconds: 0,
+                },
+            );
+        }
     }
     Ok(SynopsisBackfillResult {
         total,
         updated,
         failed,
         cancelled,
+        throttled,
     })
 }
 
@@ -6792,6 +6887,38 @@ async fn backfill_work_covers(author_id: Option<i64>) -> Result<BackfillCoversRe
     .map_err(|e| e.to_string())?
 }
 
+/// 阅读版（HTML / EPUB）的落盘路径；没生成过就返回空串。
+/// 详情弹窗的「文件」块用它列一行「阅读版」—— 比按扩展名猜有没有阅读版准得多。
+#[tauri::command]
+fn work_reading_path(work_id: i64) -> Result<String, String> {
+    let conn = db()?;
+    let (purchased, preview): (String, String) = conn
+        .query_row(
+            "SELECT purchased_path, preview_path FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let path = if purchased.trim().is_empty() {
+        preview
+    } else {
+        purchased
+    };
+    if path.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let settings = read_settings(&conn)?;
+    let preferred = reading_format_of(&settings.sync_image_format);
+    let text_path = Path::new(&path);
+    for format in [preferred, preferred.other()] {
+        let candidate = reading_output_path(text_path, format, "");
+        if candidate.is_file() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+    Ok(String::new())
+}
+
 /// 打开阅读版：先按设置里的格式找（HTML 单网页或 EPUB 电子书），找不到再退另一种格式。
 #[tauri::command]
 fn open_work_reading(work_id: i64) -> Result<(), String> {
@@ -9086,6 +9213,7 @@ pub fn run() {
             rename_character_game,
             delete_character_game,
             open_work_reading,
+            work_reading_path,
             open_external_url,
             open_search_site,
             preview_import,
@@ -9148,6 +9276,8 @@ mod tests {
         add_works_to_collections_impl, update_works_tags_impl,
         mark_work_in_progress, read_state_label, split_tags, READ_DONE, READ_IN_PROGRESS,
         READ_UNREAD,
+        throttled_delay_seconds, SYNOPSIS_ABORT_STREAK, SYNOPSIS_MAX_DELAY_SECONDS,
+        SYNOPSIS_THROTTLE_STREAK,
         text_word_count, title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
@@ -11294,5 +11424,27 @@ mod tests {
         // 空入参直接返回 0，不写库
         assert_eq!(add_works_to_collections_impl(&mut conn, &[], &[1]).unwrap(), 0);
         assert_eq!(add_works_to_collections_impl(&mut conn, &[1], &[]).unwrap(), 0);
+    }
+
+    /// 补抓简介被限流时的退避：间隔翻倍、封顶；并且「先加间隔」一定早于「直接放弃」。
+    #[test]
+    fn synopsis_backoff_doubles_then_caps() {
+        assert_eq!(throttled_delay_seconds(1), 2);
+        assert_eq!(throttled_delay_seconds(2), 4);
+        assert_eq!(throttled_delay_seconds(16), 32);
+        // 翻过上限就贴着上限，不能一路翻到几小时
+        assert_eq!(throttled_delay_seconds(40), SYNOPSIS_MAX_DELAY_SECONDS);
+        assert_eq!(throttled_delay_seconds(60), SYNOPSIS_MAX_DELAY_SECONDS);
+        // 万一有人把间隔设成 0，也不能算出 0 秒（那样等于没退避）
+        assert_eq!(throttled_delay_seconds(0), 2);
+        // 顺序：先翻倍观察，连续失败更多才放弃，别一上来就停
+        assert!(SYNOPSIS_THROTTLE_STREAK > 0);
+        assert!(SYNOPSIS_THROTTLE_STREAK < SYNOPSIS_ABORT_STREAK);
+        // 从默认 1 秒一路翻倍，到放弃那一刻还没超过上限
+        let mut delay = 1;
+        for _ in 0..(SYNOPSIS_ABORT_STREAK / SYNOPSIS_THROTTLE_STREAK) + 1 {
+            delay = throttled_delay_seconds(delay);
+        }
+        assert!(delay <= SYNOPSIS_MAX_DELAY_SECONDS);
     }
 }
