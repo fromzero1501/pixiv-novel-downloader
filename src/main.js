@@ -5,7 +5,7 @@ import { HELP_DOC_CSS, HELP_DOC_HTML } from "./help-doc.js";
 import "./styles.css";
 
 const app = document.querySelector("#app");
-const APP_VERSION = "1.0.1";
+const APP_VERSION = "1.1.0";
 const state = {
   authors: [],
   activeAuthor: null,
@@ -69,12 +69,44 @@ const state = {
   cardSelectionText: "",
   /** 卡片「复制」菜单打开时的内容：点按钮时选区已经没了，只能靠这份快照 */
   copyPayload: null,
+  /** 「我的收藏」页：收藏夹列表 / 当前打开的收藏夹 / 夹子里的作品 */
+  collections: [],
+  activeCollection: null,
+  collectionWorks: [],
+  collectionQuery: "",
+  collectionImagesOnly: false,
+  /** 收藏夹里默认按「什么时候收进来的」排，所以单独一个排序状态，不跟作者库共用 */
+  collectionSort: "added_desc",
+  /** 收藏夹选择器弹窗：正在改归属的作品 id + 已勾选的夹子 id */
+  pickerWorkId: null,
+  pickerSelected: [],
+  /** 「浏览历史」页：`{ work, viewedAt, viewCount }` 列表 + 搜索词 */
+  history: [],
+  historyQuery: "",
 };
 
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
 const previewWorks = [{ id: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", releaseDate: "2025-10-05", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\希儿.epub", wordCount: 12680, favorite: true }, { id: 2, title: "夏日短篇集", releaseDate: "2025-09-20", previewPath: "", coverPath: "", purchasedPath: "", wordCount: 4380, favorite: false }, { id: 3, title: "旧城的信", releaseDate: "2025-08-18", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\旧城的信", wordCount: 20750, favorite: false }, { id: 4, title: "月色图文辑", releaseDate: "2025-07-09", previewPath: "", coverPath: "", purchasedPath: "", favorite: true }];
 
 previewWorks.forEach((work, index) => { work.tags = ["Pixiv|小说", "短篇|日常", "小说", "插画|图文"][index]; work.pixivNovelId = ["26410188", "", "", ""][index]; work.imageCount = [4, 0, 0, 0][index]; });
+// 「我的收藏」与「浏览历史」在浏览器预览里的假数据（真数据是 SQL 出来的）
+const previewCollections = [
+  { id: 1, name: "我的收藏", createdAt: "2026-09-01T00:00:00+00:00" },
+  { id: 2, name: "短篇向", createdAt: "2026-09-10T00:00:00+00:00" },
+  { id: 3, name: "待读", createdAt: "2026-09-14T00:00:00+00:00" },
+];
+previewWorks[0].collectionIds = [1, 2];
+previewWorks[1].collectionIds = [];
+previewWorks[2].collectionIds = [3];
+previewWorks[3].collectionIds = [1];
+previewWorks.forEach((work) => { work.favorite = (work.collectionIds || []).length > 0; });
+// 历史时间按「今天 / 昨天 / 3 天前」算出来，浏览器预览里分组标题才稳定
+const previewDayAt = (offsetDays, hour, minute) => { const moment = new Date(); moment.setDate(moment.getDate() + offsetDays); moment.setHours(hour, minute, 0, 0); return moment.toISOString(); };
+const previewHistory = [
+  { workId: 1, viewedAt: previewDayAt(0, 9, 20), viewCount: 4 },
+  { workId: 3, viewedAt: previewDayAt(-1, 21, 5), viewCount: 2 },
+  { workId: 4, viewedAt: previewDayAt(-3, 17, 40), viewCount: 1 },
+];
 previewWorks.forEach((work, index) => { work.seriesId = index < 2 ? "demo-series-1" : ""; work.seriesTitle = index < 2 ? "雾海档案短篇系列" : ""; });
 // 「所有作品」卡片要显示作者名、点作者名跳作品库，mock 里也得带上（真数据由 SQL JOIN 出来）
 previewWorks.forEach((work, index) => { work.authorId = [1, 1, 2, 3][index]; work.authorName = ["雾海档案", "雾海档案", "Mori", "远野"][index]; });
@@ -112,7 +144,35 @@ async function invoke(command, args = {}) {
   if (command === "list_series") return [{ id: "demo-series-1", title: "雾海档案短篇系列", workCount: 2, purchasedCount: 1, previewCount: 1, coverPath: "", maxOrder: 2 }];
   if (command === "set_work_series") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.seriesId = args.seriesId; work.seriesTitle = "雾海档案短篇系列"; work.seriesOrder = args.seriesOrder; } return; }
   if (command === "leave_work_series") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.seriesId = ""; work.seriesTitle = ""; work.seriesOrder = 0; } return; }
-  if (command === "toggle_favorite") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.favorite = !work.favorite; return; }
+  // 收藏夹：真数据在 collection_works 关联表里，mock 里挂在作品对象上（collectionIds）
+  if (command === "list_collections") return previewCollections.map((collection) => {
+    const members = previewWorks.filter((work) => (work.collectionIds || []).includes(collection.id));
+    return { id: collection.id, name: collection.name, createdAt: collection.createdAt, workCount: members.length, coverPath: members[0]?.coverPath || "" };
+  });
+  if (command === "create_collection") {
+    const id = previewCollections.reduce((max, item) => Math.max(max, item.id), 0) + 1;
+    const createdAt = new Date().toISOString();
+    previewCollections.push({ id, name: args.name, createdAt });
+    return { id, name: args.name, workCount: 0, coverPath: "", createdAt };
+  }
+  if (command === "rename_collection") { const target = previewCollections.find((item) => item.id === args.id); if (target) target.name = args.name; return { id: args.id, name: args.name, workCount: 0, coverPath: "", createdAt: "" }; }
+  if (command === "delete_collection") {
+    const index = previewCollections.findIndex((item) => item.id === args.id);
+    if (index >= 0) previewCollections.splice(index, 1);
+    previewWorks.forEach((work) => { work.collectionIds = (work.collectionIds || []).filter((id) => id !== args.id); work.favorite = work.collectionIds.length > 0; });
+    return;
+  }
+  if (command === "work_collections") return previewWorks.find((work) => work.id === args.workId)?.collectionIds || [];
+  if (command === "set_work_collections") {
+    const work = previewWorks.find((item) => item.id === args.workId);
+    if (work) { work.collectionIds = [...args.collectionIds]; work.favorite = work.collectionIds.length > 0; }
+    return;
+  }
+  if (command === "list_collection_works") return previewWorks.filter((work) => (work.collectionIds || []).includes(args.collectionId) && (!args.query || work.title.includes(args.query)) && (!args.imagesOnly || work.hasImages));
+  // 浏览历史：mock 里存 workId，出口时再挂上作品对象（真机是一条 SQL JOIN 出来）
+  if (command === "list_history") return previewHistory.map((entry) => ({ ...entry, work: previewWorks.find((work) => work.id === entry.workId) })).filter((entry) => entry.work && (!args.query || entry.work.title.includes(args.query)));
+  if (command === "clear_history") { previewHistory.length = 0; return; }
+  if (command === "remove_history") { const index = previewHistory.findIndex((entry) => entry.workId === args.workId); if (index >= 0) previewHistory.splice(index, 1); return; }
   if (command === "toggle_has_images") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.hasImages = !work.hasImages; return; }
   if (command === "delete_work") { const index = previewWorks.findIndex((item) => item.id === args.workId); if (index >= 0) previewWorks.splice(index, 1); return; }
   if (command === "delete_works") { for (const workId of args.workIds) { const index = previewWorks.findIndex((item) => item.id === workId); if (index >= 0) previewWorks.splice(index, 1); } return; }
@@ -125,7 +185,7 @@ async function invoke(command, args = {}) {
     return;
   }
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
-  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, minimumFileSizeBytes: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
+  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, minimumFileSizeBytes: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
   if (command === "save_app_settings") return args.settings;
   // 浏览器预览默认当作「已是最新版」；要看更新界面就把 window.__mockUpdateCheck 塞进来
   if (command === "check_for_update") return window.__mockUpdateCheck || { currentVersion: APP_VERSION, latestVersion: APP_VERSION, hasUpdate: false, releaseUrl: "https://github.com/fromzero1501/pixiv-novel-downloader/releases", releaseMirrorUrl: "https://ghproxy.net/https://github.com/fromzero1501/pixiv-novel-downloader/releases", asset: null, source: "直连 GitHub" };
@@ -295,6 +355,8 @@ const icon = (name, size = 18) => {
     copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
     grip: '<circle cx="9.5" cy="6" r="1.5" fill="currentColor"/><circle cx="14.5" cy="6" r="1.5" fill="currentColor"/><circle cx="9.5" cy="12" r="1.5" fill="currentColor"/><circle cx="14.5" cy="12" r="1.5" fill="currentColor"/><circle cx="9.5" cy="18" r="1.5" fill="currentColor"/><circle cx="14.5" cy="18" r="1.5" fill="currentColor"/>',
     layers: '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5.2l3.2 1.9"/>',
+    folderHeart: '<path d="M3 6.7A1.7 1.7 0 0 1 4.7 5H10l2 2h7.3A1.7 1.7 0 0 1 21 8.7v9.6a1.7 1.7 0 0 1-1.7 1.7H4.7A1.7 1.7 0 0 1 3 18.3Z"/><path d="M12 16.4c-1.8-1.2-2.8-2.4-2.8-3.6a1.5 1.5 0 0 1 2.8-.6 1.5 1.5 0 0 1 2.8.6c0 1.2-1 2.4-2.8 3.6Z"/>',
   };
   // 名字以 Filled 结尾的图标用实心填充（如 starFilled）
   const fill = name.endsWith("Filled") ? "currentColor" : "none";
@@ -404,13 +466,40 @@ async function refreshAfterWorkFlagChange() {
   await refreshActiveAuthor();
   if (state.activeAuthor) await refreshWorks();
   else if (state.homeView === "allWorks") await refreshAllWorks();
+  else if (state.homeView === "collections") {
+    await refreshCollections();
+    if (state.activeCollection) await refreshCollectionWorks();
+  }
   render();
+}
+
+async function refreshCollections() {
+  state.collections = await invoke("list_collections");
+}
+
+async function refreshCollectionWorks() {
+  if (!state.activeCollection) return;
+  state.collectionWorks = await invoke("list_collection_works", {
+    collectionId: state.activeCollection.id,
+    query: state.collectionQuery,
+    searchField: "title",
+    status: state.status,
+    imagesOnly: state.collectionImagesOnly,
+    sort: state.collectionSort,
+  });
+}
+
+async function refreshHistory() {
+  state.history = await invoke("list_history", { query: state.historyQuery, limit: 0 });
 }
 
 function render() {
   app.innerHTML = state.activeAuthor
     ? (state.seriesView ? renderSeriesView() : renderWorks())
-    : (state.homeView === "allWorks" ? renderAllWorks() : state.homeView === "help" ? renderHelp() : renderAuthors());
+    : (state.homeView === "allWorks" ? renderAllWorks()
+      : state.homeView === "collections" ? renderCollections()
+      : state.homeView === "history" ? renderHistory()
+      : state.homeView === "help" ? renderHelp() : renderAuthors());
   document.body.classList.toggle("is-bulk", Boolean(state.bulkMode));
   mountHelpDocument();
   bindEvents();
@@ -427,7 +516,8 @@ function restoreSearchFocus(id) {
 }
 
 function findWork(workId) {
-  return [...state.works, ...state.seriesItems, ...state.allWorks].find((work) => work.id === workId);
+  const target = Number(workId);
+  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.history.map((entry) => entry.work)].find((work) => work.id === target);
 }
 
 async function openSeriesDetail(seriesId, seriesTitle, returnTo = "works") {
@@ -504,6 +594,8 @@ function renderShell(content) {
       </nav>
       <nav class="rail-nav rail-nav-secondary">
         <button class="rail-button ${state.homeView === "allWorks" && !state.activeAuthor ? "is-active" : ""}" title="\u6240\u6709\u4f5c\u54c1" data-action="go-all-works">${icon("database", 20)}</button>
+        <button class="rail-button ${state.homeView === "collections" && !state.activeAuthor ? "is-active" : ""}" title="我的收藏" aria-label="我的收藏" data-action="go-collections">${icon("folderHeart", 20)}</button>
+        <button class="rail-button ${state.homeView === "history" && !state.activeAuthor ? "is-active" : ""}" title="浏览历史" aria-label="浏览历史" data-action="go-history">${icon("clock", 20)}</button>
         <button class="rail-button ${state.homeView === "help" && !state.activeAuthor ? "is-active" : ""}" title="帮助" aria-label="帮助" data-action="help">${icon("help", 20)}</button>
       </nav>
       <div class="rail-footer">
@@ -1001,7 +1093,7 @@ function workLinkBadge(work) {
 function workBadges(work) {
   return `<div class="work-badges">
           <span class="status-badge ${work.purchasedPath ? "owned" : "unowned"}" title="${work.purchasedPath ? "完整版已绑定" : "预览版"}">${icon(work.purchasedPath ? "check" : "x", 17)}</span>
-          <button class="favorite-badge ${work.favorite ? "is-favorite" : ""}" title="${work.favorite ? "已收藏，点击取消" : "未收藏，点击收藏"}" data-action="toggle-favorite" data-work-id="${work.id}">${icon("heart", 17)}</button>
+          <button class="favorite-badge ${work.favorite ? "is-favorite" : ""}" title="${work.favorite ? "已在收藏夹里，点击调整" : "加入收藏夹"}" data-action="pick-collection" data-work-id="${work.id}">${icon("heart", 17)}</button>
           <button class="favorite-badge images-badge ${work.hasImages ? "is-images" : ""}" title="${work.hasImages ? "已设为带图版，点击取消" : "未设为带图版，点击设置"}${work.imageCount ? ` · 共 ${work.imageCount} 张配图` : ""}" data-action="toggle-has-images" data-work-id="${work.id}">${icon("image", 17)}${work.imageCount ? `<span class="badge-count">${work.imageCount}</span>` : ""}</button>
         </div>`;
 }
@@ -1065,6 +1157,207 @@ function renderAllWorks() {
       <div class="read-only-note">所有作品仅供搜索、筛选与打开查看。</div>
       <div class="works-grid">${cards || '<div class="empty-state works-empty"><h2>没有符合条件的作品</h2></div>'}</div>
     </section>`);
+}
+
+/** 跨作者的作品卡（收藏夹 / 浏览历史用）：作者名可以点，直接落到那位作者的作品库 */
+function linkedWorkCard(work) {
+  return `
+    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
+      <div class="work-cover">${workCover(work)}
+        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
+        ${workBadges(work)}
+        <div class="work-links">${workLinkBadge(work)}</div>
+      </div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${work.tags ? `<div class="work-tags">${work.tags.split("|").filter(Boolean).map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag.trim())}</span>`).join("")}</div>` : ""}</div>
+    </article>`;
+}
+
+/* ============================ 我的收藏（收藏夹） ============================ */
+
+function renderCollections() {
+  if (state.activeCollection) return renderCollectionWorks();
+  const total = state.collections.reduce((sum, item) => sum + item.workCount, 0);
+  const cards = state.collections.map((collection) => `
+    <article class="collection-card" data-collection-id="${collection.id}" tabindex="0">
+      <button class="collection-open" data-action="open-collection" data-collection-id="${collection.id}" title="打开「${escapeHtml(collection.name)}」">
+        <div class="collection-cover">${collection.coverPath ? `<img src="${asset(collection.coverPath)}" alt="" loading="lazy" onerror="this.remove()">` : `<span>${icon("folderHeart", 30)}</span>`}</div>
+        <div class="collection-copy"><h2>${escapeHtml(collection.name)}</h2><p>${collection.workCount} 篇作品</p></div>
+      </button>
+      <button class="work-menu" title="更多操作" data-action="collection-menu" data-collection-id="${collection.id}">${icon("more", 18)}</button>
+    </article>`).join("");
+  return renderShell(`
+    <section class="topbar work-topbar">
+      <div><p class="section-kicker">收藏夹</p><h1>我的收藏</h1></div>
+      <div class="topbar-actions"><button class="primary-button" data-action="create-collection">${icon("plus", 18)}<span>新建收藏夹</span></button></div>
+    </section>
+    <section class="library-content">
+      <div class="binding-bar"><div><strong>收藏夹</strong><span>${state.collections.length ? `${state.collections.length} 个收藏夹 · 共 ${total} 篇作品。同一篇作品可以同时放进多个夹子。` : "还没有收藏夹"}</span></div></div>
+      <div class="collection-grid">${cards || `<div class="empty-state works-empty"><h2>还没有收藏夹</h2><p>点右上角「新建收藏夹」建一个，再到作品卡上点心形图标把作品放进去。</p></div>`}</div>
+    </section>`);
+}
+
+function renderCollectionWorks() {
+  const collection = state.activeCollection;
+  const works = collapseSerialWorks(state.collectionWorks);
+  const cards = works.map(linkedWorkCard).join("");
+  return renderShell(`
+    <section class="topbar work-topbar">
+      <div class="crumb-heading"><button class="back-button" title="返回收藏夹列表" data-action="back-to-collections">${icon("back", 20)}</button><div><p class="section-kicker">收藏夹</p><h1>${escapeHtml(collection.name)}</h1></div></div>
+      <div class="topbar-actions"><button class="icon-text-button" data-action="rename-collection" data-collection-id="${collection.id}">${icon("settings", 18)}<span>重命名</span></button><button class="quiet-button" data-action="delete-collection" data-collection-id="${collection.id}">删除收藏夹</button></div>
+    </section>
+    <section class="library-content">
+      <div class="library-tools">
+        <label class="search-field"><span>${icon("search", 19)}</span><input id="collection-search" type="search" placeholder="搜索这个收藏夹里的作品名称" value="${escapeHtml(state.collectionQuery)}" autocomplete="off"></label>
+        <div class="filter-group" role="group" aria-label="版本状态">${[ ["all", "全部"], ["purchased", "完整版"], ["unpurchased", "预览版"] ].map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
+        <button class="icon-text-button images-filter ${state.collectionImagesOnly ? "is-active" : ""}" data-action="collection-images-only">${icon("image", 17)}<span>仅看带图版</span></button>
+        ${serialFilterButton(state.collectionWorks)}
+        <select class="sort-select" id="collection-sort" aria-label="排序"><option value="added_desc" ${state.collectionSort === "added_desc" ? "selected" : ""}>最近收藏</option><option value="date_desc" ${state.collectionSort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.collectionSort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.collectionSort === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${state.collectionSort === "words_desc" ? "selected" : ""}>字数从多到少</option></select>
+      </div>
+      <div class="works-grid">${cards || `<div class="empty-state works-empty"><h2>${state.collectionQuery || state.status !== "all" || state.collectionImagesOnly ? "没有符合条件的作品" : "这个收藏夹还是空的"}</h2><p>在任意作品卡上点心形图标，就能把它收进来。</p></div>`}</div>
+    </section>`);
+}
+
+/* ============================ 浏览历史 ============================ */
+
+/** 「今天 / 昨天 / N 天前 / 具体日期」——历史列表按这个分组 */
+function historyDayLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "更早";
+  const startOfDay = (moment) => new Date(moment.getFullYear(), moment.getMonth(), moment.getDate()).getTime();
+  const days = Math.round((startOfDay(new Date()) - startOfDay(date)) / 86400000);
+  if (days <= 0) return "今天";
+  if (days === 1) return "昨天";
+  if (days < 7) return `${days} 天前`;
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function historyTimeLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function renderHistory() {
+  // 已经按时间倒序回来，顺序扫一遍就是分组，不用再排序
+  const groups = [];
+  for (const entry of state.history) {
+    const label = historyDayLabel(entry.viewedAt);
+    const last = groups[groups.length - 1];
+    if (last && last.label === label) last.items.push(entry);
+    else groups.push({ label, items: [entry] });
+  }
+  const body = groups.map((group) => `
+    <div class="history-group">
+      <h2 class="history-day">${group.label}<span>${group.items.length} 篇</span></h2>
+      <div class="history-list">${group.items.map((entry) => `
+        <article class="history-item" data-work-id="${entry.work.id}">
+          <button class="history-thumb" data-action="open-history-work" data-work-id="${entry.work.id}" title="打开《${escapeHtml(entry.work.title)}》">${entry.work.coverPath ? `<img src="${asset(entry.work.coverPath)}" alt="" loading="lazy" onerror="this.remove()">` : `<span>${icon("image", 20)}</span>`}</button>
+          <div class="history-copy">
+            <button class="history-title" data-action="open-history-work" data-work-id="${entry.work.id}" title="${escapeHtml(entry.work.title)}">${escapeHtml(entry.work.title)}</button>
+            <p class="history-meta">${entry.work.authorName ? `<button class="history-author" data-action="open-author" data-author-id="${entry.work.authorId}">${escapeHtml(entry.work.authorName)}</button>` : ""}<span>${historyTimeLabel(entry.viewedAt)}</span><span class="history-state ${entry.work.purchasedPath ? "is-full" : "is-preview"}">${entry.work.purchasedPath ? "完整版" : "预览版"}</span>${entry.viewCount > 1 ? `<span>看过 ${entry.viewCount} 次</span>` : ""}</p>
+          </div>
+          <button class="history-remove" title="从浏览历史里移除" data-action="remove-history" data-work-id="${entry.work.id}">${icon("x", 16)}</button>
+        </article>`).join("")}</div>
+    </div>`).join("");
+  return renderShell(`
+    <section class="topbar work-topbar">
+      <div><p class="section-kicker">最近打开过的作品</p><h1>浏览历史</h1></div>
+      <div class="topbar-actions"><button class="quiet-button" data-action="clear-history" ${state.history.length ? "" : "disabled"}>清空历史</button></div>
+    </section>
+    <section class="library-content">
+      <div class="library-tools">
+        <label class="search-field"><span>${icon("search", 19)}</span><input id="history-search" type="search" placeholder="搜索标题或标签" value="${escapeHtml(state.historyQuery)}" autocomplete="off"></label>
+      </div>
+      <div class="read-only-note">打开作品或阅读版时自动记一笔，最多保留最近 500 条。不想记可以去「设置 → 6 维护与数据 → 浏览历史」关掉。</div>
+      ${body || `<div class="empty-state works-empty"><h2>${state.historyQuery ? "没有匹配的记录" : "还没有浏览记录"}</h2><p>打开任意作品后，这里会按时间排出来。</p></div>`}
+    </section>`);
+}
+
+/* ============================ 收藏夹选择器 ============================ */
+
+/** 弹窗正文单独抽出来：勾选后只换这一块，不重开弹窗（重开会把滚动位置丢掉） */
+function collectionPickerBody() {
+  const selected = new Set(state.pickerSelected);
+  const rows = state.collections.map((collection) => `
+    <button class="picker-row ${selected.has(collection.id) ? "is-selected" : ""}" data-action="picker-toggle" data-collection-id="${collection.id}">
+      <span class="picker-check">${selected.has(collection.id) ? icon("check", 15) : ""}</span>
+      <span class="picker-name">${escapeHtml(collection.name)}</span>
+      <small>${collection.workCount} 篇</small>
+    </button>`).join("");
+  return `
+    <div class="picker-list">${rows || '<p class="match-note">还没有收藏夹，在下面建一个。</p>'}</div>
+    <div class="picker-new">
+      <input id="picker-new-name" placeholder="新建收藏夹，输入名字后回车" autocomplete="off">
+      <button class="quiet-button" data-action="picker-create">${icon("plus", 16)}新建</button>
+    </div>`;
+}
+
+function refreshPickerDom() {
+  const holder = document.querySelector("#collection-picker-body");
+  if (!holder) return;
+  holder.innerHTML = collectionPickerBody();
+  bindEvents();
+}
+
+async function openCollectionPicker(workId) {
+  state.pickerWorkId = workId;
+  state.pickerSelected = await invoke("work_collections", { workId });
+  showModal(modal("收藏到…", `<div id="collection-picker-body">${collectionPickerBody()}</div>`, `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="picker-save">确定</button>`));
+}
+
+/** 新建 / 重命名收藏夹共用的「输个名字」弹窗 */
+function collectionNameModal(mode, collectionId = 0, currentName = "") {
+  const creating = mode === "create";
+  showModal(modal(creating ? "新建收藏夹" : "重命名收藏夹",
+    `<div class="form-stack"><label>收藏夹名字 <input id="collection-name-input" maxlength="24" value="${escapeHtml(currentName)}" placeholder="例如：短篇向、待读、希儿系列" autocomplete="off"></label></div><p class="match-note">最多 24 个字，同一份收藏里不能重名。</p>`,
+    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="submit-collection-name" data-mode="${mode}" data-collection-id="${collectionId}">${creating ? "创建" : "保存"}</button>`));
+  window.requestAnimationFrame(() => document.querySelector("#collection-name-input")?.focus());
+}
+
+async function submitCollectionName(mode, collectionId) {
+  const input = document.querySelector("#collection-name-input");
+  const name = (input?.value || "").trim();
+  if (!name) { toast("收藏夹名字不能为空", "error"); return; }
+  const created = mode === "create"
+    ? await invoke("create_collection", { name })
+    : await invoke("rename_collection", { id: Number(collectionId), name });
+  closeModal();
+  await refreshCollections();
+  // 从收藏夹里改的名字要同步到标题上，否则顶栏还挂着旧名字
+  if (state.activeCollection && state.activeCollection.id === Number(collectionId)) {
+    state.activeCollection = state.collections.find((item) => item.id === Number(collectionId)) || state.activeCollection;
+  }
+  render();
+  toast(mode === "create" ? `已创建收藏夹「${created?.name || name}」` : "收藏夹已重命名", "success");
+}
+
+function collectionMenu(collectionId) {
+  const collection = state.collections.find((item) => item.id === Number(collectionId));
+  if (!collection) return;
+  showModal(modal(collection.name, `<div class="menu-list"><button data-action="open-collection" data-collection-id="${collection.id}">${icon("arrow", 18)}打开收藏夹</button><button data-action="rename-collection" data-collection-id="${collection.id}">${icon("settings", 18)}重命名</button><button class="menu-danger" data-action="delete-collection" data-collection-id="${collection.id}">${icon("more", 18)}删除收藏夹</button></div>`));
+}
+
+function deleteCollection(collectionId) {
+  const collection = state.collections.find((item) => item.id === Number(collectionId));
+  if (!collection) return;
+  confirmAction("删除收藏夹", `确定删除「${collection.name}」吗？夹子里的 ${collection.workCount} 篇作品不会被删除，只是不再属于这个收藏夹。`, "删除", async () => {
+    await invoke("delete_collection", { id: collection.id });
+    if (state.activeCollection?.id === collection.id) state.activeCollection = null;
+    await refreshCollections();
+    if (state.activeCollection) await refreshCollectionWorks();
+    render();
+    toast("收藏夹已删除", "success");
+  });
+}
+
+function clearHistory() {
+  if (!state.history.length) return;
+  confirmAction("清空浏览历史", `确定清空全部 ${state.history.length} 条浏览记录吗？这不影响作品本身。`, "清空", async () => {
+    await invoke("clear_history");
+    await refreshHistory();
+    render();
+    toast("浏览历史已清空", "success");
+  });
 }
 
 function renderSeriesWorkCards(works) {
@@ -1275,7 +1568,7 @@ function workMenu(work) {
   // 三个下载按钮都从 Pixiv 重抓最新正文，抓完都**把作品绑定到新文件上**（原来在哪一侧就还留在哪一侧）：
   // HTML / EPUB 出阅读版，txt 出纯文本（正文里的插图写成 `[插图 N：xxx_images/001.jpg]` 指引）
   const download = work.pixivNovelId ? `<button data-action="download-reading" data-work-id="${work.id}" data-format="html">${icon("file", 18)}重新下载 HTML 版并绑定</button><button data-action="download-reading" data-work-id="${work.id}" data-format="epub">${icon("file", 18)}重新下载 EPUB 版并绑定</button><button data-action="redownload-txt" data-work-id="${work.id}">${icon("file", 18)}重新下载 TXT 版并绑定</button>` : "";
-  showModal(modal(work.title, `<div class="menu-list"><button data-action="open-work" data-work-id="${work.id}">${icon("arrow", 18)}打开${work.purchasedPath ? "完整版" : "预览版"}</button><button data-action="open-work-directory" data-work-id="${work.id}">${icon("folder", 18)}打开本地目录</button>${reading}${download}<button data-action="bind-work-file" data-work-id="${work.id}">${icon("folder", 18)}绑定完整版文件</button><button data-action="set-work-version" data-work-id="${work.id}" data-as-full="${work.purchasedPath ? "0" : "1"}">${icon(work.purchasedPath ? "file" : "check", 18)}${work.purchasedPath ? "设为预览版" : "设为完整版"}</button><button data-action="edit-tags" data-work-id="${work.id}">${icon("tag", 18)}编辑标签</button><button data-action="toggle-favorite" data-work-id="${work.id}">${icon("heart", 18)}${work.favorite ? "取消收藏" : "收藏"}</button><button data-action="toggle-has-images" data-work-id="${work.id}">${icon("image", 18)}${work.hasImages ? "取消带图版" : "设为带图版"}</button><button class="menu-danger" data-action="delete-work" data-work-id="${work.id}">${icon("more", 18)}删除作品</button></div>`));
+  showModal(modal(work.title, `<div class="menu-list"><button data-action="open-work" data-work-id="${work.id}">${icon("arrow", 18)}打开${work.purchasedPath ? "完整版" : "预览版"}</button><button data-action="open-work-directory" data-work-id="${work.id}">${icon("folder", 18)}打开本地目录</button>${reading}${download}<button data-action="bind-work-file" data-work-id="${work.id}">${icon("folder", 18)}绑定完整版文件</button><button data-action="set-work-version" data-work-id="${work.id}" data-as-full="${work.purchasedPath ? "0" : "1"}">${icon(work.purchasedPath ? "file" : "check", 18)}${work.purchasedPath ? "设为预览版" : "设为完整版"}</button><button data-action="edit-tags" data-work-id="${work.id}">${icon("tag", 18)}编辑标签</button><button data-action="pick-collection" data-work-id="${work.id}">${icon("heart", 18)}${work.favorite ? "调整收藏夹…" : "收藏到…"}</button><button data-action="toggle-has-images" data-work-id="${work.id}">${icon("image", 18)}${work.hasImages ? "取消带图版" : "设为带图版"}</button><button class="menu-danger" data-action="delete-work" data-work-id="${work.id}">${icon("more", 18)}删除作品</button></div>`));
 }
 
 function editTagsModal(workId, tags = null) {
@@ -1468,6 +1761,61 @@ async function bindEvents() {
       await commitWorkSearch(event.currentTarget.value);
     };
   }
+  // 收藏夹与浏览历史的搜索框：跟作品库同一套路子，中文输入法期间不重绘
+  const collectionSearch = app.querySelector("#collection-search");
+  if (collectionSearch) {
+    collectionSearch.oncompositionstart = () => { collectionSearch.dataset.composing = "true"; };
+    const commitCollectionSearch = async (query) => {
+      state.collectionQuery = query;
+      await refreshCollectionWorks();
+      if (state.collectionQuery !== query) return;
+      render();
+      restoreSearchFocus("collection-search");
+    };
+    collectionSearch.oncompositionend = (event) => {
+      delete collectionSearch.dataset.composing;
+      collectionSearch.dataset.skipNextInput = "true";
+      commitCollectionSearch(event.target.value);
+    };
+    collectionSearch.oninput = async (event) => {
+      if (event.isComposing || collectionSearch.dataset.composing) return;
+      if (collectionSearch.dataset.skipNextInput) { delete collectionSearch.dataset.skipNextInput; return; }
+      await commitCollectionSearch(event.target.value);
+    };
+    collectionSearch.onkeydown = async (event) => {
+      if (event.key !== "Enter" || event.isComposing || collectionSearch.dataset.composing) return;
+      event.preventDefault();
+      await commitCollectionSearch(event.currentTarget.value);
+    };
+  }
+  const collectionSort = app.querySelector("#collection-sort");
+  if (collectionSort) collectionSort.onchange = async (event) => { state.collectionSort = event.target.value; await refreshCollectionWorks(); render(); };
+  const historySearch = app.querySelector("#history-search");
+  if (historySearch) {
+    historySearch.oncompositionstart = () => { historySearch.dataset.composing = "true"; };
+    const commitHistorySearch = async (query) => {
+      state.historyQuery = query;
+      await refreshHistory();
+      if (state.historyQuery !== query) return;
+      render();
+      restoreSearchFocus("history-search");
+    };
+    historySearch.oncompositionend = (event) => {
+      delete historySearch.dataset.composing;
+      historySearch.dataset.skipNextInput = "true";
+      commitHistorySearch(event.target.value);
+    };
+    historySearch.oninput = async (event) => {
+      if (event.isComposing || historySearch.dataset.composing) return;
+      if (historySearch.dataset.skipNextInput) { delete historySearch.dataset.skipNextInput; return; }
+      await commitHistorySearch(event.target.value);
+    };
+    historySearch.onkeydown = async (event) => {
+      if (event.key !== "Enter" || event.isComposing || historySearch.dataset.composing) return;
+      event.preventDefault();
+      await commitHistorySearch(event.currentTarget.value);
+    };
+  }
   const sortSelect = app.querySelector("#sort-select");
   if (sortSelect) sortSelect.onchange = async (event) => { state.sort = event.target.value; if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); };
   const searchField = app.querySelector("#search-field");
@@ -1491,7 +1839,7 @@ async function bindEvents() {
       if (action === "sync-author-profile") await syncAuthorProfile();
       if (action === "sync-all-authors") await syncAllAuthors();
       if (action === "close-modal") closeModal();
-      if (action === "status") { state.status = status; if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); }
+      if (action === "status") { state.status = status; if (state.homeView === "collections" && !state.activeAuthor) await refreshCollectionWorks(); else if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); }
       if (action === "favorites-only") { if (state.homeView === "allWorks" && !state.activeAuthor) { state.allWorksFavoritesOnly = !state.allWorksFavoritesOnly; await refreshAllWorks(); } else { state.authorFavoritesOnly = !state.authorFavoritesOnly; await refreshWorks(); } render(); }
       if (action === "images-only") { if (state.homeView === "allWorks" && !state.activeAuthor) { state.allWorksImagesOnly = !state.allWorksImagesOnly; await refreshAllWorks(); } else { state.authorImagesOnly = !state.authorImagesOnly; await refreshWorks(); } render(); }
       if (action === "serial-latest") { state.serialLatestOnly = !state.serialLatestOnly; render(); }
@@ -1542,7 +1890,55 @@ async function bindEvents() {
       if (action === "remove-tag") removeEditingTag(Number(element.dataset.index));
       if (action === "remove-author-alias") removeAuthorAlias(Number(element.dataset.index));
       if (action === "save-tags") await saveTags(Number(workId));
-      if (action === "toggle-favorite") { await invoke("toggle_favorite", { workId: Number(workId) }); closeModal(); await refreshAfterWorkFlagChange(); }
+      if (action === "pick-collection") { closeModal(); await openCollectionPicker(Number(workId)); }
+      if (action === "go-collections") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "collections"; state.seriesView = null; state.seriesItems = []; state.activeCollection = null; state.collectionQuery = ""; await refreshCollections(); render(); }
+      if (action === "go-history") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "history"; state.seriesView = null; state.seriesItems = []; state.historyQuery = ""; await refreshHistory(); render(); }
+      if (action === "open-collection") { const collection = state.collections.find((item) => item.id === Number(element.dataset.collectionId)); if (!collection) { toast("这个收藏夹已经不在了，刷新一下", "error"); return; } closeModal(); state.activeCollection = collection; state.collectionQuery = ""; await refreshCollectionWorks(); render(); }
+      if (action === "back-to-collections") { state.activeCollection = null; state.collectionQuery = ""; state.collectionImagesOnly = false; await refreshCollections(); render(); }
+      if (action === "collection-menu") { closeModal(); collectionMenu(element.dataset.collectionId); }
+      if (action === "create-collection") { closeModal(); collectionNameModal("create"); }
+      if (action === "rename-collection") {
+        const collection = state.collections.find((item) => item.id === Number(element.dataset.collectionId));
+        if (!collection) { toast("这个收藏夹已经不在了，刷新一下", "error"); return; }
+        closeModal(); collectionNameModal("rename", collection.id, collection.name);
+      }
+      if (action === "delete-collection") { closeModal(); await deleteCollection(element.dataset.collectionId); }
+      if (action === "submit-collection-name") { await submitCollectionName(element.dataset.mode, element.dataset.collectionId); }
+      if (action === "picker-toggle") {
+        const id = Number(element.dataset.collectionId);
+        state.pickerSelected = state.pickerSelected.includes(id) ? state.pickerSelected.filter((item) => item !== id) : [...state.pickerSelected, id];
+        refreshPickerDom();
+      }
+      if (action === "picker-create") {
+        const input = document.querySelector("#picker-new-name");
+        const name = (input?.value || "").trim();
+        if (!name) { toast("先给收藏夹起个名字", "error"); input?.focus(); return; }
+        const created = await invoke("create_collection", { name });
+        await refreshCollections();
+        state.pickerSelected = [...state.pickerSelected, created.id];
+        refreshPickerDom();
+      }
+      if (action === "picker-save") {
+        await invoke("set_work_collections", { workId: Number(state.pickerWorkId), collectionIds: state.pickerSelected });
+        closeModal();
+        await refreshAfterWorkFlagChange();
+        toast(state.pickerSelected.length ? "已更新收藏夹" : "已从所有收藏夹移除", "success");
+        state.pickerWorkId = null;
+        state.pickerSelected = [];
+        return;
+      }
+      if (action === "collection-images-only") { state.collectionImagesOnly = !state.collectionImagesOnly; await refreshCollectionWorks(); render(); }
+      if (action === "open-history-work") { await invoke("open_work", { workId: Number(workId) }); await refreshHistory(); render(); }
+      if (action === "remove-history") { await invoke("remove_history", { workId: Number(workId) }); await refreshHistory(); render(); }
+      if (action === "clear-history") { await clearHistory(); }
+      // 设置面板里清历史：二次确认弹窗叠在设置上面，别把设置一起关掉（keepOpen）
+      if (action === "clear-history-settings") {
+        confirmAction("清空浏览历史", "确定清空全部浏览记录吗？这不影响作品本身。", "清空", async () => {
+          await invoke("clear_history");
+          await refreshHistory();
+          toast("浏览历史已清空", "success");
+        }, true);
+      }
       if (action === "toggle-has-images") { await invoke("toggle_has_images", { workId: Number(workId) }); await refreshAfterWorkFlagChange(); }
       if (action === "toggle-select") toggleWorkSelection(Number(workId));
       if (action === "bulk-mode") toggleBulkMode();
@@ -2827,6 +3223,8 @@ function collectSettings(form) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+  // 浏览历史：只是勾选框，FormData 拿不到未勾选的状态
+  values.recordHistory = Boolean(form.querySelector('[name="recordHistory"]')?.checked);
   return values;
 }
 
@@ -2942,6 +3340,12 @@ async function settingsModal() {
         <div class="settings-button-row"><button type="button" class="quiet-button" data-action="check-update">检查更新</button><button type="button" class="quiet-button" data-action="open-release-page">打开发布页</button></div>
         <label class="check-row"><input name="autoCheckUpdate" type="checkbox" ${settings.autoCheckUpdate === false ? "" : "checked"}><span>启动时自动检查新版本</span><small>关掉之后程序不会主动联网查版本，想更新时点上面的「检查更新」。</small></label>
         <label>更新加速镜像 <textarea name="updateMirrors" rows="4" placeholder="https://ghproxy.net/">${escapeHtml((settings.updateMirrors || []).join("\n"))}</textarea><button type="button" class="quiet-button" data-action="reset-update-mirrors">恢复默认</button><small>一行一个。直连 GitHub 失败后按这里的顺序重试（地址会直接接在 <code>https://github.com/...</code> 前面）。镜像失效时自己换一个即可，不用等新版。</small></label>
+      </div>
+      <div class="form-field update-setting">
+        <div class="char-setting-head"><span class="field-title">浏览历史</span><span class="settings-group-hint">最多 500 条</span></div>
+        <small>打开作品或阅读版时自动记一笔，按时间倒序排在左侧栏的「浏览历史」里。</small>
+        <label class="check-row"><input name="recordHistory" type="checkbox" ${settings.recordHistory === false ? "" : "checked"}><span>记录浏览历史</span><small>关掉之后不再新增记录，已有的记录留着，随时可以手动清空。</small></label>
+        <div class="settings-button-row"><button type="button" class="quiet-button" data-action="clear-history-settings">清空浏览历史</button></div>
       </div>
     </div>
     <p class="settings-note">下面这些操作点下去立刻执行，跟自动保存无关。</p>

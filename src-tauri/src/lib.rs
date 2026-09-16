@@ -103,6 +103,27 @@ struct SeriesSummary {
     max_order: i64,
 }
 
+/// 「我的收藏」页上的一个收藏夹卡片。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionSummary {
+    id: i64,
+    name: String,
+    work_count: i64,
+    /// 拿这个夹子里最新那篇的封面当卡片图，空夹子就是空字符串
+    cover_path: String,
+    created_at: String,
+}
+
+/// 「浏览历史」页的一行：作品本身 + 什么时候看的、看了几次。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryEntry {
+    work: Work,
+    viewed_at: String,
+    view_count: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PixivAuthorProfile {
@@ -321,6 +342,9 @@ struct AppSettings {
     /// GitHub 加速镜像（直连失败后按顺序试）。用户可以自己增删，镜像挂了不用等发新版。
     #[serde(default = "default_update_mirrors")]
     update_mirrors: Vec<String>,
+    /// 打开作品 / 阅读版时是否记一笔浏览历史。
+    #[serde(default = "default_true")]
+    record_history: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -381,6 +405,41 @@ fn app_data_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// 老库里 `works.favorite=1` 的作品，升级时统一收进这个收藏夹（v1.1.0）。
+const DEFAULT_COLLECTION_NAME: &str = "我的收藏";
+
+/// 浏览历史最多留多少条：超了就按时间从旧到新丢掉尾巴。
+const HISTORY_LIMIT: i64 = 500;
+
+/// v1.1.0 把「收藏」升级成「收藏夹」：老库里 `works.favorite=1` 的作品全部收进一个
+/// 默认收藏夹，升级后「我的收藏」才不是空的。用 app_settings 的标记位保证只跑一次 ——
+/// **不能**改成「collections 表为空就迁」：用户把夹子删空了，下次启动不该又被塞回来。
+fn migrate_favorites_into_collections(conn: &Connection) -> Result<(), String> {
+    if setting(conn, "collections_migrated")? == "1" {
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (name, sort_order, created_at) VALUES (?1, 0, ?2)",
+        params![DEFAULT_COLLECTION_NAME, now],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO collection_works (collection_id, work_id, added_at)
+         SELECT c.id, w.id, ?2 FROM collections c, works w
+         WHERE c.name = ?1 AND w.favorite = 1",
+        params![DEFAULT_COLLECTION_NAME, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('collections_migrated', '1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn db() -> Result<Connection, String> {
     let path = app_data_dir()?.join("library.db");
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
@@ -428,7 +487,25 @@ fn db() -> Result<Connection, String> {
         CREATE TABLE IF NOT EXISTS app_settings (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL DEFAULT ''
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS collections (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS collection_works (
+          collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+          work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+          added_at TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY (collection_id, work_id)
+        );
+        CREATE TABLE IF NOT EXISTS work_history (
+          work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
+          viewed_at TEXT NOT NULL DEFAULT '',
+          view_count INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS work_history_viewed_at ON work_history(viewed_at DESC);",
     )
     .map_err(|e| e.to_string())?;
     // Older portable libraries do not have this per-author setting yet.
@@ -490,6 +567,9 @@ fn db() -> Result<Connection, String> {
         [],
     );
     let _ = conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS works_author_pixiv_novel_id ON works(author_id, pixiv_novel_id) WHERE pixiv_novel_id <> ''", []);
+    // 收藏 → 收藏夹（v1.1.0）：老库里 `works.favorite=1` 的作品统一收进一个默认收藏夹，
+    // 这样升级后「我的收藏」不会是空的。
+    let _ = migrate_favorites_into_collections(&conn);
     // 常见角色名表：用于「按角色匹配」的自动分组 / 关联完整版文件。
     // game 只用来分组展示，不参与匹配；name 与 aliases（`|` 分隔）都会拿去匹配。
     let _ = conn.execute(
@@ -1021,6 +1101,10 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
             value => value == "1",
         },
         update_mirrors: read_update_mirrors(conn)?,
+        record_history: match setting(conn, "record_history")?.as_str() {
+            "" => true,
+            value => value == "1",
+        },
     })
 }
 
@@ -1552,6 +1636,14 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
         (
             "update_mirrors",
             serde_json::to_string(&settings.update_mirrors).map_err(|e| e.to_string())?,
+        ),
+        (
+            "record_history",
+            if settings.record_history {
+                "1".into()
+            } else {
+                "0".into()
+            },
         ),
     ];
     for (key, value) in values {
@@ -6541,7 +6633,10 @@ fn open_work_reading(work_id: i64) -> Result<(), String> {
             continue;
         }
         return match open::that(&candidate) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                let _ = record_history(&conn, work_id);
+                Ok(())
+            }
             // EPUB 不一定有默认阅读器，别报一句看不懂的错误
             Err(_) if format == ReadingFormat::Epub => Err(format!(
                 "已经生成好 EPUB，但系统里没有默认打开它的程序，请手动打开：{}",
@@ -6576,13 +6671,308 @@ fn delete_works(work_ids: Vec<i64>) -> Result<(), String> {
     Ok(())
 }
 
+// ============================ 收藏夹与浏览历史（v1.1.0） ============================
+
+/// 收藏夹名字：去掉首尾空白、不许空、给个长度上限（侧栏卡片放不下太长的）。
+fn clean_collection_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("收藏夹名字不能为空".into());
+    }
+    if name.chars().count() > 24 {
+        return Err("收藏夹名字最多 24 个字".into());
+    }
+    Ok(name.to_string())
+}
+
+/// `works.favorite` 是「在任意收藏夹里」的缓存位：作者卡上的收藏数、各页的
+/// 「仅看收藏」筛选都还读它，所以每次动过收藏夹成员都要回写一次。
+fn sync_work_favorite(conn: &Connection, work_id: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE works SET favorite = (SELECT COUNT(*) FROM collection_works WHERE work_id=?1) > 0 WHERE id=?1",
+        [work_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn collection_summary(conn: &Connection, id: i64) -> Result<CollectionSummary, String> {
+    conn.query_row(
+        "SELECT c.id, c.name, c.created_at,
+                (SELECT COUNT(*) FROM collection_works cw WHERE cw.collection_id = c.id),
+                COALESCE((SELECT w.cover_path FROM collection_works cw JOIN works w ON w.id = cw.work_id
+                          WHERE cw.collection_id = c.id AND w.cover_path <> ''
+                          ORDER BY cw.added_at DESC LIMIT 1), '')
+         FROM collections c WHERE c.id = ?1",
+        [id],
+        |row| {
+            Ok(CollectionSummary {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                work_count: row.get(3)?,
+                cover_path: row.get(4)?,
+            })
+        },
+    )
+    .map_err(|e| format!("没找到这个收藏夹：{e}"))
+}
+
+const COLLECTION_SELECT: &str = "SELECT c.id, c.name, c.created_at,
+    (SELECT COUNT(*) FROM collection_works cw WHERE cw.collection_id = c.id),
+    COALESCE((SELECT w.cover_path FROM collection_works cw JOIN works w ON w.id = cw.work_id
+              WHERE cw.collection_id = c.id AND w.cover_path <> ''
+              ORDER BY cw.added_at DESC LIMIT 1), '')
+ FROM collections c";
+
+fn map_collection(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionSummary> {
+    Ok(CollectionSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        work_count: row.get(3)?,
+        cover_path: row.get(4)?,
+    })
+}
+
 #[tauri::command]
-fn toggle_favorite(work_id: i64) -> Result<(), String> {
-    db()?
-        .execute(
-            "UPDATE works SET favorite = CASE favorite WHEN 1 THEN 0 ELSE 1 END WHERE id=?1",
-            [work_id],
+fn list_collections() -> Result<Vec<CollectionSummary>, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare(&format!(
+            "{COLLECTION_SELECT} ORDER BY c.sort_order ASC, c.id ASC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], map_collection)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_collection(name: String) -> Result<CollectionSummary, String> {
+    let name = clean_collection_name(&name)?;
+    let conn = db()?;
+    let used: i64 = conn
+        .query_row("SELECT COUNT(*) FROM collections WHERE name=?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    if used > 0 {
+        return Err(format!("已经有一个叫「{name}」的收藏夹了"));
+    }
+    let order: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM collections",
+            [],
+            |row| row.get(0),
         )
+        .unwrap_or(1);
+    conn.execute(
+        "INSERT INTO collections (name, sort_order, created_at) VALUES (?1, ?2, ?3)",
+        params![name, order, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    collection_summary(&conn, conn.last_insert_rowid())
+}
+
+#[tauri::command]
+fn rename_collection(id: i64, name: String) -> Result<CollectionSummary, String> {
+    let name = clean_collection_name(&name)?;
+    let conn = db()?;
+    let used: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM collections WHERE name=?1 AND id<>?2",
+            params![name, id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if used > 0 {
+        return Err(format!("已经有一个叫「{name}」的收藏夹了"));
+    }
+    conn.execute(
+        "UPDATE collections SET name=?1 WHERE id=?2",
+        params![name, id],
+    )
+    .map_err(|e| e.to_string())?;
+    collection_summary(&conn, id)
+}
+
+#[tauri::command]
+fn delete_collection(id: i64) -> Result<(), String> {
+    let conn = db()?;
+    // 先记下夹子里的作品：删完要回写它们的 favorite 缓存位
+    let mut statement = conn
+        .prepare("SELECT work_id FROM collection_works WHERE collection_id=?1")
+        .map_err(|e| e.to_string())?;
+    let work_ids = statement
+        .query_map([id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM collections WHERE id=?1", [id])
+        .map_err(|e| e.to_string())?;
+    for work_id in work_ids {
+        sync_work_favorite(&conn, work_id)?;
+    }
+    Ok(())
+}
+
+/// 这篇作品现在在哪几个收藏夹里（弹窗里勾选状态就靠它）。
+#[tauri::command]
+fn work_collections(work_id: i64) -> Result<Vec<i64>, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare("SELECT collection_id FROM collection_works WHERE work_id=?1")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([work_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 一次性替换这篇作品在各收藏夹里的归属（弹窗里勾完点确定走的就是这条路）。
+#[tauri::command]
+fn set_work_collections(work_id: i64, collection_ids: Vec<i64>) -> Result<(), String> {
+    let mut conn = db()?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM collection_works WHERE work_id=?1", [work_id])
+        .map_err(|e| e.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    for collection_id in collection_ids {
+        tx.execute(
+            "INSERT OR IGNORE INTO collection_works (collection_id, work_id, added_at) VALUES (?1, ?2, ?3)",
+            params![collection_id, work_id, now],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "UPDATE works SET favorite = (SELECT COUNT(*) FROM collection_works WHERE work_id=?1) > 0 WHERE id=?1",
+        [work_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_collection_works(
+    collection_id: i64,
+    query: String,
+    search_field: String,
+    status: String,
+    images_only: bool,
+    sort: String,
+) -> Result<Vec<Work>, String> {
+    let conn = db()?;
+    let field = if search_field == "tags" {
+        "w.tags"
+    } else {
+        "w.title"
+    };
+    let mut sql = format!("SELECT w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count FROM collection_works cw JOIN works w ON w.id=cw.work_id JOIN authors a ON a.id=w.author_id WHERE cw.collection_id=?1 AND (?2='' OR {field} LIKE ?3)");
+    match status.as_str() {
+        "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
+        "unpurchased" => sql.push_str(" AND w.purchased_path = ''"),
+        _ => {}
+    }
+    if images_only {
+        sql.push_str(" AND w.has_images = 1");
+    }
+    sql.push_str(match sort.as_str() {
+        "date_asc" => " ORDER BY w.release_date ASC, w.id ASC",
+        "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
+        "date_desc" => " ORDER BY w.release_date DESC, w.id DESC",
+        // 默认按「什么时候收进来的」：收藏夹里最自然的就是新收的排前面
+        _ => " ORDER BY cw.added_at DESC, w.id DESC",
+    });
+    let raw_query = query.trim();
+    let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map(
+            params![collection_id, raw_query, format!("%{raw_query}%")],
+            map_work,
+        )
+        .map_err(|e| e.to_string())?;
+    let mut works = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for work in &mut works {
+        populate_work_display_info(work);
+    }
+    if sort == "words_desc" {
+        sort_works_by_content_size(&mut works);
+    }
+    Ok(works)
+}
+
+/// 打开作品 / 阅读版时记一笔。设置里关掉「记录浏览历史」就完全不写。
+fn record_history(conn: &Connection, work_id: i64) -> Result<(), String> {
+    if !read_settings(conn)?.record_history {
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO work_history (work_id, viewed_at, view_count) VALUES (?1, ?2, 1)
+         ON CONFLICT(work_id) DO UPDATE SET viewed_at=excluded.viewed_at, view_count=work_history.view_count + 1",
+        params![work_id, now],
+    )
+    .map_err(|e| e.to_string())?;
+    // 超出上限就从最旧的开始丢（`LIMIT -1 OFFSET n` = 取第 n 条之后的全部）
+    conn.execute(
+        "DELETE FROM work_history WHERE work_id IN (
+            SELECT work_id FROM work_history ORDER BY viewed_at DESC LIMIT -1 OFFSET ?1
+         )",
+        [HISTORY_LIMIT],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_history(query: String, limit: i64) -> Result<Vec<HistoryEntry>, String> {
+    let conn = db()?;
+    let raw_query = query.trim().to_string();
+    let limit = if limit <= 0 {
+        HISTORY_LIMIT
+    } else {
+        limit.min(HISTORY_LIMIT)
+    };
+    let mut statement = conn
+        .prepare("SELECT w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count, h.viewed_at, h.view_count FROM work_history h JOIN works w ON w.id=h.work_id JOIN authors a ON a.id=w.author_id WHERE (?1='' OR w.title LIKE ?2 OR w.tags LIKE ?2) ORDER BY h.viewed_at DESC LIMIT ?3")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map(params![raw_query, format!("%{raw_query}%"), limit], |row| {
+            Ok(HistoryEntry {
+                work: map_work(row)?,
+                viewed_at: row.get(17)?,
+                view_count: row.get(18)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut entries = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for entry in &mut entries {
+        populate_work_display_info(&mut entry.work);
+    }
+    Ok(entries)
+}
+
+#[tauri::command]
+fn clear_history() -> Result<(), String> {
+    db()?
+        .execute("DELETE FROM work_history", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_history(work_id: i64) -> Result<(), String> {
+    db()?
+        .execute("DELETE FROM work_history WHERE work_id=?1", [work_id])
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -6748,6 +7138,8 @@ fn open_work(work_id: i64) -> Result<(), String> {
     open::that(&path).map_err(|e| format!("无法打开内容：{e}"))?;
     conn.execute("UPDATE works SET is_new=0 WHERE id=?1", [work_id])
         .map_err(|e| e.to_string())?;
+    // 记浏览历史失败不该影响「文件已经打开了」这件事
+    let _ = record_history(&conn, work_id);
     Ok(())
 }
 
@@ -7873,9 +8265,18 @@ pub fn run() {
             mark_work_as_preview,
             delete_work,
             delete_works,
-            toggle_favorite,
             toggle_has_images,
             toggle_author_starred,
+            list_collections,
+            create_collection,
+            rename_collection,
+            delete_collection,
+            list_collection_works,
+            work_collections,
+            set_work_collections,
+            list_history,
+            clear_history,
+            remove_history,
             set_has_images,
             open_work,
             open_work_directory,
@@ -7937,7 +8338,7 @@ mod tests {
         novel_image_filename_extension, novel_image_refs, novel_image_url, novel_images_dir,
         count_reading_images, novel_text_path_beside,
         path_key,
-        pixiv_novel_id_from_url, pixiv_published_at, read_settings,
+        pixiv_novel_id_from_url, pixiv_published_at, read_settings, setting,
         populate_work_display_info, reading_already_bound, reading_format_of,
         reading_output_path, refresh_reading_image_count, render_novel_html,
         render_novel_xhtml, resolve_cover_path, rewrite_novel_txt,
@@ -7950,6 +8351,8 @@ mod tests {
         version_from_tag_text,
         atom_entries, atom_field, decode_entities, html_to_text, probe_release_notes, tidy_release_notes,
         synopsis_indicates_preview,
+        clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
+        HISTORY_LIMIT, migrate_favorites_into_collections,
         text_word_count, title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
@@ -9781,5 +10184,180 @@ mod tests {
         assert!(text.ends_with("…（更新说明较长，完整内容见发布页）"));
         // 短说明不该被动
         assert_eq!(tidy_release_notes("就一行"), "就一行");
+    }
+
+    /// 收藏夹与浏览历史（v1.1.0）用到的三张表 —— 跟 db() 里那段建表语句保持一致
+    fn create_collection_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+             CREATE TABLE works (
+               id INTEGER PRIMARY KEY,
+               author_id INTEGER NOT NULL DEFAULT 1,
+               title TEXT NOT NULL DEFAULT '',
+               favorite INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE collections (
+               id INTEGER PRIMARY KEY,
+               name TEXT NOT NULL UNIQUE,
+               sort_order INTEGER NOT NULL DEFAULT 0,
+               created_at TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE collection_works (
+               collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+               work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+               added_at TEXT NOT NULL DEFAULT '',
+               PRIMARY KEY (collection_id, work_id)
+             );
+             CREATE TABLE work_history (
+               work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
+               viewed_at TEXT NOT NULL DEFAULT '',
+               view_count INTEGER NOT NULL DEFAULT 1
+             );",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn collection_names_are_trimmed_and_rejected_when_unusable() {
+        assert_eq!(clean_collection_name("  短篇向 ").unwrap(), "短篇向");
+        assert!(clean_collection_name("").is_err());
+        assert!(clean_collection_name("   ").is_err());
+        // 24 个汉字可以，25 个不行（侧栏卡片放不下）
+        assert!(clean_collection_name(&"长".repeat(24)).is_ok());
+        assert!(clean_collection_name(&"长".repeat(25)).is_err());
+        assert_eq!(DEFAULT_COLLECTION_NAME, "我的收藏");
+    }
+
+    #[test]
+    fn favorite_flag_follows_collection_membership() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute("INSERT INTO works (id, title) VALUES (1, '甲'), (2, '乙')", [])
+            .unwrap();
+        conn.execute("INSERT INTO collections (id, name) VALUES (10, '我的收藏')", [])
+            .unwrap();
+        // 一开始两边都不在收藏夹里
+        sync_work_favorite(&conn, 1).unwrap();
+        assert_eq!(favorite_of(&conn, 1), 0);
+        // 加进一个夹子 → 缓存位变 1
+        conn.execute(
+            "INSERT INTO collection_works (collection_id, work_id, added_at) VALUES (10, 1, '2026-09-16T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        sync_work_favorite(&conn, 1).unwrap();
+        assert_eq!(favorite_of(&conn, 1), 1);
+        // 移出去 → 变回 0，另一篇没被牵连
+        conn.execute("DELETE FROM collection_works WHERE work_id=1", [])
+            .unwrap();
+        sync_work_favorite(&conn, 1).unwrap();
+        assert_eq!(favorite_of(&conn, 1), 0);
+        assert_eq!(favorite_of(&conn, 2), 0);
+    }
+
+    fn favorite_of(conn: &Connection, work_id: i64) -> i64 {
+        conn.query_row("SELECT favorite FROM works WHERE id=?1", [work_id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn history_keeps_the_latest_view_and_drops_the_oldest() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        for id in 1..=(HISTORY_LIMIT + 3) {
+            conn.execute("INSERT INTO works (id, title) VALUES (?1, '作品')", [id])
+                .unwrap();
+        }
+        // 时间逐条推后，保证「最旧的是 id 最小的」
+        for id in 1..=(HISTORY_LIMIT + 3) {
+            conn.execute(
+                "INSERT INTO work_history (work_id, viewed_at, view_count) VALUES (?1, ?2, 1)",
+                (id, format!("2026-09-16T00:{:02}:{:02}Z", id / 60, id % 60)),
+            )
+            .unwrap();
+        }
+        // 再看一次 id=1 的作品：应该原地更新，而不是多出一行
+        conn.execute("UPDATE work_history SET viewed_at='2026-12-31T23:59:59Z' WHERE work_id=1", [])
+            .unwrap();
+        record_history(&conn, 1).unwrap();
+        let (count, views): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(view_count) FROM work_history WHERE work_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "同一篇作品在历史里只占一行");
+        assert_eq!(views, 2, "重复看同一篇只叠次数");
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_history", [], |row| row.get(0))
+            .unwrap();
+        assert!(total <= HISTORY_LIMIT, "超出上限要丢掉最旧的：{total}");
+    }
+
+    #[test]
+    fn history_is_not_written_when_recording_is_switched_off() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('record_history', '0')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO works (id, title) VALUES (7, '作品')", [])
+            .unwrap();
+        record_history(&conn, 7).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "关掉开关后一条都不该写");
+    }
+
+    #[test]
+    fn old_favorites_are_moved_into_the_default_collection_only_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute(
+            "INSERT INTO works (id, title, favorite) VALUES (1, '收了的', 1), (2, '没收的', 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate_favorites_into_collections(&conn).unwrap();
+
+        let (id, name): (i64, String) = conn
+            .query_row("SELECT id, name FROM collections", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(name, DEFAULT_COLLECTION_NAME, "老收藏要落进默认收藏夹");
+        let moved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collection_works WHERE collection_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 1, "只搬 favorite=1 的作品，没收的不动");
+        let only: i64 = conn
+            .query_row("SELECT work_id FROM collection_works", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(only, 1);
+
+        // 标记位挡着：第二次（乃至以后每次启动）都不许再搬，否则用户删空后又被塞回来
+        conn.execute(
+            "INSERT INTO works (id, title, favorite) VALUES (3, '升级后才收的', 1)",
+            [],
+        )
+        .unwrap();
+        migrate_favorites_into_collections(&conn).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM collection_works", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "迁移只跑一次，升级后新收的作品不该被重复搬进默认夹");
+        assert_eq!(setting(&conn, "collections_migrated").unwrap(), "1");
     }
 }
