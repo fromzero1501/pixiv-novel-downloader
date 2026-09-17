@@ -654,3 +654,154 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
   .bulk-bar-group + .bulk-bar-group { padding-left: 14px; }
   .bulk-bar-group.is-danger { margin-left: 0; }
 }
+
+/* ==================== 高级筛选面板（v1.2.7） ==================== */
+.filter-panel-button.is-open { color: #1764c5; border-color: #b8d3ef; background: #fafdff; }
+.filter-count { min-width: 17px; height: 17px; display: inline-grid; place-items: center; padding: 0 4px; color: #fff; background: #176bd3; border-radius: 9px; font-size: 11px; font-style: normal; font-weight: 700; }
+.filter-panel { margin: 12px 0 6px; padding: 14px 16px; display: grid; gap: 10px; background: #fbfdff; border: 1px solid #dbe8f5; border-radius: 9px; }
+.filter-panel-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.filter-panel-label { flex: 0 0 48px; color: #7d8fa4; font-size: 12px; font-weight: 700; }
+.filter-panel .filter-group { background: #eef3f9; flex-wrap: wrap; }
+.filter-panel-foot { display: flex; align-items: center; gap: 12px; padding-top: 8px; border-top: 1px dashed #e3ecf5; }
+.filter-panel-foot .quiet-button { min-height: 30px; padding: 0 11px; font-size: 12px; }
+.filter-panel-foot span { color: #8698ad; font-size: 12px; }
+.filter-panel-note { margin: 0; color: #a8712c; font-size: 12px; }
+.filter-panel-note strong { color: #c96a34; }
+
+/* ==================== 「所有作品」瀑布流（v1.2.8） ==================== */
+.load-more-foot { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 22px 0 6px; }
+.load-more-count { color: #8698ad; font-size: 13px; }
+.load-more-count strong { color: #304966; font-weight: 700; }
+.load-more-done { color: #9db0c6; font-size: 12px; }
+/* 哨兵本身不占视觉空间，只负责「滚到这儿就该取下一批了」 */
+.load-more-sentinel { width: 100%; height: 1px; }
+
+/* ==================== 待补完整版工作台（v1.2.7） ==================== */
+/* 待补完整版第一层：一位作者一张卡。视觉上跟作者库那张卡是一路的，
+   但不复用 `.author-card` 类 —— 那个类身上挂着「点开作者作品库」的拖拽/进入逻辑。 */
+.missing-author-card { min-height: 128px; position: relative; display: flex; gap: 15px; padding: 20px; background: #fff; border: 1px solid #dce6f1; border-radius: 9px; cursor: pointer; transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
+.missing-author-card:hover, .missing-author-card:focus { transform: translateY(-2px); border-color: #9dc6f4; box-shadow: 0 12px 28px rgba(42,84,129,.12); outline: 0; }
+.missing-author-card h2 { flex: 1 1 auto; min-width: 0; margin: 2px 0 0; font-size: 17px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.missing-author-note { margin: 13px 0 0; color: #6d8097; font-size: 13px; }
+.missing-author-note strong { color: #c96a34; font-weight: 700; }
+.missing-mark { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+.missing-state { color: #8698ad; font-size: 12px; }
+/* 「3 天前处理」（v1.2.8）：标过就有，恢复未处理就没有。精确到分在 title 里 */
+.missing-time { color: #9fadbf; font-size: 12px; white-space: nowrap; }
+.missing-time::before { content: "·"; margin: 0 5px; color: #cdd8e4; }
+.chip-button { min-height: 27px; padding: 0 10px; color: #4b6487; background: #fff; border: 1px solid #dbe5f0; border-radius: 14px; font-size: 12px; font-weight: 650; }
+.chip-button:hover { color: #1764c5; border-color: #b8d3ef; background: #fafdff; }
+
+/* ==================== 系列连续读（v1.2.7） ==================== */
+.series-progress { color: #5b7799; font-size: 13px; font-weight: 650; }
+.series-read { margin: 5px 0 0; color: #2f7a5c; font-size: 12px; font-weight: 650; }
+.primary-button[disabled] { opacity: .5; cursor: not-allowed; box-shadow: none; }
+
+/* ==================== 批量设评分（v1.2.7） ==================== */
+.rating-choices { display: grid; gap: 8px; margin-top: 4px; }
+.rating-choice { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 14px; color: #bda263; background: #fffdf6; border: 1px solid #efe3c8; border-radius: 8px; }
+.rating-choice:hover { border-color: #e6c76f; background: #fff9e8; }
+.rating-choice span { color: #6b7d92; font-size: 13px; font-weight: 650; }
+
+/* ==================== 自动备份（v1.2.7） ==================== */
+.backup-list { margin: 4px 0 0; }
+.backup-rows { display: grid; gap: 6px; }
+.backup-row { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: #f7faff; border: 1px solid #e4ecf5; border-radius: 7px; font-size: 13px; }
+.backup-time { color: #3d566f; font-weight: 650; }
+.backup-size { color: #8698ad; font-size: 12px; }
+.backup-row .quiet-button { margin-left: auto; min-height: 28px; padding: 0 10px; font-size: 12px; }
+
+/* ===== 一键标「已读」+ 系列缺篇 + 筛选模板（v1.2.9）===== */
+
+/* 封面左下角的一键标已读。平时压着封面会挡画面，所以只在悬停和「已读」时露出来；
+   已读时给它一点绿，扫一眼就知道哪些标过了 */
+.read-toggle { position: absolute; left: 9px; bottom: 9px; display: inline-flex; align-items: center; gap: 4px; height: 27px; padding: 0 10px 0 8px; color: #405d7b; background: rgba(255,255,255,.92); border: 1px solid rgba(255,255,255,.9); border-radius: 999px; font-size: 11px; font-weight: 700; opacity: 0; transition: opacity .15s ease, background .15s ease; }
+.read-toggle svg { fill: none; }
+.work-cover:hover .read-toggle, .work-card:focus-within .read-toggle { opacity: 1; }
+.read-toggle:hover { color: #1b65bf; background: #fff; border-color: #a7c9ef; }
+.read-toggle.is-read { opacity: 1; color: #fff; background: #2f9a72; border-color: #2f9a72; }
+.read-toggle.is-read:hover { background: #268663; border-color: #268663; }
+/* 批量标记模式下卡片整块可点，别让标已读按钮抢事件 */
+.is-selecting .read-toggle { display: none; }
+
+/* 系列缺篇提示。顶栏一个胶囊、总览卡片上一行小字，两处共用同一套配色 */
+.series-gap { display: inline-flex; align-items: center; gap: 5px; padding: 4px 11px; color: #96601a; background: #fdf5e6; border: 1px solid #f0dcb4; border-radius: 999px; font-size: 12px; font-weight: 650; }
+.series-gap-line { display: flex; align-items: center; gap: 4px; margin: 5px 0 0; color: #96601a; font-size: 12px; font-weight: 650; }
+
+/* 筛选模板列表 */
+.filter-view-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; min-height: 200px; align-content: start; }
+.filter-view-card { display: flex; flex-direction: column; background: #fff; border: 1px solid #dce6f1; border-radius: 9px; overflow: hidden; transition: border-color .18s ease, box-shadow .18s ease; }
+.filter-view-card:hover { border-color: #9dc6f4; box-shadow: 0 12px 28px rgba(42,84,129,.12); }
+.filter-view-open { flex: 1; padding: 16px 17px 12px; text-align: left; color: inherit; background: transparent; border: 0; cursor: pointer; }
+.filter-view-copy { display: grid; gap: 6px; }
+.filter-view-copy h2 { margin: 0; color: #25496f; font-size: 16px; line-height: 1.35; }
+.filter-view-copy p { margin: 0; color: #6c8394; font-size: 12.5px; line-height: 1.6; }
+.filter-view-count { color: #1b65bf; font-size: 12px; font-weight: 700; }
+.filter-view-actions { display: flex; gap: 7px; padding: 10px 14px; border-top: 1px solid #eef3f9; background: #fafcff; }
+.filter-view-actions .quiet-button { min-height: 30px; padding: 0 10px; font-size: 12px; }
+.filter-view-actions .quiet-button:first-child { margin-right: auto; }
+.filter-view-actions .danger-text { color: #a8443c; }
+.filter-view-actions .danger-text:hover { background: #fbeceb; border-color: #e8bab5; }
+
+/* ======================== 正文搜索（v1.2.11） ======================== */
+.text-search-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+/* 输入框和它下面的历史下拉要共用一个定位上下文，所以多包了一层（v1.2.15） */
+.text-search-field { position: relative; flex: 1 1 auto; min-width: 0; }
+.text-search-bar .search-field { width: 100%; max-width: none; height: 50px; }
+.text-search-bar .search-field input { font-size: 16px; }
+.text-search-history { position: absolute; z-index: 30; top: calc(100% + 6px); left: 0; right: 0; padding: 8px; background: #fff; border: 1px solid #d8e3ef; border-radius: 10px; box-shadow: 0 14px 30px rgba(35,68,110,.16); }
+.text-search-history-head { display: flex; align-items: center; justify-content: space-between; padding: 1px 6px 7px; color: #7b8ea4; font-size: 12px; font-weight: 650; }
+.text-search-history ul { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; max-height: 264px; list-style: none; overflow: auto; }
+.text-search-history li { display: flex; align-items: stretch; gap: 3px; }
+.text-search-history-item { flex: 1 1 auto; min-width: 0; padding: 7px 9px; overflow: hidden; color: #2a3d55; font-size: 13px; text-align: left; white-space: nowrap; text-overflow: ellipsis; background: transparent; border: 0; border-radius: 6px; cursor: pointer; }
+.text-search-history-item:hover { color: #1764c5; background: #eef5ff; }
+.text-search-history-del { flex: 0 0 27px; width: 27px; color: #a8b6c6; background: transparent; border: 0; border-radius: 6px; cursor: pointer; }
+.text-search-history-del:hover { color: #d94162; background: #fff3f6; }
+.text-search-section { margin-top: 28px; }
+.text-search-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; margin: 0 0 12px; }
+.text-search-heading h2 { margin: 0; font-size: 20px; line-height: 1.3; }
+/* 命中篇数用强调色，是整块里最先要看到的信息 */
+.text-search-heading h2 em { font-style: normal; color: #176bd3; font-size: 22px; font-weight: 800; }
+.text-search-stats { flex: 0 0 auto; color: #7c90a8; font-size: 13px; }
+.text-search-progress { margin-top: 26px; display: flex; align-items: center; gap: 10px; color: #4a6b93; font-size: 14px; }
+.text-search-progress svg { animation: text-search-spin 1.1s linear infinite; color: #176bd3; }
+@keyframes text-search-spin { to { transform: rotate(360deg); } }
+/* 命中片段：挂在作品卡的标签下面，所以字号比卡片正文再小一档 */
+.text-hit-snippets { margin-top: 10px; display: grid; gap: 6px; }
+.text-snippet { margin: 0; color: #506888; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.text-snippet mark { background: #fff1b3; color: #6b4a00; padding: 0 2px; border-radius: 3px; font-weight: 700; }
+.text-hit-count { color: #7c90a8; font-size: 12px; }
+
+/* ---------------------------------------------------------------------------
+ * 键盘快捷键说明弹窗（v1.2.12）：按 ? 弹出来的那份
+ * 左边一列键帽、右边说明 + 作用范围，扫一眼就知道哪个键在哪能用
+ * ------------------------------------------------------------------------- */
+.shortcut-note { margin: 0 0 14px; color: #5c7490; font-size: 13px; line-height: 1.7; }
+.shortcut-list { display: grid; gap: 2px; }
+.shortcut-row { display: grid; grid-template-columns: 132px minmax(0, 1fr); align-items: baseline; gap: 12px; padding: 9px 4px; border-bottom: 1px solid #eef2f7; }
+.shortcut-row:last-child { border-bottom: 0; }
+.shortcut-row kbd { color: #2c4a6b; background: #f4f7fb; border: 1px solid #dbe4ee; border-bottom-width: 2px; border-radius: 5px; padding: 3px 7px; font-family: inherit; font-size: 12px; font-weight: 650; text-align: center; white-space: nowrap; }
+.shortcut-row p { margin: 0; color: #37516f; font-size: 13px; line-height: 1.6; }
+.shortcut-row small { color: #8b9cb1; font-size: 12px; }
+
+/* ---------------------------------------------------------------------------
+ * 面板里那一串「已存模板」（v1.2.13）：点一下就把那套条件套上
+ * 尾巴上还有一句说明，所以这行要能换行 —— 模板多了不至于把说明挤没
+ * ------------------------------------------------------------------------- */
+.filter-panel-foot { flex-wrap: wrap; }
+.filter-template-list { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.filter-template-list .filter-template-label { flex: 0 0 auto; color: #a8b6c6; font-size: 12px; }
+.filter-template-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 168px; min-height: 26px; padding: 0 9px; color: #2c4a6b; background: #fff; border: 1px solid #dbe4ee; border-radius: 999px; font-family: inherit; font-size: 12px; cursor: pointer; }
+.filter-template-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; font-size: inherit; }
+.filter-template-chip svg { flex: 0 0 auto; color: #c9a63c; }
+.filter-template-chip:hover { color: #1764c5; border-color: #9dc3e8; background: #f5faff; }
+
+/* ---------------------------------------------------------------------------
+ * 设置里的「测试 Cookie」（v1.2.15）：按钮 + 一行结果
+ * 结果那行字数不定（可能是一句「网络连不上」），所以要能换行、别把按钮挤变形
+ * ------------------------------------------------------------------------- */
+.cookie-probe { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cookie-probe-result { min-width: 0; font-size: 12.5px; line-height: 1.5; }
+.cookie-probe-result.is-pending { color: #7b8ea4; }
+.cookie-probe-result.is-ok { color: #1c7a4a; }
+.cookie-probe-result.is-bad { color: #c0392b; }

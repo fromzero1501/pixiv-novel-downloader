@@ -1,5 +1,5 @@
 use calamine::{open_workbook_auto, Reader};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use encoding_rs::{GBK, UTF_16BE, UTF_16LE};
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -103,6 +103,12 @@ struct Work {
     rating: i64,
     /// 一句话笔记，最多 200 字。
     note: String,
+    /// 「待补完整版」工作台上的处理状态：0 = 未处理，1 = 找过、确实没有，
+    /// 2 = 不打算补。只有 0 的会列在工作台默认视图里。
+    need_full_state: i64,
+    /// 上面那个状态是什么时候标的（RFC3339）。没标过＝空串，
+    /// 恢复成「未处理」也会清空 —— 工作台要靠它显示「何时找过的」，别过俩月又翻一遍。
+    need_full_marked_at: String,
 }
 
 #[derive(Serialize)]
@@ -115,6 +121,17 @@ struct SeriesSummary {
     preview_count: i64,
     cover_path: String,
     max_order: i64,
+    /// 系列里「读过」的篇数 —— 「已读」和「在读」都算。
+    ///
+    /// 口径改成含「在读」是为了让进度真的动起来（v1.2.8）：外部阅读器读完不会回调，
+    /// 打开一篇只会把它标成「在读」，如果只数「已读」，进度就永远停在 0
+    /// （用户报的就是「这个已读一直是零」）。不另存一份进度数字，免得和用户手动标的状态对不上。
+    read_count: i64,
+    /// 系列里「缺的序号」（v1.2.9）：1..max_order 里没有作品占的号。
+    ///
+    /// 只算序号 ≥ 1 的 —— 序号 0 意思是「还没排进系列」，不是「第 0 篇」。
+    /// 序号唯一是 set_work_series 保证的（占位会拒绝），所以这儿只找空号、不查重。
+    gap_orders: Vec<i64>,
 }
 
 /// 「我的收藏」页上的一个收藏夹卡片。
@@ -359,6 +376,12 @@ struct AppSettings {
     /// 打开作品 / 阅读版时是否记一笔浏览历史。
     #[serde(default = "default_true")]
     record_history: bool,
+    /// 每天第一次启动时自动备份数据库（滚动的，只留最近若干份）。
+    #[serde(default = "default_true")]
+    auto_backup_enabled: bool,
+    /// 自动备份保留最近几份。
+    #[serde(default = "default_backup_keep")]
+    auto_backup_keep: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -426,6 +449,22 @@ const DEFAULT_COLLECTION_NAME: &str = "我的收藏";
 
 /// 浏览历史最多留多少条：超了就按时间从旧到新丢掉尾巴。
 const HISTORY_LIMIT: i64 = 500;
+
+/// 作品的文件路径一变，缓存下来的字数就作废（标回 -1 等后台重算，v1.2.8）。
+///
+/// 抽成常量是为了让单测能用**同一份** DDL 建触发器 —— 测试里自己手抄一遍的话，
+/// 哪天改了这里、测试还在替旧的守门。
+///
+/// 两个细节都不能省：`WHEN` 那半句（SQLite 的 `UPDATE OF` 只看列在不在 SET 里、
+/// 不看值有没有变，没这句的话每次「重扫文件」都会把全库字数标回未算）；
+/// 触发器体内只写 `word_count`，所以不会再触发自己。
+const WORD_COUNT_TRIGGER_DDL: &str = "CREATE TRIGGER IF NOT EXISTS works_path_change_resets_word_count
+     AFTER UPDATE OF preview_path, purchased_path ON works
+     FOR EACH ROW
+     WHEN OLD.preview_path <> NEW.preview_path OR OLD.purchased_path <> NEW.purchased_path
+     BEGIN
+       UPDATE works SET word_count = -1 WHERE id = NEW.id;
+     END;";
 
 /// v1.1.0 把「收藏」升级成「收藏夹」：老库里 `works.favorite=1` 的作品全部收进一个
 /// 默认收藏夹，升级后「我的收藏」才不是空的。用 app_settings 的标记位保证只跑一次 ——
@@ -497,6 +536,13 @@ fn db() -> Result<Connection, String> {
           read_state INTEGER NOT NULL DEFAULT 0,
           rating INTEGER NOT NULL DEFAULT 0,
           note TEXT NOT NULL DEFAULT '',
+          need_full_state INTEGER NOT NULL DEFAULT 0,
+          -- 「待补完整版」那个状态是什么时候标的（RFC3339，空串＝没标过）。
+          need_full_marked_at TEXT NOT NULL DEFAULT '',
+          -- 正文字数：-1 = 还没算过，0 = 读不出来（绑的是 EPUB / 目录里没 txt），> 0 = 字数。
+          -- 落库的理由是「列表页不能再读文件」：全库 1350 个 txt、98 MB，一次要 1.4 秒，
+          -- 而列表每次改筛选 / 搜索都会重查一遍（v1.2.8）。
+          word_count INTEGER NOT NULL DEFAULT -1,
           UNIQUE(author_id, title, release_date)
         );
         CREATE TABLE IF NOT EXISTS series_catalog (
@@ -525,6 +571,17 @@ fn db() -> Result<Connection, String> {
           work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
           viewed_at TEXT NOT NULL DEFAULT '',
           view_count INTEGER NOT NULL DEFAULT 1
+        );
+        -- 「筛选视图」（v1.2.9）：把当前那套筛选条件取个名字存下来，侧栏一键回到同一条件。
+        -- 它和「收藏夹」是两种东西 —— 收藏夹是**手动往里放作品**（存结果），
+        -- 这里只存**条件**（payload 里是一份 JSON），每次进来自个儿现算，
+        -- 所以「未读」这类条件会随着阅读自然变少。两者千万别做成一个入口。
+        CREATE TABLE IF NOT EXISTS filter_views (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          payload TEXT NOT NULL DEFAULT '',
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS work_history_viewed_at ON work_history(viewed_at DESC);",
     )
@@ -609,6 +666,31 @@ fn db() -> Result<Connection, String> {
         "ALTER TABLE works ADD COLUMN synopsis_checked INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // 「待补完整版」工作台（v1.2.7）：0 = 还没处理，1 = 去找过、确实没有，
+    // 2 = 不打算补。只有 0 的才会在默认视图里列出来 —— 记这一位就是为了
+    // **同一篇不用每次重新去找一遍**（这是那个工作台存在的全部理由）。
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN need_full_state INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // 标记「待补完整版」状态的时间（v1.2.8）：标过之后工作台要显示「什么时候找的」，
+    // 不然过俩月翻到一篇，根本想不起来自己找没找过。恢复成「未处理」时清空。
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN need_full_marked_at TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    // 正文字数落库（v1.2.8）：-1 = 未算，0 = 读不出来，> 0 = 字数。
+    // 之前是列表时现读文件算的，全库 1350 个 txt / 98 MB 要 1.4 秒，
+    // 而「所有作品」每次改筛选、每敲一下搜索都会重查 —— 那就叫不动了。
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN word_count INTEGER NOT NULL DEFAULT -1",
+        [],
+    );
+    // 字数缓存跟着路径走：路径一变，算好的字数就不作数了，标回「没算过」让后台重算。
+    // 用触发器而不是去改那二十来处 `UPDATE ... SET preview_path/purchased_path` ——
+    // 那些地方散在整个文件里，漏一处就是「改了文件、卡片上还挂着旧字数」，
+    // 而且以后新写的代码也会自动被兜住。
+    let _ = conn.execute_batch(WORD_COUNT_TRIGGER_DDL);
     let _ = conn.execute(
         "ALTER TABLE authors ADD COLUMN aliases TEXT NOT NULL DEFAULT ''",
         [],
@@ -1152,6 +1234,19 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
             "" => true,
             value => value == "1",
         },
+        auto_backup_enabled: match setting(conn, "auto_backup_enabled")?.as_str() {
+            "" => true,
+            value => value == "1",
+        },
+        // 存坏了 / 存成 0 都退回默认的 7；上限 50，免得用户填个天文数字把盘占满
+        auto_backup_keep: {
+            let value: usize = setting(conn, "auto_backup_keep")?.parse().unwrap_or(0);
+            if value == 0 {
+                default_backup_keep()
+            } else {
+                value.min(50)
+            }
+        },
     })
 }
 
@@ -1251,10 +1346,13 @@ fn read_author(conn: &Connection, id: i64) -> Result<AuthorSummary, String> {
 // 4 preview_path / 5 cover_path / 6 purchased_path / 7 favorite / 8 has_images / 9 tags /
 // 10 pixiv_novel_id / 11 series_id / 12 series_title / 13 series_order / 14 is_new /
 // 15 author_name / 16 image_count / 17 synopsis / 18 read_state / 19 rating / 20 note /
-// 21 synopsis_checked。**新列一律加在末尾** —— 插在中间会让所有列号整体后移，
-// 那种错编译器看不出来，只会静默读错列。
+// 21 synopsis_checked / 22 need_full_state / 23 word_count / 24 need_full_marked_at。
+// **新列一律加在末尾** ——
+// 插在中间会让所有列号整体后移，那种错编译器看不出来，只会静默读错列。
 // （浏览历史在那之后再接 viewed_at / view_count，行号见 HISTORY_VIEWED_AT_INDEX）
 fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
+    // -1 = 还没算过；0 = 读不出来；> 0 = 字数
+    let stored_word_count: i64 = row.get(23)?;
     Ok(Work {
         author_id: row.get(0)?,
         id: row.get(1)?,
@@ -1272,7 +1370,7 @@ fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
         series_order: row.get(13)?,
         is_new: row.get::<_, i64>(14)? == 1,
         author_name: row.get(15)?,
-        word_count: None,
+        word_count: usize::try_from(stored_word_count).ok(),
         file_format: None,
         image_count: row.get::<_, i64>(16)?,
         synopsis: row.get(17)?,
@@ -1280,28 +1378,42 @@ fn map_work(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work> {
         rating: row.get(19)?,
         note: row.get(20)?,
         synopsis_checked: row.get::<_, i64>(21)? == 1,
+        need_full_state: row.get(22)?,
+        need_full_marked_at: row.get(24)?,
     })
 }
 
 /// 五处 SELECT 共用的作品列清单，避免手写列号时漏改一处。
-const WORK_COLUMNS: &str = "author_id, id, title, release_date, preview_path, cover_path, purchased_path, favorite, has_images, tags, pixiv_novel_id, series_id, series_title, series_order, is_new, '' AS author_name, image_count, synopsis, read_state, rating, note, synopsis_checked";
-const WORK_COLUMNS_W: &str = "w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count, w.synopsis, w.read_state, w.rating, w.note, w.synopsis_checked";
+const WORK_COLUMNS: &str = "author_id, id, title, release_date, preview_path, cover_path, purchased_path, favorite, has_images, tags, pixiv_novel_id, series_id, series_title, series_order, is_new, '' AS author_name, image_count, synopsis, read_state, rating, note, synopsis_checked, need_full_state, word_count, need_full_marked_at";
+const WORK_COLUMNS_W: &str = "w.author_id, w.id, w.title, w.release_date, w.preview_path, w.cover_path, w.purchased_path, w.favorite, w.has_images, w.tags, w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.is_new, a.name AS author_name, w.image_count, w.synopsis, w.read_state, w.rating, w.note, w.synopsis_checked, w.need_full_state, w.word_count, w.need_full_marked_at";
 /// 接在 `WORK_COLUMNS` / `WORK_COLUMNS_W` 之后的第一列下标（浏览历史把 `h.viewed_at`
 /// 拼在作品列后面）。抽成常量是因为往列清单里加字段时最容易漏改这里：
 /// 数字写错编译器不会报错，只会静默读错列。
-const HISTORY_VIEWED_AT_INDEX: usize = 22;
+const HISTORY_VIEWED_AT_INDEX: usize = 25;
+
+/// 读一个文本文件并按「BOM → UTF-8 → GBK」的顺序猜编码。
+/// 字数统计和合集 EPUB 都走这儿，免得两处各猜一套、同一份文件读出两种结果。
+fn read_text_file(path: &Path) -> Option<String> {
+    Some(decode_text_bytes(&fs::read(path).ok()?))
+}
+
+/// 字节 → 文本。顺序不能改：BOM → UTF-8 → GBK。
+/// 全库的正文都走这一条路（字数统计、合集导出、正文检索），
+/// 换顺序会让同一份文件在三处读出不同结果。
+fn decode_text_bytes(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        UTF_16LE.decode(&bytes[2..]).0.into_owned()
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        UTF_16BE.decode(&bytes[2..]).0.into_owned()
+    } else if let Ok(content) = std::str::from_utf8(bytes) {
+        content.to_string()
+    } else {
+        GBK.decode(bytes).0.into_owned()
+    }
+}
 
 fn text_file_word_count(path: &Path) -> Option<usize> {
-    let bytes = fs::read(path).ok()?;
-    let content = if bytes.starts_with(&[0xFF, 0xFE]) {
-        UTF_16LE.decode(&bytes[2..]).0
-    } else if bytes.starts_with(&[0xFE, 0xFF]) {
-        UTF_16BE.decode(&bytes[2..]).0
-    } else if let Ok(content) = std::str::from_utf8(&bytes) {
-        content.into()
-    } else {
-        GBK.decode(&bytes).0
-    };
+    let content = read_text_file(path)?;
     Some(
         content
             .chars()
@@ -1367,12 +1479,19 @@ fn resolve_cover_path(cover_path: &str, preview_path: &str, purchased_path: &str
     String::new()
 }
 
+/**
+ * 补齐「只有看了文件才知道」的那几位。**这里不再读正文文件。**
+ *
+ * 之前 `word_count` 是在这里现读文件算的 —— 全库 1350 个 txt、98 MB，一次 1.4 秒，
+ * 而列表每次改筛选 / 敲搜索都会重跑一遍，界面就卡住了（v1.2.8 用户报的「加载得有点慢」）。
+ * 现在字数走 `works.word_count` 那一列（由 `refresh_word_counts` 在后台一次算好），
+ * 这里只做两件便宜事：封面兜底、认出 EPUB/HTML 这类非 txt 的阅读版格式。
+ * 想再加「要读文件」的字段，请走后台补算那条路，别加回这个函数。
+ */
 fn populate_work_display_info(work: &mut Work) {
     work.cover_path = resolve_cover_path(&work.cover_path, &work.preview_path, &work.purchased_path);
-    work.word_count = None;
     work.file_format = None;
     if work.purchased_path.is_empty() {
-        work.word_count = text_word_count(&work.preview_path);
         return;
     }
     let purchased_path = Path::new(&work.purchased_path);
@@ -1386,10 +1505,8 @@ fn populate_work_display_info(work: &mut Work) {
             .unwrap_or_else(|| "文件".into());
         if extension != "TXT" {
             work.file_format = Some(extension);
-            return;
         }
     }
-    work.word_count = text_word_count(&work.purchased_path);
 }
 
 /// 「字数从多到少」排序用的比较键：EPUB / HTML 这类阅读版**没有字数**，改成按配图张数比。
@@ -1577,20 +1694,6 @@ fn update_author_path(
 }
 
 #[tauri::command]
-fn set_match_threshold(author_id: i64, threshold: i64) -> Result<AuthorSummary, String> {
-    if !(1..=100).contains(&threshold) {
-        return Err("匹配相似度必须在 1 到 100 之间".into());
-    }
-    let conn = db()?;
-    conn.execute(
-        "UPDATE authors SET match_threshold=?1 WHERE id=?2",
-        params![threshold, author_id],
-    )
-    .map_err(|e| e.to_string())?;
-    read_author(&conn, author_id)
-}
-
-#[tauri::command]
 fn get_app_settings() -> Result<AppSettings, String> {
     read_settings(&db()?)
 }
@@ -1715,6 +1818,24 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
                 "0".into()
             },
         ),
+        (
+            "auto_backup_enabled",
+            if settings.auto_backup_enabled {
+                "1".into()
+            } else {
+                "0".into()
+            },
+        ),
+        (
+            "auto_backup_keep",
+            // 与 read_settings 同一套规则：0 当没填、退回默认；上限 50
+            if settings.auto_backup_keep == 0 {
+                default_backup_keep()
+            } else {
+                settings.auto_backup_keep.min(50)
+            }
+            .to_string(),
+        ),
     ];
     for (key, value) in values {
         conn.execute("INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value]).map_err(|e| e.to_string())?;
@@ -1727,6 +1848,388 @@ fn read_pixiv_cookie_file(path: String) -> Result<String, String> {
     normalize_pixiv_cookie(&fs::read_to_string(path).map_err(|e| e.to_string())?)
 }
 
+/// 搜索范围 → SQL 里的匹配条件。三处作品查询（作者作品库 / 所有作品 / 收藏夹）共用。
+///
+/// 列一律用 `COALESCE(..,'')` 拼：SQLite 里 `'x' || NULL` 结果是 NULL，会让整条 LIKE
+/// 永远不成立（老库里 synopsis 可能是 NULL）。固定只用两个占位符 —— 空的短路判断 +
+/// 「%词%」，所以三处调用点的 params 顺序完全一致，不用为每种范围数占位符。
+fn search_match_clause(
+    search_field: &str,
+    prefix: &str,
+    empty_param: &str,
+    like_param: &str,
+) -> String {
+    let title = format!("{prefix}title");
+    let body = match search_field {
+        "tags" => format!("{prefix}tags LIKE {like_param}"),
+        "title_synopsis" => format!(
+            "(COALESCE({title},'') || ' ' || COALESCE({prefix}synopsis,'')) LIKE {like_param}"
+        ),
+        "title_synopsis_tags" => format!(
+            "(COALESCE({title},'') || ' ' || COALESCE({prefix}synopsis,'') || ' ' || COALESCE({prefix}tags,'')) LIKE {like_param}"
+        ),
+        _ => format!("{title} LIKE {like_param}"),
+    };
+    format!("({empty_param} = '' OR {body})")
+}
+
+/* ======================== 库内正文全文检索（v1.2.11） ======================== */
+
+/// 命中片段前后各留多少**字符**（不是字节）。太小读不出上下文，太大卡片上排不下。
+const TEXT_SEARCH_CONTEXT_CHARS: usize = 36;
+/// 每篇最多给几段。卡片上留三段就到顶了。
+const TEXT_SEARCH_MAX_SNIPPETS: usize = 3;
+/// 命中篇目上限。搜「的」这种字会命中九成作品，全返回既没意义又拖慢渲染。
+const TEXT_SEARCH_MAX_HITS: usize = 200;
+/// 连正文都没找到的作品只报总数 + 前几个名字，列全了没地方放。
+const TEXT_SEARCH_LISTED_MISSING: usize = 12;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextSnippet {
+    /// 命中处前面的正文（已压成单行）
+    before: String,
+    /// 命中的那几个字，原样保留大小写，前端拿它做高亮
+    hit: String,
+    /// 命中处后面的正文
+    after: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextSearchHit {
+    work_id: i64,
+    hit_count: usize,
+    snippets: Vec<TextSnippet>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextSearchResult {
+    hits: Vec<TextSearchHit>,
+    /// 真扫过正文的作品数
+    scanned_count: usize,
+    /// 没找到正文的作品（没绑阅读版 / 文件丢了），只列前几个
+    missing: Vec<String>,
+    missing_count: usize,
+    elapsed_ms: u64,
+    /// 命中数超过上限、列表被截断了
+    truncated: bool,
+}
+
+/// 一段正文里出现多少处，外加头几处的前后文。
+/// 计数要把整段扫完（不然报的数是假的），但片段只留前三段。
+fn text_search_matches(text: &str, query: &str) -> (usize, Vec<TextSnippet>) {
+    let mut count = 0usize;
+    let mut snippets = Vec::new();
+    for (start, matched) in text.match_indices(query) {
+        count += 1;
+        if snippets.len() < TEXT_SEARCH_MAX_SNIPPETS {
+            snippets.push(text_snippet_at(text, start, start + matched.len()));
+        }
+    }
+    (count, snippets)
+}
+
+/// 抠出命中处前后各 N 个**字符**。
+/// 中文一个字三字节，这里必须按字符走 —— 直接切字节会切出半个字，
+/// 轻则显示成乱码，重则因为不是 char 边界直接 panic。
+fn text_snippet_at(text: &str, start: usize, end: usize) -> TextSnippet {
+    let before: String = text[..start]
+        .chars()
+        .rev()
+        .take(TEXT_SEARCH_CONTEXT_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let after: String = text[end..].chars().take(TEXT_SEARCH_CONTEXT_CHARS).collect();
+    TextSnippet {
+        before: single_line(&before),
+        hit: text[start..end].to_string(),
+        after: single_line(&after),
+    }
+}
+
+/// 正文里到处都是换行，片段得压成一行才好排在卡片上
+fn single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 丢掉 `<script>…</script>` / `<style>…</style>` 里的**内容**。
+/// 现成的 `html_to_text` 只丢标签本身，脚本原文会原样留下来 ——
+/// 不掐掉的话搜「function」会在每一篇带 JS 的 HTML 里搜出一堆假命中。
+fn strip_element_block(source: &str, tag: &str) -> String {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}");
+    // 只动 ASCII 大小写，字节长度不变 —— 所以拿它算出来的偏移能直接切原文
+    let lowered = source.to_ascii_lowercase();
+    let mut out = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    while let Some(offset) = lowered[cursor..].find(&open) {
+        let start = cursor + offset;
+        out.push_str(&source[cursor..start]);
+        let Some(close_offset) = lowered[start..].find(&close) else {
+            return out; // 没闭合就当后面全是脚本，整段丢掉
+        };
+        let mut end = start + close_offset;
+        match lowered[end..].find('>') {
+            Some(gt) => end += gt + 1,
+            None => return out,
+        }
+        cursor = end;
+    }
+    out.push_str(&source[cursor..]);
+    out
+}
+
+/// HTML / XHTML 正文 → 纯文本
+fn document_text(source: &str) -> String {
+    let without_script = strip_element_block(source, "script");
+    let without_style = strip_element_block(&without_script, "style");
+    html_to_text(&without_style)
+}
+
+/// EPUB 里哪些条目算正文 —— 按扩展名认。
+/// 图片条目**一个字节都不读**：zip 只解压点名要的那几条，
+/// 所以 20 MB 的图文 epub 抽正文跟 2 MB 的一样快（实测都是毫秒级）。
+fn is_epub_text_entry(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    if lowered.contains("__macosx") {
+        return false;
+    }
+    matches!(
+        Path::new(&lowered)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("xhtml" | "html" | "htm" | "txt")
+    )
+}
+
+/// 从 EPUB 里抽出正文。失败（文件坏了 / 加密 / 没见过的 zip 写法）就返回 None，
+/// 让这一篇进「没找到正文」名单 —— 一次搜索不能因为一本坏书整个失败。
+fn epub_text(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    // by_index 会可变借用 archive，所以先把名字拷出来，下面再按名字取内容
+    let mut names: Vec<String> = Vec::new();
+    for index in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(index) {
+            let name = entry.name().to_string();
+            if is_epub_text_entry(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    let mut out = String::new();
+    for name in names {
+        let Ok(mut entry) = archive.by_name(&name) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if entry.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        out.push_str(&document_text(&decode_text_bytes(&bytes)));
+        out.push('\n');
+    }
+    (!out.trim().is_empty()).then_some(out)
+}
+
+/// 一篇作品的正文纯文本：txt/md 直接读，html 剥标签，epub 抽内页。
+/// 认不出的扩展名返回 None（不是错误 —— 大部分作品本来就没绑阅读版）。
+fn text_search_document(path: &Path) -> Option<String> {
+    if path.is_dir() {
+        return anthology_text_file(path).and_then(|file| text_search_document(&file));
+    }
+    if !path.is_file() {
+        return None;
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "txt" | "md" => read_text_file(path),
+        "html" | "htm" | "xhtml" => read_text_file(path).map(|source| document_text(&source)),
+        "epub" => {
+            // 同名 .txt 比 epub 里那堆 xhtml 干净得多，有就直接用
+            let beside = path.with_extension("txt");
+            if beside.is_file() {
+                return read_text_file(&beside);
+            }
+            epub_text(path)
+        }
+        _ => None,
+    }
+}
+
+fn search_full_text_impl(query: &str, limit: Option<usize>) -> Result<TextSearchResult, String> {
+    let rows: Vec<(i64, String, String, String)> = {
+        let conn = db()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id, COALESCE(title,''), COALESCE(purchased_path,''), COALESCE(preview_path,'')
+                 FROM works",
+            )
+            .map_err(|error| error.to_string())?;
+        let collected = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        collected
+    };
+    search_full_text_over(&rows, query, limit)
+}
+
+/// 扫描本体：只认「一篇作品 = 一个 id + 名字 + 几条候选路径」，
+/// 跟数据库脱开 —— 单测拿一批临时文件就能把整条读取链路跑通，
+/// 不用去碰真的库文件。
+fn search_full_text_over(
+    rows: &[(i64, String, String, String)],
+    query: &str,
+    limit: Option<usize>,
+) -> Result<TextSearchResult, String> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return Err("先输入要搜的内容".into());
+    }
+    let cap = limit.unwrap_or(TEXT_SEARCH_MAX_HITS).clamp(1, TEXT_SEARCH_MAX_HITS);
+    let started = std::time::Instant::now();
+
+    // 整库一百来兆正文，单线程也就零点几秒 —— 但读文件大半时间在等 IO，
+    // 几个线程重叠起来能省掉不少。上限压在 6：线程再多也是抢同一块盘。
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .clamp(1, 6);
+    let chunk = rows.len().div_ceil(workers).max(1);
+
+    let mut collected: Vec<(i64, usize, Vec<TextSnippet>)> = Vec::new();
+    let mut scanned_count = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || {
+                    let mut hits: Vec<(i64, usize, Vec<TextSnippet>)> = Vec::new();
+                    let mut scanned = 0usize;
+                    let mut missing: Vec<String> = Vec::new();
+                    for (work_id, title, purchased, preview) in slice {
+                        // 完整版在前、预览版在后。两份都在就都扫 ——
+                        // 预览版和完整版的正文不一定是同一份，漏掉哪边都可能少命中。
+                        let mut sources: Vec<&str> = Vec::new();
+                        if !purchased.is_empty() {
+                            sources.push(purchased.as_str());
+                        }
+                        if !preview.is_empty() && preview != purchased {
+                            sources.push(preview.as_str());
+                        }
+                        let mut document = String::new();
+                        for source in sources {
+                            if let Some(part) = text_search_document(Path::new(source)) {
+                                document.push_str(&part);
+                                document.push('\n');
+                            }
+                        }
+                        if document.trim().is_empty() {
+                            missing.push(title.clone());
+                            continue;
+                        }
+                        scanned += 1;
+                        let (count, snippets) = text_search_matches(&document, needle);
+                        if count > 0 {
+                            hits.push((*work_id, count, snippets));
+                        }
+                    }
+                    (hits, scanned, missing)
+                })
+            })
+            .collect();
+        for handle in handles {
+            let (hits, scanned, missed) = handle
+                .join()
+                .unwrap_or_else(|_| (Vec::new(), 0usize, Vec::new()));
+            collected.extend(hits);
+            scanned_count += scanned;
+            missing.extend(missed);
+        }
+    });
+
+    // 命中多的排前面，同样多的按 work_id 稳定排 —— 免得每次搜出来顺序都不一样
+    collected.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    let truncated = collected.len() > cap;
+    collected.truncate(cap);
+    let missing_count = missing.len();
+    missing.sort();
+    missing.truncate(TEXT_SEARCH_LISTED_MISSING);
+
+    Ok(TextSearchResult {
+        hits: collected
+            .into_iter()
+            .map(|(work_id, hit_count, snippets)| TextSearchHit {
+                work_id,
+                hit_count,
+                snippets,
+            })
+            .collect(),
+        scanned_count,
+        missing,
+        missing_count,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        truncated,
+    })
+}
+
+/// 库内正文全文检索。**不建索引、不落地** —— 每次现扫绑定的本地正文。
+/// 实测整库一百来兆正文 + 一千四百个文件约 0.2～0.4 秒（epub 只解压正文条目，
+/// 图片一个字节不读），所以没必要维护一份索引；代价是每次都要真的读一遍盘，
+/// 因此**只该在回车时调用**，不能挂在输入事件上（每敲一个字扫一遍库，必卡）。
+#[tauri::command]
+async fn search_full_text(query: String, limit: Option<usize>) -> Result<TextSearchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || search_full_text_impl(&query, limit))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 「配图」三档拼出来的条件（v1.2.13）：`all` 不限 / `has` 有图 / `none` 无图。
+///
+/// `prefix` 是表别名 —— 作者库那条 SQL 没别名（传空串），另外两条是 `w.`。
+///
+/// 抽成函数只为一件事：**这几处 SQL 是运行时拼的字符串，写错了编译器不管**，
+/// 只有真点一下才发现「有图和无图筛出来一模一样」。所以给它一个拿内存库真跑的单测。
+fn images_filter_clause(filter: &str, prefix: &str) -> String {
+    match filter {
+        "has" => format!(" AND {prefix}has_images = 1"),
+        "none" => format!(" AND {prefix}has_images = 0"),
+        _ => String::new(),
+    }
+}
+
+/// 「收藏夹」那一档：`0` = 不限、`-1` = 任意收藏夹、正数 = 指定夹子。
+///
+/// 放 EXISTS 而不是 JOIN：作品可能同时在多个夹子里，JOIN 会把它变成多行。
+/// 条件写成恒真的形式（而不是拼不拼这段），这样占位符永远存在于 SQL 里，
+/// params 的数量不用分情况。
+///
+/// 「任意收藏」不必另写一段 SQL：内层 `{placeholder} = -1` 恒真，EXISTS 就退化成
+/// 「在任何一个夹子里」。收藏夹主键都是正数，-1 撞不上真的夹子。
+///
+/// `alias` 是子查询里 `collection_works` 的别名 —— 收藏夹视图那条 SQL 外层已经用了
+/// `cw`，内层不能重名，传 `cw2`。
+fn collection_filter_clause(work_column: &str, alias: &str, placeholder: &str) -> String {
+    format!(
+        " AND ({placeholder} = 0 OR EXISTS (SELECT 1 FROM collection_works {alias} WHERE {alias}.work_id = {work_column} AND ({placeholder} = -1 OR {alias}.collection_id = {placeholder})))"
+    )
+}
+
 #[tauri::command]
 fn list_works(
     author_id: i64,
@@ -1734,16 +2237,13 @@ fn list_works(
     search_field: String,
     status: String,
     favorites_only: bool,
-    images_only: bool,
+    images_filter: String,
+    collection_id: i64,
     sort: String,
 ) -> Result<Vec<Work>, String> {
     let conn = db()?;
-    let field = if search_field == "tags" {
-        "tags"
-    } else {
-        "title"
-    };
-    let mut sql = format!("SELECT {WORK_COLUMNS} FROM works WHERE author_id = ?1 AND (?2 = '' OR {field} LIKE ?3)");
+    let condition = search_match_clause(&search_field, "", "?2", "?3");
+    let mut sql = format!("SELECT {WORK_COLUMNS} FROM works WHERE author_id = ?1 AND {condition}");
     match status.as_str() {
         "purchased" => sql.push_str(" AND purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND purchased_path = ''"),
@@ -1752,9 +2252,8 @@ fn list_works(
     if favorites_only {
         sql.push_str(" AND favorite = 1");
     }
-    if images_only {
-        sql.push_str(" AND has_images = 1");
-    }
+    sql.push_str(&images_filter_clause(&images_filter, ""));
+    sql.push_str(&collection_filter_clause("works.id", "cw", "?4"));
     sql.push_str(match sort.as_str() {
         "date_asc" => " ORDER BY release_date ASC, id ASC",
         "title_asc" => " ORDER BY title COLLATE NOCASE ASC",
@@ -1768,7 +2267,12 @@ fn list_works(
     let raw_query = query.trim();
     let rows = statement
         .query_map(
-            params![author_id, raw_query, format!("%{raw_query}%")],
+            params![
+                author_id,
+                raw_query,
+                format!("%{raw_query}%"),
+                collection_id
+            ],
             map_work,
         )
         .map_err(|e| e.to_string())?;
@@ -1790,16 +2294,13 @@ fn list_all_works(
     search_field: String,
     status: String,
     favorites_only: bool,
-    images_only: bool,
+    images_filter: String,
+    collection_id: i64,
     sort: String,
 ) -> Result<Vec<Work>, String> {
     let conn = db()?;
-    let field = if search_field == "tags" {
-        "w.tags"
-    } else {
-        "w.title"
-    };
-    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id WHERE (?1 = '' OR {field} LIKE ?2)");
+    let condition = search_match_clause(&search_field, "w.", "?1", "?2");
+    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id WHERE {condition}");
     match status.as_str() {
         "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND w.purchased_path = ''"),
@@ -1808,9 +2309,8 @@ fn list_all_works(
     if favorites_only {
         sql.push_str(" AND w.favorite = 1");
     }
-    if images_only {
-        sql.push_str(" AND w.has_images = 1");
-    }
+    sql.push_str(&images_filter_clause(&images_filter, "w."));
+    sql.push_str(&collection_filter_clause("w.id", "cw", "?3"));
     sql.push_str(match sort.as_str() {
         "date_asc" => " ORDER BY w.release_date ASC, w.id ASC",
         "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
@@ -1822,7 +2322,10 @@ fn list_all_works(
     let raw_query = query.trim();
     let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = statement
-        .query_map(params![raw_query, format!("%{raw_query}%")], map_work)
+        .query_map(
+            params![raw_query, format!("%{raw_query}%"), collection_id],
+            map_work,
+        )
         .map_err(|e| e.to_string())?;
     let mut works = rows
         .collect::<Result<Vec<_>, _>>()
@@ -1856,9 +2359,12 @@ fn list_series_works(author_id: i64, series_id: String) -> Result<Vec<Work>, Str
 
 #[tauri::command]
 fn list_series(author_id: i64) -> Result<Vec<SeriesSummary>, String> {
-    let conn = db()?;
+    list_series_impl(&db()?, author_id)
+}
+
+fn list_series_impl(conn: &Connection, author_id: i64) -> Result<Vec<SeriesSummary>, String> {
     let mut statement = conn
-        .prepare("SELECT s.id, s.title, COUNT(w.id), COALESCE(SUM(CASE WHEN w.purchased_path <> '' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN w.purchased_path = '' THEN 1 ELSE 0 END), 0), COALESCE(MAX(NULLIF(w.cover_path, '')), ''), COALESCE(MAX(w.series_order), 0) FROM series_catalog s LEFT JOIN works w ON w.author_id=s.author_id AND w.series_id=s.id WHERE s.author_id=?1 GROUP BY s.id, s.title ORDER BY s.title COLLATE NOCASE")
+        .prepare("SELECT s.id, s.title, COUNT(w.id), COALESCE(SUM(CASE WHEN w.purchased_path <> '' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN w.purchased_path = '' THEN 1 ELSE 0 END), 0), COALESCE(MAX(NULLIF(w.cover_path, '')), ''), COALESCE(MAX(w.series_order), 0), COALESCE(SUM(CASE WHEN w.read_state IN (1, 2) THEN 1 ELSE 0 END), 0) FROM series_catalog s LEFT JOIN works w ON w.author_id=s.author_id AND w.series_id=s.id WHERE s.author_id=?1 GROUP BY s.id, s.title ORDER BY s.title COLLATE NOCASE")
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([author_id], |row| {
@@ -1870,11 +2376,52 @@ fn list_series(author_id: i64) -> Result<Vec<SeriesSummary>, String> {
                 preview_count: row.get(4)?,
                 cover_path: row.get(5)?,
                 max_order: row.get(6)?,
+                read_count: row.get(7)?,
+                gap_orders: Vec::new(),
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())
+    let mut series = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+    let gaps = series_gap_orders(conn, author_id)?;
+    for item in series.iter_mut() {
+        if let Some(orders) = gaps.get(&item.id) {
+            item.gap_orders = orders.clone();
+        }
+    }
+    Ok(series)
+}
+
+/// 每个系列缺哪几号。**一条查询把这位作者所有系列的序号一次取回来**，
+/// 别按系列循环查库 —— 一个作者几十个系列就是几十次去重查询。
+fn series_gap_orders(
+    conn: &Connection,
+    author_id: i64,
+) -> Result<std::collections::HashMap<String, Vec<i64>>, String> {
+    let mut statement = conn
+        .prepare("SELECT series_id, series_order FROM works WHERE author_id=?1 AND series_order > 0")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([author_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut present: std::collections::HashMap<String, HashSet<i64>> = std::collections::HashMap::new();
+    for row in rows {
+        let (series_id, order) = row.map_err(|e| e.to_string())?;
+        present.entry(series_id).or_default().insert(order);
+    }
+    let mut gaps: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+    for (series_id, orders) in present {
+        let max = orders.iter().copied().max().unwrap_or(0);
+        let missing: Vec<i64> = (1..=max).filter(|order| !orders.contains(order)).collect();
+        if !missing.is_empty() {
+            gaps.insert(series_id, missing);
+        }
+    }
+    Ok(gaps)
 }
 
 #[tauri::command]
@@ -2630,31 +3177,29 @@ fn sync_preview_entries(
     Ok(entries)
 }
 
+/// 同步时复用本地已有的预览版文件（顺带把它同名的封面也带上）。
+///
+/// **只看名字（`name_key` 去掉扩展名后）是否完全相同，不比相似度** —— 与
+/// `existing_sync_target()` 的去重规则保持一致。相似度只属于「本地文件关联」，
+/// 拿它做同步复用会把「其一 / 其二」这类长共同前缀的不同作品认成同一篇，
+/// 直接复用错正文（宁可多下一份，也不能复用错内容）。
+///
+/// 同名文件有两份（理论上不该出现）时不猜，返回 `None` 走正常下载。
 fn matched_sync_preview(
     entries: &[SyncPreviewEntry],
     title: &str,
-    threshold: i64,
-    title_limit: i64,
 ) -> Option<(PathBuf, Option<PathBuf>)> {
-    let mut matches: Vec<(&SyncPreviewEntry, i64)> = entries
+    let key = name_key(title);
+    let mut matches = entries
         .iter()
-        .filter(|entry| entry.is_preview)
-        .map(|entry| (entry, similarity_with_title_limit(title, &entry.name, title_limit)))
-        .filter(|(_, score)| *score >= threshold)
-        .collect();
-    matches.sort_by(|left, right| right.1.cmp(&left.1));
-    let (preview, best_score) = matches.first()?;
-    if matches
-        .iter()
-        .filter(|(_, score)| *score == *best_score)
-        .count()
-        != 1
-    {
+        .filter(|entry| entry.is_preview && name_key(&entry.name) == key);
+    let preview = matches.next()?;
+    if matches.next().is_some() {
         return None;
     }
     let cover = entries
         .iter()
-        .find(|entry| !entry.is_preview && name_key(&entry.name) == name_key(&preview.name))
+        .find(|entry| !entry.is_preview && name_key(&entry.name) == key)
         .map(|entry| entry.path.clone());
     Some((preview.path.clone(), cover))
 }
@@ -2781,6 +3326,51 @@ fn fetch_pixiv_cover(client: &Client, cover_url: &str) -> Result<Vec<u8>, String
         .and_then(|response| response.bytes())
         .map(|bytes| bytes.to_vec())
         .map_err(|error| error.to_string())
+}
+
+/// 封面重压质量。依据见 `compress_cover`：在界面真实显示尺寸下实测肉眼无差别，
+/// 而全库体积降到 24%。**改这个值等于改变所有新同步作品的封面画质**，别随手调。
+const COVER_JPEG_QUALITY: u8 = 75;
+
+/// 封面一律在落盘前压一道。
+///
+/// **为什么压**：Pixiv 封面走 `c/600x600` 档，本身只有 600px 高，却用极高的编码质量
+/// （实测 415×600 占 206 KB ≈ 0.83 字节/像素），是同尺寸 q75 的四倍大。而它在界面里
+/// 从没 1:1 显示过 —— 卡片 185 CSS px（DPR 2 → 370 物理像素）、详情页 `.detail-cover`
+/// 只有 118 CSS px，都是把原图缩下来看，压缩痕迹被二次缩放又抹掉一道（实测 +2.4 dB）。
+/// 实测：卡片真实尺寸下 q75 与原图的平均差 0.82%、PSNR 约 38 dB；缩略图场景更小。
+///
+/// **为什么放在「下载 → 写盘」这一步**：源头永远是刚从网络下来的原图，只压一次，
+/// 天然不会出现「对已压过的文件再压一遍」的代际劣化。**不要去改成读本地文件再压** ——
+/// 那样每个重新生成封面的路径（搬家、补封面、重新下载并绑定）都会再压一轮，JPEG 的
+/// 劣化是累加的，几轮就糊了。
+///
+/// 解不开、编码失败、或压完反而变大（灰度/CMYK 之类的来源），一律原样返回 ——
+/// 宁可存一张大图，也不能让同步断在一次编码上。
+fn compress_cover(bytes: &[u8]) -> Vec<u8> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::{ExtendedColorType, ImageReader};
+    use std::io::Cursor;
+
+    let Ok(decoded) = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())
+        .and_then(|reader| reader.decode().map_err(|error| error.to_string()))
+    else {
+        return bytes.to_vec();
+    };
+    let rgb = decoded.to_rgb8();
+    let mut out: Vec<u8> = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut out, COVER_JPEG_QUALITY);
+    if encoder
+        .encode(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
+        .is_err()
+        || out.is_empty()
+        || out.len() >= bytes.len()
+    {
+        return bytes.to_vec();
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3097,6 +3687,8 @@ struct NovelHtmlMeta<'a> {
     author_name: &'a str,
     release_date: &'a str,
     tags: &'a str,
+    /// 简介原文（Pixiv 那种 HTML），渲染前自己净化。
+    synopsis: &'a str,
     cover_file: &'a str,
     image_count: usize,
 }
@@ -3179,6 +3771,20 @@ fn render_novel_html(content: &str, slots: &[NovelImageSlot], meta: &NovelHtmlMe
         .map(|tag| format!("<span class=\"tag\">{}</span>", escape_novel_html(tag)))
         .collect::<Vec<_>>()
         .join("");
+    // 简介（v1.2.11）：阅读版里折起来放，不打扰正文。作者没写就整块不出现。
+    let synopsis = {
+        let plain = synopsis_plain_text(meta.synopsis);
+        if plain.is_empty() {
+            String::new()
+        } else {
+            let paragraphs = plain
+                .split('\n')
+                .map(|line| format!("<p>{}</p>", escape_novel_html(line)))
+                .collect::<Vec<_>>()
+                .join("");
+            format!("<details class=\"synopsis\"><summary>作品简介</summary>{paragraphs}</details>")
+        }
+    };
     format!(
         r#"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -3204,12 +3810,17 @@ figure img {{ max-width: 100%; border-radius: 10px; }}
 figcaption {{ margin-top: 6px; color: #98a2b3; font-size: 12px; }}
 hr.page {{ border: 0; border-top: 1px dashed #d0d5dd; margin: 28px 0; }}
 ruby rt {{ font-size: 10px; color: #98a2b3; }}
+details.synopsis {{ margin: 14px 0 4px; padding: 10px 14px; border-radius: 10px;
+  background: #f8fafc; border: 1px solid #e6eaf0; color: #475467; font-size: 13px; }}
+details.synopsis summary {{ cursor: pointer; color: #475467; font-weight: 600; }}
+details.synopsis p {{ margin: 8px 0 0; font-size: 13px; text-align: left; }}
 </style></head>
 <body><main>
 {cover}
 <h1>{title}</h1>
 <p class="meta">{author_name}{date}{images}</p>
 <div class="tags">{tags}</div>
+{synopsis}
 {body}
 </main></body></html>
 "#,
@@ -3227,6 +3838,7 @@ ruby rt {{ font-size: 10px; color: #98a2b3; }}
             format!(" · 配图 {} 张", meta.image_count)
         },
         tags = tags,
+        synopsis = synopsis,
         body = body,
     )
 }
@@ -3432,7 +4044,36 @@ p{margin:0 0 .9em;text-align:justify;}
 .caption{color:#98a2b3;font-size:.75em;margin-top:.3em;text-align:center;}
 ruby rt{font-size:.55em;color:#98a2b3;}
 hr.page{border:0;border-top:1px dashed #d0d5dd;margin:1.6em 0;}
+details.synopsis{margin:0 0 1.4em;padding:.6em .8em;border:1px solid #e6eaf0;border-radius:.5em;background:#f8fafc;color:#475467;font-size:.9em;}
+details.synopsis summary{cursor:pointer;font-weight:600;}
+details.synopsis p{margin:.6em 0 0;font-size:.95em;text-align:left;}
 "#;
+
+/// 元数据里的简介留多长 —— 一部长篇的简介能有两千字，塞进 EPUB 元数据没意义。
+const SYNOPSIS_META_MAX_CHARS: usize = 1200;
+
+/// Pixiv 简介是 HTML（库里存原文，只在显示层净化）。
+/// 写进 EPUB / Markdown 元数据时要先变成纯文本：剥脚本样式 → 剥标签 → 还原实体。
+/// 段落之间保留换行，段内压平 —— 一坨两千字连成一行在 Calibre 里没法看。
+fn synopsis_plain_text(synopsis: &str) -> String {
+    if synopsis.trim().is_empty() {
+        return String::new();
+    }
+    let text = decode_entities(&document_text(synopsis));
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let flat = single_line(line);
+        if !flat.is_empty() {
+            lines.push(flat);
+        }
+    }
+    let mut plain = lines.join("\n");
+    if plain.chars().count() > SYNOPSIS_META_MAX_CHARS {
+        plain = plain.chars().take(SYNOPSIS_META_MAX_CHARS).collect::<String>();
+        plain.push('…');
+    }
+    plain
+}
 
 /// 组包：封面页 + 正文页 + 目录 + 元数据。图片按正文顺序编成 001.jpg 这类包内路径。
 fn build_novel_epub(
@@ -3441,6 +4082,7 @@ fn build_novel_epub(
     release_date: &str,
     novel_id: &str,
     tags: &str,
+    synopsis: &str,
     content: &str,
     slots: &[NovelImageSlot],
     images: &[(String, Vec<u8>)],
@@ -3480,6 +4122,16 @@ fn build_novel_epub(
         .map(|tag| format!("<dc:subject>{}</dc:subject>", escape_novel_html(tag)))
         .collect::<Vec<_>>()
         .join("");
+    // 简介（v1.2.11）：写进 `<dc:description>`，Calibre 导入后能直接看到。
+    // 库里存的是 Pixiv 那种 HTML，先净化成纯文本再截短 —— 元数据里放一坨标签没意义。
+    let description_xml = {
+        let plain = synopsis_plain_text(synopsis);
+        if plain.is_empty() {
+            String::new()
+        } else {
+            format!("<dc:description>{}</dc:description>", escape_novel_html(&plain))
+        }
+    };
 
     let used = slots
         .iter()
@@ -3572,8 +4224,22 @@ fn build_novel_epub(
         .map(|tag| format!("<span class=\"tag\">{}</span>", escape_novel_html(tag)))
         .collect::<Vec<_>>()
         .join("");
+    // 简介（v1.2.11）：标题页上也折一份 —— 元数据是给书库看的，这一份才是给读者看的。
+    let synopsis_block = {
+        let plain = synopsis_plain_text(synopsis);
+        if plain.is_empty() {
+            String::new()
+        } else {
+            let paragraphs = plain
+                .split('\n')
+                .map(|line| format!("<p>{}</p>", escape_novel_html(line)))
+                .collect::<Vec<_>>()
+                .join("");
+            format!("<details class=\"synopsis\"><summary>作品简介</summary>{paragraphs}</details>\n")
+        }
+    };
     let novel_page = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"zh-CN\" lang=\"zh-CN\">\n<head><meta charset=\"utf-8\"/><title>{title_xml}</title><link rel=\"stylesheet\" type=\"text/css\" href=\"../style.css\"/></head>\n<body>\n<h1>{title_xml}</h1>\n<p class=\"meta\">{meta_line}</p>\n<p>{tag_line}</p>\n{body}</body></html>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"zh-CN\" lang=\"zh-CN\">\n<head><meta charset=\"utf-8\"/><title>{title_xml}</title><link rel=\"stylesheet\" type=\"text/css\" href=\"../style.css\"/></head>\n<body>\n<h1>{title_xml}</h1>\n<p class=\"meta\">{meta_line}</p>\n<p>{tag_line}</p>\n{synopsis_block}{body}</body></html>\n"
     );
     zip_push(
         &mut out,
@@ -3612,13 +4278,346 @@ fn build_novel_epub(
         ""
     };
     let opf = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"bookid\" xml:lang=\"zh-CN\">\n<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"bookid\">{identifier}</dc:identifier><dc:title>{title_xml}</dc:title><dc:language>zh-CN</dc:language><dc:creator>{author_xml}</dc:creator>{date_xml}{subjects}<meta property=\"dcterms:modified\">{modified}</meta>{cover_meta}</metadata>\n<manifest>{}</manifest>\n<spine toc=\"ncx\">{}</spine>\n</package>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"bookid\" xml:lang=\"zh-CN\">\n<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"bookid\">{identifier}</dc:identifier><dc:title>{title_xml}</dc:title><dc:language>zh-CN</dc:language><dc:creator>{author_xml}</dc:creator>{date_xml}{subjects}{description_xml}<meta property=\"dcterms:modified\">{modified}</meta>{cover_meta}</metadata>\n<manifest>{}</manifest>\n<spine toc=\"ncx\">{}</spine>\n</package>\n",
         manifest.join(""),
         spine.join("")
     );
     zip_push(&mut out, &mut items, "OEBPS/content.opf", opf.as_bytes());
     zip_finish(&mut out, &items);
     out
+}
+
+// ---------------------------------------------------------------------------
+// 合集 EPUB（v1.2.9）：把一个系列 / 一个收藏夹里的多篇作品打成一本书
+//
+// 和单篇那套的区别只有「一章变多章」：单篇的 `build_novel_epub` 只写
+// `text/novel.xhtml` 一页、目录也就一条；这里一章一个 xhtml，目录按章列。
+// 素材全部取自**本地文件**（正文 txt + 同名 `_images` 目录），不联网 ——
+// 用户要的是「把已经躺在硬盘上的那批打成一本书」，不是重新抓一遍。
+// 联网重抓是「重新下载 EPUB 版」那条路，两者别混。
+// ---------------------------------------------------------------------------
+
+/// 合集里的一章（＝一篇作品）。
+struct AnthologyChapter {
+    title: String,
+    /// 「作者 · 日期 · N 字」
+    meta: String,
+    tags: String,
+    body: String,
+    /// 这一章的配图：`(包内文件名, 字节)`。文件名带章节前缀，跨章不会撞。
+    images: Vec<(String, Vec<u8>)>,
+}
+
+fn build_anthology_epub(
+    title: &str,
+    author_name: &str,
+    // 这批作品同属一个系列时填系列名，写进 calibre:series
+    series: Option<&str>,
+    chapters: &[AnthologyChapter],
+    cover: Option<(&str, &[u8])>,
+) -> Vec<u8> {
+    let title_xml = escape_novel_html(title);
+    let author_xml = escape_novel_html(author_name);
+    let identifier = format!("pixiv-anthology-{}", zip_crc32(title.as_bytes()));
+    let modified = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    // 合集没有「作者写的简介」，就自己报一份目录当简介 —— 书库里一眼能看出收了哪几篇。
+    let subjects = chapters
+        .iter()
+        .flat_map(|chapter| chapter.tags.split(['|', ',']))
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .fold(Vec::<String>::new(), |mut acc, tag| {
+            if !acc.iter().any(|existing| existing == tag) {
+                acc.push(tag.to_string());
+            }
+            acc
+        });
+    let subjects_xml = subjects
+        .iter()
+        .map(|tag| format!("<dc:subject>{}</dc:subject>", escape_novel_html(tag)))
+        .collect::<Vec<_>>()
+        .join("");
+    let description_xml = {
+        let mut listed = chapters
+            .iter()
+            .enumerate()
+            .map(|(index, chapter)| format!("{}.{}", index + 1, chapter.title))
+            .collect::<Vec<_>>()
+            .join("；");
+        if listed.chars().count() > SYNOPSIS_META_MAX_CHARS {
+            listed = listed.chars().take(SYNOPSIS_META_MAX_CHARS).collect::<String>();
+            listed.push('…');
+        }
+        format!(
+            "<dc:description>共收录 {} 篇：{}</dc:description>",
+            chapters.len(),
+            escape_novel_html(&listed)
+        )
+    };
+    let series_meta = match series.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!(
+            "<meta name=\"calibre:series\" content=\"{}\"/>",
+            escape_novel_html(name)
+        ),
+        None => String::new(),
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut items: Vec<ZipItem> = Vec::new();
+    zip_push(&mut out, &mut items, "mimetype", b"application/epub+zip");
+    zip_push(
+        &mut out,
+        &mut items,
+        "META-INF/container.xml",
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+    );
+    zip_push(&mut out, &mut items, "OEBPS/style.css", EPUB_STYLE.as_bytes());
+
+    let mut manifest = vec![
+        r#"<item id="style" href="style.css" media-type="text/css"/>"#.to_string(),
+        r#"<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>"#
+            .to_string(),
+        r#"<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>"#.to_string(),
+    ];
+    let mut spine: Vec<String> = Vec::new();
+    let mut nav_items: Vec<String> = Vec::new();
+    let mut ncx_items: Vec<String> = Vec::new();
+
+    if let Some((cover_name, cover_bytes)) = cover {
+        zip_push(
+            &mut out,
+            &mut items,
+            &format!("OEBPS/images/{cover_name}"),
+            cover_bytes,
+        );
+        manifest.push(format!(
+            r#"<item id="cover-image" href="images/{cover_name}" media-type="{}"/>"#,
+            epub_image_media_type(cover_name)
+        ));
+        manifest.push(
+            r#"<item id="coverpage" href="text/cover.xhtml" media-type="application/xhtml+xml"/>"#
+                .to_string(),
+        );
+        let cover_page = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"zh-CN\" lang=\"zh-CN\">\n<head><meta charset=\"utf-8\"/><title>封面</title><link rel=\"stylesheet\" type=\"text/css\" href=\"../style.css\"/></head>\n<body><div><img class=\"cover\" src=\"../images/{}\" alt=\"封面\"/></div></body></html>\n",
+            escape_novel_html(cover_name)
+        );
+        zip_push(
+            &mut out,
+            &mut items,
+            "OEBPS/text/cover.xhtml",
+            cover_page.as_bytes(),
+        );
+        spine.push(r#"<itemref idref="coverpage"/>"#.to_string());
+        nav_items.push(r#"<li><a href="text/cover.xhtml">封面</a></li>"#.to_string());
+        ncx_items.push(
+            r#"<navPoint id="nav-cover" playOrder="1"><navLabel><text>封面</text></navLabel><content src="text/cover.xhtml"/></navPoint>"#
+                .to_string(),
+        );
+    }
+
+    for (index, chapter) in chapters.iter().enumerate() {
+        let number = index + 1;
+        let page_name = format!("chapter{number:03}.xhtml");
+        let page_id = format!("chapter{number}");
+
+        for (image_index, (image_name, bytes)) in chapter.images.iter().enumerate() {
+            zip_push(
+                &mut out,
+                &mut items,
+                &format!("OEBPS/images/{image_name}"),
+                bytes,
+            );
+            // XML 的 id 不能带点，所以这里另起一个规整的 id —— 单篇那版直接把
+            // 「001.jpg」拼进 id 里，是能凑合用，但没必要再复制一遍这个毛病。
+            manifest.push(format!(
+                r#"<item id="img{number}-{}" href="images/{image_name}" media-type="{}"/>"#,
+                image_index + 1,
+                epub_image_media_type(image_name)
+            ));
+        }
+
+        let tag_line = chapter
+            .tags
+            .split(['|', ','])
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(|tag| format!("<span class=\"tag\">{}</span>", escape_novel_html(tag)))
+            .collect::<Vec<_>>()
+            .join("");
+        let heading = escape_novel_html(&chapter.title);
+        let page = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"zh-CN\" lang=\"zh-CN\">\n<head><meta charset=\"utf-8\"/><title>{heading}</title><link rel=\"stylesheet\" type=\"text/css\" href=\"../style.css\"/></head>\n<body>\n<h1>{heading}</h1>\n<p class=\"meta\">{}</p>\n<p>{tag_line}</p>\n{}</body></html>\n",
+            escape_novel_html(&chapter.meta),
+            chapter.body
+        );
+        zip_push(
+            &mut out,
+            &mut items,
+            &format!("OEBPS/text/{page_name}"),
+            page.as_bytes(),
+        );
+        manifest.push(format!(
+            r#"<item id="{page_id}" href="text/{page_name}" media-type="application/xhtml+xml"/>"#
+        ));
+        spine.push(format!(r#"<itemref idref="{page_id}"/>"#));
+        let order = ncx_items.len() + 1;
+        nav_items.push(format!(
+            r#"<li><a href="text/{page_name}">{heading}</a></li>"#
+        ));
+        ncx_items.push(format!(
+            r#"<navPoint id="nav-{number}" playOrder="{order}"><navLabel><text>{heading}</text></navLabel><content src="text/{page_name}"/></navPoint>"#
+        ));
+    }
+
+    let nav = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE html>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\" xml:lang=\"zh-CN\" lang=\"zh-CN\">\n<head><meta charset=\"utf-8\"/><title>目录</title></head>\n<body><nav epub:type=\"toc\" id=\"toc\"><h1>目录</h1><ol>{}</ol></nav></body></html>\n",
+        nav_items.join("")
+    );
+    zip_push(&mut out, &mut items, "OEBPS/nav.xhtml", nav.as_bytes());
+    let depth = if ncx_items.is_empty() { 0 } else { 1 };
+    let ncx = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ncx xmlns=\"http://www.daisy.org/z3986/2005/ncx/\" version=\"2005-1\">\n<head><meta name=\"dtb:uid\" content=\"{identifier}\"/><meta name=\"dtb:depth\" content=\"{depth}\"/></head>\n<docTitle><text>{title_xml}</text></docTitle>\n<navMap>{}</navMap>\n</ncx>\n",
+        ncx_items.join("")
+    );
+    zip_push(&mut out, &mut items, "OEBPS/toc.ncx", ncx.as_bytes());
+
+    let cover_meta = if cover.is_some() {
+        r#"<meta name="cover" content="cover-image"/>"#
+    } else {
+        ""
+    };
+    let opf = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"bookid\" xml:lang=\"zh-CN\">\n<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:identifier id=\"bookid\">{identifier}</dc:identifier><dc:title>{title_xml}</dc:title><dc:language>zh-CN</dc:language><dc:creator>{author_xml}</dc:creator>{subjects_xml}{description_xml}{series_meta}<meta property=\"dcterms:modified\">{modified}</meta>{cover_meta}</metadata>\n<manifest>{}</manifest>\n<spine toc=\"ncx\">{}</spine>\n</package>\n",
+        manifest.join(""),
+        spine.join("")
+    );
+    zip_push(&mut out, &mut items, "OEBPS/content.opf", opf.as_bytes());
+    zip_finish(&mut out, &items);
+    out
+}
+
+/// 合集取正文的那个文件：绑的是 txt / md / html 就用它本身；绑的是 `.epub` 这类
+/// 电子书，就用同目录那份同名 `.txt`（程序自己维护的正文副本）；绑的是目录就在里面找一个 txt。
+/// 找不到就返回 `None`，调用方把这篇记进「跳过」名单、别把整本书卡掉。
+fn anthology_text_file(bound: &Path) -> Option<PathBuf> {
+    if bound.is_dir() {
+        let mut found = fs::read_dir(bound)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| extension.eq_ignore_ascii_case("txt"))
+                        .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        return found.into_iter().next();
+    }
+    if !bound.is_file() {
+        return None;
+    }
+    let extension = bound
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(extension.as_str(), "txt" | "md" | "html" | "htm" | "xhtml") {
+        return Some(bound.to_path_buf());
+    }
+    let beside = bound.with_extension("txt");
+    beside.is_file().then_some(beside)
+}
+
+/// 把本地正文里 `[插图 N：xxx_images/003.jpg]` 这类标记编成配图槽位。
+///
+/// 只认**落盘后**的友好标记，不认 Pixiv 原始 token（`[uploadedimage:…]`）——
+/// 后者在这份 txt 里没有对应文件，硬编个空槽位只会让正文里多一块破图。
+///
+/// 返回 `(槽位, 图片字节)`：槽位给 `render_novel_xhtml` 定位插图，字节给 zip 直接写。
+/// 字节不塞进 `NovelImageSlot` 里 —— 那个结构在「下配图」那条路上按值传来传去，
+/// 挂上几十兆图片会跟着复制。
+fn anthology_image_slots(
+    content: &str,
+    text_path: &Path,
+    chapter: usize,
+) -> (Vec<NovelImageSlot>, Vec<(String, Vec<u8>)>) {
+    let dir = novel_images_dir(text_path);
+    let folder_name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut slots: Vec<NovelImageSlot> = Vec::new();
+    let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rest = content;
+    while let Some(start) = rest.find('[') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find(']') else {
+            break;
+        };
+        let inner = &after[..end];
+        rest = &after[end + 1..];
+        let external = if inner.starts_with("引用插画") {
+            true
+        } else if inner.starts_with("插图") {
+            false
+        } else {
+            continue;
+        };
+        let reference = inner
+            .rsplit(['：', ':'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if reference.is_empty() {
+            continue;
+        }
+        let file_name = reference
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&reference)
+            .trim()
+            .to_string();
+        if file_name.is_empty() {
+            continue;
+        }
+        let token = format!("[{inner}]");
+        if !seen.insert(token.clone()) {
+            continue;
+        }
+        let source = dir.join(&file_name);
+        let Ok(bytes) = fs::read(&source) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let order = slots.len() + 1;
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("jpg");
+        let packaged = format!("c{:02}_{:03}.{}", chapter + 1, order, extension);
+        images.push((packaged.clone(), bytes));
+        slots.push(NovelImageSlot {
+            token,
+            order,
+            file_name: packaged,
+            relative: format!("{folder_name}/{file_name}"),
+            url: String::new(),
+            external,
+        });
+    }
+    (slots, images)
 }
 
 /// EPUB 与作品正文同目录、同名（跟「单份」模型一致：作品在哪一侧，epub 就在哪一侧）。
@@ -3692,6 +4691,8 @@ struct ReadingWriteMeta<'a> {
     author_name: &'a str,
     release_date: &'a str,
     tags: &'a str,
+    /// 简介原文（HTML），HTML / EPUB 各自净化后写入。
+    synopsis: &'a str,
     image_count: usize,
 }
 
@@ -3721,6 +4722,7 @@ fn write_reading_output(
                     author_name: meta.author_name,
                     release_date: meta.release_date,
                     tags: meta.tags,
+                    synopsis: meta.synopsis,
                     cover_file: &cover_file,
                     image_count: meta.image_count,
                 },
@@ -3752,6 +4754,7 @@ fn write_reading_output(
                 meta.release_date,
                 meta.novel_id,
                 meta.tags,
+                meta.synopsis,
                 content,
                 slots,
                 &images,
@@ -3817,14 +4820,13 @@ fn pixiv_sync_impl(
         .filter(|tag| !tag.is_empty())
         .map(|tag| tag.to_lowercase())
         .collect();
-    let match_title_length: i64 = setting(&conn, "match_title_length")?
-        .parse()
-        .unwrap_or(0);
     let sync_settings = read_settings(&conn)?;
     let image_quality = sync_settings.image_quality.clone();
     // 同步时就按设置生成阅读版：html 单网页，或者直接产出 epub
     let reading_format = reading_format_of(&sync_settings.sync_image_format);
-    let (homepage, preview_dir, purchased_dir, threshold, last_sync, cookie, author_name): (String, String, String, i64, String, String, String) = conn.query_row(
+    // `_threshold`（作者级的 match_threshold）在同步里已经不用了：复用本地预览版
+    // 只认文件名完全相同，不再比相似度。留在 SELECT 里只是为了不改 tuple 的取列顺序。
+    let (homepage, preview_dir, purchased_dir, _threshold, last_sync, cookie, author_name): (String, String, String, i64, String, String, String) = conn.query_row(
         "SELECT a.homepage, a.preview_dir, a.purchased_dir, a.match_threshold, a.pixiv_last_sync_at, COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), ''), a.name FROM authors a WHERE a.id=?1",
         [author_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
     ).map_err(|e| e.to_string())?;
@@ -4066,9 +5068,7 @@ fn pixiv_sync_impl(
             })
             .unwrap_or_default();
         let is_preview = synopsis_indicates_preview(&description);
-        if let Some((preview_path, cover_path)) =
-            matched_sync_preview(&preview_entries, &title, threshold, match_title_length)
-        {
+        if let Some((preview_path, cover_path)) = matched_sync_preview(&preview_entries, &title) {
             // 单份模型：预览版作品留在预览版目录，完整版作品整份搬去完整版目录，不再复制第二份。
             let cover_name = cover_path
                 .as_ref()
@@ -4168,7 +5168,8 @@ fn pixiv_sync_impl(
                 break;
             }
             let cover = match cover {
-                Ok(bytes) => bytes,
+                // 封面在这里压完再落盘（见 compress_cover）：只写压缩版，不留原图。
+                Ok(bytes) => compress_cover(&bytes),
                 Err(_) => {
                     result.failed_count += 1;
                     continue;
@@ -4211,6 +5212,7 @@ fn pixiv_sync_impl(
                         author_name: &author_name,
                         release_date: &work.release_date,
                         tags: &work.tags,
+                        synopsis: &work.synopsis,
                         image_count: image_saved,
                     },
                 )
@@ -4709,40 +5711,180 @@ async fn sync_pixiv_author_profile(
     .map_err(|e| e.to_string())?
 }
 
+/// Cookie 体检结果。设置面板的「测试 Cookie」和启动自检共用这一份。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct PixivCookieProbe {
+    /// 唯一需要判断的字段：true 才算通过
+    ok: bool,
+    /// `ok` / `missing` / `invalid` / `network` / `unknown` —— 前端按它决定说什么话
+    status: String,
+    /// 直接显示给用户的中文说明
+    message: String,
+    /// 登录账号名，拿得到才有
+    user_name: Option<String>,
+    /// 检测时刻（毫秒时间戳），前端自己格式化
+    checked_at_ms: i64,
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 拿一份 Cookie 去问 Pixiv「我现在是谁」。
+///
+/// `cookie` 传了就用传进来的那份（设置面板里刚粘贴、还没轮到自动保存的），
+/// 没传就读数据库里存的那份 —— 这样「测完再存」和「存完再测」都是同一个答案。
 #[tauri::command]
-async fn check_pixiv_cookie() -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let conn = db()?;
-        let cookie = setting(&conn, "pixiv_cookie")?;
-        
-        // 如果没有设置cookie，返回false
-        if cookie.trim().is_empty() {
-            return Ok(false);
+async fn check_pixiv_cookie(cookie: Option<String>) -> Result<PixivCookieProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = match cookie {
+            Some(value) if !value.trim().is_empty() => value,
+            _ => {
+                let conn = db()?;
+                setting(&conn, "pixiv_cookie")?
+            }
+        };
+        if raw.trim().is_empty() {
+            return Ok(PixivCookieProbe {
+                ok: false,
+                status: "missing".into(),
+                message: "还没填 Pixiv Cookie —— 同步作品列表、正文和 R-18 内容都需要它。".into(),
+                user_name: None,
+                checked_at_ms: now_millis(),
+            });
         }
-        
-        // 尝试使用cookie请求Pixiv API
-        let client = pixiv_client(Some(normalize_pixiv_cookie(&cookie)?))?;
-        
-        // 请求一个简单的API来验证cookie有效性
-        // 使用用户自己的信息API，这个需要有效的cookie
-        let response = client
-            .get("https://www.pixiv.net/ajax/user/0")
-            .send()
-            .map_err(|e| e.to_string())?;
-        
-        // 检查响应状态
-        // 如果cookie无效，Pixiv通常会返回401或403
-        // 如果cookie有效，会返回200或重定向
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Ok(false);
-        }
-        
-        // 如果状态码是200或重定向，认为cookie有效
-        Ok(status == reqwest::StatusCode::OK || status.is_redirection())
+        let normalized = normalize_pixiv_cookie(&raw)?;
+        Ok(probe_pixiv_cookie(&normalized))
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// 从 PHPSESSID 里抠出账号 UID。Pixiv 的格式是 `<uid>_<随机串>`，前缀那串数字就是账号自己的 UID。
+///
+/// **只用来显示账号名**，不参与「Cookie 还有效吗」的判断 —— 抠不出来就当没有，
+/// 不能让一个解析细节决定体检结论。
+fn pixiv_uid_from_cookie(cookie: &str) -> Option<String> {
+    cookie
+        .split(';')
+        .map(str::trim)
+        .find_map(|pair| pair.strip_prefix("PHPSESSID="))
+        .and_then(|value| value.split('_').next())
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit()))
+        .map(str::to_string)
+}
+
+/// 用 UID 查一个**公开**接口拿账号名 —— 这个接口谁都能查，所以它只负责显示，
+/// 判断登录态一律靠 `probe_pixiv_cookie` 里的 `/ajax/user/extra`。
+/// 任何一步失败都返回 None：拿不到名字只该让提示少半句，不该让体检报错。
+fn fetch_pixiv_user_name(client: &Client, uid: &str) -> Option<String> {
+    let text = client
+        .get(format!("https://www.pixiv.net/ajax/user/{uid}"))
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    let body: Value = serde_json::from_str(&text).ok()?;
+    body.get("body")?
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+/// 用 `/ajax/user/extra` 探一次登录态 —— 这个接口必须带有效 Cookie 才回得出当前账号信息。
+///
+/// 判断口径是「HTTP 成功 + 接口没报 error」。**不要**去要求 body 里有 userId / name ——
+/// 实测这个接口成功时的 body 只有 `{following, followers, mypixivCount, background}`，
+/// 压根没有 userId（v1.2.15 第一版按「拿得到 userId」判，结果对每一份有效 Cookie 都报失效）。
+/// 它不带参数返回的就是**当前登录账号自己**的关注数，未登录拿不到（400/401 + error:true），
+/// 所以「200 且没报 error」本身就等于「这份 Cookie 是活的」。
+/// 失败时把「网络不通」和「Cookie 失效」分开报 —— 这两件事该做的处理完全不同。
+fn probe_pixiv_cookie(cookie: &str) -> PixivCookieProbe {
+    let checked_at_ms = now_millis();
+    let unknown = |message: String| PixivCookieProbe {
+        ok: false,
+        status: "unknown".into(),
+        message,
+        user_name: None,
+        checked_at_ms,
+    };
+    // 失败原因不同，用户该做的事也不同，所以分开三段说；但结构体长得一模一样，统一从这里出
+    let invalid = |message: &str| PixivCookieProbe {
+        ok: false,
+        status: "invalid".into(),
+        message: message.into(),
+        user_name: None,
+        checked_at_ms,
+    };
+    let client = match pixiv_client(Some(cookie.to_string())) {
+        Ok(client) => client,
+        Err(error) => return unknown(error),
+    };
+    let response = match client.get("https://www.pixiv.net/ajax/user/extra").send() {
+        Ok(response) => response,
+        Err(error) => {
+            return PixivCookieProbe {
+                ok: false,
+                status: "network".into(),
+                message: format!(
+                    "连不上 Pixiv（{error}）。这多半不是 Cookie 的问题，先确认浏览器/代理能打开 pixiv.net 再测一次。"
+                ),
+                user_name: None,
+                checked_at_ms,
+            };
+        }
+    };
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    let body: Option<Value> = serde_json::from_str(&text).ok();
+    let Some(body) = body else {
+        return unknown(format!(
+            "Pixiv 回了 HTTP {}，但内容读不出来（可能是被拦截或接口改了）。稍后再试。",
+            status.as_u16()
+        ));
+    };
+    let api_error = body
+        .get("error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if status.is_success() && !api_error {
+        // 名字只是「附赠」：拿 UID 再查一次公开接口，拿不到就少半句话，不影响结论
+        let user_name =
+            pixiv_uid_from_cookie(cookie).and_then(|uid| fetch_pixiv_user_name(&client, &uid));
+        return PixivCookieProbe {
+            ok: true,
+            status: "ok".into(),
+            message: match &user_name {
+                Some(name) => format!("Cookie 有效，当前登录：{name}"),
+                None => "Cookie 有效。".into(),
+            },
+            user_name,
+            checked_at_ms,
+        };
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return invalid("Pixiv 拒绝了这份 Cookie（登录已失效）。重新导出一次 PHPSESSID 再填进来。");
+    }
+    if status == reqwest::StatusCode::BAD_REQUEST {
+        // 实测：一份已作废的 PHPSESSID 会走到这里（400，不是 401）
+        return invalid("Pixiv 说这次请求里没有登录凭证 —— 这份 PHPSESSID 多半已经作废。重新导出一次再填进来。");
+    }
+    if status.is_success() {
+        // 兜底：200 但接口自己说 error，同样按失效算
+        return invalid("Pixiv 认出这是未登录状态 —— 这份 Cookie 已经不能用。重新导出一次 PHPSESSID 再填进来。");
+    }
+    unknown(format!(
+        "没测出结果：Pixiv 返回了 HTTP {}。稍后再试，或先确认浏览器里能正常打开 pixiv.net。",
+        status.as_u16()
+    ))
 }
 
 #[allow(dead_code)]
@@ -6015,6 +7157,8 @@ struct NovelAssets {
     author_name: String,
     release_date: String,
     tags: String,
+    /// 简介原文（HTML）。优先用库里存的，缺了就拿 Pixiv 这次返回的补。
+    synopsis: String,
     text_path: PathBuf,
     cover_path: PathBuf,
     cover_url: String,
@@ -6026,17 +7170,10 @@ struct NovelAssets {
 /// 调用方负责真正下图片（便于「只导出」和「下配图」走同一套解析）。
 fn prepare_novel_assets(work_id: i64) -> Result<(NovelAssets, Client), String> {
     let conn = db()?;
-    let (novel_id, title, preview_path, purchased_path, release_date, tags, author_name): (
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-    ) = conn
+    let (novel_id, title, preview_path, purchased_path, release_date, tags, author_name, stored_synopsis):
+        (String, String, String, String, String, String, String, String) = conn
         .query_row(
-            "SELECT w.pixiv_novel_id, w.title, w.preview_path, w.purchased_path, w.release_date, w.tags, a.name FROM works w JOIN authors a ON a.id=w.author_id WHERE w.id=?1",
+            "SELECT w.pixiv_novel_id, w.title, w.preview_path, w.purchased_path, w.release_date, w.tags, a.name, w.synopsis FROM works w JOIN authors a ON a.id=w.author_id WHERE w.id=?1",
             [work_id],
             |row| {
                 Ok((
@@ -6047,6 +7184,7 @@ fn prepare_novel_assets(work_id: i64) -> Result<(NovelAssets, Client), String> {
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -6084,6 +7222,13 @@ fn prepare_novel_assets(work_id: i64) -> Result<(NovelAssets, Client), String> {
         .cloned()
         .unwrap_or(Value::Null);
     let slots = plan_novel_images(&client, &embedded, &content, &text_path, &quality);
+    // 简介优先用库里那份（和界面上看到的一致）；老库里没存过就用这次 Pixiv 返回的补上，
+    // 但**不回头写库** —— 导出是只读操作，别在这儿偷偷改作品数据。
+    let synopsis = if stored_synopsis.trim().is_empty() {
+        json_string(body, "description")
+    } else {
+        stored_synopsis
+    };
     Ok((
         NovelAssets {
             novel_id,
@@ -6091,6 +7236,7 @@ fn prepare_novel_assets(work_id: i64) -> Result<(NovelAssets, Client), String> {
             author_name,
             release_date,
             tags,
+            synopsis,
             cover_path: text_path.with_extension("jpg"),
             text_path,
             cover_url: json_string(body, "coverUrl"),
@@ -6105,7 +7251,7 @@ fn prepare_novel_assets(work_id: i64) -> Result<(NovelAssets, Client), String> {
 fn ensure_novel_cover(client: &Client, assets: &NovelAssets) -> String {
     if !assets.cover_path.exists() && !assets.cover_url.is_empty() {
         if let Ok(bytes) = fetch_pixiv_cover(client, &assets.cover_url) {
-            let _ = fs::write(&assets.cover_path, &bytes);
+            let _ = fs::write(&assets.cover_path, compress_cover(&bytes));
         }
     }
     assets
@@ -6498,6 +7644,7 @@ fn download_reading_version_impl(
                     author_name: &assets.author_name,
                     release_date: &assets.release_date,
                     tags: &assets.tags,
+                    synopsis: &assets.synopsis,
                     cover_file: &cover_file,
                     image_count: saved,
                 },
@@ -6533,6 +7680,7 @@ fn download_reading_version_impl(
                 &assets.release_date,
                 &assets.novel_id,
                 &assets.tags,
+                &assets.synopsis,
                 &assets.content,
                 &assets.slots,
                 &images,
@@ -6866,7 +8014,7 @@ fn fetch_missing_cover(client: &Client, novel_id: &str, target: &Path) -> Result
     if bytes.is_empty() {
         return Err("封面是空文件".into());
     }
-    write_bytes_atomic(target, &bytes)?;
+    write_bytes_atomic(target, &compress_cover(&bytes))?;
     Ok(target.to_path_buf())
 }
 
@@ -7275,6 +8423,148 @@ fn set_work_collections(work_id: i64, collection_ids: Vec<i64>) -> Result<(), St
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 筛选视图（v1.2.9）
+//
+// 存的只是**条件**，不是作品 —— 和收藏夹是两码事。`payload` 里是一份 JSON，
+// 后端不解释它（前端加一档筛选项不用改库），只保证名字唯一、长度别太离谱。
+// 这样做的代价是「条件口径变了老视图会失效」，但换来的是加筛选条件不用迁移。
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FilterView {
+    id: i64,
+    name: String,
+    /// 筛选条件的 JSON 原文（阅读状态 / 评分 / 字数 / 收藏夹 / 搜索词 / 范围 / 排序…）
+    payload: String,
+    created_at: String,
+}
+
+const FILTER_VIEW_MAX_NAME: usize = 30;
+
+fn clean_filter_view_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("视图名字不能空着".into());
+    }
+    if name.chars().count() > FILTER_VIEW_MAX_NAME {
+        return Err(format!("视图名字最多 {FILTER_VIEW_MAX_NAME} 个字"));
+    }
+    Ok(name.to_string())
+}
+
+fn filter_view_by_id(conn: &Connection, id: i64) -> Result<FilterView, String> {
+    conn.query_row(
+        "SELECT id, name, payload, created_at FROM filter_views WHERE id=?1",
+        [id],
+        |row| {
+            Ok(FilterView {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                payload: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        },
+    )
+    .map_err(|e| format!("没找到这个筛选视图：{e}"))
+}
+
+#[tauri::command]
+fn list_filter_views() -> Result<Vec<FilterView>, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare("SELECT id, name, payload, created_at FROM filter_views ORDER BY sort_order ASC, id ASC")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(FilterView {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                payload: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_filter_view(name: String, payload: String) -> Result<FilterView, String> {
+    let name = clean_filter_view_name(&name)?;
+    let conn = db()?;
+    let used: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM filter_views WHERE name=?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if used > 0 {
+        return Err(format!("已经有一个叫「{name}」的筛选视图了"));
+    }
+    let order: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM filter_views",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+    conn.execute(
+        "INSERT INTO filter_views (name, payload, sort_order, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![name, payload, order, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    filter_view_by_id(&conn, conn.last_insert_rowid())
+}
+
+#[tauri::command]
+fn rename_filter_view(id: i64, name: String) -> Result<FilterView, String> {
+    let name = clean_filter_view_name(&name)?;
+    let conn = db()?;
+    let used: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM filter_views WHERE name=?1 AND id<>?2",
+            params![name, id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if used > 0 {
+        return Err(format!("已经有一个叫「{name}」的筛选视图了"));
+    }
+    conn.execute(
+        "UPDATE filter_views SET name=?1 WHERE id=?2",
+        params![name, id],
+    )
+    .map_err(|e| e.to_string())?;
+    filter_view_by_id(&conn, id)
+}
+
+/// 用当前条件覆盖已有视图（「更新为当前条件」）—— 名字保持不变。
+#[tauri::command]
+fn update_filter_view(id: i64, payload: String) -> Result<FilterView, String> {
+    let conn = db()?;
+    let changed = conn
+        .execute(
+            "UPDATE filter_views SET payload=?1 WHERE id=?2",
+            params![payload, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("没找到这个筛选视图".into());
+    }
+    filter_view_by_id(&conn, id)
+}
+
+#[tauri::command]
+fn delete_filter_view(id: i64) -> Result<(), String> {
+    let conn = db()?;
+    conn.execute("DELETE FROM filter_views WHERE id=?1", [id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 批量把作品**加进**若干收藏夹（并集，不覆盖已有归属）——
 /// 批量操作里用。单篇的「一次性替换」走 set_work_collections。
 #[tauri::command]
@@ -7316,24 +8606,21 @@ fn list_collection_works(
     query: String,
     search_field: String,
     status: String,
-    images_only: bool,
+    images_filter: String,
+    also_in_collection_id: i64,
     sort: String,
 ) -> Result<Vec<Work>, String> {
     let conn = db()?;
-    let field = if search_field == "tags" {
-        "w.tags"
-    } else {
-        "w.title"
-    };
-    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM collection_works cw JOIN works w ON w.id=cw.work_id JOIN authors a ON a.id=w.author_id WHERE cw.collection_id=?1 AND (?2='' OR {field} LIKE ?3)");
+    let condition = search_match_clause(&search_field, "w.", "?2", "?3");
+    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM collection_works cw JOIN works w ON w.id=cw.work_id JOIN authors a ON a.id=w.author_id WHERE cw.collection_id=?1 AND {condition}");
     match status.as_str() {
         "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND w.purchased_path = ''"),
         _ => {}
     }
-    if images_only {
-        sql.push_str(" AND w.has_images = 1");
-    }
+    sql.push_str(&images_filter_clause(&images_filter, "w."));
+    // 这个视图本身已经锁在一个夹子里了，面板里再选一个就是「同时也在那个夹子里」的收窄
+    sql.push_str(&collection_filter_clause("w.id", "cw2", "?4"));
     sql.push_str(match sort.as_str() {
         "date_asc" => " ORDER BY w.release_date ASC, w.id ASC",
         "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
@@ -7345,7 +8632,12 @@ fn list_collection_works(
     let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = statement
         .query_map(
-            params![collection_id, raw_query, format!("%{raw_query}%")],
+            params![
+                collection_id,
+                raw_query,
+                format!("%{raw_query}%"),
+                also_in_collection_id
+            ],
             map_work,
         )
         .map_err(|e| e.to_string())?;
@@ -7777,7 +9069,7 @@ struct ExportResult {
 }
 
 /// 导出列（顺序即 CSV 列顺序，Markdown 也按这个取下标）。
-const EXPORT_HEADERS: [&str; 14] = [
+const EXPORT_HEADERS: [&str; 18] = [
     "标题",
     "作者",
     "发布日期",
@@ -7791,8 +9083,33 @@ const EXPORT_HEADERS: [&str; 14] = [
     "阅读状态",
     "笔记",
     "Pixiv 链接",
-    "文件路径",
+    "正文文件路径",
+    "封面路径",
+    "作品 ID",
+    "配图张数",
+    "简介",
 ];
+
+// 导出列的位置：CSV 和 Markdown 吃的是同一份行数据，两边必须对齐。
+// 一律用这些名字，别在下面写裸数字 —— 行号写死过一次，读错列还不报错。
+const EXPORT_COL_TITLE: usize = 0;
+const EXPORT_COL_AUTHOR: usize = 1;
+const EXPORT_COL_DATE: usize = 2;
+const EXPORT_COL_WORDS: usize = 3;
+const EXPORT_COL_FORMAT: usize = 4;
+const EXPORT_COL_TAGS: usize = 5;
+const EXPORT_COL_SERIES: usize = 6;
+const EXPORT_COL_VERSION: usize = 7;
+const EXPORT_COL_COLLECTIONS: usize = 8;
+const EXPORT_COL_RATING: usize = 9;
+const EXPORT_COL_READ: usize = 10;
+const EXPORT_COL_NOTE: usize = 11;
+const EXPORT_COL_PIXIV_URL: usize = 12;
+const EXPORT_COL_TEXT_PATH: usize = 13;
+const EXPORT_COL_COVER_PATH: usize = 14;
+const EXPORT_COL_NOVEL_ID: usize = 15;
+const EXPORT_COL_IMAGES: usize = 16;
+const EXPORT_COL_SYNOPSIS: usize = 17;
 
 fn read_state_label(state: i64) -> &'static str {
     match state {
@@ -7842,6 +9159,12 @@ fn export_rows(conn: &Connection, works: Vec<Work>) -> Result<Vec<Vec<String>>, 
                 work.pixiv_novel_id
             )
         };
+        // 本地正文文件：完整版用 purchased，预览版只有 preview —— 导出时给个能直接双击的路径
+        let text_path = if work.purchased_path.trim().is_empty() {
+            work.preview_path.clone()
+        } else {
+            work.purchased_path.clone()
+        };
         rows.push(vec![
             work.title.clone(),
             work.author_name.clone(),
@@ -7867,7 +9190,15 @@ fn export_rows(conn: &Connection, works: Vec<Work>) -> Result<Vec<Vec<String>>, 
             read_state_label(work.read_state).to_string(),
             work.note.replace('\n', " ").replace('\r', " "),
             pixiv_url,
-            work.purchased_path.clone(),
+            text_path,
+            work.cover_path.clone(),
+            work.pixiv_novel_id.clone(),
+            if work.image_count > 0 {
+                work.image_count.to_string()
+            } else {
+                String::new()
+            },
+            synopsis_plain_text(&work.synopsis),
         ]);
     }
     Ok(rows)
@@ -7898,43 +9229,283 @@ fn write_export_markdown(path: &str, rows: &[Vec<String>]) -> Result<(), String>
         Utc::now().format("%Y-%m-%d %H:%M")
     );
     for row in rows {
-        text.push_str(&format!("\n## {}\n\n", row[0]));
+        let get = |index: usize| row.get(index).map(String::as_str).unwrap_or("");
+        text.push_str(&format!("\n## {}\n\n", get(EXPORT_COL_TITLE)));
         let mut facts: Vec<String> = Vec::new();
-        if !row[1].trim().is_empty() {
-            facts.push(format!("作者：{}", row[1]));
+        if !get(EXPORT_COL_AUTHOR).trim().is_empty() {
+            facts.push(format!("作者：{}", get(EXPORT_COL_AUTHOR)));
         }
-        if !row[2].trim().is_empty() {
-            facts.push(format!("发布：{}", row[2]));
+        if !get(EXPORT_COL_DATE).trim().is_empty() {
+            facts.push(format!("发布：{}", get(EXPORT_COL_DATE)));
         }
-        if !row[3].trim().is_empty() {
-            facts.push(format!("字数：{}", row[3]));
+        if !get(EXPORT_COL_WORDS).trim().is_empty() {
+            facts.push(format!("字数：{}", get(EXPORT_COL_WORDS)));
         }
-        if !row[4].trim().is_empty() {
-            facts.push(format!("格式：{}", row[4]));
+        if !get(EXPORT_COL_FORMAT).trim().is_empty() {
+            facts.push(format!("格式：{}", get(EXPORT_COL_FORMAT)));
         }
-        facts.push(row[7].clone());
-        if !row[6].trim().is_empty() {
-            facts.push(row[6].clone());
+        if !get(EXPORT_COL_IMAGES).trim().is_empty() {
+            facts.push(format!("配图：{} 张", get(EXPORT_COL_IMAGES)));
         }
-        if !row[8].trim().is_empty() {
-            facts.push(format!("收藏夹：{}", row[8]));
+        facts.push(get(EXPORT_COL_VERSION).to_string());
+        if !get(EXPORT_COL_SERIES).trim().is_empty() {
+            facts.push(get(EXPORT_COL_SERIES).to_string());
         }
-        if !row[9].trim().is_empty() {
-            facts.push(row[9].clone());
+        if !get(EXPORT_COL_COLLECTIONS).trim().is_empty() {
+            facts.push(format!("收藏夹：{}", get(EXPORT_COL_COLLECTIONS)));
         }
-        facts.push(row[10].clone());
+        if !get(EXPORT_COL_RATING).trim().is_empty() {
+            facts.push(get(EXPORT_COL_RATING).to_string());
+        }
+        facts.push(get(EXPORT_COL_READ).to_string());
+        facts.retain(|fact| !fact.trim().is_empty());
         text.push_str(&format!("{}\n", facts.join(" · ")));
-        if !row[5].trim().is_empty() {
-            text.push_str(&format!("\n标签：{}\n", row[5]));
+        if !get(EXPORT_COL_TAGS).trim().is_empty() {
+            text.push_str(&format!("\n标签：{}\n", get(EXPORT_COL_TAGS)));
         }
-        if !row[11].trim().is_empty() {
-            text.push_str(&format!("\n> {}\n", row[11]));
+        if !get(EXPORT_COL_NOTE).trim().is_empty() {
+            text.push_str(&format!("\n> {}\n", get(EXPORT_COL_NOTE)));
         }
-        if !row[12].trim().is_empty() {
-            text.push_str(&format!("\n[Pixiv 原页]({})\n", row[12]));
+        // 简介按段落引起来，段落之间的换行不能丢
+        if !get(EXPORT_COL_SYNOPSIS).trim().is_empty() {
+            text.push_str("\n简介：\n\n");
+            for line in get(EXPORT_COL_SYNOPSIS).lines().filter(|line| !line.trim().is_empty()) {
+                text.push_str(&format!("> {line}\n"));
+            }
+        }
+        // 本地文件与 Pixiv 页都留一句，导出来的清单能直接当索引用
+        text.push_str("\n");
+        if !get(EXPORT_COL_PIXIV_URL).trim().is_empty() {
+            text.push_str(&format!("[Pixiv 原页]({})", get(EXPORT_COL_PIXIV_URL)));
+            if !get(EXPORT_COL_NOVEL_ID).trim().is_empty() {
+                text.push_str(&format!("（ID {}）", get(EXPORT_COL_NOVEL_ID)));
+            }
+            text.push_str("\n");
+        } else if !get(EXPORT_COL_NOVEL_ID).trim().is_empty() {
+            text.push_str(&format!("Pixiv ID：{}\n", get(EXPORT_COL_NOVEL_ID)));
+        }
+        if !get(EXPORT_COL_TEXT_PATH).trim().is_empty() {
+            text.push_str(&format!(
+                "\n正文：`{}`\n",
+                get(EXPORT_COL_TEXT_PATH).replace('`', "'")
+            ));
+        }
+        if !get(EXPORT_COL_COVER_PATH).trim().is_empty() {
+            text.push_str(&format!(
+                "封面：`{}`\n",
+                get(EXPORT_COL_COVER_PATH).replace('`', "'")
+            ));
         }
     }
     fs::write(path, text).map_err(|e| format!("写入 Markdown 失败：{e}"))
+}
+
+/// 合集 EPUB 的导出进度（复用阅读版那套浮层，另起一个事件名免得两边串台）。
+const ANTHOLOGY_PROGRESS_EVENT: &str = "anthology-export-progress";
+
+fn emit_anthology_progress(app: &AppHandle, total: usize, current: usize, title: String, done: bool) {
+    let _ = app.emit(
+        ANTHOLOGY_PROGRESS_EVENT,
+        ReadingProgress {
+            total,
+            current,
+            title,
+            done,
+        },
+    );
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnthologyResult {
+    title: String,
+    output_path: String,
+    chapters: usize,
+    image_count: usize,
+    size_bytes: u64,
+    /// 没找到本地正文、被跳过的作品名（前端照着提示一句，别让用户以为少打包是他点错了）
+    skipped: Vec<String>,
+}
+
+/// 把一个系列 / 一个收藏夹打成一整本 EPUB。作品顺序**按传进来的顺序**，
+/// 前端已经把系列按 `series_order` 排好、收藏夹按收藏时间排好，后端不再自作主张重排。
+#[tauri::command]
+async fn export_anthology_epub(
+    app: AppHandle,
+    path: String,
+    title: String,
+    author_name: String,
+    work_ids: Vec<i64>,
+) -> Result<AnthologyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_anthology_epub_impl(&app, &path, &title, &author_name, &work_ids)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn export_anthology_epub_impl(
+    app: &AppHandle,
+    path: &str,
+    title: &str,
+    author_name: &str,
+    work_ids: &[i64],
+) -> Result<AnthologyResult, String> {
+    if path.trim().is_empty() {
+        return Err("请先选择保存位置".into());
+    }
+    if work_ids.is_empty() {
+        return Err("这批作品是空的，没什么可打包的".into());
+    }
+    let book_title = if title.trim().is_empty() {
+        "合集".to_string()
+    } else {
+        title.trim().to_string()
+    };
+    let conn = db()?;
+    let total = work_ids.len();
+    let mut chapters: Vec<AnthologyChapter> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut cover: Option<(String, Vec<u8>)> = None;
+    // 这批作品全都属于同一个系列时，把系列名写进 calibre:series；
+    // 混着选的（比如一个收藏夹）就不写，免得给书库塞个假系列。
+    let mut series_names: Vec<String> = Vec::new();
+    emit_anthology_progress(app, total, 0, "正在准备合集…".into(), false);
+    for (index, work_id) in work_ids.iter().enumerate() {
+        let row = conn
+            .query_row(
+                "SELECT w.title, a.name, w.release_date, w.tags, w.preview_path, w.purchased_path, w.cover_path, w.series_title FROM works w JOIN authors a ON a.id=w.author_id WHERE w.id=?1",
+                [work_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((
+            work_title,
+            work_author,
+            release_date,
+            tags,
+            preview_path,
+            purchased_path,
+            cover_path,
+            series_title,
+        )) = row
+        else {
+            continue;
+        };
+        let series_title = series_title.trim().to_string();
+        if !series_title.is_empty() && !series_names.iter().any(|name| name == &series_title) {
+            series_names.push(series_title);
+        }
+        emit_anthology_progress(app, total, index, work_title.clone(), false);
+        let bound = if purchased_path.trim().is_empty() {
+            PathBuf::from(&preview_path)
+        } else {
+            PathBuf::from(&purchased_path)
+        };
+        let Some(text_path) = anthology_text_file(&bound) else {
+            skipped.push(work_title);
+            continue;
+        };
+        let Some(raw) = read_text_file(&text_path) else {
+            skipped.push(work_title);
+            continue;
+        };
+        if raw.trim().is_empty() {
+            skipped.push(work_title);
+            continue;
+        }
+        let extension = text_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        let content = if matches!(extension.as_str(), "html" | "htm" | "xhtml") {
+            html_to_text(&raw)
+        } else {
+            raw
+        };
+        let (slots, images) = anthology_image_slots(&content, &text_path, chapters.len());
+        let body = render_novel_xhtml(&content, &slots);
+        let words = content
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .count();
+        let mut parts = vec![work_author];
+        if !release_date.trim().is_empty() {
+            parts.push(release_date.trim().to_string());
+        }
+        if words > 0 {
+            parts.push(format!("{words} 字"));
+        }
+        chapters.push(AnthologyChapter {
+            title: work_title,
+            meta: parts.join(" · "),
+            tags,
+            body,
+            images,
+        });
+        if cover.is_none() {
+            let resolved = resolve_cover_path(&cover_path, &preview_path, &purchased_path);
+            if !resolved.trim().is_empty() {
+                let candidate = PathBuf::from(&resolved);
+                if let Ok(bytes) = fs::read(&candidate) {
+                    if !bytes.is_empty() {
+                        let name = candidate
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "cover.jpg".into());
+                        cover = Some((name, bytes));
+                    }
+                }
+            }
+        }
+    }
+    if chapters.is_empty() {
+        return Err("这批作品里没有找到可用的本地正文，打不出合集。先给它们下一份阅读版试试。".into());
+    }
+    let chapter_count = chapters.len();
+    let image_count = chapters.iter().map(|chapter| chapter.images.len()).sum();
+    let cover_ref = cover
+        .as_ref()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()));
+    let series = if series_names.len() == 1 {
+        Some(series_names[0].as_str())
+    } else {
+        None
+    };
+    let epub = build_anthology_epub(
+        &book_title,
+        author_name.trim(),
+        series,
+        &chapters,
+        cover_ref,
+    );
+    let target = PathBuf::from(path);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("无法创建目录：{e}"))?;
+    }
+    write_bytes_atomic(&target, &epub)?;
+    emit_anthology_progress(app, total, total, "合集已生成".into(), true);
+    Ok(AnthologyResult {
+        title: book_title,
+        output_path: path.to_string(),
+        chapters: chapter_count,
+        image_count,
+        size_bytes: epub.len() as u64,
+        skipped,
+    })
 }
 
 /// 导出作品清单。
@@ -8092,6 +9663,35 @@ fn open_work_directory(work_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// 打开任意一个本地路径：`parent=false` 直接打开它，`parent=true` 打开它所在的目录。
+///
+/// 详情页每条路径旁边都有「打开」「所在目录」两个按钮，传进来的是路径字符串本身
+/// （可能是 txt、epub、封面图片，也可能直接是个目录），所以这里收 `path` 而不是 `work_id`。
+/// 这个命令原先只在文档里被前端调用过、后端从没实现 —— 详情页那排按钮点了只会报
+/// 「命令不存在」。别再删。
+#[tauri::command]
+fn open_local_path(path: String, parent: bool) -> Result<(), String> {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return Err("路径是空的".into());
+    }
+    let target = PathBuf::from(raw);
+    if !target.exists() {
+        return Err(format!("路径已不存在：{raw}"));
+    }
+    if !parent {
+        open::that(&target).map_err(|e| format!("无法打开：{e}"))?;
+        return Ok(());
+    }
+    if target.is_dir() {
+        open::that(&target).map_err(|e| format!("无法打开目录：{e}"))?;
+    } else {
+        // 要的是「打开所在目录」，顺手在资源管理器里选中这个文件才算交代清楚
+        reveal_in_explorer(&target)?;
+    }
+    Ok(())
+}
+
 /// 拼 explorer 的 `/select,` 参数：`/select,"<路径>"`（引号只包路径，不包 `/select,`）。
 /// 单独抽出来是为了能单测 —— 引号位置错一格，症状就是「不管点谁固定打开文档」，很难一眼看出来。
 #[cfg(windows)]
@@ -8213,6 +9813,11 @@ fn default_update_mirrors() -> Vec<String> {
 
 fn default_true() -> bool {
     true
+}
+
+/// 自动备份默认保留最近 7 份（每天首次启动备一份，够回滚一周）。
+fn default_backup_keep() -> usize {
+    7
 }
 
 #[derive(Serialize, Clone)]
@@ -9248,6 +10853,369 @@ fn restore_backup(path: String) -> Result<(), String> {
     Ok(())
 }
 
+
+// ============ 字数后台补算（v1.2.8） ============
+
+/// 本次算了几篇、还剩几篇没算。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WordCountProgress {
+    updated: i64,
+    remaining: i64,
+}
+
+/// 把一批还没算过字数的作品算出来写回 `works.word_count`。
+///
+/// **为什么必须放后台，不能留在列表里现算**：全库 1350 个 txt、98 MB，一次要 1.4 秒，
+/// 而列表每次改筛选、每敲一下搜索都会重跑一遍 —— 那就是「所有作品加载得有点慢」的根。
+/// 算一次落库，之后列表只读这一列。
+///
+/// 传 `limit = 0` 就是「不干活、只报还剩多少」，前端用它来显示进度和决定还要不要继续调。
+/// 每篇一个自动提交的短事务：这个库是默认的 rollback journal、不是 WAL，
+/// 攒成一个大事务会把写锁按住好几秒，界面那边的读就得干等。
+/// 结果里 0 ＝「读不出来」（绑的是 EPUB、或目录里没有 txt），**不会重算**；
+/// 只有路径变了才会被触发器标回 -1 重新排上队。
+#[tauri::command]
+fn refresh_word_counts(limit: usize) -> Result<WordCountProgress, String> {
+    refresh_word_counts_impl(&db()?, limit)
+}
+
+fn refresh_word_counts_impl(conn: &Connection, limit: usize) -> Result<WordCountProgress, String> {
+    let rows: Vec<(i64, String, String)> = {
+        let mut statement = conn
+            .prepare("SELECT id, preview_path, purchased_path FROM works WHERE word_count < 0 LIMIT ?1")
+            .map_err(|e| e.to_string())?;
+        let mapped = statement
+            .query_map([limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    let mut updated = 0;
+    for (id, preview_path, purchased_path) in rows {
+        // 和 `populate_work_display_info` 同一套取路径的规矩：完整版优先，没有就看预览版
+        let path = if purchased_path.trim().is_empty() {
+            preview_path
+        } else {
+            purchased_path
+        };
+        let count = text_word_count(&path).unwrap_or(0) as i64;
+        conn.execute(
+            "UPDATE works SET word_count=?1 WHERE id=?2",
+            params![count, id],
+        )
+        .map_err(|e| e.to_string())?;
+        updated += 1;
+    }
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM works WHERE word_count < 0", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(WordCountProgress { updated, remaining })
+}
+
+// ============ 「待补完整版」工作台（v1.2.7） ============
+
+/// 全库「还没有完整版」的作品（`purchased_path` 为空）。
+///
+/// 带上作者名，前端自己按作者分组 —— 分组结构放前端，后端不用再定一套。
+/// **不在 SQL 里过滤 `need_full_state`**：前端要在「未处理 / 已找过 / 不打算补」
+/// 之间切换，全量给回去最省事。
+#[tauri::command]
+fn list_missing_full() -> Result<Vec<Work>, String> {
+    list_missing_full_impl(&db()?)
+}
+
+fn list_missing_full_impl(conn: &Connection) -> Result<Vec<Work>, String> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id
+             WHERE w.purchased_path = ''
+             ORDER BY a.name COLLATE NOCASE ASC, w.release_date DESC, w.id DESC"
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], map_work)
+        .map_err(|e| e.to_string())?;
+    let mut works = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for work in &mut works {
+        populate_work_display_info(work);
+    }
+    Ok(works)
+}
+
+/// 给一批作品标「待补完整版」的处理状态：0 = 未处理，1 = 找过、确实没有，2 = 不打算补。
+#[tauri::command]
+fn set_works_need_full_state(work_ids: Vec<i64>, state: i64) -> Result<usize, String> {
+    set_works_need_full_state_impl(&mut db()?, &work_ids, state)
+}
+
+fn set_works_need_full_state_impl(
+    conn: &mut Connection,
+    work_ids: &[i64],
+    state: i64,
+) -> Result<usize, String> {
+    if !(0..=2).contains(&state) {
+        return Err("未知的处理状态".into());
+    }
+    // 0 = 恢复未处理，那就把时间也清掉 —— 留着时间会让工作台显示
+    // 「3 天前处理」却又是未处理，自相矛盾。
+    let marked_at = if state == 0 {
+        String::new()
+    } else {
+        Utc::now().to_rfc3339()
+    };
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut changed = 0;
+    for work_id in work_ids {
+        changed += tx
+            .execute(
+                "UPDATE works SET need_full_state=?1, need_full_marked_at=?3 WHERE id=?2",
+                params![state, work_id, marked_at],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+// ============ 批量操作补充（v1.2.7） ============
+
+/// 把作品从若干收藏夹里**移除**。对照 `add_works_to_collections` 的并集语义：
+/// 那边只加不减，移出必须单独一条路，否则用户一勾就把作品从别的夹子里踢出去了。
+#[tauri::command]
+fn remove_works_from_collections(
+    work_ids: Vec<i64>,
+    collection_ids: Vec<i64>,
+) -> Result<usize, String> {
+    remove_works_from_collections_impl(&mut db()?, &work_ids, &collection_ids)
+}
+
+fn remove_works_from_collections_impl(
+    conn: &mut Connection,
+    work_ids: &[i64],
+    collection_ids: &[i64],
+) -> Result<usize, String> {
+    if work_ids.is_empty() || collection_ids.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut removed = 0;
+    for work_id in work_ids {
+        for collection_id in collection_ids {
+            removed += tx
+                .execute(
+                    "DELETE FROM collection_works WHERE collection_id=?1 AND work_id=?2",
+                    params![collection_id, work_id],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        // 作品已经不在任何夹子里了 → favorite 那个缓存位跟着落下来
+        tx.execute(
+            "UPDATE works SET favorite = (SELECT COUNT(*) FROM collection_works WHERE work_id=?1) > 0 WHERE id=?1",
+            [work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(removed)
+}
+
+/// 批量设评分（0 = 清除评分）。
+#[tauri::command]
+fn set_works_rating(work_ids: Vec<i64>, rating: i64) -> Result<usize, String> {
+    set_works_rating_impl(&mut db()?, &work_ids, rating)
+}
+
+fn set_works_rating_impl(
+    conn: &mut Connection,
+    work_ids: &[i64],
+    rating: i64,
+) -> Result<usize, String> {
+    if !(0..=5).contains(&rating) {
+        return Err("评分只能是 0 到 5".into());
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut changed = 0;
+    for work_id in work_ids {
+        changed += tx
+            .execute(
+                "UPDATE works SET rating=?1 WHERE id=?2",
+                params![rating, work_id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(changed)
+}
+
+// ============ 自动备份（v1.2.7） ============
+
+/// 自动备份只认这个前缀 —— 滚动清理不会误删用户自己导出的备份。
+const AUTO_BACKUP_PREFIX: &str = "library-auto-";
+
+/// 自动备份落在 `<程序目录>/data/backup/auto`，和用户手动导出的备份分开放。
+fn auto_backup_dir() -> Result<PathBuf, String> {
+    let dir = app_data_dir()?.join("backup").join("auto");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// 备份文件名的时间戳（本地时间，用户翻文件夹时对得上自己的钟）。
+fn backup_stamp() -> String {
+    Local::now().format("%Y%m%d-%H%M%S%3f").to_string()
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BackupEntry {
+    /// 备份文件的完整路径（恢复时直接交给 `restore_backup`）
+    path: String,
+    name: String,
+    size: u64,
+    /// 显示用的时间（本地时间，形如 `2026-09-16 23:40`）
+    created_at: String,
+}
+
+/// 只列出自动备份目录里的 `library-auto-*.db`，按新的在前。
+fn list_auto_backups_impl() -> Result<Vec<BackupEntry>, String> {
+    let dir = auto_backup_dir()?;
+    let mut entries: Vec<BackupEntry> = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(AUTO_BACKUP_PREFIX) || !name.ends_with(".db") {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        entries.push(BackupEntry {
+            path: path.to_string_lossy().to_string(),
+            name: name.to_string(),
+            size: metadata.len(),
+            created_at: metadata
+                .modified()
+                .ok()
+                .map(|time| DateTime::<Local>::from(time).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default(),
+        });
+    }
+    entries.sort_by(|left, right| right.name.cmp(&left.name));
+    Ok(entries)
+}
+
+#[tauri::command]
+fn list_backups() -> Result<Vec<BackupEntry>, String> {
+    list_auto_backups_impl()
+}
+
+/// 做一份备份：`VACUUM INTO` 出一致性快照，然后按份数滚动清理。
+///
+/// **不能直接 `fs::copy` library.db** —— 连接开着的时候可能有还没落盘的内容，
+/// 拷出来可能是半个事务。`VACUUM INTO` 由 SQLite 自己保证快照一致。
+fn create_auto_backup(keep: usize) -> Result<BackupEntry, String> {
+    let dir = auto_backup_dir()?;
+    let name = format!("{AUTO_BACKUP_PREFIX}{}.db", backup_stamp());
+    let path = dir.join(&name);
+    if path.exists() {
+        return Err("同一秒内已经备过一份了，稍后再试".into());
+    }
+    {
+        let conn = db()?;
+        conn.execute("VACUUM INTO ?1", [path.to_string_lossy().to_string()])
+            .map_err(|e| format!("备份失败：{e}"))?;
+    }
+    prune_auto_backups(keep)?;
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    Ok(BackupEntry {
+        path: path.to_string_lossy().to_string(),
+        name,
+        size: metadata.len(),
+        created_at: Local::now().format("%Y-%m-%d %H:%M").to_string(),
+    })
+}
+
+/// 滚动清理：只留最近 `keep` 份。**只删自己生成的 `library-auto-*.db`**，
+/// 用户手动导出的备份和其它文件一概不碰。
+fn prune_auto_backups(keep: usize) -> Result<Vec<String>, String> {
+    let dir = auto_backup_dir()?;
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with(AUTO_BACKUP_PREFIX) && name.ends_with(".db") {
+            entries.push((name.to_string(), path));
+        }
+    }
+    entries.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut removed = Vec::new();
+    for (name, path) in entries.into_iter().skip(keep.max(1)) {
+        if fs::remove_file(&path).is_ok() {
+            removed.push(name);
+        }
+    }
+    Ok(removed)
+}
+
+/// 手动「立即备份一份」（设置页的按钮）。
+#[tauri::command]
+fn backup_database_now() -> Result<BackupEntry, String> {
+    let settings = read_settings(&db()?)?;
+    create_auto_backup(settings.auto_backup_keep)
+}
+
+/// 每天第一次启动时自动备份一次。
+///
+/// 「一天只备一次」靠 app_settings 里的日期标记，**不能**改成「今天还没有备份文件就备」——
+/// 用户手动删掉今天那份之后，每次启动都会再补一份。
+fn auto_backup_on_startup() -> Result<Option<BackupEntry>, String> {
+    let conn = db()?;
+    let settings = read_settings(&conn)?;
+    if !settings.auto_backup_enabled {
+        return Ok(None);
+    }
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    if setting(&conn, "auto_backup_date")? == today {
+        return Ok(None);
+    }
+    // 新装的程序库里一篇作品都没有，这时候备份只会留一堆空库
+    let works: i64 = conn
+        .query_row("SELECT COUNT(*) FROM works", [], |row| row.get(0))
+        .unwrap_or(0);
+    let entry = if works > 0 {
+        Some(create_auto_backup(settings.auto_backup_keep)?)
+    } else {
+        None
+    };
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('auto_backup_date', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [&today],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(entry)
+}
+
+/// 前端启动时调一次；真的备了才返回一份记录（用来提示用户）。
+#[tauri::command]
+fn auto_backup_if_due() -> Result<Option<BackupEntry>, String> {
+    auto_backup_on_startup()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -9258,7 +11226,6 @@ pub fn run() {
             set_author_order,
             delete_author,
             update_author_path,
-            set_match_threshold,
             get_app_settings,
             save_app_settings,
             read_pixiv_cookie_file,
@@ -9288,6 +11255,12 @@ pub fn run() {
             list_collection_works,
             work_collections,
             set_work_collections,
+            list_filter_views,
+            search_full_text,
+            save_filter_view,
+            rename_filter_view,
+            update_filter_view,
+            delete_filter_view,
             list_history,
             clear_history,
             remove_history,
@@ -9301,8 +11274,10 @@ pub fn run() {
             scan_work_files,
             clear_missing_bindings,
             export_work_list,
+            export_anthology_epub,
             open_work,
             open_work_directory,
+            open_local_path,
             download_reading_version,
             download_reading_versions,
             redownload_novel_txt,
@@ -9331,6 +11306,16 @@ pub fn run() {
             update_work_tags,
             export_backup,
             restore_backup,
+            // v1.2.7：待补完整版工作台 / 批量补充 / 自动备份
+            // v1.2.8：字数后台补算
+            refresh_word_counts,
+            list_missing_full,
+            set_works_need_full_state,
+            remove_works_from_collections,
+            set_works_rating,
+            list_backups,
+            backup_database_now,
+            auto_backup_if_due,
             check_for_update,
             fetch_release_notes,
             download_update,
@@ -9349,6 +11334,7 @@ mod tests {
         bind_work_to_reading, build_novel_epub, build_search_url, clip_match_title,
         collect_files_recursively,
         collect_pending_purchased_files,
+        compress_cover,
         direct_target_path, distribute_file, epub_target_path, existing_sync_target, file_name,
         follow_cover_path, preview_is_redundant, recycle_to_bin,
         has_invalid_date_range, insert_local_work, is_after_last_sync, is_generated_asset,
@@ -9359,6 +11345,7 @@ mod tests {
         resolve_match_mode, scope_allows_path, shared_characters, MatchMode,
         needs_a_purchased_file,
         normalize_aliases, normalize_author_homepage, normalize_pixiv_cookie,
+        pixiv_uid_from_cookie, probe_pixiv_cookie,
         novel_image_filename_extension, novel_image_refs, novel_image_url, novel_images_dir,
         count_reading_images, novel_text_path_beside,
         path_key,
@@ -9378,11 +11365,25 @@ mod tests {
         clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
         HISTORY_LIMIT, migrate_favorites_into_collections,
         add_works_to_collections_impl, update_works_tags_impl,
+        set_works_rating_impl, set_works_need_full_state_impl,
+        remove_works_from_collections_impl, search_match_clause, list_missing_full_impl,
+        list_series_impl, refresh_word_counts_impl, WORD_COUNT_TRIGGER_DDL,
+        anthology_image_slots, clean_filter_view_name, FILTER_VIEW_MAX_NAME,
+        document_text, is_epub_text_entry, single_line, strip_element_block,
+        search_full_text_over, text_search_document, text_search_matches,
+        TEXT_SEARCH_CONTEXT_CHARS, TEXT_SEARCH_MAX_SNIPPETS,
         mark_work_in_progress, read_state_label, split_tags, READ_DONE, READ_IN_PROGRESS,
         READ_UNREAD,
         throttled_delay_seconds, synopsis_progress_title,
         SYNOPSIS_ABORT_STREAK, SYNOPSIS_MAX_DELAY_SECONDS,
-        SYNOPSIS_THROTTLE_STREAK,
+        SYNOPSIS_THROTTLE_STREAK, SYNOPSIS_META_MAX_CHARS,
+        synopsis_plain_text, build_anthology_epub, AnthologyChapter,
+        images_filter_clause, collection_filter_clause,
+        write_export_markdown, EXPORT_HEADERS, EXPORT_COL_TITLE, EXPORT_COL_AUTHOR,
+        EXPORT_COL_DATE, EXPORT_COL_WORDS, EXPORT_COL_FORMAT, EXPORT_COL_TAGS,
+        EXPORT_COL_SERIES, EXPORT_COL_VERSION, EXPORT_COL_COLLECTIONS, EXPORT_COL_RATING,
+        EXPORT_COL_READ, EXPORT_COL_NOTE, EXPORT_COL_PIXIV_URL, EXPORT_COL_TEXT_PATH,
+        EXPORT_COL_COVER_PATH, EXPORT_COL_NOVEL_ID, EXPORT_COL_IMAGES, EXPORT_COL_SYNOPSIS,
         text_word_count, title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
@@ -9393,9 +11394,43 @@ mod tests {
     use serde_json::json;
     use std::{
         fs,
+        io::Write,
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// 封面重压：产物必须是更小的 JPEG，且**像素尺寸一点不能动** —— 尺寸变了卡片会变形。
+    #[test]
+    fn cover_compression_shrinks_the_file_and_keeps_the_pixel_size() {
+        // 高频细节是最难压的情况；按 Pixiv 那种高画质（q95）存出来当输入。
+        let mut source = image::RgbImage::new(400, 600);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = image::Rgb([
+                ((x * 7 + y * 3) % 251) as u8,
+                ((y * 11) % 241) as u8,
+                ((x + y * 13) % 233) as u8,
+            ]);
+        }
+        let mut raw: Vec<u8> = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut raw, 95)
+            .encode(source.as_raw(), 400, 600, image::ExtendedColorType::Rgb8)
+            .unwrap();
+
+        let packed = compress_cover(&raw);
+
+        assert!(packed.len() < raw.len(), "重压后应当变小");
+        assert_eq!(&packed[..2], &[0xFF, 0xD8], "产物仍要是 JPEG 文件头");
+        let back = image::load_from_memory(&packed).expect("产物要能解回来");
+        assert_eq!((back.width(), back.height()), (400, 600), "像素尺寸不能变");
+    }
+
+    /// 解不开的输入必须**原样返回**：同步不能因为一张坏封面就整体中断。
+    #[test]
+    fn cover_compression_falls_back_to_the_original_bytes() {
+        let junk = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
+        assert_eq!(compress_cover(&junk), junk);
+        assert!(compress_cover(&[]).is_empty());
+    }
 
     /// 「打开本地目录」选中文件靠的是 explorer 的 `/select,`，引号只包路径这一条是硬要求：
     /// 整条被引号包住时 explorer 认不出 `/select,`，会退回打开「文档」（v0.3.62~63 的翻车点）。
@@ -9484,6 +11519,54 @@ mod tests {
         assert_eq!(resolve_match_mode("title").unwrap(), MatchMode::Title);
         assert_eq!(resolve_match_mode("character").unwrap(), MatchMode::Character);
         assert!(resolve_match_mode("whatever").is_err());
+    }
+
+    /// 「配图」「收藏夹」这两档拼出来的 SQL，拿内存库真跑一遍。
+    ///
+    /// 为什么值得写：三处命令里的 SQL 都是**运行时拼的字符串**，写错（括号少一个、
+    /// 别名撞了、-1 那档忘了加）编译器一个字都不会说，只有用户真点一下才发现
+    /// ——「有图」和「无图」筛出来一样、或者「任意收藏」恒为空。这类错静默且难查。
+    #[test]
+    fn image_and_collection_filters_do_what_their_labels_say() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE works (id INTEGER PRIMARY KEY, has_images INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE collection_works (collection_id INTEGER NOT NULL, work_id INTEGER NOT NULL);
+             INSERT INTO works (id, has_images) VALUES (1, 1), (2, 0), (3, 1), (4, 0);
+             INSERT INTO collection_works (collection_id, work_id) VALUES (1, 1), (2, 2), (2, 3);",
+        )
+        .unwrap();
+        // 拼法跟三处命令完全一致
+        let hits = |filter: &str, collection: i64| -> Vec<i64> {
+            let sql = format!(
+                "SELECT id FROM works w WHERE 1=1{}{} ORDER BY id",
+                images_filter_clause(filter, "w."),
+                collection_filter_clause("w.id", "cw", "?1")
+            );
+            let mut statement = conn.prepare(&sql).unwrap();
+            let rows = statement
+                .query_map([collection], |row| row.get::<_, i64>(0))
+                .unwrap();
+            rows.collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(hits("all", 0), vec![1, 2, 3, 4], "不限就是不加条件");
+        assert_eq!(hits("has", 0), vec![1, 3], "「有图」只能出 has_images=1");
+        assert_eq!(hits("none", 0), vec![2, 4], "「无图」是 has_images=0，不是「没绑配图」");
+        assert_eq!(hits("all", 1), vec![1], "指定夹子");
+        assert_eq!(hits("all", 2), vec![2, 3]);
+        assert_eq!(hits("all", -1), vec![1, 2, 3], "「任意收藏」＝在任何一个夹子里");
+        assert!(hits("all", 999).is_empty(), "不存在的夹子当然是空的");
+        assert_eq!(hits("has", 2), vec![3], "两档叠起来也要对");
+
+        // 收藏夹视图那条 SQL 外层已经用了 `cw`，内层别名换成 `cw2` —— 顺手证一下不冲突
+        let sql = format!(
+            "SELECT w.id FROM collection_works cw JOIN works w ON w.id = cw.work_id WHERE 1=1{} ORDER BY w.id",
+            collection_filter_clause("w.id", "cw2", "?1")
+        );
+        let mut statement = conn.prepare(&sql).unwrap();
+        let rows = statement.query_map([-1_i64], |row| row.get::<_, i64>(0)).unwrap();
+        let ids = rows.collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(ids, vec![1, 2, 3], "收藏夹视图里的「任意收藏」恒真，但别名不能撞");
     }
 
     #[test]
@@ -10150,6 +12233,67 @@ mod tests {
     }
 
     #[test]
+    fn pixiv_uid_is_read_from_the_session_cookie_prefix() {
+        // 真实格式 `<uid>_<随机串>`。**只用来显示账号名**，抠不出来就当没有 ——
+        // 判断 Cookie 死活一律靠接口返回，不看这里
+        assert_eq!(
+            pixiv_uid_from_cookie("PHPSESSID=22871380_pq05W3eyaiA8hVDS2FT4yVhghHW79fOM").as_deref(),
+            Some("22871380")
+        );
+        // 混在别的 cookie 里也能挑出来
+        assert_eq!(
+            pixiv_uid_from_cookie("a=b; PHPSESSID=123_xyz; c=d").as_deref(),
+            Some("123")
+        );
+        // 没有下划线前缀：认不出就返回 None，绝不拿整串去拼 URL
+        assert_eq!(pixiv_uid_from_cookie("PHPSESSID=garbage").as_deref(), None);
+        // 前缀不是纯数字：同样不认
+        assert_eq!(pixiv_uid_from_cookie("PHPSESSID=abc_123").as_deref(), None);
+        assert_eq!(pixiv_uid_from_cookie("").as_deref(), None);
+    }
+
+    /// 真机联网验证 Cookie 体检的判据（默认 `#[ignore]`）。
+    ///
+    /// 这条为什么必须存在：判据写错时**前端 mock 和全部单测都是绿的** ——
+    /// mock 是我们自己写的假接口，假接口只会按「我们以为的样子」回话，
+    /// 判据错在哪它一点都看不出来。v1.2.15 就是栽在这儿（要求 body 里有 userId，
+    /// 而真实成功响应里根本没这个字段），只有真接口证得伪。
+    /// 手动跑：`WB_PIXIV_COOKIE="PHPSESSID=…" cargo test -- --ignored --nocapture pixiv_cookie`
+    #[test]
+    #[ignore]
+    fn pixiv_cookie_probe_matches_the_real_api() {
+        let Ok(cookie) = std::env::var("WB_PIXIV_COOKIE") else {
+            eprintln!("没设 WB_PIXIV_COOKIE，跳过");
+            return;
+        };
+        let valid = probe_pixiv_cookie(&cookie);
+        println!("有效 Cookie → {valid:?}");
+        if valid.status == "network" {
+            eprintln!("连不上 Pixiv（先确认代理），跳过：{}", valid.message);
+            return;
+        }
+        assert!(valid.ok, "这份 Cookie 应该被判为有效：{valid:?}");
+        assert_eq!(valid.status, "ok");
+        assert!(
+            valid.user_name.is_some(),
+            "账号名应该能从 PHPSESSID 前缀查出来：{valid:?}"
+        );
+
+        // 同前缀、令牌改坏：Pixiv 认不出 → 必须翻成 invalid（而不是 unknown 或 ok）
+        let broken = match cookie.split_once('_') {
+            Some((head, tail)) => format!("{head}_definitely-wrong-{tail}"),
+            None => format!("{cookie}-definitely-wrong"),
+        };
+        let invalid = probe_pixiv_cookie(&broken);
+        println!("改坏的 Cookie → {invalid:?}");
+        assert!(!invalid.ok);
+        assert_eq!(
+            invalid.status, "invalid",
+            "失效的 Cookie 要报 invalid，不能报 unknown"
+        );
+    }
+
+    #[test]
     fn sync_date_range_is_inclusive_and_rejects_outside_dates() {
         let start = NaiveDate::from_ymd_opt(2025, 1, 1);
         let end = NaiveDate::from_ymd_opt(2025, 1, 31);
@@ -10185,28 +12329,57 @@ mod tests {
     }
 
     #[test]
-    fn sync_reuses_a_unique_matching_preview_file() {
+    fn sync_reuses_a_preview_file_only_when_the_name_is_identical() {
+        // 名字完全一致（去掉扩展名后）才复用，顺手带上同名封面
         let entries = vec![
             SyncPreviewEntry {
-                path: PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.txt"),
-                name: "2025-10-05 希儿与布洛妮娅".into(),
+                path: PathBuf::from("D:/preview/希儿与布洛妮娅.txt"),
+                name: "希儿与布洛妮娅".into(),
                 is_preview: true,
             },
             SyncPreviewEntry {
-                path: PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.jpg"),
-                name: "2025-10-05 希儿与布洛妮娅".into(),
+                path: PathBuf::from("D:/preview/希儿与布洛妮娅.jpg"),
+                name: "希儿与布洛妮娅".into(),
                 is_preview: false,
             },
         ];
-        let (preview, cover) = matched_sync_preview(&entries, "希儿与布洛妮娅", 70, 0).unwrap();
-        assert_eq!(
-            preview,
-            PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.txt")
-        );
+        let (preview, cover) = matched_sync_preview(&entries, "希儿与布洛妮娅").unwrap();
+        assert_eq!(preview, PathBuf::from("D:/preview/希儿与布洛妮娅.txt"));
         assert_eq!(
             cover,
-            Some(PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.jpg"))
+            Some(PathBuf::from("D:/preview/希儿与布洛妮娅.jpg"))
         );
+
+        // 「其一 / 其二」这类长共同前缀不能再被认成同一篇 —— 这正是旧相似度逻辑的翻车点
+        let similar_but_different = vec![SyncPreviewEntry {
+            path: PathBuf::from("D:/preview/希儿与布洛妮娅 其二.txt"),
+            name: "希儿与布洛妮娅 其二".into(),
+            is_preview: true,
+        }];
+        assert!(matched_sync_preview(&similar_but_different, "希儿与布洛妮娅").is_none());
+
+        // 用户手改过、带日期前缀的文件名同样不复用（宁可重下一份，也不能复用错内容）
+        let dated = vec![SyncPreviewEntry {
+            path: PathBuf::from("D:/preview/2025-10-05 希儿与布洛妮娅.txt"),
+            name: "2025-10-05 希儿与布洛妮娅".into(),
+            is_preview: true,
+        }];
+        assert!(matched_sync_preview(&dated, "希儿与布洛妮娅").is_none());
+
+        // 同名文件有两份时不猜
+        let duplicated = vec![
+            SyncPreviewEntry {
+                path: PathBuf::from("D:/a/同名.txt"),
+                name: "同名".into(),
+                is_preview: true,
+            },
+            SyncPreviewEntry {
+                path: PathBuf::from("D:/b/同名.txt"),
+                name: "同名".into(),
+                is_preview: true,
+            },
+        ];
+        assert!(matched_sync_preview(&duplicated, "同名").is_none());
     }
 
     #[test]
@@ -10341,6 +12514,7 @@ mod tests {
                 author_name: "作者",
                 release_date: "2025-03-20",
                 tags: "Pixiv|图文",
+                synopsis: "简介<b>重点</b><br>第二行",
                 cover_file: "标题.jpg",
                 image_count: 1,
             },
@@ -10352,6 +12526,11 @@ mod tests {
         assert!(html.contains("配图 1 张"));
         assert!(!html.contains("uploadedimage"));
         assert!(!html.contains("[newpage]"));
+        // 简介折起来放，标签剥掉
+        assert!(html.contains("<details class=\"synopsis\"><summary>作品简介</summary>"));
+        assert!(html.contains("<p>简介重点</p>"));
+        assert!(html.contains("<p>第二行</p>"));
+        assert!(!html.contains("</b>"), "简介里的标签应该被剥掉");
     }
 
     #[test]
@@ -10533,6 +12712,7 @@ mod tests {
             author_name: "作者",
             release_date: "2025-03-20",
             tags: "Pixiv|图文",
+            synopsis: "作者写的一段简介 &amp; 一点补充",
             image_count: 1,
         };
         let content = "[[rb:汉字 > 读音]]正文[uploadedimage:20454900]尾巴";
@@ -10550,6 +12730,8 @@ mod tests {
         let html_text = fs::read_to_string(&html).unwrap();
         assert!(html_text.contains("<ruby>汉字<rt>读音</rt></ruby>"));
         assert!(html_text.contains("标题-26410188_images/001.jpg"));
+        assert!(html_text.contains("<details class=\"synopsis\">"), "HTML 阅读版应该带简介");
+        assert!(html_text.contains("作者写的一段简介 &amp; 一点补充"));
 
         let epub = write_reading_output(
             &text_path,
@@ -10567,7 +12749,9 @@ mod tests {
             bytes.windows(7).any(|window| window == b"001.jpg"),
             "配图应该打进包里"
         );
-        assert!(String::from_utf8_lossy(&bytes).contains("汉字"));
+        let raw_epub = String::from_utf8_lossy(&bytes);
+        assert!(raw_epub.contains("汉字"));
+        assert!(raw_epub.contains("<dc:description>作者写的一段简介 &amp; 一点补充"));
 
         // 设置里指定了输出目录时，EPUB 落到那个目录
         let out_dir = root.join("导出");
@@ -10632,6 +12816,8 @@ mod tests {
             rating: 0,
             note: String::new(),
             synopsis_checked: false,
+            need_full_state: 0,
+            need_full_marked_at: String::new(),
         }
     }
 
@@ -10668,6 +12854,8 @@ mod tests {
             rating: 0,
             note: String::new(),
             synopsis_checked: false,
+            need_full_state: 0,
+            need_full_marked_at: String::new(),
         };
 
         populate_work_display_info(&mut work);
@@ -10814,6 +13002,87 @@ mod tests {
         names
     }
 
+    /// 导出列的位置写死过一次、读错列还不报错，所以这里钉住：
+    /// 列常量必须正好覆盖 `0..EXPORT_HEADERS.len()`，不重不漏。
+    #[test]
+    fn export_columns_stay_in_sync_with_the_header_row() {
+        let columns = [
+            EXPORT_COL_TITLE,
+            EXPORT_COL_AUTHOR,
+            EXPORT_COL_DATE,
+            EXPORT_COL_WORDS,
+            EXPORT_COL_FORMAT,
+            EXPORT_COL_TAGS,
+            EXPORT_COL_SERIES,
+            EXPORT_COL_VERSION,
+            EXPORT_COL_COLLECTIONS,
+            EXPORT_COL_RATING,
+            EXPORT_COL_READ,
+            EXPORT_COL_NOTE,
+            EXPORT_COL_PIXIV_URL,
+            EXPORT_COL_TEXT_PATH,
+            EXPORT_COL_COVER_PATH,
+            EXPORT_COL_NOVEL_ID,
+            EXPORT_COL_IMAGES,
+            EXPORT_COL_SYNOPSIS,
+        ];
+        assert_eq!(columns.len(), EXPORT_HEADERS.len(), "列常量数量和表头对不上");
+        let mut sorted = columns.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), columns.len(), "有两个列常量指到了同一格");
+        assert_eq!(
+            sorted,
+            (0..EXPORT_HEADERS.len()).collect::<Vec<_>>(),
+            "列号应该正好是 0..N"
+        );
+    }
+
+    #[test]
+    fn markdown_export_carries_synopsis_paths_and_ids() {
+        let mut row = vec![String::new(); EXPORT_HEADERS.len()];
+        row[EXPORT_COL_TITLE] = "旧城的信".into();
+        row[EXPORT_COL_AUTHOR] = "远野".into();
+        row[EXPORT_COL_TAGS] = "悬疑、完结".into();
+        row[EXPORT_COL_VERSION] = "完整版".into();
+        row[EXPORT_COL_READ] = "未读".into();
+        row[EXPORT_COL_IMAGES] = "7".into();
+        row[EXPORT_COL_NOVEL_ID] = "26410189".into();
+        row[EXPORT_COL_PIXIV_URL] = "https://www.pixiv.net/novel/show.php?id=26410189".into();
+        row[EXPORT_COL_TEXT_PATH] = r"D:\已购\旧城的信.txt".into();
+        row[EXPORT_COL_COVER_PATH] = r"D:\已购\旧城的信.jpg".into();
+        row[EXPORT_COL_SYNOPSIS] = "第一段\n第二段".into();
+
+        let stamp = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wb-export-{stamp}.md"));
+        write_export_markdown(&path.to_string_lossy(), &[row]).unwrap();
+        let markdown = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert!(markdown.contains("## 旧城的信"), "实际输出：{markdown}");
+        assert!(markdown.contains("作者：远野"));
+        assert!(markdown.contains("配图：7 张"));
+        assert!(markdown.contains("标签：悬疑、完结"));
+        // 简介要按段落引起来，段落之间的换行不能拍成一行
+        assert!(markdown.contains("> 第一段\n> 第二段"), "实际输出：{markdown}");
+        assert!(markdown.contains(
+            "[Pixiv 原页](https://www.pixiv.net/novel/show.php?id=26410189)（ID 26410189）"
+        ));
+        assert!(markdown.contains(r"正文：`D:\已购\旧城的信.txt`"));
+        assert!(markdown.contains(r"封面：`D:\已购\旧城的信.jpg`"));
+
+        // 列少的行（老数据 / 手写行）不能把导出整崩，缺的格子当空串
+        let short = vec!["只有标题".to_string()];
+        let path = std::env::temp_dir().join(format!("wb-export-short-{stamp}.md"));
+        write_export_markdown(&path.to_string_lossy(), &[short]).unwrap();
+        let markdown = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).ok();
+        assert!(markdown.contains("## 只有标题"));
+    }
+
     #[test]
     fn crc32_matches_the_standard_check_value() {
         assert_eq!(zip_crc32(b"123456789"), 0xCBF4_3926);
@@ -10833,6 +13102,7 @@ mod tests {
             "2025-11-08",
             "24319453",
             "插画|图文",
+            "简介第一段<br>第二段 &amp; 尾巴",
             "第一段[[rb:汉字>かんじ]]\n[uploadedimage:20454750]\n[newpage]\n[pixivimage:1234]",
             &slots,
             &images,
@@ -10860,6 +13130,68 @@ mod tests {
         assert!(raw.contains("pixiv-novel-24319453"));
         assert!(raw.contains("../images/001.jpg"));
         assert!(raw.contains("<ruby>汉字<rt>かんじ</rt></ruby>"));
+        // 简介进 OPF：标签剥掉、实体还原、再按 XML 规则重新转义
+        assert!(raw.contains("<dc:description>简介第一段"), "缺少简介元数据");
+        assert!(raw.contains("第二段 &amp; 尾巴"), "简介实体应还原后再转义");
+        assert!(!raw.contains("<br>"), "简介里不该留 HTML 标签");
+        assert!(raw.contains("<dc:subject>插画</dc:subject>"));
+    }
+
+    #[test]
+    fn synopsis_plain_text_drops_markup_keeps_paragraphs_and_clips() {
+        let plain = synopsis_plain_text("<p>第一段&amp;补充</p><p>第二段</p><ul><li>条目</li></ul>");
+        assert_eq!(plain, "第一段&补充\n第二段\n- 条目");
+
+        // 空简介和纯标签的简介都不该产出空白块
+        assert!(synopsis_plain_text("").is_empty());
+        assert!(synopsis_plain_text("   ").is_empty());
+        assert!(synopsis_plain_text("<p></p>").is_empty());
+
+        // 脚本内容不算简介
+        assert!(!synopsis_plain_text("<script>alert(1)</script><p>正文</p>").contains("alert"));
+
+        // 超长要截短，按字符切（中文一个字 3 字节，切字节会切碎字符）
+        let long = "字".repeat(SYNOPSIS_META_MAX_CHARS + 50);
+        let clipped = synopsis_plain_text(&long);
+        assert_eq!(clipped.chars().count(), SYNOPSIS_META_MAX_CHARS + 1);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn anthology_opf_reports_contents_and_series() {
+        let chapters = vec![
+            AnthologyChapter {
+                title: "第一篇".into(),
+                meta: "作者 · 2025-01-01".into(),
+                tags: "奇幻|连载".into(),
+                body: "<p>正文一</p>".into(),
+                images: Vec::new(),
+            },
+            AnthologyChapter {
+                title: "第二篇".into(),
+                meta: "作者 · 2025-02-01".into(),
+                tags: "奇幻|日常".into(),
+                body: "<p>正文二</p>".into(),
+                images: Vec::new(),
+            },
+        ];
+        let epub = build_anthology_epub("某某系列", "作者", Some("某某系列"), &chapters, None);
+        let raw = String::from_utf8_lossy(&epub).to_string();
+        assert!(raw.contains("<dc:description>共收录 2 篇：1.第一篇；2.第二篇</dc:description>"));
+        assert!(raw.contains(r#"<meta name="calibre:series" content="某某系列"/>"#));
+        // 标签取并集且不重复
+        assert!(raw.contains("<dc:subject>奇幻</dc:subject>"));
+        assert!(raw.contains("<dc:subject>连载</dc:subject>"));
+        assert!(raw.contains("<dc:subject>日常</dc:subject>"));
+        assert_eq!(raw.matches("<dc:subject>奇幻</dc:subject>").count(), 1);
+
+        // 混着选（不属于同一系列）时不能硬写一个假系列名
+        let loose = build_anthology_epub("杂集", "作者", None, &chapters, None);
+        let loose_raw = String::from_utf8_lossy(&loose).to_string();
+        assert!(!loose_raw.contains("calibre:series"));
+        // 空白系列名同样不写
+        let blank = build_anthology_epub("杂集", "作者", Some("   "), &chapters, None);
+        assert!(!String::from_utf8_lossy(&blank).contains("calibre:series"));
     }
 
     #[test]
@@ -10880,12 +13212,15 @@ mod tests {
                 author_name: "作者",
                 release_date: "",
                 tags: "",
+                synopsis: "",
                 cover_file: "",
                 image_count: 1,
             },
         );
         assert!(html.contains("开头文字"), "实际输出：{html}");
         assert!(html.contains("结尾文字"), "实际输出：{html}");
+        // 作者没写简介时整块不出现，别留个空框
+        assert!(!html.contains("作品简介"), "实际输出：{html}");
     }
 
     #[test]
@@ -11240,7 +13575,10 @@ mod tests {
                note TEXT NOT NULL DEFAULT '',
                tags TEXT NOT NULL DEFAULT '',
                synopsis TEXT NOT NULL DEFAULT '',
-               synopsis_checked INTEGER NOT NULL DEFAULT 0
+               synopsis_checked INTEGER NOT NULL DEFAULT 0,
+               need_full_state INTEGER NOT NULL DEFAULT 0,
+               need_full_marked_at TEXT NOT NULL DEFAULT '',
+               word_count INTEGER NOT NULL DEFAULT -1
              );
              CREATE TABLE collections (
                id INTEGER PRIMARY KEY,
@@ -11261,6 +13599,221 @@ mod tests {
              );",
         )
         .unwrap();
+    }
+
+    /// 建一张「列齐全」的 works 表 + authors：专门用来验证 `WORK_COLUMNS` 与 `map_work`
+    /// 的列号对齐。列清单少一列时 SELECT 会直接报错，比在真机上静默读错列好得多。
+    fn create_full_work_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE authors (
+               id INTEGER PRIMARY KEY,
+               name TEXT NOT NULL DEFAULT '',
+               homepage TEXT NOT NULL DEFAULT '',
+               avatar_path TEXT NOT NULL DEFAULT '',
+               notes TEXT NOT NULL DEFAULT '',
+               preview_dir TEXT NOT NULL DEFAULT '',
+               purchased_dir TEXT NOT NULL DEFAULT '',
+               match_threshold INTEGER NOT NULL DEFAULT 70,
+               pixiv_last_sync_at TEXT NOT NULL DEFAULT '',
+               avatar_managed INTEGER NOT NULL DEFAULT 0,
+               sort_order INTEGER NOT NULL DEFAULT 0,
+               starred INTEGER NOT NULL DEFAULT 0,
+               aliases TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE works (
+               id INTEGER PRIMARY KEY,
+               author_id INTEGER NOT NULL DEFAULT 1,
+               title TEXT NOT NULL DEFAULT '',
+               release_date TEXT NOT NULL DEFAULT '',
+               preview_path TEXT NOT NULL DEFAULT '',
+               cover_path TEXT NOT NULL DEFAULT '',
+               purchased_path TEXT NOT NULL DEFAULT '',
+               favorite INTEGER NOT NULL DEFAULT 0,
+               has_images INTEGER NOT NULL DEFAULT 0,
+               image_count INTEGER NOT NULL DEFAULT 0,
+               tags TEXT NOT NULL DEFAULT '',
+               pixiv_novel_id TEXT NOT NULL DEFAULT '',
+               series_id TEXT NOT NULL DEFAULT '',
+               series_title TEXT NOT NULL DEFAULT '',
+               series_order INTEGER NOT NULL DEFAULT 0,
+               is_new INTEGER NOT NULL DEFAULT 0,
+               synopsis TEXT NOT NULL DEFAULT '',
+               synopsis_checked INTEGER NOT NULL DEFAULT 0,
+               read_state INTEGER NOT NULL DEFAULT 0,
+               rating INTEGER NOT NULL DEFAULT 0,
+               note TEXT NOT NULL DEFAULT '',
+               need_full_state INTEGER NOT NULL DEFAULT 0,
+               need_full_marked_at TEXT NOT NULL DEFAULT '',
+               word_count INTEGER NOT NULL DEFAULT -1
+             );",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn search_clause_widens_with_the_selected_scope() {
+        // 标题：只比 title，不碰简介
+        let title = search_match_clause("title", "", "?2", "?3");
+        assert!(title.starts_with("(?2 = ''"));
+        assert!(title.contains("title LIKE ?3"));
+        assert!(!title.contains("synopsis"));
+        // 标题 + 简介
+        let with_synopsis = search_match_clause("title_synopsis", "", "?2", "?3");
+        assert!(with_synopsis.contains("synopsis"));
+        assert!(with_synopsis.contains("COALESCE"));
+        // 标题 + 简介 + 标签（三处调用点里前缀带 w.）
+        let widest = search_match_clause("title_synopsis_tags", "w.", "?2", "?3");
+        assert!(widest.contains("w.synopsis"));
+        assert!(widest.contains("w.tags"));
+        // 标签
+        assert!(search_match_clause("tags", "w.", "?2", "?3").contains("w.tags LIKE ?3"));
+        // 不认识的范围退回「标题」；占位符编号必须原样带出去（三处调用点各自不同）
+        let fallback = search_match_clause("mystery", "w.", "?1", "?2");
+        assert!(fallback.contains("w.title LIKE ?2"));
+        assert!(fallback.contains("?1 = ''"));
+        assert!(!fallback.contains("?3"));
+    }
+
+    #[test]
+    fn missing_full_lists_only_works_without_a_purchased_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute_batch(
+            "INSERT INTO authors (id, name) VALUES (1, 'A 站'), (2, 'B 站');
+             INSERT INTO works (id, author_id, title, release_date, preview_path, purchased_path) VALUES
+               (1, 1, '只有预览版', '2025-01-01', 'D:/预览/A/a.txt', ''),
+               (2, 1, '已经补齐', '2025-01-02', 'D:/预览/A/b.txt', 'D:/已购/A/b.txt'),
+               (3, 2, '预览版二', '2025-03-03', 'D:/预览/B/c.txt', '');
+             INSERT INTO works (id, author_id, title, release_date) VALUES (4, 2, '两边都没有', '2024-01-01');",
+        )
+        .unwrap();
+        let works = list_missing_full_impl(&conn).unwrap();
+        let ids: Vec<i64> = works.iter().map(|work| work.id).collect();
+        // 先按作者名，再按发布日期倒序。4 号两边都没有也算「缺完整版」——
+        // 它同样得去补，不该被漏掉。
+        assert_eq!(ids, vec![1, 3, 4]);
+        // 作者名带了回来，且按作者名排序
+        assert_eq!(works[0].author_name, "A 站");
+        assert_eq!(works[1].author_name, "B 站");
+        // 靠后读的那几列（标题 / 状态）都落在正确位置上
+        assert_eq!(works[0].title, "只有预览版");
+        assert_eq!(works[0].need_full_state, 0);
+        assert_eq!(works[0].synopsis_checked, false);
+    }
+
+
+    #[test]
+    fn bulk_rating_accepts_zero_but_rejects_out_of_range() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute_batch("INSERT INTO works (id, title) VALUES (1, '甲'), (2, '乙');")
+            .unwrap();
+        assert_eq!(set_works_rating_impl(&mut conn, &[1, 2], 4).unwrap(), 2);
+        let value: i64 = conn
+            .query_row("SELECT rating FROM works WHERE id=2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 4);
+        // 0 是「清除评分」，不是非法值
+        assert_eq!(set_works_rating_impl(&mut conn, &[2], 0).unwrap(), 1);
+        assert!(set_works_rating_impl(&mut conn, &[1], 6).is_err());
+        assert!(set_works_rating_impl(&mut conn, &[1], -1).is_err());
+    }
+
+    #[test]
+    fn removing_works_from_collections_clears_the_favorite_cache() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute_batch(
+            "INSERT INTO works (id, title, favorite) VALUES (1, '甲', 1), (2, '乙', 1);
+             INSERT INTO collections (id, name) VALUES (7, 'A'), (8, 'B');
+             INSERT INTO collection_works (collection_id, work_id) VALUES (7, 1), (8, 1), (8, 2);",
+        )
+        .unwrap();
+        // 只从 A 里移出：作品 1 还在 B 里 → favorite 缓存位不该落下
+        assert_eq!(remove_works_from_collections_impl(&mut conn, &[1], &[7]).unwrap(), 1);
+        let favorite: i64 = conn
+            .query_row("SELECT favorite FROM works WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(favorite, 1);
+        // 再从 B 里移出：一个夹子都不在了 → 归零
+        assert_eq!(remove_works_from_collections_impl(&mut conn, &[1], &[8]).unwrap(), 1);
+        let favorite: i64 = conn
+            .query_row("SELECT favorite FROM works WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(favorite, 0);
+        // 本来就不在夹子里的不移除任何东西
+        assert_eq!(remove_works_from_collections_impl(&mut conn, &[2], &[7]).unwrap(), 0);
+    }
+
+    #[test]
+    fn need_full_marks_reject_unknown_states() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute_batch("INSERT INTO works (id, title) VALUES (1, '甲');")
+            .unwrap();
+        assert_eq!(set_works_need_full_state_impl(&mut conn, &[1], 1).unwrap(), 1);
+        let value: i64 = conn
+            .query_row("SELECT need_full_state FROM works WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(value, 1);
+        assert!(set_works_need_full_state_impl(&mut conn, &[1], 3).is_err());
+    }
+
+    #[test]
+    fn need_full_marks_record_and_clear_the_time() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute_batch("INSERT INTO works (id, title) VALUES (1, '甲'), (2, '乙');")
+            .unwrap();
+        // 新作品是「没标过」：状态 0、时间也是空的
+        let (state, marked): (i64, String) = conn
+            .query_row(
+                "SELECT need_full_state, need_full_marked_at FROM works WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, 0);
+        assert!(marked.is_empty());
+
+        // 标完之后要留下时间 —— 工作台得显示「什么时候找过的」，
+        // 不然过俩月翻到同一篇，想不起来自己找没找过（这就是这列存在的理由）
+        assert_eq!(set_works_need_full_state_impl(&mut conn, &[1, 2], 2).unwrap(), 2);
+        let marked: String = conn
+            .query_row(
+                "SELECT need_full_marked_at FROM works WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            DateTime::parse_from_rfc3339(&marked).is_ok(),
+            "标记时间应当是可解析的 RFC3339，实际是 {marked:?}"
+        );
+
+        // 恢复「未处理」要把时间一起清掉，否则「未处理」还挂着「刚刚处理」，
+        // 两句话互相打架
+        assert_eq!(set_works_need_full_state_impl(&mut conn, &[1], 0).unwrap(), 1);
+        let (state, marked): (i64, String) = conn
+            .query_row(
+                "SELECT need_full_state, need_full_marked_at FROM works WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, 0);
+        assert!(marked.is_empty());
+        // 另一篇还留着时间：清的是被点的那一篇，不是整批
+        let kept: String = conn
+            .query_row(
+                "SELECT need_full_marked_at FROM works WHERE id=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!kept.is_empty());
     }
 
     #[test]
@@ -11577,6 +14130,418 @@ mod tests {
         assert_eq!(
             synopsis_progress_title(1, 0, 0, Some(0)),
             "已更新 1 篇 · 作者没写简介 0 篇"
+        );
+    }
+
+    /// v1.2.8：字数缓存落库 + 路径一变就作废。
+    ///
+    /// 起因是「所有作品」加载得有点慢 —— 原来每跑一次列表（每次改筛选、每敲一下搜索）
+    /// 都要把全库的正文读一遍来数字数，真机 1350 篇 / 98 MB 要 1.4 秒。
+    /// 现在算一次写进 `works.word_count`，列表只读这一列；算不出来的记 0（不会重算），
+    /// 只有路径变了才由触发器标回 -1 重新排队。
+    #[test]
+    fn word_count_is_cached_and_invalidated_when_the_path_changes() {
+        let root = std::env::temp_dir().join(format!("word-count-cache-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let text = root.join("书.txt");
+        fs::write(&text, "一二三四五").unwrap();
+        let text_path = text.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute_batch(WORD_COUNT_TRIGGER_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO works (id, title, preview_path) VALUES (1, '甲', ?1)",
+            [text_path.as_str()],
+        )
+        .unwrap();
+
+        // limit = 0：只体检不干活，剩一篇待算
+        let probe = refresh_word_counts_impl(&conn, 0).unwrap();
+        assert_eq!(probe.updated, 0);
+        assert_eq!(probe.remaining, 1);
+
+        let done = refresh_word_counts_impl(&conn, 10).unwrap();
+        assert_eq!(done.updated, 1);
+        assert_eq!(done.remaining, 0);
+        let stored: i64 = conn
+            .query_row("SELECT word_count FROM works WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stored > 0, "算出来的字数要落库，实际 {stored}");
+        // 已经算过的不会重复排队（-1 才排，0 和正数都不排）
+        assert_eq!(refresh_word_counts_impl(&conn, 10).unwrap().updated, 0);
+
+        // 改无关列不该把缓存清掉（触发器里那句 WHEN 就是为这个）
+        conn.execute("UPDATE works SET title='乙' WHERE id=1", [])
+            .unwrap();
+        let stored: i64 = conn
+            .query_row("SELECT word_count FROM works WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stored > 0, "改标题不该作废字数缓存");
+
+        // 绑定换到另一份文件 —— 字数缓存必须作废，标回 -1 重新排队
+        conn.execute(
+            "UPDATE works SET preview_path='D:/书库/别的.txt' WHERE id=1",
+            [],
+        )
+        .unwrap();
+        let stored: i64 = conn
+            .query_row("SELECT word_count FROM works WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, -1, "路径变了字数缓存必须作废");
+        assert_eq!(refresh_word_counts_impl(&conn, 0).unwrap().remaining, 1);
+    }
+
+    /// v1.2.8：「系列连读」的进度把「在读」也算进去。
+    ///
+    /// 之前只数 `read_state = 2`，而这套软件打开一篇只会把它推到「在读」——
+    /// 外部阅读器读完不会回调回来。于是进度永远停在 0，用户报的就是「这个已读一直是零」。
+    #[test]
+    fn series_read_count_treats_in_progress_as_read() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE series_catalog (
+                 author_id INTEGER NOT NULL,
+                 id TEXT NOT NULL,
+                 title TEXT NOT NULL DEFAULT '',
+                 PRIMARY KEY (author_id, id)
+             );
+             CREATE TABLE works (
+                 id INTEGER PRIMARY KEY,
+                 author_id INTEGER NOT NULL DEFAULT 1,
+                 series_id TEXT NOT NULL DEFAULT '',
+                 series_order INTEGER NOT NULL DEFAULT 0,
+                 read_state INTEGER NOT NULL DEFAULT 0,
+                 purchased_path TEXT NOT NULL DEFAULT '',
+                 cover_path TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO series_catalog (author_id, id, title) VALUES (1, 's1', '长夜')",
+            [],
+        )
+        .unwrap();
+        // 5 篇：1 篇已读(2)、2 篇在读(1)、2 篇没碰过(0)
+        conn.execute(
+            "INSERT INTO works (author_id, series_id, read_state) VALUES
+               (1, 's1', 2), (1, 's1', 1), (1, 's1', 1), (1, 's1', 0), (1, 's1', 0)",
+            [],
+        )
+        .unwrap();
+        let series = list_series_impl(&conn, 1).unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].work_count, 5);
+        assert_eq!(series[0].read_count, 3, "已读 1 + 在读 2 都要算「读过」");
+        // 5 篇都没排序号（series_order 默认 0）—— 那不是「第 0 篇」，不该报成缺口
+        assert!(series[0].gap_orders.is_empty(), "没排序号 ≠ 缺号");
+    }
+
+    #[test]
+    fn series_gap_orders_report_the_empty_numbers() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE series_catalog (
+                 author_id INTEGER NOT NULL,
+                 id TEXT NOT NULL,
+                 title TEXT NOT NULL DEFAULT '',
+                 PRIMARY KEY (author_id, id)
+             );
+             CREATE TABLE works (
+                 id INTEGER PRIMARY KEY,
+                 author_id INTEGER NOT NULL DEFAULT 1,
+                 series_id TEXT NOT NULL DEFAULT '',
+                 series_order INTEGER NOT NULL DEFAULT 0,
+                 read_state INTEGER NOT NULL DEFAULT 0,
+                 purchased_path TEXT NOT NULL DEFAULT '',
+                 cover_path TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO series_catalog (author_id, id, title) VALUES (1, 's1', '有缺口'), (1, 's2', '连着的'), (1, 's3', '没排序号');
+             INSERT INTO works (author_id, series_id, series_order) VALUES
+               (1, 's1', 1), (1, 's1', 4), (1, 's1', 5),
+               (1, 's2', 1), (1, 's2', 2),
+               (1, 's3', 0), (1, 's3', 0);
+             -- 另一位作者的号码不该串进来
+             INSERT INTO works (author_id, series_id, series_order) VALUES (2, 's1', 3);",
+        )
+        .unwrap();
+        let series = list_series_impl(&conn, 1).unwrap();
+        let by_id = |id: &str| series.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(by_id("s1").max_order, 5);
+        assert_eq!(by_id("s1").gap_orders, vec![2, 3], "1/4/5 之间缺 2、3");
+        assert!(by_id("s2").gap_orders.is_empty(), "1、2 连着，没有缺口");
+        assert!(
+            by_id("s3").gap_orders.is_empty(),
+            "序号 0 是「还没排进系列」，不该被当成第 0 篇"
+        );
+    }
+
+    #[test]
+    fn anthology_slots_only_take_images_that_are_actually_on_disk() {
+        let root = std::env::temp_dir().join(format!("anthology-slots-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let images = root.join("书_images");
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("001.jpg"), b"a").unwrap();
+        fs::write(images.join("002.png"), b"b").unwrap();
+        let text_path = root.join("书.txt");
+
+        let content = "开头\n[插图 1：书_images/001.jpg]\n中间\n[引用插画 2：书_images/002.png]\n\
+                       [插图 3：书_images/003.jpg]\n[a pixiv 原始标记 leftover: 这里不该当图]\n\
+                       [uploads]\n结尾";
+        let (slots, bundled) = anthology_image_slots(content, &text_path, 0);
+        // 003.jpg 不在盘上 → 这个槽位整个丢掉，正文里那句就留成普通文字
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].file_name, "c01_001.jpg");
+        assert!(!slots[0].external);
+        assert_eq!(slots[1].file_name, "c01_002.png");
+        assert!(slots[1].external, "「引用插画」要按外链插画标注");
+        assert_eq!(bundled.len(), 2);
+        assert_eq!(bundled[1].1, b"b");
+        // 槽位的 token 必须是正文里原样的那一段，render 时靠它做替换
+        assert_eq!(slots[0].token, "[插图 1：书_images/001.jpg]");
+        // 换个章节号，包内文件名跟着变，跨章不会撞
+        let (second, _) = anthology_image_slots(content, &text_path, 7);
+        assert_eq!(second[0].file_name, "c08_001.jpg");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filter_view_names_are_trimmed_and_length_checked() {
+        assert_eq!(clean_filter_view_name("  待读长篇  ").unwrap(), "待读长篇");
+        assert!(clean_filter_view_name("   ").is_err());
+        assert!(clean_filter_view_name(&"字".repeat(FILTER_VIEW_MAX_NAME)).is_ok());
+        assert!(clean_filter_view_name(&"字".repeat(FILTER_VIEW_MAX_NAME + 1)).is_err());
+    }
+
+    #[test]
+    fn document_text_drops_script_and_style_content() {
+        let html = "<html><head><style>body{color:red}</style>\
+                    <script>function boot(){return 1}</script></head>\
+                    <body><p>正文第一段</p><p>第二段</p></body></html>";
+        let text = document_text(html);
+        assert!(text.contains("正文第一段"));
+        assert!(text.contains("第二段"));
+        // 只丢标签的话，JS / CSS 原文会被当成正文搜到 —— 这是这个函数存在的理由
+        assert!(!text.contains("function"), "script 内容必须整个丢掉：{text}");
+        assert!(!text.contains("color"), "style 内容必须整个丢掉：{text}");
+    }
+
+    #[test]
+    fn element_block_strip_survives_missing_close_tag() {
+        assert_eq!(strip_element_block("<p>留着</p>", "script"), "<p>留着</p>");
+        assert_eq!(
+            strip_element_block("<p>前</p><script>没闭合", "script"),
+            "<p>前</p>"
+        );
+        // 大小写混写也要认出来（HTML 不区分大小写）
+        assert_eq!(
+            strip_element_block("A<SCRIPT>x</Script>B", "script"),
+            "AB"
+        );
+    }
+
+    #[test]
+    fn text_snippets_are_cut_on_character_boundaries() {
+        // 中文一个字三字节：按字节切会切出半个字，轻则乱码、重则 panic
+        let text = "前面的话。".repeat(20) + "关键句子" + &"后面的话。".repeat(20);
+        let (count, snippets) = text_search_matches(&text, "关键句子");
+        assert_eq!(count, 1);
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].hit, "关键句子");
+        assert!(snippets[0].before.ends_with('。'), "{:?}", snippets[0].before);
+        assert!(snippets[0].after.starts_with('后'), "{:?}", snippets[0].after);
+        // 前后文各截到 N 个字符，不是整段
+        assert_eq!(snippets[0].before.chars().count(), TEXT_SEARCH_CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn text_search_counts_every_hit_but_keeps_few_snippets() {
+        let text = "书".repeat(50);
+        let (count, snippets) = text_search_matches(&text, "书");
+        assert_eq!(count, 50);
+        assert_eq!(snippets.len(), TEXT_SEARCH_MAX_SNIPPETS);
+        assert_eq!(single_line("  换行\n和  空格 "), "换行 和 空格");
+    }
+
+    #[test]
+    fn epub_text_entries_take_content_files_only() {
+        assert!(is_epub_text_entry("OEBPS/chapter001.xhtml"));
+        assert!(is_epub_text_entry("text/part.html"));
+        assert!(is_epub_text_entry("note.TXT"));
+        // 图片（哪怕是最大的那几个）绝不该被当正文读进来
+        assert!(!is_epub_text_entry("OEBPS/images/001.jpg"));
+        assert!(!is_epub_text_entry("OEBPS/cover.png"));
+        assert!(!is_epub_text_entry("OEBPS/content.opf"));
+        // 只在别的地方出现的同类目录
+        assert!(!is_epub_text_entry("__MACOSX/._chapter.xhtml"));
+        assert!(!is_epub_text_entry("OEBPS/"));
+    }
+
+    /// 搭一个真会走盘的临时素材集：纯文本 / HTML / EPUB 各一份
+    fn text_search_fixture(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("text-search-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn text_search_document_reads_txt_html_and_epub() {
+        let root = text_search_fixture("read");
+
+        let txt = root.join("纯文本.txt");
+        fs::write(&txt, "第一段\n关键句子在这里\n").unwrap();
+        assert!(text_search_document(&txt).unwrap().contains("关键句子"));
+
+        // HTML：标签和脚本内容都要剥掉
+        let html = root.join("网页.html");
+        fs::write(&html, "<p>关键句子</p><script>var 关键句子=1</script>").unwrap();
+        assert!(text_search_document(&html).unwrap().contains("关键句子"));
+
+        // EPUB：正文在内页里，图片条目一个字节都不该被读进来。
+        // 名字特意跟上面那个 txt 岔开 —— 同名 .txt 会被优先取走（下面单独验那条）。
+        let epub = root.join("电子书.epub");
+        {
+            let mut writer = zip::ZipWriter::new(fs::File::create(&epub).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("OEBPS/chapter1.xhtml", options).unwrap();
+            writer.write_all("<p>关键句子在正文里</p>".as_bytes()).unwrap();
+            writer.start_file("OEBPS/images/001.jpg", options).unwrap();
+            writer.write_all(b"not-really-a-jpeg").unwrap();
+            writer.finish().unwrap();
+        }
+        let text = text_search_document(&epub).unwrap();
+        assert!(text.contains("关键句子在正文里"));
+        assert!(!text.contains("not-really"), "图片条目不该被当正文读：{text}");
+
+        // 同名 .txt 优先 —— 比 epub 里那堆 xhtml 干净，也省一次解压
+        fs::write(root.join("电子书.txt"), "同名文本优先").unwrap();
+        assert!(text_search_document(&epub).unwrap().contains("同名文本优先"));
+
+        // 目录：找里面的 txt
+        let folder = root.join("目录版");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("正文.txt"), "目录里的关键句子").unwrap();
+        assert!(text_search_document(&folder).unwrap().contains("目录里的关键句子"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_text_search_reports_hits_missing_and_truncation() {
+        let root = text_search_fixture("scan");
+        let first = root.join("一.txt");
+        fs::write(&first, "关键句子。又一句关键句子。").unwrap();
+        let second = root.join("二.txt");
+        fs::write(&second, "这里也有关键句子").unwrap();
+        let gone = root.join("没了.txt"); // 故意不建：模拟绑定了但文件丢了
+
+        let rows = vec![
+            (
+                1i64,
+                "第一篇".to_string(),
+                first.to_string_lossy().into_owned(),
+                String::new(),
+            ),
+            (
+                2,
+                "第二篇".to_string(),
+                second.to_string_lossy().into_owned(),
+                String::new(),
+            ),
+            (
+                3,
+                "文件丢了".to_string(),
+                gone.to_string_lossy().into_owned(),
+                String::new(),
+            ),
+        ];
+
+        let result = search_full_text_over(&rows, "关键句子", None).unwrap();
+        assert_eq!(result.scanned_count, 2, "只有两篇真有正文");
+        assert_eq!(result.hits.len(), 2);
+        // 命中多的排前面：第一篇有两处
+        assert_eq!(result.hits[0].work_id, 1);
+        assert_eq!(result.hits[0].hit_count, 2);
+        assert_eq!(result.hits[0].snippets[0].hit, "关键句子");
+        assert!(!result.truncated);
+        // 文件不在原处的作品要点名报出来，不能静默跳过
+        assert_eq!(result.missing_count, 1);
+        assert_eq!(result.missing, vec!["文件丢了".to_string()]);
+
+        // 上限：命中两篇但只留一篇，得给截断标记
+        let capped = search_full_text_over(&rows, "关键句子", Some(1)).unwrap();
+        assert_eq!(capped.hits.len(), 1);
+        assert!(capped.truncated);
+
+        // 空词直接报错，别让一次全库扫描白跑
+        assert!(search_full_text_over(&rows, "   ", None).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 拿**真库**跑一遍，只关心两件事：扫得动、耗时是亚秒级。
+    ///
+    /// 平时不跑（`#[ignore]`）：它会读一整个库的正文（含几个 G 的 epub），
+    /// 不该拖慢日常 `cargo test`。想手动量一遍：
+    /// `WB_REAL_LIBRARY_DB="…\library.db" cargo test -- --ignored --nocapture real_library`
+    #[test]
+    #[ignore]
+    fn real_library_full_text_search_stays_subsecond() {
+        let Ok(path) = std::env::var("WB_REAL_LIBRARY_DB") else {
+            eprintln!("没设 WB_REAL_LIBRARY_DB，跳过");
+            return;
+        };
+        if !Path::new(&path).is_file() {
+            eprintln!("库文件不存在：{path}");
+            return;
+        }
+        let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("打不开库");
+        let rows: Vec<(i64, String, String, String)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT id, COALESCE(title,''), COALESCE(purchased_path,''), COALESCE(preview_path,'')
+                     FROM works",
+                )
+                .unwrap();
+            let collected = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            collected
+        };
+        drop(conn);
+
+        // 「的」是最坏情况：几乎每篇都命中，且每篇都要数到最后一个字
+        let result = search_full_text_over(&rows, "的", None).unwrap();
+        eprintln!(
+            "作品 {} 篇 / 扫过正文 {} 篇 / 命中 {} 篇 / 没正文 {} 篇 / 用时 {} ms",
+            rows.len(),
+            result.scanned_count,
+            result.hits.len(),
+            result.missing_count,
+            result.elapsed_ms
+        );
+        assert!(result.scanned_count > 0, "一篇正文都没读到，路径口径有问题");
+        assert!(
+            result.elapsed_ms < 3000,
+            "整库扫描慢到 {} ms，超出「亚秒级」的预期",
+            result.elapsed_ms
         );
     }
 }
