@@ -495,6 +495,50 @@ fn migrate_favorites_into_collections(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// v1.2.18：老库里非 txt 的完整版（EPUB / HTML）被当文本读过，把压缩包解出来的乱码
+/// 字符数当成了正文字数 —— 用户库里 56 本 EPUB 因此挂着 98 万～5288 万的假字数，
+/// 作品卡和详情页显示的是那个数，而不是「EPUB」。这里把它们标回 -1（未算），
+/// 交给启动时的 `refresh_word_counts` 按新判据重算，会得 0 ＝「读不出来」。
+///
+/// 判据直接调 `is_text_body_path()`，**不写成 SQL 里的 `LIKE '%.txt'`** ——
+/// 那样等于把扩展名规则抄第二遍（`a.txt.bak` 这种还会被判错），
+/// 以后改白名单必然漏掉这一处。全库八百来条完整版，循环判断毫秒级。
+///
+/// 只动 `purchased_path` 非空的行：没有完整版的作品，字数本来就取预览版的 txt，
+/// 不在这件事的范围内。
+fn migrate_word_counts_for_non_text_files(conn: &Connection) -> Result<(), String> {
+    if setting(conn, "word_counts_non_text_reset")? == "1" {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, purchased_path FROM works WHERE word_count >= 0 AND purchased_path <> ''",
+            )
+            .map_err(|e| e.to_string())?;
+        let mapped = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for (id, path) in rows {
+        if is_text_body_path(Path::new(&path)) {
+            continue;
+        }
+        conn.execute("UPDATE works SET word_count = -1 WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('word_counts_non_text_reset', '1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn db() -> Result<Connection, String> {
     let path = app_data_dir()?.join("library.db");
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
@@ -699,6 +743,10 @@ fn db() -> Result<Connection, String> {
     // 收藏 → 收藏夹（v1.1.0）：老库里 `works.favorite=1` 的作品统一收进一个默认收藏夹，
     // 这样升级后「我的收藏」不会是空的。
     let _ = migrate_favorites_into_collections(&conn);
+    // 非 txt 完整版的假字数（v1.2.18）：EPUB 曾被当文本读出乱码字符数落库，
+    // 标回未算让后台按新判据重算。要排在触发器 DDL 之后 —— 那个触发器盯着路径列，
+    // 这里只写 word_count，不会互相踩。
+    let _ = migrate_word_counts_for_non_text_files(&conn);
     // 常见角色名表：用于「按角色匹配」的自动分组 / 关联完整版文件。
     // game 只用来分组展示，不参与匹配；name 与 aliases（`|` 分隔）都会拿去匹配。
     let _ = conn.execute(
@@ -1422,9 +1470,33 @@ fn text_file_word_count(path: &Path) -> Option<usize> {
     )
 }
 
+/// 能当「正文」数出字数的扩展名白名单：**只有 txt**。
+///
+/// 口径和 `populate_work_display_info()` 里的 `extension != "TXT"` 是同一条：
+/// 非 txt 的完整版算「阅读版」，界面上显示格式名（EPUB / HTML…）而不是字数。
+/// 两处判据必须一起改，别在一处偷偷放宽。
+const TEXT_BODY_EXTENSIONS: &[&str] = &["txt"];
+
+fn is_text_body_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            TEXT_BODY_EXTENSIONS
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        })
+        .unwrap_or(false)
+}
+
 fn text_word_count_at(path: &Path) -> Option<usize> {
     if path.is_file() {
-        return text_file_word_count(path);
+        // EPUB / MOBI / PDF 这些是压缩包或二进制：硬当文本读会解出一大堆乱码，
+        // 数出来的就成了「乱码字符数」——用户库里 56 本 EPUB 因此挂着 98 万～5288 万的
+        // 假字数，作品卡和详情页一直显示那个数、而不是「EPUB」（v1.2.18 修）。
+        // 目录那条分支也是同一个判据，两处不能各写一套。
+        return is_text_body_path(path)
+            .then(|| text_file_word_count(path))
+            .flatten();
     }
     if !path.is_dir() {
         return None;
@@ -1433,12 +1505,7 @@ fn text_word_count_at(path: &Path) -> Option<usize> {
     let mut found = false;
     for entry in fs::read_dir(path).ok()?.flatten() {
         let entry_path = entry.path();
-        let is_text = entry_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.eq_ignore_ascii_case("txt"))
-            .unwrap_or(false);
-        let count = if entry_path.is_dir() || is_text {
+        let count = if entry_path.is_dir() || is_text_body_path(&entry_path) {
             text_word_count_at(&entry_path)
         } else {
             None
@@ -11364,6 +11431,7 @@ mod tests {
         synopsis_indicates_preview,
         clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
         HISTORY_LIMIT, migrate_favorites_into_collections,
+        migrate_word_counts_for_non_text_files,
         add_works_to_collections_impl, update_works_tags_impl,
         set_works_rating_impl, set_works_need_full_state_impl,
         remove_works_from_collections_impl, search_match_clause, list_missing_full_impl,
@@ -11384,7 +11452,8 @@ mod tests {
         EXPORT_COL_SERIES, EXPORT_COL_VERSION, EXPORT_COL_COLLECTIONS, EXPORT_COL_RATING,
         EXPORT_COL_READ, EXPORT_COL_NOTE, EXPORT_COL_PIXIV_URL, EXPORT_COL_TEXT_PATH,
         EXPORT_COL_COVER_PATH, EXPORT_COL_NOVEL_ID, EXPORT_COL_IMAGES, EXPORT_COL_SYNOPSIS,
-        text_word_count, title_indicates_images, unique_target_path, write_reading_output,
+        text_word_count, is_text_body_path, TEXT_BODY_EXTENSIONS,
+        title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
         SyncPreviewEntry, Work,
@@ -14196,6 +14265,87 @@ mod tests {
             .unwrap();
         assert_eq!(stored, -1, "路径变了字数缓存必须作废");
         assert_eq!(refresh_word_counts_impl(&conn, 0).unwrap().remaining, 1);
+    }
+
+    /// v1.2.18：EPUB 不是文本，**不能**当正文数字数。
+    ///
+    /// 起因：EPUB 是 zip 包，`read_text_file` 硬解码出来一大堆乱码，数出来就成了
+    /// 「乱码字符数」——用户库里 56 本 EPUB 挂着 98 万～5288 万的假字数，
+    /// 作品卡和详情页因此显示那个数、而不是「EPUB」。
+    #[test]
+    fn non_text_file_is_never_counted_as_words() {
+        let root = std::env::temp_dir().join(format!("text-body-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // 真 EPUB 就是 PK 开头的 zip；这里只要是「非文本字节」就够了
+        let epub = root.join("假书.epub");
+        fs::write(&epub, [0x50_u8, 0x4b, 0x03, 0x04, 0xff, 0x00, 0x80, 0xfe]).unwrap();
+        let txt = root.join("真书.txt");
+        fs::write(&txt, "一二三四五").unwrap();
+        let epub_text = epub.to_string_lossy().to_string();
+        let txt_text = txt.to_string_lossy().to_string();
+        let root_text = root.to_string_lossy().to_string();
+
+        assert_eq!(text_word_count(&epub_text), None, "EPUB 读不出正文字数");
+        assert_eq!(text_word_count(&txt_text), Some(5));
+        // 目录那条分支必须和文件分支同判据：只数 txt，跳过 epub
+        assert_eq!(text_word_count(&root_text), Some(5));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.2.18：升级时要把老库里 EPUB 的假字数清掉，txt 的一字不动；而且只跑一次 ——
+    /// 重算出来的 0（＝「读不出来」）不能被下一次启动又标回未算。
+    #[test]
+    fn migration_resets_fake_word_counts_on_non_text_files() {
+        let root = std::env::temp_dir().join(format!("word-count-migrate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let epub = root.join("假书.epub");
+        fs::write(&epub, [0x50_u8, 0x4b, 0x03, 0x04]).unwrap();
+        let txt = root.join("真书.txt");
+        fs::write(&txt, "一二三四五").unwrap();
+        let epub_path = epub.to_string_lossy().to_string();
+        let txt_path = txt.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute_batch(WORD_COUNT_TRIGGER_DDL).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, title, purchased_path, word_count) VALUES (1, '甲的电子书', ?1, 45296941)",
+            [epub_path.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, title, purchased_path, word_count) VALUES (2, '乙的 txt', ?1, 5)",
+            [txt_path.as_str()],
+        )
+        .unwrap();
+
+        migrate_word_counts_for_non_text_files(&conn).unwrap();
+
+        let stored = |id: i64| -> i64 {
+            conn.query_row("SELECT word_count FROM works WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(stored(1), -1, "EPUB 的假字数要标回未算");
+        assert_eq!(stored(2), 5, "txt 的字数不能动");
+
+        // 后台按新判据重算：EPUB 读不出正文 → 0
+        assert_eq!(refresh_word_counts_impl(&conn, 10).unwrap().updated, 1);
+        assert_eq!(stored(1), 0);
+
+        // 标记位必须挡住第二次：否则重算好的 0 每次启动都被标回未算，白跑一遍全库
+        migrate_word_counts_for_non_text_files(&conn).unwrap();
+        assert_eq!(stored(1), 0, "迁移只跑一次");
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// v1.2.8：「系列连读」的进度把「在读」也算进去。

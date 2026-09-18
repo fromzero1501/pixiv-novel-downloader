@@ -189,7 +189,9 @@ const state = {
 };
 
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "D:\\头像\\雾海.png", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
-const previewWorks = [{ id: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", releaseDate: "2025-10-05", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\希儿.epub", wordCount: 12680, favorite: true }, { id: 2, title: "夏日短篇集", releaseDate: "2025-09-20", previewPath: "", coverPath: "", purchasedPath: "", wordCount: 4380, favorite: false }, { id: 3, title: "旧城的信", releaseDate: "2025-08-18", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\旧城的信", wordCount: 20750, favorite: false }, { id: 4, title: "月色图文辑", releaseDate: "2025-07-09", previewPath: "", coverPath: "", purchasedPath: "", favorite: true }];
+// 第 1 篇故意绑 .epub：字数是 0（EPUB 读不出正文），卡片上该显示「EPUB」而不是字数 ——
+// 预览数据必须和真机一个规矩，否则 v1.2.18 修的那个 bug 在这里根本复现不出来。
+const previewWorks = [{ id: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", releaseDate: "2025-10-05", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\希儿.epub", wordCount: 0, favorite: true }, { id: 2, title: "夏日短篇集", releaseDate: "2025-09-20", previewPath: "", coverPath: "", purchasedPath: "", wordCount: 4380, favorite: false }, { id: 3, title: "旧城的信", releaseDate: "2025-08-18", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\旧城的信.txt", wordCount: 20750, favorite: false }, { id: 4, title: "月色图文辑", releaseDate: "2025-07-09", previewPath: "", coverPath: "", purchasedPath: "", favorite: true }];
 
 // 瀑布流（v1.2.8）在预览里没法验：就 4 篇，翻页永远触发不到。
 // `window.__previewWorkScale = N` 把这 4 篇整体复制 N 份（id 与标题都错开），
@@ -223,6 +225,9 @@ previewWorks.forEach((work, index) => {
   work.needFullState = [0, 0, 0, 2][index];
   // 处理时间（v1.2.8）：第 4 篇标成「3 天前」，正好验相对时间的渲染
   work.needFullMarkedAt = index === 3 ? new Date(Date.now() - 3 * 86400000).toISOString() : "";
+  // 完整版不是 txt（EPUB / HTML…）才叫「阅读版」，卡片上显示格式名 ——
+  // 判据和 Rust 侧 `populate_work_display_info` 的 `extension != "TXT"` 是同一条
+  work.fileFormat = ["EPUB", "", "", ""][index];
   if (work.wordCount === undefined) work.wordCount = 0;
 });
 
