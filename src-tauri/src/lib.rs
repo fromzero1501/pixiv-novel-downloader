@@ -2969,14 +2969,24 @@ fn sync_paths(preview_dir: &Path, title: &str, novel_id: &str) -> (PathBuf, Path
     )
 }
 
-/// 配图文件夹（`{标题}_images`）与图文 HTML 是同步的附属产物，
-/// 不能当成「作品的本地文件」参与相似度匹配，否则会被误判成另一个版本。
-fn is_generated_asset(path: &Path) -> bool {
-    let named_images_dir = path
-        .file_name()
+/// `{标题}_images` 配图文件夹：同步图文小说时落下的插图，不是作品文件本身。
+fn is_images_asset_dir(path: &Path) -> bool {
+    path.file_name()
         .map(|name| name.to_string_lossy().ends_with("_images"))
-        .unwrap_or(false);
-    named_images_dir
+        .unwrap_or(false)
+}
+
+/// 同步自己生成的附属产物：配图文件夹（`{标题}_images`）与图文阅读版（HTML / EPUB）。
+/// 不能当成「作品的本地文件」参与相似度匹配，否则会被误判成另一个版本。
+///
+/// **只在扫「预览版文件夹」时用**（`sync_preview_entries` 那几处）—— 那里出现的
+/// html/epub 一定是同步刚落下来的阅读版。
+///
+/// **待归档文件夹（自动分组）不能用它**：用户放在那里的 epub / HTML 是手头正经的
+/// 完整版（能当作品文件的只有文本、电子书和 HTML，见 `is_image_like_asset`），
+/// 用这个判据会把它们整批滤掉。那边改用 `is_images_asset_dir`，见 `collect_files_recursively`。
+fn is_generated_asset(path: &Path) -> bool {
+    is_images_asset_dir(path)
         || path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -6682,19 +6692,24 @@ fn distribute_file(
     })
 }
 
-/// 递归收集目录下的所有文件（含子文件夹）。
+/// 递归收集待归档文件夹下的所有文件（含子文件夹）。
 /// 顶层目录读不动时报错；子目录读不动时跳过，不影响其余文件。
+///
+/// **这里刻意不用 `is_generated_asset`**：那个判据把 HTML / EPUB 一起当附属产物滤掉，
+/// 但用户往待归档文件夹里放的 epub / HTML 恰恰是正经的完整版，滤掉就永远分不了组
+/// （v1.2.19 修的就是这个）。这里只整棵跳过 `{标题}_images` 配图文件夹 —— 里面的插图
+/// 是同步落下的附属物，不是作品文件。封面 / 单张插图由调用方的
+/// `is_image_like_asset` 那一道兜住。
 fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("无法读取文件夹 {}：{e}", dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // `{标题}_images` 是同步下来的配图文件夹，里面的图不是待分组的作品文件
-            if is_generated_asset(&path) {
+            if is_images_asset_dir(&path) {
                 continue;
             }
             let _ = collect_files_recursively(&path, out);
-        } else if path.is_file() && !is_generated_asset(&path) {
+        } else if path.is_file() {
             out.push(path);
         }
     }
@@ -11405,6 +11420,7 @@ mod tests {
         direct_target_path, distribute_file, epub_target_path, existing_sync_target, file_name,
         follow_cover_path, preview_is_redundant, recycle_to_bin,
         has_invalid_date_range, insert_local_work, is_after_last_sync, is_generated_asset,
+        is_images_asset_dir,
         is_image_like_asset,
         is_within_date_range, matched_sync_preview, move_cover_along, move_path, name_key,
         sibling_assets,
@@ -12249,6 +12265,60 @@ mod tests {
         assert!(names.contains(&"深层.txt".to_string()));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// v1.2.19 修的就是这条：自动分组原先复用「扫预览目录」的判据，
+    /// 把 HTML / EPUB 也当同步附属产物一起滤掉 —— 用户丢进待归档文件夹的电子书
+    /// 永远不会被分组，而且一声不吭（目录里还有 txt 时连提示都没有）。
+    /// 现在只整棵跳过 `{标题}_images` 配图文件夹，其余一律收。
+    #[test]
+    fn recursive_scan_keeps_ebooks_and_html_but_skips_image_folders() {
+        let root =
+            std::env::temp_dir().join(format!("recursive-scan-ebooks-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("希儿_images")).unwrap();
+        fs::create_dir_all(root.join("子目录")).unwrap();
+        fs::write(root.join("希儿.txt"), b"txt").unwrap();
+        fs::write(root.join("希儿.epub"), b"epub").unwrap();
+        fs::write(root.join("希儿.html"), b"html").unwrap();
+        fs::write(root.join("希儿.jpg"), b"jpg").unwrap();
+        fs::write(root.join("希儿_images").join("01.jpg"), b"img").unwrap();
+        fs::write(root.join("子目录").join("另一本.epub"), b"epub").unwrap();
+
+        let mut files = vec![];
+        collect_files_recursively(&root, &mut files).unwrap();
+        let names: Vec<String> = files.iter().map(|path| file_name(path)).collect();
+
+        // 电子书与 HTML 必须参与自动分组（本次修复的重点）
+        assert!(names.contains(&"希儿.epub".to_string()), "epub 要参与自动分组");
+        assert!(names.contains(&"希儿.html".to_string()), "html 要参与自动分组");
+        assert!(
+            names.contains(&"另一本.epub".to_string()),
+            "子文件夹里的 epub 也要收"
+        );
+        assert!(names.contains(&"希儿.txt".to_string()));
+        // 单张插图收进来没关系（调用方还会过一道 is_image_like_asset 兜底），
+        // 但配图文件夹必须整棵跳过 —— 否则里面的每张图都会被当成一个作品
+        assert!(
+            !names.contains(&"01.jpg".to_string()),
+            "{{标题}}_images 里的插图不能进来"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 判据分工：`is_images_asset_dir` 只认配图文件夹（自动分组用），
+    /// `is_generated_asset` 才顺带认阅读版文件（只该用在预览目录那三处）。
+    #[test]
+    fn only_the_preview_scan_treats_reading_formats_as_generated_assets() {
+        assert!(is_images_asset_dir(Path::new("D:/待分组/希儿_images")));
+        assert!(!is_images_asset_dir(Path::new("D:/待分组/希儿.epub")));
+        assert!(!is_images_asset_dir(Path::new("D:/待分组/希儿.html")));
+        assert!(!is_images_asset_dir(Path::new("D:/待分组/希儿.txt")));
+        // 旧判据保持不变：预览目录里出现的 epub / html 仍然是同步产物
+        assert!(is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.epub")));
+        assert!(is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.html")));
+        assert!(!is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.txt")));
     }
 
     #[test]

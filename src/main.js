@@ -234,6 +234,9 @@ previewWorks.forEach((work, index) => {
 // 验证脚本要在页面加载后改这几篇的字段（比如把处理时间调成 40 天前看日期分支），
 // 和 `__previewWorkScale` 一个用途：预览数据在模块作用域里，不挂出来就够不着。
 window.__previewWorks = previewWorks;
+// 作者库同理：预览里只有 3 位作者，一屏就放完了 —— 而「换页后视口该回到最上方」
+// 这条得先让上一页滚得动才验得出来，验证脚本靠它把作者池撑大（v1.2.19）
+window.__previewAuthors = previewAuthors;
 
 /**
  * mock 里的「搜索范围 → 待匹配文字」，和 Rust 侧的 `search_match_clause` 保持同一套规则，
@@ -1124,6 +1127,15 @@ function render() {
   // 界面记忆的**唯一落盘点**：筛选、排序、搜索、切页最后都会走到这里，
   // 挂一处就够，加新筛选项不必再去追那十几处 data-action（详见「视图状态记忆」一节）
   scheduleViewStateSave();
+  // 换页就把视口带回顶部。不这么做的话：`innerHTML` 换掉了、`scrollTop` 却还留着
+  // 上一页的位置 —— 新列表要是也够长，浏览器不会夹它，于是一点进作品库就停在半空。
+  // 判据用「桶」，所以点进任意作者的作品库、切到侧栏任何一页都从顶部开始；
+  // 同一页内的刷新（筛选、排序、搜索、加载更多）桶没变，位置保持不动。
+  const bucket = viewStateBucket();
+  if (bucket !== renderedBucket) {
+    renderedBucket = bucket;
+    restoreScrollTop(0);
+  }
 }
 
 function restoreSearchFocus(id) {
@@ -7023,6 +7035,11 @@ function currentScrollTop() {
 
 /** 各页面的滚动位置，模块级实时更新（切页前的那一次必须已经记下来，见本节开头第 3 条） */
 const scrollTops = {};
+/**
+ * 上一次 `render()` 画的是哪个桶。只用来判断这次是「换页」还是「同一页刷新」：
+ * 换页要把视口带回顶部（见 `render()` 末尾），同一页刷不动它。
+ */
+let renderedBucket = null;
 let viewStateTimer = 0;
 
 function readViewState() {
@@ -7076,15 +7093,25 @@ function trackScrollPosition() {
 }
 
 /**
- * 还原滚动位置。等两帧再滚 —— 刚 `innerHTML` 完，瀑布流那些卡片还没完成布局，
+ * 把视口移到指定位置。等两帧再滚 —— 刚 `innerHTML` 完，瀑布流那些卡片还没完成布局，
  * 直接设 scrollTop 会被后面撑开的高度顶回去。
+ *
+ * **`0` 也得真的执行**：`render()` 靠它把换页后的视口带回顶部。早先这里守着一条
+ * `if (!value) return`（本意是「没必要滚就别滚」），结果让「回到顶部」变成空操作 ——
+ * 页面换了、`scrollTop` 却还留着上一页的值，新列表够长时浏览器不会夹它，
+ * 于是一点进作品库就停在半空（v1.2.19 修的）。
  */
+let scrollRestoreFrame = 0;
 function restoreScrollTop(top) {
   const value = Math.max(0, Number(top) || 0);
-  if (!value) return;
   const scroller = libraryScroller();
-  window.requestAnimationFrame(() => {
-    window.requestAnimationFrame(() => { scroller.scrollTop = value; });
+  // 连着两次调用只认最后一次：先排的那次后到，位置会闪一下
+  if (scrollRestoreFrame) window.cancelAnimationFrame(scrollRestoreFrame);
+  scrollRestoreFrame = window.requestAnimationFrame(() => {
+    scrollRestoreFrame = window.requestAnimationFrame(() => {
+      scrollRestoreFrame = 0;
+      scroller.scrollTop = value;
+    });
   });
 }
 
@@ -7153,8 +7180,12 @@ async function restoreViewState() {
       await refreshWorks();
     }
   }
+  // 启动首屏不算「换页」：先把桶登记上，免得下面那次 render() 按换页把视口带回顶部，
+  // 白白冲掉刚恢复好的位置
+  const bucket = viewStateBucket();
+  renderedBucket = bucket;
   render();
-  restoreScrollTop(scrollTops[viewStateBucket()] || 0);
+  restoreScrollTop(scrollTops[bucket] || 0);
   // 正文搜索：把词放回框里，并重跑那次搜索（后端现扫本地文件，几百毫秒，不挡界面）。
   // 只放词不重跑的话框里有字、下面却写着「搜一下试试」，看着像坏了
   if (state.homeView === "textSearch" && state.textSearchQuery.trim()) {
