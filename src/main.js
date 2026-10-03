@@ -58,6 +58,13 @@ const state = {
   pendingMatch: null,
   /** 常见角色名列表（按游戏分组） */
   characters: [],
+  /**
+   * 封面角色名匹配用的扁平索引（角色名 + 别名，长名在前）：启动时建一次，角色增删改后重建。
+   * 匹配完全在前端做，卡片渲染才是同步的 —— 不然名字会「先空着再弹出来」。
+   */
+  characterIndex: [],
+  /** 封面是否常显匹配到的角色名（作者作品库工具栏的开关，跟着视图状态一起存） */
+  showCharacterNames: false,
   /** 设置里配的「完整版搜索网站」：选中标题右键时的搜索入口，启动时读一次、保存设置后刷新 */
   searchSites: [],
   /** 启动时读回来的整份设置（自动更新要不要跑得看它） */
@@ -141,6 +148,15 @@ const state = {
   /** 「浏览历史」页：`{ work, viewedAt, viewCount }` 列表 + 搜索词 */
   history: [],
   historyQuery: "",
+  /**
+   * 「稍后再看」（v1.2.20）：`{ work, addedAt }` 列表 + 搜索词。
+   * `watchLaterIds` 是同一批作品的 id 集合 —— 卡片上那个书签按钮遍布七八个列表页，
+   * 每张卡都要问一句「这篇在不在清单里」，所以启动时拉一次 id、增删时就地改这个 Set，
+   * 不去每页都拉一遍完整条目。
+   */
+  watchLater: [],
+  watchLaterQuery: "",
+  watchLaterIds: new Set(),
   /**
    * 阅读状态筛选（v1.2.0）：`all` / `unread`（未读） / `reading`（在读，＝「继续读」清单）。
    * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
@@ -238,6 +254,11 @@ window.__previewWorks = previewWorks;
 // 这条得先让上一页滚得动才验得出来，验证脚本靠它把作者池撑大（v1.2.19）
 window.__previewAuthors = previewAuthors;
 
+// 同步结果也要能在验证脚本里改：默认 mock 返回一个「什么都没干成」的空结果，
+// 而「失败原因 / 疑似限流 / 无新作品」这几条分支只有拿到特定返回才走得出来（v1.2.20）。
+// 置成一个函数即可让它接管 `sync_pixiv_novels` 的返回。
+window.__syncMockResult = null;
+
 /**
  * mock 里的「搜索范围 → 待匹配文字」，和 Rust 侧的 `search_match_clause` 保持同一套规则，
  * 否则无头验证会跟真机行为对不上。
@@ -286,6 +307,13 @@ const previewHistory = [
   { workId: 1, viewedAt: previewDayAt(0, 9, 20), viewCount: 4 },
   { workId: 3, viewedAt: previewDayAt(-1, 21, 5), viewCount: 2 },
   { workId: 4, viewedAt: previewDayAt(-3, 17, 40), viewCount: 1 },
+];
+// 稍后再看（v1.2.20）：同样是「存 workId，出口时再挂作品对象」。
+// 预置两条 —— 一条是「本来就在清单里」（卡片按钮该是实心的），一条不在，
+// 这样浏览器预览里两头状态都看得到。
+const previewWatchLater = [
+  { workId: 2, addedAt: previewDayAt(0, 8, 10) },
+  { workId: 4, addedAt: previewDayAt(-2, 20, 30) },
 ];
 previewWorks.forEach((work, index) => { work.seriesId = index < 2 ? "demo-series-1" : ""; work.seriesTitle = index < 2 ? "雾海档案短篇系列" : ""; });
 
@@ -503,6 +531,17 @@ async function invoke(command, args = {}) {
   if (command === "list_history") return previewHistory.map((entry) => ({ ...entry, work: previewWorks.find((work) => work.id === entry.workId) })).filter((entry) => entry.work && (!args.query || entry.work.title.includes(args.query)));
   if (command === "clear_history") { previewHistory.length = 0; return; }
   if (command === "remove_history") { const index = previewHistory.findIndex((entry) => entry.workId === args.workId); if (index >= 0) previewHistory.splice(index, 1); return; }
+  // 稍后再看：同浏览历史一套写法，只是没有「看过几次」，只有「什么时候加进来的」
+  if (command === "list_watch_later") return previewWatchLater.map((entry) => ({ ...entry, work: previewWorks.find((work) => work.id === entry.workId) })).filter((entry) => entry.work && (!args.query || entry.work.title.includes(args.query)));
+  if (command === "list_watch_later_ids") return previewWatchLater.map((entry) => entry.workId);
+  if (command === "add_watch_later") {
+    const found = previewWatchLater.find((entry) => entry.workId === args.workId);
+    if (found) found.addedAt = new Date().toISOString();
+    else previewWatchLater.unshift({ workId: args.workId, addedAt: new Date().toISOString() });
+    return;
+  }
+  if (command === "remove_watch_later") { const index = previewWatchLater.findIndex((entry) => entry.workId === args.workId); if (index >= 0) previewWatchLater.splice(index, 1); return; }
+  if (command === "clear_watch_later") { previewWatchLater.length = 0; return; }
   if (command === "toggle_has_images") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.hasImages = !work.hasImages; return; }
   // 作品个人元数据（v1.2.0）：评分 / 阅读状态 / 笔记
   if (command === "set_work_meta") {
@@ -724,7 +763,10 @@ async function invoke(command, args = {}) {
     return;
   }
   if (command === "bind_work_with_rename") return args.path;
-  if (command === "sync_pixiv_novels") return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, lastSyncAt: new Date().toISOString() };
+  if (command === "sync_pixiv_novels") {
+    if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
+    return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, lastSyncAt: new Date().toISOString() };
+  }
   if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.isNew = false; if (work.readState === 0) work.readState = 1; } return; }
   if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
   if (command === "open_search_site") {
@@ -767,6 +809,10 @@ const icon = (name, size = 18) => {
     grip: '<circle cx="9.5" cy="6" r="1.5" fill="currentColor"/><circle cx="14.5" cy="6" r="1.5" fill="currentColor"/><circle cx="9.5" cy="12" r="1.5" fill="currentColor"/><circle cx="14.5" cy="12" r="1.5" fill="currentColor"/><circle cx="9.5" cy="18" r="1.5" fill="currentColor"/><circle cx="14.5" cy="18" r="1.5" fill="currentColor"/>',
     layers: '<path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 13 9 5 9-5"/>',
     clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5.2l3.2 1.9"/>',
+    user: '<circle cx="12" cy="8.2" r="3.4"/><path d="M5.5 20c.6-3.3 3.3-5.2 6.5-5.2s5.9 1.9 6.5 5.2"/>',
+    // 「稍后再看」：书签。给了实心版是为了让「已经加进去了」一眼可辨
+    bookmark: '<path d="M6 3.5h12a1 1 0 0 1 1 1V21l-7-4.6L5 21V4.5a1 1 0 0 1 1-1Z"/>',
+    bookmarkFilled: '<path d="M6 3.5h12a1 1 0 0 1 1 1V21l-7-4.6L5 21V4.5a1 1 0 0 1 1-1Z"/>',
     info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5.6"/><path d="M12 7.7h.01"/>',
     download: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M5 20h14"/>',
     archive: '<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M10 12h4"/>',
@@ -1092,11 +1138,20 @@ async function refreshCollectionWorks() {
 async function refreshActiveList() {
   if (state.homeView === "collections" && state.activeCollection) await refreshCollectionWorks();
   else if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks();
+  else if (state.homeView === "watchLater" && !state.activeAuthor) await refreshWatchLater();
   else await refreshWorks();
 }
 
 async function refreshHistory() {
   state.history = await invoke("list_history", { query: state.historyQuery, limit: 0 });
+}
+
+/**
+ * 「稍后再看」的数据源。顺手把 id 集合重建一遍 —— 卡片上那个书签按钮靠它翻面。
+ */
+async function refreshWatchLater() {
+  state.watchLater = await invoke("list_watch_later", { query: state.watchLaterQuery, limit: 0 });
+  state.watchLaterIds = new Set(state.watchLater.map((entry) => entry.work.id));
 }
 
 /**
@@ -1117,6 +1172,7 @@ function render() {
     : (state.homeView === "allWorks" ? renderAllWorks()
       : state.homeView === "collections" ? renderCollections()
       : state.homeView === "history" ? renderHistory()
+      : state.homeView === "watchLater" ? renderWatchLater()
       : state.homeView === "missingFull" ? renderMissingFull()
       : state.homeView === "filterViews" ? renderFilterViews()
       : state.homeView === "textSearch" ? renderTextSearch()
@@ -1151,8 +1207,9 @@ function restoreSearchFocus(id) {
 function findWork(workId) {
   const target = Number(workId);
   // 待补工作台和正文搜索结果也要算进来：那儿的卡片和别处长得一模一样，少了它点标题
-  // 只会弹「没找到这篇作品」—— 明明就在眼前
-  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.textSearchPool, ...state.history.map((entry) => entry.work)].find((work) => work.id === target);
+  // 只会弹「没找到这篇作品」—— 明明就在眼前。（稍后再看页目前只走「打开文件」，
+  // 用不到查对象，但一并留着，免得以后给它加个「开详情」就踩这个坑。）
+  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.textSearchPool, ...state.history.map((entry) => entry.work), ...state.watchLater.map((entry) => entry.work)].find((work) => work.id === target);
 }
 
 async function openSeriesDetail(seriesId, seriesTitle, returnTo = "works") {
@@ -1230,6 +1287,7 @@ function renderShell(content) {
         <button class="rail-button ${state.homeView === "allWorks" && !state.activeAuthor ? "is-active" : ""}" title="\u6240\u6709\u4f5c\u54c1" data-action="go-all-works">${icon("database", 20)}</button>
         <button class="rail-button ${state.homeView === "collections" && !state.activeAuthor ? "is-active" : ""}" title="我的收藏" aria-label="我的收藏" data-action="go-collections">${icon("folderHeart", 20)}</button>
         <button class="rail-button ${state.homeView === "history" && !state.activeAuthor ? "is-active" : ""}" title="浏览历史" aria-label="浏览历史" data-action="go-history">${icon("clock", 20)}</button>
+        <button class="rail-button ${state.homeView === "watchLater" && !state.activeAuthor ? "is-active" : ""}" title="稍后再看" aria-label="稍后再看" data-action="go-watch-later">${icon("bookmark", 20)}</button>
         <button class="rail-button ${state.homeView === "missingFull" && !state.activeAuthor ? "is-active" : ""}" title="待补完整版" aria-label="待补完整版" data-action="go-missing-full">${icon("archive", 20)}</button>
         <button class="rail-button ${state.homeView === "filterViews" && !state.activeAuthor ? "is-active" : ""}" title="筛选模板" aria-label="筛选模板" data-action="go-filter-views">${icon("star", 20)}</button>
         <button class="rail-button ${state.homeView === "textSearch" && !state.activeAuthor ? "is-active" : ""}" title="正文搜索" aria-label="正文搜索" data-action="go-text-search">${icon("bookText", 20)}</button>
@@ -1300,7 +1358,7 @@ function syncFloater() {
   return `<div class="sync-floater" id="sync-floater">
     <div class="sync-floater-head">
       <strong>${icon("sync", 16)}<span id="sync-progress-label">${escapeHtml(task.label)}</span></strong>
-      <span class="sync-floater-count" id="sync-progress-count">${task.current} / ${task.total}</span>
+      <span class="sync-floater-count" id="sync-progress-count">${syncCountText(task)}</span>
     </div>
     <progress id="sync-progress-bar" value="${task.current}" max="${Math.max(task.total, 1)}"></progress>
     <div class="sync-floater-foot">
@@ -1313,22 +1371,59 @@ function syncFloater() {
   </div>`;
 }
 
+// 右上角的计数文案。**跑完之后不能再按 `current / total` 报**：
+// 计数是按待抓篇数算的，一篇都没抓到时 total 就是 0，于是永远停在「0 / 0」
+// 或者「核对中」，看着像没跑完。收尾了就改说状态本身。
+function syncCountText(task) {
+  if (task.status === "pending") return "等待中";
+  if (task.status === "done") return "核对完成";
+  if (task.status === "throttled") return "已中断";
+  if (task.status === "cancelled") return "已终止";
+  if (task.status === "failed") return "失败";
+  return task.total ? `${task.current} / ${task.total}` : "核对中";
+}
+
+// 进度条的填充量。**跑完的行一律填满** ——
+// 绿色是画在「已填充的部分」上的（`::-webkit-progress-value`），收尾时
+// `value` 还停在 0 的话，整条都是灰底，绿色根本没机会画出来。
+// 首帧渲染和后续增量更新都走这里，免得两处各写一份、改一处漏一处。
+function syncRowProgress(item) {
+  const max = Math.max(item.total, 1);
+  const finished = item.status !== "pending" && item.status !== "running";
+  return { value: finished ? max : Math.min(item.current, max), max };
+}
+
 // 批量同步时每一行的状态说明文字
 function syncRowStatusText(item) {
   if (item.status === "pending") return "等待中";
-  if (item.status === "running") return item.title || "正在读取作品列表...";
-  return item.note || (item.status === "failed" ? "同步失败" : "已完成");
+  if (item.status === "running") return item.title || (item.total ? "正在读取作品列表..." : "正在核对作品列表...");
+  if (item.status === "throttled") return item.note || "疑似被限流，已提前停止";
+  if (item.status === "cancelled") return item.note || "已终止";
+  if (item.status === "failed") return item.note || "同步失败";
+  if (!item.total) return "已是最新，无新作品";
+  return item.note || "已完成";
+}
+
+// 把后端给的失败原因拼成一句人话（最多 3 条，多了用「等 N 条」收口）
+function failureReasonText(reasons, failedCount) {
+  const list = (reasons || []).filter(Boolean);
+  if (!list.length) return "";
+  const shown = list.slice(0, 3).join("；");
+  return list.length > 3 ? `${shown} 等 ${list.length} 条` : shown;
 }
 
 function batchSyncFloater(task) {
-  const rows = task.authors.map((item) => `<div class="sync-floater-row is-${item.status}" data-sync-author-id="${item.authorId}">
+  const rows = task.authors.map((item) => {
+    const { value, max } = syncRowProgress(item);
+    return `<div class="sync-floater-row is-${item.status}" data-sync-author-id="${item.authorId}">
       <div class="sync-floater-row-head">
         <span class="sync-row-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
-        <span class="sync-row-count" data-sync-count>${item.current} / ${item.total}</span>
+        <span class="sync-row-count" data-sync-count>${syncCountText(item)}</span>
       </div>
-      <progress data-sync-bar value="${item.current}" max="${Math.max(item.total, 1)}"></progress>
+      <progress data-sync-bar value="${value}" max="${max}"></progress>
       <p class="sync-row-title" data-sync-title title="${escapeHtml(syncRowStatusText(item))}">${escapeHtml(syncRowStatusText(item))}</p>
-    </div>`).join("");
+    </div>`;
+  }).join("");
   const finished = task.authors.filter((item) => item.status !== "pending" && item.status !== "running").length;
   return `<div class="sync-floater is-batch" id="sync-floater">
     <div class="sync-floater-head">
@@ -1364,9 +1459,10 @@ function updateSyncFloater() {
       if (!line) return;
       line.className = `sync-floater-row is-${item.status}`;
       const bar = line.querySelector("[data-sync-bar]");
-      bar.max = Math.max(item.total, 1);
-      bar.value = item.current;
-      line.querySelector("[data-sync-count]").textContent = `${item.current} / ${item.total}`;
+      const { value, max } = syncRowProgress(item);
+      bar.max = max;
+      bar.value = value;
+      line.querySelector("[data-sync-count]").textContent = syncCountText(item);
       const status = line.querySelector("[data-sync-title]");
       status.textContent = syncRowStatusText(item);
       status.title = status.textContent;
@@ -1725,21 +1821,43 @@ function serialFilterButton(works) {
   return `<button class="icon-text-button favorite-filter serial-filter ${state.serialLatestOnly ? "is-active" : ""}" data-action="serial-latest" title="连载作品只显示最新章节">${icon("layers", 17)}<span>连载只看最新${suffix}</span></button>`;
 }
 
-/** 作品在 Pixiv 上的页面地址；没作品 ID 时给空串（本地导入的作品就没有） */
-function pixivNovelUrl(novelId) {
-  const id = String(novelId || "").trim();
-  return id ? `https://www.pixiv.net/novel/show.php?id=${id}` : "";
+/**
+ * 封面上的角色名。
+ *
+ * 匹配口径和「扫描完整版 / 自动分组」那套按角色**不一样**：那边只扫标题，这里还要多扫标签，
+ * 两套各自独立 —— 自动分组那套一个字都没动。
+ * 角色表来自 `state.characterIndex`（启动时建一次、角色增删改后重建），所以匹配是同步的。
+ */
+function matchedCharacterNames(work) {
+  const index = state.characterIndex;
+  if (!index.length) return [];
+  const haystack = `${work.title || ""} ${String(work.tags || "").replace(/\|/g, " ")}`;
+  const hits = [];
+  for (const name of index) {
+    if (!hits.includes(name) && haystack.includes(name)) hits.push(name);
+  }
+  return hits;
 }
 
-/** 封面第二排的「打开作品网址」徽标（第一排留给状态 / 收藏 / 带图版，别把一排挤满）：有 Pixiv 作品 ID 才给 */
-function workLinkBadge(work) {
-  if (!work.pixivNovelId) return "";
-  return `<button class="favorite-badge link-badge" title="在浏览器里打开 Pixiv 作品页" data-action="open-work-url" data-work-id="${work.id}">${icon("link", 17)}</button>`;
+/** 封面上最多平铺几个角色名，多出来的收成「+N」（完整名单进 title） */
+const WORK_CHARACTER_LIMIT = 6;
+
+/**
+ * 封面上的角色名条：平时和「标为已读」同一组、悬停才淡入；工具栏开关打开后常显（靠 CSS 上的 body 类）。
+ * 整条 `pointer-events: none` —— 它压在封面上，不能把「点封面打开作品」挡掉。
+ */
+function workCharacterNames(work) {
+  const names = matchedCharacterNames(work);
+  if (!names.length) return "";
+  const shown = names.slice(0, WORK_CHARACTER_LIMIT);
+  const rest = names.length - shown.length;
+  const chips = shown.map((name) => `<span>${escapeHtml(name)}</span>`).join("");
+  return `<div class="work-characters" title="${escapeHtml(names.join("、"))}">${chips}${rest > 0 ? `<span class="work-characters-more">+${rest}</span>` : ""}</div>`;
 }
 
 /**
  * 封面第一排的徽标（状态 / 收藏 / 带图版）——作者作品库、系列作品、所有作品三处共用，
- * 免得以后改一个地方漏掉另外两个；链接徽标属于第二排 `.work-links`，不在这里。
+ * 免得以后改一个地方漏掉另外两个。
  */
 function workBadges(work) {
   return `<div class="work-badges">
@@ -1774,6 +1892,18 @@ function workReadDot(work) {
 function workReadToggle(work) {
   const read = Number(work.readState || 0) === 2;
   return `<button class="read-toggle ${read ? "is-read" : ""}" title="${read ? "标为未读" : "标为已读"}" data-action="toggle-read" data-work-id="${work.id}">${icon("check", 15)}<span>${read ? "已读" : "标为已读"}</span></button>`;
+}
+
+/**
+ * 封面左下角的「稍后再看」书签，位置就压在「标为已读」上面（v1.2.20）。
+ *
+ * 和「标为已读」是同一组悬停按钮：平时跟着它一起藏起来，免得封面被按钮占满；
+ * 但**已经在清单里的**那一篇会常显（`is-added`），否则用户看不出哪些已经收过了。
+ * 图标用实心版区分状态 —— 空心＝还没加，实心＝已加。
+ */
+function workWatchLaterButton(work) {
+  const added = state.watchLaterIds.has(work.id);
+  return `<button class="watch-later-toggle ${added ? "is-added" : ""}" title="${added ? "移出稍后再看" : "加入稍后再看"}" data-action="toggle-watch-later" data-work-id="${work.id}">${icon(added ? "bookmarkFilled" : "bookmark", 14)}<span>${added ? "已在稍后再看" : "稍后再看"}</span></button>`;
 }
 
 /** 卡片上的评分：没打过分就不显示，免得一排空星星白占地方。 */
@@ -2440,8 +2570,8 @@ function renderWorks() {
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
-        <div class="work-links">${workLinkBadge(work)}</div>
-        ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workReadToggle(work)}${workMenuButton(work)}`}
+        ${workCharacterNames(work)}
+        ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
       <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
@@ -2460,6 +2590,7 @@ function renderWorks() {
         <button class="icon-text-button favorite-filter ${state.authorFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <button class="icon-text-button favorite-filter images-filter ${state.imagesFilter === "has" ? "is-active" : ""}" data-action="images-only" title="只看有配图的作品（等同高级筛选里的「配图 · 有图」）">${icon("image", 17)}<span>仅看带图版</span></button>
         ${serialFilterButton(state.works)}
+        <button class="icon-text-button favorite-filter character-name-filter ${state.showCharacterNames ? "is-active" : ""}" data-action="toggle-character-names" title="在作品封面上常显匹配到的角色名（按标题和标签匹配）">${icon("user", 17)}<span>显示角色名</span></button>
         ${filterButton()}
         ${sortSelect(state.sort)}
       </div>
@@ -2478,7 +2609,7 @@ function renderAllWorks() {
       <div class="work-cover">${workCover(work)}
         ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
-        <div class="work-links">${workLinkBadge(work)}</div>
+        ${workCharacterNames(work)}
         ${workReadToggle(work)}
       </div>
       <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
@@ -2529,8 +2660,8 @@ function linkedWorkCard(work, extra = "") {
       <div class="work-cover">${workCover(work)}
         ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
-        <div class="work-links">${workLinkBadge(work)}</div>
-        ${workReadToggle(work)}${workMenuButton(work)}
+        ${workCharacterNames(work)}
+        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
       </div>
       <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}${extra}</div>
     </article>`;
@@ -2766,6 +2897,7 @@ async function refreshVisibleList() {
     await refreshCollections();
     if (state.activeCollection) await refreshCollectionWorks();
   } else if (state.homeView === "history") await refreshHistory();
+  else if (state.homeView === "watchLater") await refreshWatchLater();
   else if (state.homeView === "missingFull") await refreshMissingFull();
 }
 
@@ -3068,6 +3200,80 @@ function renderHistory() {
     </section>`);
 }
 
+/* ============================ 稍后再看（v1.2.20） ============================ */
+
+/** 加入时间：今天/昨天带具体时刻，更早的只给日期 —— 这里没有「看过几次」的语义 */
+function watchLaterTimeLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const startOfDay = (moment) => new Date(moment.getFullYear(), moment.getMonth(), moment.getDate()).getTime();
+  const days = Math.round((startOfDay(new Date()) - startOfDay(date)) / 86400000);
+  const clock = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (days <= 0) return `今天 ${clock}`;
+  if (days === 1) return `昨天 ${clock}`;
+  if (days < 7) return `${days} 天前`;
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * 「稍后再看」清单。骨架和浏览历史一样（顶栏 + 搜索 + 列表），但**不按天分组** ——
+ * 历史那边分的是「什么时候看的」，这里只有一个加入时间，按加入顺序倒序平铺就够清楚。
+ * 想区分「哪些是自己加的、哪些是打开过的」时，看两页的差别就明白了。
+ */
+function renderWatchLater() {
+  const items = state.watchLater.map((entry) => `
+    <article class="history-item" data-work-id="${entry.work.id}">
+      <button class="history-thumb" data-action="open-history-work" data-work-id="${entry.work.id}" title="打开《${escapeHtml(entry.work.title)}》">${entry.work.coverPath ? `<img src="${asset(entry.work.coverPath)}" alt="" loading="lazy" onerror="this.remove()">` : `<span>${icon("image", 20)}</span>`}</button>
+      <div class="history-copy">
+        <button class="history-title" data-action="open-history-work" data-work-id="${entry.work.id}" title="${escapeHtml(entry.work.title)}">${escapeHtml(entry.work.title)}</button>
+        <p class="history-meta">${entry.work.authorName ? `<button class="history-author" data-action="open-author" data-author-id="${entry.work.authorId}">${escapeHtml(entry.work.authorName)}</button>` : ""}<span>${watchLaterTimeLabel(entry.addedAt)}加入</span><span class="history-state ${entry.work.purchasedPath ? "is-full" : "is-preview"}">${entry.work.purchasedPath ? "完整版" : "预览版"}</span></p>
+      </div>
+      <button class="history-remove" title="移出稍后再看" data-action="remove-watch-later" data-work-id="${entry.work.id}">${icon("x", 16)}</button>
+    </article>`).join("");
+  return renderShell(`
+    <section class="topbar work-topbar">
+      <div><p class="section-kicker">存着晚点看</p><h1>稍后再看</h1></div>
+      <div class="topbar-actions"><button class="quiet-button" data-action="clear-watch-later" ${state.watchLater.length ? "" : "disabled"}>清空</button></div>
+    </section>
+    <section class="library-content">
+      <div class="library-tools">
+        <label class="search-field"><span>${icon("search", 19)}</span><input id="watch-later-search" type="search" placeholder="搜索标题或标签" value="${escapeHtml(state.watchLaterQuery)}" autocomplete="off"></label>
+      </div>
+      <div class="read-only-note">在作品封面上点左下角的书签按钮就能加进来，按加入时间倒序排。它和「浏览历史」是两回事 —— 历史是打开过就自动记一笔，这里是你主动标了想晚点看。</div>
+      ${items || `<div class="empty-state works-empty"><h2>${state.watchLaterQuery ? "没有匹配的作品" : "还没有要稍后再看的作品"}</h2><p>鼠标移到作品封面上，点左下角的书签按钮就收进来。</p></div>`}
+    </section>`);
+}
+
+/** 清空稍后再看（要二次确认，和历史那边一个口径） */
+function clearWatchLater() {
+  if (!state.watchLater.length) return;
+  confirmAction("清空稍后再看", `确定清空全部 ${state.watchLater.length} 篇吗？这不影响作品本身。`, "清空", async () => {
+    await invoke("clear_watch_later");
+    state.watchLaterIds = new Set();
+    await refreshWatchLater();
+    render();
+    toast("稍后再看已清空", "success");
+  });
+}
+
+/** 卡片上的书签按钮：加入 / 移出。它只改这一个标记，不碰作品本身的任何字段。 */
+async function toggleWatchLater(workId) {
+  const added = state.watchLaterIds.has(workId);
+  try {
+    await invoke(added ? "remove_watch_later" : "add_watch_later", { workId });
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  if (added) state.watchLaterIds.delete(workId);
+  else state.watchLaterIds.add(workId);
+  // 站在「稍后再看」页上时，条目会真的消失 / 出现，得重拉这一页；
+  // 别的页面只要按钮翻面，重画一次就够，不必重查数据。
+  if (state.homeView === "watchLater" && !state.activeAuthor) await refreshWatchLater();
+  render();
+  toast(added ? "已移出稍后再看" : "已加入稍后再看", "success");
+}
+
 /* ============================ 收藏夹选择器 ============================ */
 
 /** 弹窗正文单独抽出来：勾选后只换这一块，不重开弹窗（重开会把滚动位置丢掉） */
@@ -3328,12 +3534,12 @@ function missingFullCard(work) {
   const selected = state.selectedWorkIds.has(work.id);
   const corner = state.missingFullBulk
     ? `<button class="selection-badge ${selected ? "is-selected" : ""}" title="${selected ? "取消选择" : "选择作品"}" data-action="missing-toggle-select" data-work-id="${work.id}">${selected ? icon("check", 16) : ""}</button>`
-    : `${workReadToggle(work)}${workMenuButton(work)}`;
+    : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`;
   return `
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.missingFullBulk ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}
         ${workBadges(work)}
-        <div class="work-links">${workLinkBadge(work)}</div>
+        ${workCharacterNames(work)}
         ${corner}
       </div>
       <div class="work-copy">
@@ -3389,8 +3595,8 @@ function renderSeriesWorkCards(works) {
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
-        <div class="work-links">${workLinkBadge(work)}</div>
-        ${workReadToggle(work)}${workMenuButton(work)}
+        ${workCharacterNames(work)}
+        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
       </div>
       <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
@@ -3857,6 +4063,32 @@ async function bindEvents() {
       await commitHistorySearch(event.currentTarget.value);
     };
   }
+  const watchLaterSearch = app.querySelector("#watch-later-search");
+  if (watchLaterSearch) {
+    watchLaterSearch.oncompositionstart = () => { watchLaterSearch.dataset.composing = "true"; };
+    const commitWatchLaterSearch = async (query) => {
+      state.watchLaterQuery = query;
+      await refreshWatchLater();
+      if (state.watchLaterQuery !== query) return;
+      render();
+      restoreSearchFocus("watch-later-search");
+    };
+    watchLaterSearch.oncompositionend = (event) => {
+      delete watchLaterSearch.dataset.composing;
+      watchLaterSearch.dataset.skipNextInput = "true";
+      commitWatchLaterSearch(event.target.value);
+    };
+    watchLaterSearch.oninput = async (event) => {
+      if (event.isComposing || watchLaterSearch.dataset.composing) return;
+      if (watchLaterSearch.dataset.skipNextInput) { delete watchLaterSearch.dataset.skipNextInput; return; }
+      await commitWatchLaterSearch(event.target.value);
+    };
+    watchLaterSearch.onkeydown = async (event) => {
+      if (event.key !== "Enter" || event.isComposing || watchLaterSearch.dataset.composing) return;
+      event.preventDefault();
+      await commitWatchLaterSearch(event.currentTarget.value);
+    };
+  }
   const textSearchBox = app.querySelector("#text-search-input");
   if (textSearchBox) {
     textSearchBox.oncompositionstart = () => { textSearchBox.dataset.composing = "true"; };
@@ -3939,6 +4171,14 @@ async function bindEvents() {
       // 不会出现「工具栏亮着、面板说无图」这种自相矛盾的状态
       if (action === "images-only") { state.imagesFilter = state.imagesFilter === "has" ? "all" : "has"; await refreshActiveList(); render(); }
       if (action === "serial-latest") { state.serialLatestOnly = !state.serialLatestOnly; render(); }
+      // 只切一个 body 类 + 按钮自己的高亮：不重绘，免得把滚动位置和搜索框焦点一起冲掉
+      if (action === "toggle-character-names") {
+        state.showCharacterNames = !state.showCharacterNames;
+        applyCharacterNameDisplay();
+        saveViewState();
+        element.classList.toggle("is-active", state.showCharacterNames);
+        return;
+      }
       // 已读 / 评分筛选是纯前端过滤（数据都在列表里了），不用回后端重查
       if (action === "read-filter") { state.readFilter = element.dataset.readFilter; render(); }
       if (action === "toggle-author-starred") {
@@ -4011,6 +4251,7 @@ async function bindEvents() {
       if (action === "detail-delete") detailDeleteWork(Number(workId));
       if (action === "go-collections") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "collections"; state.seriesView = null; state.seriesItems = []; state.activeCollection = null; state.collectionQuery = ""; await refreshCollections(); render(); }
       if (action === "go-history") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "history"; state.seriesView = null; state.seriesItems = []; state.historyQuery = ""; await refreshHistory(); render(); }
+      if (action === "go-watch-later") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "watchLater"; state.seriesView = null; state.seriesItems = []; state.watchLaterQuery = ""; await refreshWatchLater(); render(); }
       if (action === "go-missing-full") { state.authorReturnTo = null; state.activeAuthor = null; state.seriesView = null; state.seriesItems = []; state.homeView = "missingFull"; state.missingFullAuthorId = null; await refreshMissingFull(); render(); }
       // 高级筛选面板：开合、三档条件、清空
       if (action === "toggle-filter-panel") {
@@ -4174,9 +4415,12 @@ async function bindEvents() {
         state.pickerSelected = [];
         return;
       }
-      if (action === "open-history-work") { await invoke("open_work", { workId: Number(workId) }); await refreshHistory(); render(); }
+      if (action === "open-history-work") { await invoke("open_work", { workId: Number(workId) }); await refreshHistory(); if (state.homeView === "watchLater") await refreshWatchLater(); render(); }
       if (action === "remove-history") { await invoke("remove_history", { workId: Number(workId) }); await refreshHistory(); render(); }
       if (action === "clear-history") { await clearHistory(); }
+      if (action === "toggle-watch-later") await toggleWatchLater(Number(workId));
+      if (action === "remove-watch-later") { await invoke("remove_watch_later", { workId: Number(workId) }); await refreshWatchLater(); render(); }
+      if (action === "clear-watch-later") await clearWatchLater();
       // 设置面板里清历史：二次确认弹窗叠在设置上面，别把设置一起关掉（keepOpen）
       if (action === "clear-history-settings") {
         confirmAction("清空浏览历史", "确定清空全部浏览记录吗？这不影响作品本身。", "清空", async () => {
@@ -4238,11 +4482,6 @@ async function bindEvents() {
       if (action === "backfill-covers") await backfillCovers();
       if (action === "scan-work-files") await scanWorkFiles();
       if (action === "clear-missing-bindings") await clearMissingBindings();
-      if (action === "open-work-url") {
-        const url = pixivNovelUrl(findWork(Number(workId))?.pixivNovelId);
-        if (!url) { toast("这个作品没有 Pixiv 作品 ID，先同步一次才能跳过去", "info"); return; }
-        await openExternalUrl(url);
-      }
       if (action === "download-selected-reading") { await downloadSelectedReadings(element.dataset.format === "epub" ? "epub" : ""); return; }
       if (action === "backfill-images") { await downloadSelectedReadings(""); return; }
       if (action === "pick-avatar") await pickPath("avatarPath", false, ["jpg", "jpeg", "png", "webp"]);
@@ -5849,7 +6088,7 @@ function pixivSyncModal() {
       <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : !author.purchasedDir ? "请先在作者设置中绑定完整版文件夹。" : !author.homepage ? "填写单篇小说地址可直接同步；批量同步则需先填写作者主页。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
       <label>单篇小说地址 <input name="novelUrl" type="url" placeholder="https://www.pixiv.net/novel/show.php?id=28686066"><small>填写有效地址后只同步该作品，不更新上次成功同步时间，也不使用日期范围。</small></label>
       <div class="date-range"><label>开始日期 <input name="startDate" type="date"></label><label>结束日期 <input name="endDate" type="date"></label></div>
-      <small>批量同步时，投稿时间以 Pixiv 原始投稿时间为准。不填日期时，仅检查上次成功同步后的新投稿；填写日期后，按指定投稿时间范围重新检查。已有作品会先按 Pixiv 小说 ID、再按关联相似度跳过。</small>
+      <small>批量同步时，投稿时间以 Pixiv 原始投稿时间为准。不填日期时，会核对作者主页上的全部作品，已收藏的自动跳过；填写日期后，只检查投稿时间落在该范围内的作品。已有作品会先按 Pixiv 小说 ID、再按关联相似度跳过。</small>
       <p class="read-only-note">点击开始后同步会在后台进行，窗口关闭也不影响；进度显示在页面右下角，可随时终止。</p>
     </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="confirm-pixiv-sync" ${author.homepage && author.previewDir && author.purchasedDir ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
   const novelUrlInput = document.querySelector('[name="novelUrl"]');
@@ -5894,8 +6133,26 @@ async function syncPixivWorks() {
   state.activeAuthor = state.authors.find((author) => author.id === authorId) || state.activeAuthor;
   await refreshWorks();
   render();
-  const summary = `已下载 ${result.downloadedCount} 篇；已关联 ${result.reusedPreviewCount || 0} 篇已有预览版；已跳过 ${result.skippedExistingCount} 篇已有作品；日期筛除 ${result.skippedDateCount} 篇；大小筛除 ${result.skippedSizeCount || 0} 篇`;
-  toast(result.cancelled ? `同步已终止；${summary}` : (result.failedCount ? `${summary}；${result.failedCount} 篇失败，将在下次同步时重试` : summary), result.cancelled || result.failedCount ? "info" : "success");
+  const summaryParts = [
+    `已下载 ${result.downloadedCount} 篇`,
+    `已关联 ${result.reusedPreviewCount || 0} 篇已有预览版`,
+    `已跳过 ${result.skippedExistingCount} 篇已有作品`,
+  ];
+  // 这两项只在**真有作品被筛掉**时才报。默认情况下它们恒为 0，
+  // 每次都在收尾里列一遍，只会让人以为「我没选日期，怎么日期筛除了」。
+  if (result.skippedDateCount) summaryParts.push(`投稿时间在日期范围外 ${result.skippedDateCount} 篇`);
+  if (result.skippedSizeCount) summaryParts.push(`小于设定体积 ${result.skippedSizeCount} 篇`);
+  const summary = summaryParts.join("；");
+  if (result.throttled) {
+    toast(`疑似被 Pixiv 限流，已提前停止；${summary}${result.failedCount ? `；${result.failedCount} 篇失败` : ""}。建议过一会儿再试，或把设置里的抓取间隔调大。`, "error");
+  } else if (result.cancelled) {
+    toast(`同步已终止；${summary}`, "info");
+  } else if (result.failedCount) {
+    const why = failureReasonText(result.failedReasons, result.failedCount);
+    toast(`${summary}；${result.failedCount} 篇失败，将在下次同步时重试${why ? `（${why}）` : ""}`, "info");
+  } else {
+    toast(summary, "success");
+  }
 }
 
 // 作者库的「同步所有作者」：逐位串行同步，全程后台运行，右下角为每位作者各显示一根进度条
@@ -5944,14 +6201,33 @@ async function syncAllAuthors() {
       const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "" });
       downloaded += result.downloadedCount || 0;
       if (row) {
-        row.status = "done";
-        row.note = result.cancelled
-          ? "已终止"
-          : `完成 · 下载 ${result.downloadedCount || 0} 篇${result.failedCount ? ` · ${result.failedCount} 篇失败` : ""}`;
+        row.current = result.downloadedCount || 0;
+        if (result.cancelled) {
+          // 单独一个状态：终止不算「核对完成」，别让它顶着绿的过去
+          row.status = "cancelled";
+          row.note = "已终止";
+        } else if (result.throttled) {
+          // 后端识别出疑似限流、主动踩了刹车，这一位要单独标出来
+          row.status = "throttled";
+          row.note = "疑似被限流，已提前停止";
+        } else if (result.failedCount) {
+          row.status = "done";
+          const why = failureReasonText(result.failedReasons, result.failedCount);
+          row.note = `完成 · 下载 ${result.downloadedCount || 0} 篇 · ${result.failedCount} 篇失败${why ? `（${why}）` : ""}`;
+        } else {
+          row.status = "done";
+          row.note = `完成 · 下载 ${result.downloadedCount || 0} 篇`;
+        }
       }
       if (result.cancelled) { stopped = true; updateSyncFloater(); break; }
+      if (result.throttled) {
+        stopped = true;
+        failures.push(`${author.name}（疑似限流已停止）`);
+        updateSyncFloater();
+        break;
+      }
       doneAuthors += 1;
-      if (result.failedCount) failures.push(`${author.name}（${result.failedCount} 篇失败）`);
+      if (result.failedCount) failures.push(`${author.name}（${result.failedCount} 篇失败${failureReasonText(result.failedReasons, result.failedCount) ? `：${failureReasonText(result.failedReasons, result.failedCount)}` : ""}）`);
     } catch (error) {
       doneAuthors += 1;
       if (row) { row.status = "failed"; row.note = String(error); }
@@ -5972,7 +6248,10 @@ async function syncAllAuthors() {
   const head = stopped ? `批量同步已终止（完成 ${doneAuthors} / ${targets.length} 位作者）` : `已同步 ${doneAuthors} / ${targets.length} 位作者，共下载 ${downloaded} 篇`;
   if (failures.length) {
     const detail = failures.slice(0, 3).join("；");
-    toast(`${head}；${failures.length} 位有失败：${detail}${failures.length > 3 ? " 等" : ""}`, "info");
+    // 限流是「整轮别再点」的信号，单独提一句，跟个别作品的失败区分开
+    const limited = stopped && failures.some((text) => text.includes("疑似限流"));
+    const tail = limited ? "。疑似被 Pixiv 限流，建议过一会儿再同步，或把设置里的抓取间隔调大。" : "";
+    toast(`${head}；${failures.length} 位有失败：${detail}${failures.length > 3 ? " 等" : ""}${tail}`, limited ? "error" : "info");
   } else {
     toast(stopped ? `${head}，共下载 ${downloaded} 篇` : head, stopped ? "info" : "success");
   }
@@ -6366,6 +6645,44 @@ async function openSearchSettings() {
   else addSearchSiteRow();
 }
 
+/**
+ * 把 `list_characters` 的分组摊平成匹配用索引：只收启用中的角色名与别名，长名排前面。
+ * 长名优先是为了「先认长的」—— 不然短的先命中，长名字就永远显示不出来。
+ */
+function buildCharacterIndex(groups) {
+  const index = [];
+  (groups || []).forEach((group) => {
+    (group.characters || []).forEach((entry) => {
+      if (!entry.enabled) return;
+      const name = String(entry.name || "").trim();
+      if (name) index.push(name);
+      String(entry.aliases || "").split("|").forEach((alias) => {
+        const value = alias.trim();
+        if (value && value !== name) index.push(value);
+      });
+    });
+  });
+  index.sort((left, right) => right.length - left.length);
+  return [...new Set(index)];
+}
+
+/** 启动时建一次索引。读失败就当没有角色表（封面不显示角色名），绝不拦启动。 */
+async function loadCharacterIndex() {
+  try {
+    state.characters = await invoke("list_characters");
+  } catch (error) {
+    console.log("角色表读取失败，封面角色名先不显示:", error);
+    state.characterIndex = [];
+    return;
+  }
+  state.characterIndex = buildCharacterIndex(state.characters);
+}
+
+/** 「显示角色名」开关只切一个 body 类：CSS 靠它把角色名条常显，不用重绘整页。 */
+function applyCharacterNameDisplay() {
+  document.body.classList.toggle("show-character-names", Boolean(state.showCharacterNames));
+}
+
 /** 常见角色名列表编辑器：就地更新 DOM，绝不动设置弹窗本身（重开会丢未保存的设置） */
 async function renderCharacterEditor() {
   const box = document.querySelector("#character-editor");
@@ -6378,6 +6695,8 @@ async function renderCharacterEditor() {
     return;
   }
   state.characters = groups;
+  // 角色增删改都从这里过一遍，顺手把封面匹配用的索引也重建（不用再单独拉一次）
+  state.characterIndex = buildCharacterIndex(groups);
   const total = groups.reduce((sum, group) => sum + group.characters.length, 0);
   const gameList = document.querySelector("#character-game-list");
   if (gameList) gameList.innerHTML = groups.map((group) => `<option value="${escapeHtml(group.game)}"></option>`).join("");
@@ -6998,6 +7317,7 @@ const VIEW_STATE_EXTRA_FIELDS = [
   ["textSearchQuery", ""],
   ["authorFavoritesOnly", false],
   ["serialLatestOnly", false],
+  ["showCharacterNames", false],
   ["collectionSort", "added_desc"],
   ["missingFullFilter", "todo"],
   ["filterPanelOpen", false],
@@ -7158,6 +7478,9 @@ async function restoreViewState() {
   } else if (view === "history") {
     state.homeView = "history";
     await refreshHistory();
+  } else if (view === "watchLater") {
+    state.homeView = "watchLater";
+    await refreshWatchLater();
   } else if (view === "missingFull") {
     state.homeView = "missingFull";
     state.missingFullAuthorId = Number(saved.missingFullAuthorId || 0) || null;
@@ -7210,7 +7533,12 @@ async function bootstrap() {
   installGlobalShortcuts();
   try {
     await refreshAuthors();
+    // 卡片上的书签按钮要按「这篇在不在清单里」翻面，而卡片遍布七八个列表页 ——
+    // 启动时只拉一份 id 集合，别每页都拉一遍完整条目
+    state.watchLaterIds = new Set(await invoke("list_watch_later_ids"));
     await loadSearchSites();
+    // 封面角色名匹配用的索引：一次拉全，别每张卡片单独去查
+    await loadCharacterIndex();
     // 接着上次那页看；还原不了（或压根没记过）就照老样子落在作者库
     let restored = false;
     try {
@@ -7220,6 +7548,7 @@ async function bootstrap() {
       state.homeView = "authors";
       state.activeAuthor = null;
     }
+    applyCharacterNameDisplay();
     if (!restored) render();
 
     // 启动时检查Pixiv Cookie有效性

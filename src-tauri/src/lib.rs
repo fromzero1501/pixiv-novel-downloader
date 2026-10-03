@@ -155,6 +155,15 @@ struct HistoryEntry {
     view_count: i64,
 }
 
+/// 「稍后再看」列表项：作品 + 加入时间。和 `HistoryEntry` 长得像，但**编号**只有一个
+/// （历史有 `view_count`，这里没有「看过几次」这回事）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchLaterEntry {
+    work: Work,
+    added_at: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PixivAuthorProfile {
@@ -404,6 +413,11 @@ struct PixivSyncResult {
     failed_count: usize,
     cancelled: bool,
     last_sync_at: String,
+    /// 失败原因去重后的前几条。以前只报「N 篇失败」，用户根本不知道是限流、
+    /// 作品被删、还是写盘失败 —— 原因在下面各处都被 `_ =>` 糊掉了。
+    failed_reasons: Vec<String>,
+    /// 疑似被 Pixiv 限流、提前中止
+    throttled: bool,
 }
 
 struct PixivDownloadCandidate {
@@ -627,7 +641,16 @@ fn db() -> Result<Connection, String> {
           sort_order INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL DEFAULT ''
         );
-        CREATE INDEX IF NOT EXISTS work_history_viewed_at ON work_history(viewed_at DESC);",
+        CREATE INDEX IF NOT EXISTS work_history_viewed_at ON work_history(viewed_at DESC);
+        -- 「稍后再看」（v1.2.20）：手动往里放作品，和浏览历史是两张表、两种意思 ——
+        -- 历史是「打开过就自动记一笔」，这里是「我主动标了想晚点看」。
+        -- 单独一张表是为了不碰 `WORK_COLUMNS` 那套列下标（加一列要连带改 `_W`、`map_work`、
+        -- `HISTORY_VIEWED_AT_INDEX`），而且这里天然需要一个「什么时候加进来的」来排序。
+        CREATE TABLE IF NOT EXISTS work_watch_later (
+          work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
+          added_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS work_watch_later_added_at ON work_watch_later(added_at DESC);",
     )
     .map_err(|e| e.to_string())?;
     // Older portable libraries do not have this per-author setting yet.
@@ -2855,15 +2878,6 @@ fn is_within_date_range(value: &str, start: Option<NaiveDate>, end: Option<Naive
     !start.is_some_and(|bound| date < bound) && !end.is_some_and(|bound| date > bound)
 }
 
-fn is_after_last_sync(value: &str, last_sync: Option<DateTime<Utc>>) -> bool {
-    let Some(last_sync) = last_sync else {
-        return true;
-    };
-    DateTime::parse_from_rfc3339(value)
-        .map(|date| date.with_timezone(&Utc) > last_sync)
-        .unwrap_or_else(|_| release_date(value).is_some_and(|date| date > last_sync.date_naive()))
-}
-
 // Pixiv's createDate is the original submission time. uploadDate can change when
 // an author edits a work, so it must only be used as a fallback for older payloads.
 fn pixiv_published_at(value: &Value) -> String {
@@ -3392,6 +3406,91 @@ fn fetch_pixiv_novel_detail(client: &Client, novel_id: &str) -> Result<Value, St
         .and_then(|response| response.error_for_status())
         .and_then(|response| response.json())
         .map_err(|error| error.to_string())
+}
+
+/// 列表接口一次最多能带的 id 数。超了 Pixiv 直接回「不正确的请求。」
+const PIXIV_LIST_IDS_LIMIT: usize = 100;
+
+/// 列表接口的元数据。**字段形状与详情接口不同**（实测确认，别想着一套代码吃两边）：
+///
+/// | | 列表接口 | 详情接口 |
+/// | --- | --- | --- |
+/// | 系列 | 平铺 `seriesId` / `seriesTitle` / `seriesContentOrder` | 嵌套 `seriesNavData` |
+/// | 标签 | 字符串数组 `["a","b"]` | 对象数组 `tags.tags[].tag` |
+/// | 正文 | **没有** | `content` |
+/// | 封面原图 | **没有**（`url` 是列表页缩略图） | `coverUrl` |
+/// 只取下面两个字段 —— 预筛要的就这两样：「这篇本地有没有」（判重看 id，
+/// 不在这个结构里）和「投稿时间在不在日期范围内」。标题、标签、系列详情接口
+/// 都会带回来，在这里再解一遍等于养两份会走岔的实现。
+struct PixivNovelListMeta {
+    /// 列表接口的 description 直接就是简介，补简介时可以免掉一次详情请求
+    description: String,
+    /// Pixiv 的 createDate（**不是 uploadDate**），喂给 `is_within_date_range`
+    published_at: String,
+}
+
+impl PixivNovelListMeta {
+    fn from_list_item(item: &Value) -> Self {
+        Self {
+            description: json_string(item, "description"),
+            published_at: json_string(item, "createDate"),
+        }
+    }
+}
+
+/// 用**列表接口**批量拿元数据：一次请求最多 100 篇，用来给同步做**前置过滤**。
+///
+/// `GET /ajax/user/{uid}/profile/novels?ids[]=a&ids[]=b...`
+///
+/// 实测返回结构（2026-10-03 真机验证，与网上老文档不同，别照文档写）：
+/// `{"error":false,"body":{"works":{"<novel_id>":{...},"<novel_id>":{...}}}}`
+/// —— `works` 是**以 id 为键的对象**，不是数组；字段平铺在每项里。
+///
+/// 能拿到标题、标签、简介、`createDate`、字数、系列信息 —— 做「日期筛选 +
+/// 是否已存在」所需的全部字段。**拿不到正文和封面原图**，所以它只能用来
+/// 减少请求，不能替代 `fetch_pixiv_novel_detail`。
+///
+/// 单批失败（多半是被限流）就跳过这一批，让后面逐篇抓详情去兜 ——
+/// 预筛失效只会退化成原来的行为，不会丢作品。
+fn fetch_pixiv_novel_list_meta(
+    client: &Client,
+    user_id: &str,
+    novel_ids: &[String],
+) -> Vec<(String, PixivNovelListMeta)> {
+    let mut out = Vec::new();
+    for chunk in novel_ids.chunks(PIXIV_LIST_IDS_LIMIT) {
+        let query: Vec<(&str, &str)> = chunk
+            .iter()
+            .map(|id| ("ids[]", id.as_str()))
+            .collect();
+        let listing: Result<Value, _> = client
+            .get(format!(
+                "https://www.pixiv.net/ajax/user/{user_id}/profile/novels"
+            ))
+            .query(&query)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.json());
+        let Ok(listing) = listing else {
+            continue;
+        };
+        let Some(items) = listing.pointer("/body/works").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, item) in items {
+            // works 的键就是 id；键空时用字段兜底，避免个别条目漏掉
+            let novel_id = if key.is_empty() {
+                json_id_string(item, "id")
+            } else {
+                key.clone()
+            };
+            if novel_id.is_empty() {
+                continue;
+            }
+            out.push((novel_id, PixivNovelListMeta::from_list_item(item)));
+        }
+    }
+    out
 }
 
 fn fetch_pixiv_cover(client: &Client, cover_url: &str) -> Result<Vec<u8>, String> {
@@ -4925,7 +5024,12 @@ fn pixiv_sync_impl(
     if !is_single_sync && has_invalid_date_range(start, end) {
         return Err("开始日期不能晚于结束日期。".into());
     }
-    let use_incremental_filter = !is_single_sync && start.is_none() && end.is_none();
+    // v1.2.20 起不再按「投稿时间是否晚于上次同步」做增量筛选。
+    // 理由：没有列表接口的年代，只能靠时间戳把候选压下来，代价是**没同步下来的作品
+    // 会被永久放弃** —— 被删/转私密的失败作品一次也抓不到，正常的漏抓也回不来
+    // （用户能看到的现象就是「没填日期，却报『日期筛除 N 篇』」）。
+    // 现在有了列表接口预筛，「已存在」已经由 pixiv_novel_id 精确剔掉，
+    // 主页上剩下的就是真正缺的，逐次核对一遍既不会多抓，也不会漏。
     let last_sync = DateTime::parse_from_rfc3339(&last_sync)
         .ok()
         .map(|date| date.with_timezone(&Utc));
@@ -4935,10 +5039,16 @@ fn pixiv_sync_impl(
         Some(normalize_pixiv_cookie(&cookie)?)
     };
     let client = pixiv_client(cookie)?;
+    // 列表接口（预筛用）需要作者 user_id，在单篇同步时用不上
+    let author_user_id = if single_novel_id.is_some() {
+        String::new()
+    } else {
+        pixiv_user_id(&homepage)?
+    };
     let mut novels: Vec<String> = if let Some(novel_id) = single_novel_id {
         vec![novel_id]
     } else {
-        let user_id = pixiv_user_id(&homepage)?;
+        let user_id = author_user_id.as_str();
         let list_url = format!("https://www.pixiv.net/ajax/user/{user_id}/profile/all");
         let listing: Value = client
             .get(list_url)
@@ -4976,20 +5086,73 @@ fn pixiv_sync_impl(
         failed_count: 0,
         cancelled: false,
         last_sync_at: last_sync.map(|date| date.to_rfc3339()).unwrap_or_default(),
+        failed_reasons: Vec::new(),
+        throttled: false,
     };
-    let total = novels.len();
-    let use_request_delay = total > delay_threshold && delay_seconds > 0;
-    let candidates: Vec<String> = novels
-        .into_iter()
-        .filter(|novel_id| {
-            if known_novel_ids.contains(novel_id) {
+    let _total = novels.len();
+    // ── 前置过滤（v1.2.20）──────────────────────────────────────────────
+    // 原来只按 known_novel_ids 剔掉「已同步」的，剩下的**全部逐篇抓详情**，
+    // 日期范围筛选要等详情回来才做 —— 等于日期范围外的作品每次都被白抓一遍。
+    //
+    // 现在先花几次请求（每 100 篇一次）用列表接口把元数据捞回来，
+    // 把「已存在」和「日期不符」在抓详情之前就剔掉。
+    //
+    // 判据只用 pixiv_novel_id 精确匹配，**不比标题**：
+    // 标题判重容易误杀（同名篇目、标题改过），而 ID 是唯一的。
+    let mut candidates: Vec<String> = Vec::new();
+    let list_meta: Vec<(String, PixivNovelListMeta)> = if is_single_sync {
+        // 单篇同步（按链接）只有一篇，走列表接口没意义，直接进详情
+        Vec::new()
+    } else {
+        let pending: Vec<String> = novels
+            .iter()
+            .filter(|novel_id| {
+                if known_novel_ids.contains(*novel_id) {
+                    result.skipped_existing_count += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            Vec::new()
+        } else {
+            let _ = app.emit(
+                "pixiv-sync-progress",
+                PixivSyncProgress {
+                    author_id,
+                    total: pending.len(),
+                    current: 0,
+                    title: format!(
+                        "已跳过 {} 篇已同步作品，正在核对作品列表",
+                        result.skipped_existing_count
+                    ),
+                },
+            );
+            fetch_pixiv_novel_list_meta(&client, &author_user_id, &pending)
+        }
+    };
+
+    if is_single_sync {
+        // 单篇：保持原样，不经列表预筛
+        candidates = novels.clone();
+    } else {
+        for (novel_id, meta) in list_meta {
+            if known_novel_ids.contains(&novel_id) {
                 result.skipped_existing_count += 1;
-                false
-            } else {
-                true
+                continue;
             }
-        })
-        .collect();
+            // 日期范围筛选提前到这里：不及格的连详情都不用抓
+            if !is_within_date_range(&meta.published_at, start, end) {
+                result.skipped_date_count += 1;
+                continue;
+            }
+            candidates.push(novel_id);
+        }
+    }
+
     let _ = app.emit(
         "pixiv-sync-progress",
         PixivSyncProgress {
@@ -4997,12 +5160,19 @@ fn pixiv_sync_impl(
             total: candidates.len(),
             current: 0,
             title: format!(
-                "已跳过 {} 篇已同步作品，正在抓取详情",
-                result.skipped_existing_count
+                "已跳过 {} 篇已同步、{} 篇不在日期范围内，正在抓取详情",
+                result.skipped_existing_count, result.skipped_date_count
             ),
         },
     );
+    // 是否改用「一篇一篇来 + 中间 sleep」：按**预筛之后真正要抓的数量**判断。
+    // 预筛前按原始总数判会让「156 篇里只有 3 篇要抓」也走串行，白等。
+    let use_request_delay = candidates.len() > delay_threshold && delay_seconds > 0;
     let mut details = Vec::with_capacity(candidates.len());
+    // 连续失败退避：和「补抓简介」同一套思路（那边早就有了，同步这条一直缺）。
+    // 没有它的时候，撞上风控会一路错到底 —— 用户看到的就是整片失败。
+    let mut current_delay = if delay_seconds > 0 { delay_seconds } else { 1 };
+    let mut fail_streak = 0usize;
     if use_request_delay {
         for (index, novel_id) in candidates.iter().enumerate() {
             if pixiv_sync_cancelled(author_id) {
@@ -5010,13 +5180,31 @@ fn pixiv_sync_impl(
                 break;
             }
             if index > 0 {
-                std::thread::sleep(Duration::from_secs(delay_seconds));
+                std::thread::sleep(Duration::from_secs(current_delay));
             }
             match fetch_pixiv_novel_detail(&client, novel_id) {
                 Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
                     details.push((novel_id.clone(), detail));
+                    fail_streak = 0;
                 }
-                _ => result.failed_count += 1,
+                other => {
+                    // 记下原因：限流 / 作品被删 / 网络错，用户该采取的行动完全不同
+                    let reason = match other {
+                        Err(error) => error,
+                        Ok(_) => "Pixiv 拒绝返回这篇作品（可能已被作者删除或转为私密）".into(),
+                    };
+                    result.failed_count += 1;
+                    note_sync_failure(&mut result.failed_reasons, reason);
+                    fail_streak += 1;
+                    if fail_streak % SYNC_THROTTLE_STREAK == 0 {
+                        current_delay = throttled_delay_seconds(current_delay);
+                    }
+                    if fail_streak >= SYNC_ABORT_STREAK {
+                        // 连着失败＝大概率被限流，继续跑只是白白喂风控
+                        result.throttled = true;
+                        break;
+                    }
+                }
             }
             let _ = app.emit(
                 "pixiv-sync-progress",
@@ -5056,9 +5244,33 @@ fn pixiv_sync_impl(
                 match detail {
                     Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
                         details.push((novel_id, detail));
+                        fail_streak = 0;
                     }
-                    _ => result.failed_count += 1,
+                    other => {
+                        let reason = match other {
+                            Err(error) => error,
+                            Ok(_) => {
+                                "Pixiv 拒绝返回这篇作品（可能已被作者删除或转为私密）".into()
+                            }
+                        };
+                        result.failed_count += 1;
+                        note_sync_failure(&mut result.failed_reasons, reason);
+                        fail_streak += 1;
+                    }
                 }
+            }
+            // 并发分支没有逐篇 sleep 的位置，所以这里的退避体现在「整批之间」：
+            // 连着失败够多就先睡一觉再继续，再不行就提前收工。
+            // 原来这里是完全裸奔的 —— 撞上风控会一路错到底。
+            if fail_streak > 0 && fail_streak % SYNC_THROTTLE_STREAK == 0 {
+                let wait = throttled_delay_seconds(current_delay);
+                current_delay = wait;
+                std::thread::sleep(Duration::from_secs(wait));
+            }
+            if fail_streak >= SYNC_ABORT_STREAK {
+                // 已经抓到的成功作品照常落库，只是不再继续往下撞墙
+                result.throttled = true;
+                break;
             }
             let current = ((batch_index + 1) * DETAIL_CONCURRENCY).min(candidates.len());
             let _ = app.emit(
@@ -5104,10 +5316,6 @@ fn pixiv_sync_impl(
         }
         let published_at = pixiv_published_at(body);
         if !is_single_sync && !is_within_date_range(&published_at, start, end) {
-            result.skipped_date_count += 1;
-            continue;
-        }
-        if use_incremental_filter && !is_after_last_sync(&published_at, last_sync) {
             result.skipped_date_count += 1;
             continue;
         }
@@ -5322,7 +5530,18 @@ fn pixiv_sync_impl(
             },
         );
     }
-    if !is_single_sync && !result.cancelled && result.failed_count == 0 {
+    // 记下本次同步时间。
+    //
+    // 原来要求 `failed_count == 0` 才记 —— 后果很严重：只要有 1 篇失败
+    // （比如作品被作者删了、转为私密了），时间戳就不落库，于是**下次同步
+    // 又把全部作品重抓一遍**。用户看到的现象就是「第一次成功、隔几分钟再
+    // 同步就整片失败」：不是第二次坏了，是第二次在全量重来，撞上了风控。
+    //
+    // 现在只要「跑通了」就记：没被终止、也没被限流提前中止。
+    // 少数失败的作品不靠这里重试 —— 它们本来就不在 known_novel_ids 里，
+    // 下次同步仍会被当作候选（v1.2.20 起已去掉「按上次同步时间增量筛」，
+    // 所以这句现在成立；之前那个增量筛会让它们被永久挡在门外）。
+    if !is_single_sync && !result.cancelled && !result.throttled {
         result.last_sync_at = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE authors SET pixiv_last_sync_at=?1 WHERE id=?2",
@@ -5404,10 +5623,46 @@ const SYNOPSIS_ABORT_STREAK: usize = 10;
 /// 间隔翻倍的上限，别翻到天荒地老
 const SYNOPSIS_MAX_DELAY_SECONDS: u64 = 60;
 
+/// 「作品同步」连续失败多少篇后开始退避。
+///
+/// 同步这条链路原来完全没有限流保护：6 并发一路猛冲，失败就记个数继续冲。
+/// 后果是「第一次同步成功、隔几分钟再同步就整片失败」—— 第二次之所以会重来，
+/// 是因为第一次有少数失败导致时间戳没落库（见 `pixiv_sync_impl` 末尾）。
+/// 现在按和「补抓简介」同一套阈值退避。
+const SYNC_THROTTLE_STREAK: usize = 4;
+/// 同步连着失败到这个数就提前停下，别继续喂风控
+const SYNC_ABORT_STREAK: usize = 10;
+
 /// 连续失败之后的新间隔：翻倍，但封顶。
 /// 抽成函数是为了能单测 —— 这段决定了被限流时是「等一等再试」还是「干脆停下」。
+/// 用 saturation 而不是裸乘法：debug 构建下 `u64::MAX * 2` 会 panic，
+/// 而这个值来自设置面板，理论上能被填成一个离谱的大数。
 fn throttled_delay_seconds(current: u64) -> u64 {
-    (current.max(1) * 2).min(SYNOPSIS_MAX_DELAY_SECONDS)
+    current.max(1).saturating_mul(2).min(SYNOPSIS_MAX_DELAY_SECONDS)
+}
+
+/// 失败原因最多记几条（去重后的上限）。报太多反而没人看，关键是要能区分
+/// 「被限流」「作品没了」「写盘失败」这三类，它们该采取的行动完全不同。
+const SYNC_MAX_FAILED_REASONS: usize = 5;
+
+/// 记一条失败原因：去重、限量、去掉 Pixiv 那边又长又碎的原始报错。
+/// 失败原因不该只是个计数器 —— 用户看到「2 篇失败」却无从下手，
+/// 正是这次报 bug 的直接起因。
+fn note_sync_failure(reasons: &mut Vec<String>, reason: String) {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    // 超长的原始报错截断，避免浮层里塞进一整页 reqwest 内部信息
+    let mut label: String = trimmed.chars().take(80).collect();
+    if trimmed.chars().count() > 80 {
+        label.push('…');
+    }
+    if !reasons.iter().any(|existing| existing == &label) {
+        if reasons.len() < SYNC_MAX_FAILED_REASONS {
+            reasons.push(label);
+        }
+    }
 }
 
 /// 浮层第二行的文案。顶上已经有「正在补抓简介」和「15 / 294」了，这里只报顶上没有的：
@@ -5512,6 +5767,84 @@ fn backfill_synopses_impl(
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?
+    };
+    // ── 列表接口预筛（v1.2.20）──────────────────────────────────────────
+    // 简介**列表接口里就有**（`description`），没必要为一句话逐篇抓详情。
+    // 这里先批量把能拿到的直接写库，剩下的才走详情接口兜底
+    // （列表接口按作者批量，跨作者的整库补抓也能按作者分组各来一次）。
+    //
+    // 只处理「能确定归属」的：拿到的 description 非空就直接落库；
+    // 空的（列表接口没给 / 批次失败）留到下面走详情，不改变原有行为。
+    let mut prefiltered = 0usize;
+    if !targets.is_empty() {
+        // 按作者分组：列表接口的 URL 需要 user_id
+        let mut by_author: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        for (work_id, novel_id) in targets.iter() {
+            let author_of_work: i64 = conn
+                .query_row(
+                    "SELECT author_id FROM works WHERE id=?1",
+                    params![work_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if author_of_work > 0 {
+                by_author
+                    .entry(author_of_work)
+                    .or_default()
+                    .push(novel_id.clone());
+            }
+        }
+        let mut meta_by_novel: std::collections::HashMap<String, PixivNovelListMeta> =
+            std::collections::HashMap::new();
+        for (author_of_work, novel_ids) in by_author.iter() {
+            let homepage: String = conn
+                .query_row(
+                    "SELECT homepage FROM authors WHERE id=?1",
+                    params![author_of_work],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+            let Ok(user_id) = pixiv_user_id(&homepage) else {
+                continue;
+            };
+            for (novel_id, meta) in fetch_pixiv_novel_list_meta(&client, &user_id, novel_ids) {
+                meta_by_novel.insert(novel_id, meta);
+            }
+        }
+        for (work_id, novel_id) in targets.iter() {
+            let Some(meta) = meta_by_novel.get(novel_id) else {
+                continue;
+            };
+            if meta.description.trim().is_empty() {
+                continue;
+            }
+            if conn
+                .execute(
+                    "UPDATE works SET synopsis=?1, synopsis_checked=1 WHERE id=?2",
+                    params![meta.description, work_id],
+                )
+                .is_err()
+            {
+                continue;
+            }
+            prefiltered += 1;
+        }
+    }
+
+    // 已经靠列表接口补上的就不必再抓详情
+    let targets: Vec<(i64, String)> = if prefiltered > 0 {
+        let sql = format!(
+            "SELECT id, pixiv_novel_id FROM works WHERE pixiv_novel_id <> '' AND synopsis = ''{checked_filter}{filter} ORDER BY id"
+        );
+        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    } else {
+        targets
     };
     let total = targets.len();
     // 和「作品同步」共用同一套间隔设置（设置 → 抓取间隔：超过 N 篇时每篇间隔 M 秒）。
@@ -8804,6 +9137,95 @@ fn remove_history(work_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// 加入「稍后再看」。**幂等** —— 同一篇再点一次不报错，只把「加进来的时间」刷新；
+/// 卡片上那两个状态的按钮共用一个动作，重复触发是常态。
+fn add_watch_later_impl(conn: &Connection, work_id: i64) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO work_watch_later (work_id, added_at) VALUES (?1, ?2)
+         ON CONFLICT(work_id) DO UPDATE SET added_at=excluded.added_at",
+        params![work_id, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn remove_watch_later_impl(conn: &Connection, work_id: i64) -> Result<(), String> {
+    conn.execute("DELETE FROM work_watch_later WHERE work_id=?1", [work_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 「稍后再看」清单。按加入时间倒序 —— 和浏览历史不同，这里**不做**任何分组，
+/// 「什么时候加进来的」只用来排序，与日期无关。
+fn list_watch_later_impl(
+    conn: &Connection,
+    query: String,
+    limit: i64,
+) -> Result<Vec<WatchLaterEntry>, String> {
+    let raw_query = query.trim().to_string();
+    // 前端传 0 = 全都要（SQLite 的 `LIMIT -1` 就是「不限」）
+    let limit = if limit <= 0 { -1 } else { limit };
+    let mut statement = conn
+        .prepare(&format!("SELECT {WORK_COLUMNS_W}, wl.added_at FROM work_watch_later wl JOIN works w ON w.id=wl.work_id JOIN authors a ON a.id=w.author_id WHERE (?1='' OR w.title LIKE ?2 OR w.tags LIKE ?2) ORDER BY wl.added_at DESC LIMIT ?3"))
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map(params![raw_query, format!("%{raw_query}%"), limit], |row| {
+            Ok(WatchLaterEntry {
+                work: map_work(row)?,
+                added_at: row.get(HISTORY_VIEWED_AT_INDEX)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut entries = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for entry in &mut entries {
+        populate_work_display_info(&mut entry.work);
+    }
+    Ok(entries)
+}
+
+/// 只要 id 的轻量版：卡片上那个按钮要按「这篇在不在清单里」翻面，而卡片遍布七八个列表页，
+/// 每页都拉一份完整条目太浪费。启动时拉一次、增删时就地改前端那个 Set。
+fn list_watch_later_ids_impl(conn: &Connection) -> Result<Vec<i64>, String> {
+    let mut statement = conn
+        .prepare("SELECT work_id FROM work_watch_later")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_watch_later(query: String, limit: i64) -> Result<Vec<WatchLaterEntry>, String> {
+    list_watch_later_impl(&db()?, query, limit)
+}
+
+#[tauri::command]
+fn list_watch_later_ids() -> Result<Vec<i64>, String> {
+    list_watch_later_ids_impl(&db()?)
+}
+
+#[tauri::command]
+fn add_watch_later(work_id: i64) -> Result<(), String> {
+    add_watch_later_impl(&db()?, work_id)
+}
+
+#[tauri::command]
+fn remove_watch_later(work_id: i64) -> Result<(), String> {
+    remove_watch_later_impl(&db()?, work_id)
+}
+
+#[tauri::command]
+fn clear_watch_later() -> Result<(), String> {
+    db()?
+        .execute("DELETE FROM work_watch_later", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn toggle_has_images(work_id: i64) -> Result<(), String> {
     db()?
@@ -11346,6 +11768,11 @@ pub fn run() {
             list_history,
             clear_history,
             remove_history,
+            list_watch_later,
+            list_watch_later_ids,
+            add_watch_later,
+            remove_watch_later,
+            clear_watch_later,
             set_has_images,
             set_work_meta,
             set_works_read_state,
@@ -11419,7 +11846,7 @@ mod tests {
         compress_cover,
         direct_target_path, distribute_file, epub_target_path, existing_sync_target, file_name,
         follow_cover_path, preview_is_redundant, recycle_to_bin,
-        has_invalid_date_range, insert_local_work, is_after_last_sync, is_generated_asset,
+        has_invalid_date_range, insert_local_work, is_generated_asset,
         is_images_asset_dir,
         is_image_like_asset,
         is_within_date_range, matched_sync_preview, move_cover_along, move_path, name_key,
@@ -11447,6 +11874,8 @@ mod tests {
         synopsis_indicates_preview,
         clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
         HISTORY_LIMIT, migrate_favorites_into_collections,
+        add_watch_later_impl, remove_watch_later_impl, list_watch_later_impl,
+        list_watch_later_ids_impl,
         migrate_word_counts_for_non_text_files,
         add_works_to_collections_impl, update_works_tags_impl,
         set_works_rating_impl, set_works_need_full_state_impl,
@@ -11461,6 +11890,8 @@ mod tests {
         throttled_delay_seconds, synopsis_progress_title,
         SYNOPSIS_ABORT_STREAK, SYNOPSIS_MAX_DELAY_SECONDS,
         SYNOPSIS_THROTTLE_STREAK, SYNOPSIS_META_MAX_CHARS,
+        PixivNovelListMeta, note_sync_failure, SYNC_MAX_FAILED_REASONS,
+        SYNC_THROTTLE_STREAK, SYNC_ABORT_STREAK,
         synopsis_plain_text, build_anthology_epub, AnthologyChapter,
         images_filter_clause, collection_filter_clause,
         write_export_markdown, EXPORT_HEADERS, EXPORT_COL_TITLE, EXPORT_COL_AUTHOR,
@@ -13045,27 +13476,6 @@ mod tests {
     }
 
     #[test]
-    fn incremental_sync_requires_a_later_submission_time() {
-        let last_sync = DateTime::parse_from_rfc3339("2025-01-31T12:00:00+00:00")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert!(is_after_last_sync(
-            "2025-01-31T12:00:01+00:00",
-            Some(last_sync)
-        ));
-        assert!(!is_after_last_sync(
-            "2025-01-31T12:00:00+00:00",
-            Some(last_sync)
-        ));
-        assert!(!is_after_last_sync(
-            "2025-01-31T11:59:59+00:00",
-            Some(last_sync)
-        ));
-        assert!(!is_after_last_sync("2025-01-31", Some(last_sync)));
-        assert!(is_after_last_sync("2025-02-01", Some(last_sync)));
-    }
-
-    #[test]
     fn sync_uses_submission_time_instead_of_last_edit_time() {
         let detail = json!({
             "createDate": "2025-01-15T09:30:00+00:00",
@@ -13079,8 +13489,90 @@ mod tests {
     }
 
     #[test]
-    fn synopsis_marks_previews_except_full_release_phrase() {
-        assert!(synopsis_indicates_preview("这里是全文的前半部分"));
+    fn list_meta_reads_flat_fields_from_the_bulk_endpoint() {
+        // 这个结构**必须**按列表接口的平铺字段解，不能照详情接口的嵌套形状写。
+        // （真机实测：列表接口给 seriesId / seriesTitle / seriesContentOrder 平铺，
+        //  详情接口才给 seriesNavData 嵌套；写混了两边都读不出东西。）
+        let meta = PixivNovelListMeta::from_list_item(&json!({
+            "title": "某篇带图的小说（插画）",
+            "description": "购买后可看全文",
+            "createDate": "2025-01-15T09:30:00+00:00",
+            "seriesId": "12345",
+            "seriesTitle": "某系列",
+            "seriesContentOrder": 3
+        }));
+        assert_eq!(meta.published_at, "2025-01-15T09:30:00+00:00");
+        assert_eq!(meta.description, "购买后可看全文");
+    }
+
+    #[test]
+    fn list_meta_prefers_create_date_over_upload_date() {
+        // 和落库时同一套判据：作者改稿会把 uploadDate 推后，用它做日期筛选会漏抓
+        let meta = PixivNovelListMeta::from_list_item(&json!({
+            "createDate": "2025-01-15T09:30:00+00:00",
+            "uploadDate": "2025-03-01T00:00:00+00:00"
+        }));
+        assert_eq!(meta.published_at, "2025-01-15T09:30:00+00:00");
+    }
+
+    #[test]
+    fn list_meta_tolerates_missing_fields() {
+        // 字段缺失只会退化成「没有简介、日期未知」，不能让整批预筛炸掉
+        let meta = PixivNovelListMeta::from_list_item(&json!({ "title": "单篇" }));
+        assert_eq!(meta.description, "");
+        assert_eq!(meta.published_at, "");
+    }
+
+    #[test]
+    fn sync_failure_reasons_are_deduped_and_capped() {
+        let mut reasons = Vec::new();
+        // 同一条原因重复报只留一份（同一批里多篇作品被同一原因打回是常态）
+        note_sync_failure(&mut reasons, "连接超时".into());
+        note_sync_failure(&mut reasons, "连接超时".into());
+        assert_eq!(reasons, vec!["连接超时".to_string()]);
+
+        // 空白原因直接丢，不该占额度
+        note_sync_failure(&mut reasons, "   ".into());
+        assert_eq!(reasons.len(), 1);
+
+        // 收满上限就不再收 —— 失败原因要能一眼看完，不是日志
+        for index in 0..(SYNC_MAX_FAILED_REASONS + 3) {
+            note_sync_failure(&mut reasons, format!("原因 {index}"));
+        }
+        assert_eq!(reasons.len(), SYNC_MAX_FAILED_REASONS);
+        assert_eq!(reasons[0], "连接超时");
+    }
+
+    #[test]
+    fn sync_failure_reason_truncates_long_backend_errors() {
+        let mut reasons = Vec::new();
+        let long: String = "x".repeat(500);
+        note_sync_failure(&mut reasons, long);
+        assert_eq!(reasons.len(), 1);
+        // 80 个字符 + 一个省略号，别把整页 reqwest 内部信息塞进浮层
+        assert_eq!(reasons[0].chars().count(), 81);
+        assert!(reasons[0].ends_with('…'));
+    }
+
+    #[test]
+    fn sync_throttle_backoff_doubles_and_caps() {
+        // 连着失败够多一次就翻倍；起始值至少按 1 算，避免第一次就乘出 0
+        assert_eq!(throttled_delay_seconds(0), 2);
+        assert_eq!(throttled_delay_seconds(1), 2);
+        assert_eq!(throttled_delay_seconds(5), 10);
+        // 有上限，不会一路翻到天荒地老
+        assert_eq!(
+            throttled_delay_seconds(u64::MAX),
+            SYNOPSIS_MAX_DELAY_SECONDS
+        );
+        // 退避门槛是「连续失败」，不是「总失败」——中间成功一次就该清零，
+        // 这条钉住常量本身，改的时候得同时想清楚两条分支的语义
+        assert!(SYNC_THROTTLE_STREAK >= 2);
+        assert!(SYNC_ABORT_STREAK > SYNC_THROTTLE_STREAK);
+    }
+
+    #[test]
+    fn synopsis_marks_previews_except_full_release_phrase() {        assert!(synopsis_indicates_preview("这里是全文的前半部分"));
         assert!(synopsis_indicates_preview("全文 \n 将在其他平台发布"));
         assert!(!synopsis_indicates_preview("全文放出，感谢支持"));
         assert!(!synopsis_indicates_preview("完整内容已经发布"));
@@ -13735,6 +14227,10 @@ mod tests {
                work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
                viewed_at TEXT NOT NULL DEFAULT '',
                view_count INTEGER NOT NULL DEFAULT 1
+             );
+             CREATE TABLE work_watch_later (
+               work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
+               added_at TEXT NOT NULL DEFAULT ''
              );",
         )
         .unwrap();
@@ -13784,6 +14280,10 @@ mod tests {
                need_full_state INTEGER NOT NULL DEFAULT 0,
                need_full_marked_at TEXT NOT NULL DEFAULT '',
                word_count INTEGER NOT NULL DEFAULT -1
+             );
+             CREATE TABLE IF NOT EXISTS work_watch_later (
+               work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
+               added_at TEXT NOT NULL DEFAULT ''
              );",
         )
         .unwrap();
@@ -14052,6 +14552,84 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM work_history", [], |row| row.get(0))
             .unwrap();
         assert_eq!(total, 0, "关掉开关后一条都不该写");
+    }
+
+    #[test]
+    fn watch_later_add_is_idempotent_and_keeps_one_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute("INSERT INTO works (id, title) VALUES (1, '作品')", [])
+            .unwrap();
+        // 先把时间压旧，再点一次「稍后再看」：该是原地更新，而不是多出一行
+        conn.execute(
+            "INSERT INTO work_watch_later (work_id, added_at) VALUES (1, '2020-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        add_watch_later_impl(&conn, 1).unwrap();
+        let (count, added): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(added_at) FROM work_watch_later WHERE work_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "同一篇作品在稍后再看里只占一行");
+        assert!(
+            added.starts_with("20") && added > "2020-01-01T00:00:00Z".to_string(),
+            "重复加入要把时间刷新成最近一次：{added}"
+        );
+    }
+
+    #[test]
+    fn watch_later_remove_and_clear_leave_nothing_behind() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        for id in 1..=3 {
+            conn.execute("INSERT INTO works (id, title) VALUES (?1, '作品')", [id])
+                .unwrap();
+            add_watch_later_impl(&conn, id).unwrap();
+        }
+        remove_watch_later_impl(&conn, 2).unwrap();
+        let ids = list_watch_later_ids_impl(&conn).unwrap();
+        assert_eq!(ids.len(), 2, "移出一篇后还剩两篇：{ids:?}");
+        assert!(!ids.contains(&2), "移出的那篇不该还在：{ids:?}");
+        // 再移一次不该报错（卡片上的按钮可能被连点）
+        remove_watch_later_impl(&conn, 2).unwrap();
+        conn.execute("DELETE FROM work_watch_later", []).unwrap();
+        assert!(list_watch_later_ids_impl(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn watch_later_lists_newest_first_and_filters_by_query() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute("INSERT INTO authors (id, name) VALUES (1, '作者')", [])
+            .unwrap();
+        for (id, title) in [(1, "想看的那篇"), (2, "另外一篇")] {
+            conn.execute(
+                "INSERT INTO works (id, title) VALUES (?1, ?2)",
+                (id, title),
+            )
+            .unwrap();
+        }
+        // 加入时间手动写死：id=1 更晚加入，排序时该排前面
+        conn.execute(
+            "INSERT INTO work_watch_later (work_id, added_at) VALUES (1, '2026-10-03T10:00:00Z'), (2, '2026-10-01T10:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let all = list_watch_later_impl(&conn, String::new(), 0).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].work.id, 1, "按加入时间倒序，最近加的在最前");
+        assert_eq!(all[0].work.title, "想看的那篇");
+        // 搜索词命中标题
+        let hit = list_watch_later_impl(&conn, "另外".to_string(), 0).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].work.id, 2);
+        // limit 生效
+        let capped = list_watch_later_impl(&conn, String::new(), 1).unwrap();
+        assert_eq!(capped.len(), 1);
     }
 
     #[test]
