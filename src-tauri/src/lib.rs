@@ -402,7 +402,7 @@ struct PixivSyncProgress {
     title: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct PixivSyncResult {
     downloaded_count: usize,
@@ -418,6 +418,9 @@ struct PixivSyncResult {
     failed_reasons: Vec<String>,
     /// 疑似被 Pixiv 限流、提前中止
     throttled: bool,
+    /// 作者主页在 Pixiv 上打不开（HTTP 404，多半是作者销号了）。
+    /// 前端据此把作者卡变灰 —— 所以它不是一个「失败」，而是一个独立状态。
+    author_missing: bool,
 }
 
 struct PixivDownloadCandidate {
@@ -762,6 +765,12 @@ fn db() -> Result<Connection, String> {
         "ALTER TABLE authors ADD COLUMN aliases TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // 「主页打不开」标记（v1.2.21）：同步时发现作者主页返回 404 就写下时间戳，作者卡据此变灰；
+    // 之后哪次同步能读到作品列表就清空。空串 = 正常。
+    let _ = conn.execute(
+        "ALTER TABLE authors ADD COLUMN missing_since TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     let _ = conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS works_author_pixiv_novel_id ON works(author_id, pixiv_novel_id) WHERE pixiv_novel_id <> ''", []);
     // 收藏 → 收藏夹（v1.1.0）：老库里 `works.favorite=1` 的作品统一收进一个默认收藏夹，
     // 这样升级后「我的收藏」不会是空的。
@@ -787,6 +796,16 @@ fn db() -> Result<Connection, String> {
     );
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS characters_game ON characters(game)",
+        [],
+    );
+    // 「内置角色已投放」账本：记下内置表里哪些条目已经交给过这个库。
+    // 有了它，"用户删掉 / 改名 / 改组而缺失的条目"就不会在下一次合并时被补回来。
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS characters_builtin (
+          game TEXT NOT NULL,
+          name TEXT NOT NULL,
+          PRIMARY KEY (game, name)
+        )",
         [],
     );
     conn.execute(
@@ -819,14 +838,10 @@ fn db() -> Result<Connection, String> {
             }
         }
     }
-    // 库是空的（第一次运行，或用户把角色表清空了）就把内置的常见角色名灌进来。
-    // 用户后续的增删都会保留，不会被这里覆盖。
-    let character_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM characters", [], |row| row.get(0))
-        .unwrap_or(0);
-    if character_count == 0 {
-        import_builtin_characters(&conn);
-    }
+    // 内置角色表按「账本 + 差集」合并增量（见 merge_builtin_characters）：
+    // 内置表里新加的角色会补进老库，用户改过的行一个字段都不动。
+    // 门禁是内容指纹 —— 内置表没换过时，这里只花一次查询。
+    let _ = ensure_builtin_characters(&conn);
     Ok(conn)
 }
 
@@ -834,13 +849,33 @@ fn db() -> Result<Connection, String> {
 /// 先从各游戏中文 wiki 拉全量角色名单，再按 pixiv 同人热度排序，只留有热度的。
 const BUILTIN_CHARACTERS: &str = include_str!("../characters.json");
 
-fn import_builtin_characters(conn: &Connection) {
+/// 内置角色表的内容指纹（FNV-1a 64）。用来判断"这次的内置表是不是换过了" ——
+/// 没换过就整个跳过合并，免得每次打开库都把三百多条遍历一遍。
+fn builtin_characters_rev() -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in BUILTIN_CHARACTERS.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// 把内置角色「补」进这个库，返回这次真正新插入的条数。
+///
+/// 规则（2026-10-04 用户拍板，方案 A「已投放集合」）：
+/// - **只插不改**：同名同游戏的行已存在时一个字段都不动 —— 用户改过的别名、停用状态、
+///   改过的名字、自己加的条目，全部原样保留。
+/// - **记账防回补**：凡"交给过这个库"的条目都记进 `characters_builtin`。用户删掉 / 改名 /
+///   改组而缺失的条目，因为账本里有它，**不会**被后面的合并反复补回来。
+/// - 内置表本身只增不减，所以老用户拿到的永远是"差集" = 纯新增。
+fn merge_builtin_characters(conn: &Connection) -> usize {
     let Ok(root) = serde_json::from_str::<Value>(BUILTIN_CHARACTERS) else {
-        return;
+        return 0;
     };
     let Some(map) = root.as_object() else {
-        return;
+        return 0;
     };
+    let mut inserted = 0usize;
     for (game, list) in map {
         let Some(items) = list.as_array() else {
             continue;
@@ -854,13 +889,58 @@ fn import_builtin_characters(conn: &Connection) {
             if name.is_empty() {
                 continue;
             }
+            // 投放过的跳过：删掉 / 改名 / 改组掉的条目就靠这一条不再被补回来
+            let offered: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM characters_builtin WHERE game=?1 AND name=?2",
+                    params![game, name],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if offered > 0 {
+                continue;
+            }
             let heat = item.get("heat").and_then(|v| v.as_i64()).unwrap_or(0);
+            // 同名同游戏的行已存在时被 UNIQUE 拦下（affected = 0）—— 不动它，但照样记一笔账
+            let added = conn
+                .execute(
+                    "INSERT OR IGNORE INTO characters (game, name, aliases, heat, source) VALUES (?1, ?2, '', ?3, 'builtin')",
+                    params![game, name, heat],
+                )
+                .map(|affected| affected > 0)
+                .unwrap_or(false);
+            if added {
+                inserted += 1;
+            }
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO characters (game, name, aliases, heat, source) VALUES (?1, ?2, '', ?3, 'builtin')",
-                params![game, name, heat],
+                "INSERT OR IGNORE INTO characters_builtin (game, name) VALUES (?1, ?2)",
+                params![game, name],
             );
         }
     }
+    inserted
+}
+
+/// 带指纹门禁的合并：内置表没换过就直接返回，换过了才合并并记下新指纹。
+fn ensure_builtin_characters(conn: &Connection) {
+    let rev = builtin_characters_rev();
+    if setting(conn, "characters_builtin_rev").unwrap_or_default() == rev {
+        return;
+    }
+    merge_builtin_characters(conn);
+    let _ = put_setting(conn, "characters_builtin_rev", &rev);
+}
+
+/// 「恢复内置角色」：把内置表里有、这个库里没有的角色补回来，返回补回的条数。
+///
+/// 做法是把账本清空后重跑一次合并 —— 只补"缺失"的条目，
+/// 已改过的名字 / 别名、被停用的、自己加的，都不碰。
+#[tauri::command]
+fn restore_builtin_characters() -> Result<usize, String> {
+    let conn = db()?;
+    conn.execute("DELETE FROM characters_builtin", [])
+        .map_err(|e| e.to_string())?;
+    Ok(merge_builtin_characters(&conn))
 }
 
 #[derive(Serialize)]
@@ -1259,6 +1339,15 @@ fn setting(conn: &Connection, key: &str) -> Result<String, String> {
     .map(|value| value.unwrap_or_default())
 }
 
+fn put_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
     Ok(AppSettings {
         pixiv_cookie: setting(conn, "pixiv_cookie")?,
@@ -1645,6 +1734,21 @@ fn preview_works_for_author(
 
 /// 作者库排序（v0.3.69）：手动拖过的（`sort_order` 1..n）按手动顺序排在前面，
 /// 没拖过的（0）按名字排在其后。全都还是 0 时就是纯按名字 —— 与拖动排序上线前一致。
+/// 「主页打不开」的作者 id 列表（v1.2.21）。作者卡据此变灰。
+/// 单独一个轻量命令，免得把 missing_since 塞进 AuthorSummary、连累那两处查询的取列顺序。
+#[tauri::command]
+fn list_missing_author_ids() -> Result<Vec<i64>, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare("SELECT id FROM authors WHERE missing_since <> ''")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<i64>, _>>()
+        .map_err(|e| e.to_string())
+}
+
 const AUTHOR_ORDER_BY: &str =
     " ORDER BY CASE WHEN a.sort_order = 0 THEN 1 ELSE 0 END, a.sort_order, a.name COLLATE NOCASE";
 
@@ -3562,6 +3666,8 @@ struct NovelImageRef {
     token: String,
     id: String,
     external: bool,
+    /// `[pixivimage:ID-PAGE]` 里的页码（1 起）；没有后缀时是 1。
+    page: usize,
 }
 
 fn novel_image_refs(content: &str) -> Vec<NovelImageRef> {
@@ -3575,14 +3681,25 @@ fn novel_image_refs(content: &str) -> Vec<NovelImageRef> {
         };
         let inner = &after[..end];
         rest = &after[end + 1..];
-        let (external, id) = if let Some(id) = inner.strip_prefix("uploadedimage:") {
-            (false, id)
-        } else if let Some(id) = inner.strip_prefix("pixivimage:") {
-            (true, id)
+        // v1.2.21：`pixivimage:` 后面**可能是 `ID`，也可能是 `ID-PAGE`**（多图插画的第几页）。
+        // 以前这里要求整段全是数字，于是所有带页码的引用被整条丢掉 ——
+        // 后果就是「正文里明明一堆插图，却一张都没下下来」。实例：novel 28610768，
+        // 正文里 59 张图全是 `[pixivimage:147243201-1]` … `[pixivimage:147243201-59]`。
+        let (external, raw_id, page) = if let Some(rest) = inner.strip_prefix("uploadedimage:") {
+            (false, rest.to_string(), 1usize)
+        } else if let Some(rest) = inner.strip_prefix("pixivimage:") {
+            let mut parts = rest.trim().splitn(2, '-');
+            let id = parts.next().unwrap_or("").trim().to_string();
+            let page = parts
+                .next()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(1);
+            (true, id, page)
         } else {
             continue;
         };
-        let id = id.trim();
+        let id = raw_id.trim();
         if id.is_empty() || !id.chars().all(|character| character.is_ascii_digit()) {
             continue;
         }
@@ -3592,6 +3709,7 @@ fn novel_image_refs(content: &str) -> Vec<NovelImageRef> {
                 token,
                 id: id.to_string(),
                 external,
+                page,
             });
         }
     }
@@ -3671,6 +3789,47 @@ fn fetch_pixiv_illust_url(client: &Client, illust_id: &str, quality: &str) -> Op
     None
 }
 
+/// `[pixivimage:ID-PAGE]` 里的多图插画：分页接口一次给出所有页的直链，按页序返回。
+/// 拿不到就返回空表，让调用方退回 `fetch_pixiv_illust_url`（只取第一张）。
+fn fetch_pixiv_illust_page_urls(client: &Client, illust_id: &str, quality: &str) -> Vec<String> {
+    let Ok(value) = client
+        .get(format!(
+            "https://www.pixiv.net/ajax/illust/{illust_id}/pages"
+        ))
+        .send()
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.json::<Value>())
+    else {
+        return Vec::new();
+    };
+    if value.get("error").and_then(Value::as_bool) == Some(true) {
+        return Vec::new();
+    }
+    let keys: [&str; 4] = if quality == "original" {
+        ["original", "regular", "small", "thumb_mini"]
+    } else {
+        ["regular", "original", "small", "thumb_mini"]
+    };
+    value
+        .get("body")
+        .and_then(Value::as_array)
+        .map(|pages| {
+            pages
+                .iter()
+                .filter_map(|page| {
+                    let urls = page.get("urls")?.as_object()?;
+                    keys.iter().find_map(|key| {
+                        urls.get(*key)
+                            .and_then(Value::as_str)
+                            .filter(|url| !url.is_empty())
+                            .map(str::to_string)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 一篇作品待下载的一张配图。
 struct NovelImageSlot {
     token: String,
@@ -3706,9 +3865,18 @@ fn plan_novel_images(
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
     let mut slots = Vec::new();
+    // 同一张多图插画在正文里会被引用很多次（`[pixivimage:ID-1]` … `[pixivimage:ID-59]`），
+    // 分页接口按插画 ID 缓存一次就够 —— 别同一份列表请求几十遍，既慢又容易撞风控。
+    let mut external_pages: HashMap<String, Vec<String>> = HashMap::new();
     for (index, reference) in novel_image_refs(content).iter().enumerate() {
         let url = if reference.external {
-            fetch_pixiv_illust_url(client, &reference.id, quality)
+            let pages = external_pages
+                .entry(reference.id.clone())
+                .or_insert_with(|| fetch_pixiv_illust_page_urls(client, &reference.id, quality));
+            pages
+                .get(reference.page.saturating_sub(1))
+                .cloned()
+                .or_else(|| fetch_pixiv_illust_url(client, &reference.id, quality))
         } else {
             novel_image_url(embedded, &reference.id, quality)
         };
@@ -5050,10 +5218,24 @@ fn pixiv_sync_impl(
     } else {
         let user_id = author_user_id.as_str();
         let list_url = format!("https://www.pixiv.net/ajax/user/{user_id}/profile/all");
-        let listing: Value = client
+        let response = client
             .get(list_url)
             .send()
-            .map_err(|e| format!("无法读取 Pixiv 作者作品列表：{e}"))?
+            .map_err(|e| format!("无法读取 Pixiv 作者作品列表：{e}"))?;
+        // 作者销号 / 主页被删时 Pixiv 给 404 —— 单独认出来，记一笔好让作者卡变灰。
+        // **只认 404**：Cookie 失效给的是 401，要是也算进来，整库作者都会被打成「销号」。
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            let _ = conn.execute(
+                "UPDATE authors SET missing_since=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), author_id],
+            );
+            return Ok(PixivSyncResult {
+                last_sync_at: last_sync.map(|date| date.to_rfc3339()).unwrap_or_default(),
+                author_missing: true,
+                ..PixivSyncResult::default()
+            });
+        }
+        let listing: Value = response
             .error_for_status()
             .map_err(|e| format!("读取 Pixiv 作者作品列表失败：{e}"))?
             .json()
@@ -5067,6 +5249,8 @@ fn pixiv_sync_impl(
             .map(|items| items.keys().cloned().collect())
             .unwrap_or_default()
     };
+    // 能正常读到作品列表 ⇒ 之前若被标过「主页打不开」，这一笔要摘掉
+    let _ = conn.execute("UPDATE authors SET missing_since='' WHERE id=?1", [author_id]);
     // profile/all intentionally only contains IDs for novels. Process newer IDs
     // first; the submission-time filter is applied after loading each detail.
     novels.sort_by(|left, right| right.cmp(left));
@@ -5088,6 +5272,7 @@ fn pixiv_sync_impl(
         last_sync_at: last_sync.map(|date| date.to_rfc3339()).unwrap_or_default(),
         failed_reasons: Vec::new(),
         throttled: false,
+        author_missing: false,
     };
     let _total = novels.len();
     // ── 前置过滤（v1.2.20）──────────────────────────────────────────────
@@ -5513,7 +5698,11 @@ fn pixiv_sync_impl(
             } else {
                 (String::new(), text_path.to_string_lossy().to_string())
             };
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, title_indicates_images(&work.title) as i64, image_saved as i64, work.synopsis]).is_err() {
+            // 配图真的下下来了就以它为准：正文里 `[pixivimage:...]` 引用的插画很常见，
+            // 光看标题里有没有「插画 / 图文」会漏掉一大批带图版
+            //（「重新下载」那条路本来就是按实际张数盖 has_images 的，这里对齐）。
+            let has_images = image_saved > 0 || title_indicates_images(&work.title);
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, has_images as i64, image_saved as i64, work.synopsis]).is_err() {
             result.failed_count += 1;
             continue;
         }
@@ -11380,17 +11569,24 @@ struct WordCountProgress {
 /// 结果里 0 ＝「读不出来」（绑的是 EPUB、或目录里没有 txt），**不会重算**；
 /// 只有路径变了才会被触发器标回 -1 重新排上队。
 #[tauri::command]
-fn refresh_word_counts(limit: usize) -> Result<WordCountProgress, String> {
-    refresh_word_counts_impl(&db()?, limit)
+fn refresh_word_counts(limit: usize, work_id: Option<i64>) -> Result<WordCountProgress, String> {
+    refresh_word_counts_impl(&db()?, limit, work_id)
 }
 
-fn refresh_word_counts_impl(conn: &Connection, limit: usize) -> Result<WordCountProgress, String> {
+/// `work_id` 传了 `Some(id)` 就只算这一篇 —— 详情里「绑定完整版 / 换版本 / 重新下载」
+/// 之后，路径一变 SQL 触发器就把 `word_count` 标回 -1，这里当场补算，让字数立刻出现，
+/// 不用等下次启动那轮全库补算。传 `None` 就是原来的「扫一批未算的」。
+fn refresh_word_counts_impl(
+    conn: &Connection,
+    limit: usize,
+    work_id: Option<i64>,
+) -> Result<WordCountProgress, String> {
     let rows: Vec<(i64, String, String)> = {
         let mut statement = conn
-            .prepare("SELECT id, preview_path, purchased_path FROM works WHERE word_count < 0 LIMIT ?1")
+            .prepare("SELECT id, preview_path, purchased_path FROM works WHERE word_count < 0 AND (?2 IS NULL OR id = ?2) LIMIT ?1")
             .map_err(|e| e.to_string())?;
         let mapped = statement
-            .query_map([limit as i64], |row| {
+            .query_map(params![limit as i64, work_id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .map_err(|e| e.to_string())?;
@@ -11800,6 +11996,8 @@ pub fn run() {
             add_character_game,
             rename_character_game,
             delete_character_game,
+            restore_builtin_characters,
+            list_missing_author_ids,
             open_work_reading,
             work_reading_path,
             open_external_url,
@@ -11851,7 +12049,7 @@ mod tests {
         is_image_like_asset,
         is_within_date_range, matched_sync_preview, move_cover_along, move_path, name_key,
         sibling_assets,
-        characters_in_text, detect_author_in_name, file_stem, import_builtin_characters,
+        characters_in_text, detect_author_in_name, file_stem, merge_builtin_characters,
         resolve_match_mode, scope_allows_path, shared_characters, MatchMode,
         needs_a_purchased_file,
         normalize_aliases, normalize_author_homepage, normalize_pixiv_cookie,
@@ -12091,8 +12289,7 @@ mod tests {
         assert_eq!(file_stem(Path::new("D:/书库/无名作品.epub")), "无名作品");
     }
 
-    #[test]
-    fn builtin_characters_can_be_imported() {
+    fn character_test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE characters (
@@ -12104,24 +12301,78 @@ mod tests {
                source TEXT NOT NULL DEFAULT 'builtin',
                enabled INTEGER NOT NULL DEFAULT 1,
                UNIQUE(game, name)
+             );
+             CREATE TABLE characters_builtin (
+               game TEXT NOT NULL,
+               name TEXT NOT NULL,
+               PRIMARY KEY (game, name)
              );",
         )
         .unwrap();
-        import_builtin_characters(&conn);
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM characters", [], |row| row.get(0))
-            .unwrap();
-        assert!(count > 200, "内置角色应该在 200 条以上，实际 {count}");
+        conn
+    }
+
+    fn character_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM characters", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn builtin_characters_can_be_imported() {
+        let conn = character_test_conn();
+        let inserted = merge_builtin_characters(&conn);
+        assert!(inserted > 200, "内置角色应该在 200 条以上，实际 {inserted}");
+        let count = character_count(&conn);
+        assert_eq!(inserted as i64, count, "第一次合并应该把内置表整表插进来");
         let ganyu: i64 = conn
             .query_row("SELECT COUNT(*) FROM characters WHERE name='甘雨'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(ganyu, 1);
-        // 重复导入不会产生副本
-        import_builtin_characters(&conn);
-        let again: i64 = conn
-            .query_row("SELECT COUNT(*) FROM characters", [], |row| row.get(0))
+        // 重复合并：一条都不再插，也不会产生副本
+        assert_eq!(merge_builtin_characters(&conn), 0);
+        assert_eq!(character_count(&conn), count);
+    }
+
+    #[test]
+    fn merging_keeps_user_edits_and_deletions_but_delivers_new_entries() {
+        let conn = character_test_conn();
+        merge_builtin_characters(&conn);
+        // 用户在库里动了三处：停用一条并加了别名、删掉一条、自己加一条
+        conn.execute("UPDATE characters SET enabled=0, aliases='老婆' WHERE name='甘雨'", [])
             .unwrap();
-        assert_eq!(again, count);
+        conn.execute("DELETE FROM characters WHERE name='钟离'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO characters (game, name, aliases, heat, source) VALUES ('原神','自建角色','',0,'user')",
+            [],
+        )
+        .unwrap();
+
+        // 账本还在 ⇒ 被删的不该被补回来，用户改过的纹丝不动
+        assert_eq!(merge_builtin_characters(&conn), 0);
+        let ganyu: (i64, String) = conn
+            .query_row("SELECT enabled, aliases FROM characters WHERE name='甘雨'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ganyu, (0, "老婆".to_string()), "用户改过的行不能被覆盖");
+        let zhongli: i64 = conn
+            .query_row("SELECT COUNT(*) FROM characters WHERE name='钟离'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(zhongli, 0, "用户删掉的内置角色不该被反复补回来");
+        let custom: i64 = conn
+            .query_row("SELECT COUNT(*) FROM characters WHERE name='自建角色'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(custom, 1);
+
+        // 账本里也拿掉 = 这一条在内置表里是「新加的」⇒ 应该补进老库
+        conn.execute("DELETE FROM characters_builtin WHERE name='钟离'", [])
+            .unwrap();
+        assert_eq!(merge_builtin_characters(&conn), 1, "内置表新增的条目应该补到老库里");
+        let zhongli: i64 = conn
+            .query_row("SELECT COUNT(*) FROM characters WHERE name='钟离'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(zhongli, 1);
     }
 
     #[test]
@@ -13025,6 +13276,18 @@ mod tests {
         assert_eq!(refs[1].id, "998877");
         assert!(refs[1].external);
         assert!(novel_image_refs("没有插图的正文").is_empty());
+        // v1.2.21：多图插画的引用带着页码 —— 以前整条被丢掉，
+        // 正文里一堆图却一张也下不下来（实例 novel 28610768）
+        let paged = novel_image_refs("[pixivimage:147243201-3]后面[uploadedimage:20454900]");
+        assert_eq!(paged.len(), 2);
+        assert_eq!(paged[0].id, "147243201");
+        assert_eq!(paged[0].page, 3);
+        assert_eq!(paged[0].token, "[pixivimage:147243201-3]");
+        assert_eq!(paged[1].page, 1, "没有页码后缀的引用按第一页算");
+        // 页码写坏了就退回第一页，别把整条引用丢掉
+        let broken = novel_image_refs("[pixivimage:147243201-x]");
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].page, 1);
     }
 
     #[test]
@@ -14874,11 +15137,11 @@ mod tests {
         .unwrap();
 
         // limit = 0：只体检不干活，剩一篇待算
-        let probe = refresh_word_counts_impl(&conn, 0).unwrap();
+        let probe = refresh_word_counts_impl(&conn, 0, None).unwrap();
         assert_eq!(probe.updated, 0);
         assert_eq!(probe.remaining, 1);
 
-        let done = refresh_word_counts_impl(&conn, 10).unwrap();
+        let done = refresh_word_counts_impl(&conn, 10, None).unwrap();
         assert_eq!(done.updated, 1);
         assert_eq!(done.remaining, 0);
         let stored: i64 = conn
@@ -14888,7 +15151,7 @@ mod tests {
             .unwrap();
         assert!(stored > 0, "算出来的字数要落库，实际 {stored}");
         // 已经算过的不会重复排队（-1 才排，0 和正数都不排）
-        assert_eq!(refresh_word_counts_impl(&conn, 10).unwrap().updated, 0);
+        assert_eq!(refresh_word_counts_impl(&conn, 10, None).unwrap().updated, 0);
 
         // 改无关列不该把缓存清掉（触发器里那句 WHEN 就是为这个）
         conn.execute("UPDATE works SET title='乙' WHERE id=1", [])
@@ -14912,7 +15175,55 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stored, -1, "路径变了字数缓存必须作废");
-        assert_eq!(refresh_word_counts_impl(&conn, 0).unwrap().remaining, 1);
+        assert_eq!(refresh_word_counts_impl(&conn, 0, None).unwrap().remaining, 1);
+    }
+
+    /// v1.2.22：详情里「绑定完整版 / 换版本 / 重新下载」之后要把**当前这一篇**当场补算。
+    /// `work_id` 传 `Some` 就只动这一篇 —— 库里还有别的待算作品时，不该因为改了一篇
+    /// 就把整库顺手扫一遍。
+    #[test]
+    fn word_count_can_be_refreshed_for_a_single_work() {
+        let root = std::env::temp_dir().join(format!("word-count-single-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("甲.txt");
+        fs::write(&first, "一二三四五").unwrap();
+        let second = root.join("乙.txt");
+        fs::write(&second, "一二三").unwrap();
+        let first_path = first.to_string_lossy().to_string();
+        let second_path = second.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute_batch(WORD_COUNT_TRIGGER_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO works (id, title, preview_path) VALUES (1, '甲', ?1)",
+            [first_path.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, title, preview_path) VALUES (2, '乙', ?1)",
+            [second_path.as_str()],
+        )
+        .unwrap();
+
+        let stored = |id: i64| -> i64 {
+            conn.query_row("SELECT word_count FROM works WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+
+        // 只点第二篇：第一篇得原样排队，不能被顺手算掉
+        let one = refresh_word_counts_impl(&conn, 10, Some(2)).unwrap();
+        assert_eq!(one.updated, 1);
+        assert_eq!(stored(2), 3);
+        assert_eq!(stored(1), -1, "没点到的那篇不该被算");
+
+        // 已经是算过的了，再点一次不该有动作
+        assert_eq!(refresh_word_counts_impl(&conn, 10, Some(2)).unwrap().updated, 0);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// v1.2.18：EPUB 不是文本，**不能**当正文数字数。
@@ -14986,7 +15297,7 @@ mod tests {
         assert_eq!(stored(2), 5, "txt 的字数不能动");
 
         // 后台按新判据重算：EPUB 读不出正文 → 0
-        assert_eq!(refresh_word_counts_impl(&conn, 10).unwrap().updated, 1);
+        assert_eq!(refresh_word_counts_impl(&conn, 10, None).unwrap().updated, 1);
         assert_eq!(stored(1), 0);
 
         // 标记位必须挡住第二次：否则重算好的 0 每次启动都被标回未算，白跑一遍全库

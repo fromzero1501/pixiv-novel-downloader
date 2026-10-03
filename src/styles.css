@@ -44,6 +44,10 @@ body.is-author-dragging .card-drag { cursor: grabbing; }
 .author-drag-ghost.is-dropping .author-drag-inner { transform: rotate(0deg) scale(.9); opacity: 0; }
 .author-card.is-starred { background: linear-gradient(180deg, #fffef9 0%, #fff8e6 100%); border-color: #efce7d; box-shadow: inset 3px 0 0 #efb842; }
 .author-card.is-starred:hover, .author-card.is-starred:focus { border-color: #e3b34c; box-shadow: inset 3px 0 0 #efb842, 0 12px 28px rgba(180, 132, 20, .2); }
+/* v1.2.21：作者主页在 Pixiv 上返回 404（多半销号）—— 卡片整体压灰压暗，但仍然能点开看已存的作品 */
+.author-card.is-missing { opacity: .6; filter: grayscale(.78); border-color: #d5dde6; background: #f7f9fb; }
+.author-card.is-missing:hover, .author-card.is-missing:focus { opacity: .85; border-color: #c4ceda; box-shadow: 0 10px 22px rgba(42,84,129,.09); }
+.author-missing-badge { position: absolute; left: -6px; bottom: -4px; z-index: 1; padding: 1px 6px; color: #fff; background: #7b8794; border: 1px solid #fff; border-radius: 999px; font-size: 10px; font-weight: 700; line-height: 1.5; white-space: nowrap; box-shadow: 0 1px 3px rgba(52,64,78,.3); }
 /* 作者库：搜索框与「只看特别关注」并排 */
 .authors-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .authors-toolbar .search-field { flex: 1 1 280px; }
@@ -162,8 +166,10 @@ body.is-bulk button { cursor: pointer; }
 .work-badges { gap: 7px; }
 /* 封面第二排：角色名（v1.2.21）。位置沿用原来链接徽标那一行，top 跟着第一排的 32px 按钮 + 7px 间距往下让 */
 .work-characters { position: absolute; top: calc(9px + 32px + 7px); left: 9px; right: 9px; display: flex; flex-wrap: wrap; gap: 4px; opacity: 0; transition: opacity .15s ease; pointer-events: none; }
-.work-characters > span { max-width: 100%; padding: 2px 8px; color: #fff; background: rgba(23,43,68,.68); border-radius: 999px; font-size: 11px; font-weight: 650; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; box-shadow: 0 1px 4px rgba(18,36,58,.28); }
-.work-characters .work-characters-more { background: rgba(23,43,68,.5); }
+/* v1.2.21：底色调深加实 —— 原来 .68 太透，压在亮封面上几乎看不出是个标签。
+   现在接近不透明 + 一圈半透明白描边 + 更重的投影 + 极淡的文字阴影，任何封面上都读得清。 */
+.work-characters > span { max-width: 100%; padding: 2px 9px; color: #fff; background: rgba(15,31,51,.94); border: 1px solid rgba(255,255,255,.5); border-radius: 999px; font-size: 11px; font-weight: 700; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 1px 2px rgba(6,18,34,.65); box-shadow: 0 2px 7px rgba(6,18,34,.5); }
+.work-characters .work-characters-more { background: rgba(15,31,51,.8); border-color: rgba(255,255,255,.36); }
 /* 默认和「标为已读」同一组：悬停封面才淡入；工具栏开关打开后（body 类）常显 */
 .work-cover:hover .work-characters, .work-card:focus-within .work-characters, body.show-character-names .work-characters { opacity: 1; }
 .status-badge, .favorite-badge { width: 32px; height: 32px; border-color: rgba(255,255,255,.9); box-shadow: 0 2px 8px rgba(27,54,82,.22); }
@@ -261,6 +267,12 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 /* 用户主动终止：灰，别跟「核对完成」的绿、限流的橙混在一起 */
 .sync-floater-row.is-cancelled progress::-webkit-progress-value { background: #c9d8e8; }
 .sync-floater-row.is-cancelled .sync-row-title { color: #8a9cb0; }
+/* 正在检查作者主页：同步的前置阶段，用中性蓝，别跟「核对完成」的绿混 */
+.sync-floater-row.is-checking progress::-webkit-progress-value { background: #bcd7f2; }
+.sync-floater-row.is-checking .sync-row-title { color: #2f6ba8; }
+.sync-floater-row.is-missing progress::-webkit-progress-value { background: #d4dae1; }
+.sync-floater-row.is-missing .sync-row-title { color: #7b8794; }
+.sync-floater-row.is-missing .sync-row-name { color: #7b8794; }
 @keyframes sync-spin { to { transform: rotate(360deg); } }
 
 /* 右下角「回到顶部 / 滚到底部」：列表长到需要滚动时才出现；有同步进度浮层时自动抬到它上面 */
@@ -380,6 +392,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 
 /* 匹配分组里角色列表的标题行 */
 .char-setting-head { display: flex; align-items: baseline; gap: 8px; }
+.char-setting-head .char-restore-button { margin-left: auto; align-self: center; }
 .char-setting .field-title { color: #405773; }
 
 /* 抓取间隔：三个输入在一行里并排，别被单列布局撑成竖排 */
@@ -548,6 +561,9 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .detail-author { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 0; color: #6e87a1; font-size: 13px; }
 .detail-sep { color: #c3cddb; }
 .detail-quick { display: flex; flex-wrap: wrap; gap: 9px; margin-top: auto; }
+/* v1.2.21：「打开完整版」旁边那个只显示图标的 Pixiv 原页按钮，尺寸跟主按钮对齐 */
+.detail-pixiv-button { width: 38px; min-height: 38px; display: inline-grid; place-items: center; padding: 0; color: #176bd3; background: #eef6ff; border: 1px solid #cfe3fb; border-radius: 7px; cursor: pointer; }
+.detail-pixiv-button:hover { color: #0e5fc2; background: #dcecff; border-color: #a9cdf5; }
 .detail-block { padding: 18px 0; border-bottom: 1px solid #eef3f9; }
 .detail-block:last-child { padding-bottom: 4px; border-bottom: 0; }
 .detail-block h4 { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; color: #34618e; font-size: 14px; }

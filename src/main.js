@@ -158,6 +158,11 @@ const state = {
   watchLaterQuery: "",
   watchLaterIds: new Set(),
   /**
+   * 「主页打不开」的作者 id 集合（v1.2.21）。作者卡据此变灰 ——
+   * 后端同步时发现主页 404 就落库，成功同步再清掉；这里只负责显示。
+   */
+  missingAuthorIds: new Set(),
+  /**
    * 阅读状态筛选（v1.2.0）：`all` / `unread`（未读） / `reading`（在读，＝「继续读」清单）。
    * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
    * v1.2.8 起显示在「高级筛选」面板里（工具栏那排按钮撤了）。
@@ -465,8 +470,29 @@ async function invoke(command, args = {}) {
   ];
   if (command === "backup_database_now") return { path: "D:\\备份\\library-auto-20260916-235900000.db", name: "library-auto-20260916-235900000.db", size: 1_835_008, createdAt: "2026-09-16 23:59" };
   if (command === "auto_backup_if_due") return null;
-  // 字数后台补算（v1.2.8）：浏览器预览里字数都是现成的，没什么可补的
-  if (command === "refresh_word_counts") return { updated: 0, remaining: 0 };
+  // 字数后台补算（v1.2.8）：浏览器预览里字数都是现成的，没什么可补的。
+  // v1.2.21 起「同步完就地补字数」要能验：脚本用 `window.__wordCountProgress`
+  // 预置一串返回（数组按次取，用完停在最后一个），不预置就还是老样子。
+  if (command === "refresh_word_counts") {
+    const scripted = window.__wordCountProgress;
+    if (Array.isArray(scripted) && scripted.length) {
+      const step = scripted[Math.min(window.__wordCountStep || 0, scripted.length - 1)];
+      window.__wordCountStep = (window.__wordCountStep || 0) + 1;
+      return step;
+    }
+    // 「补算完再刷列表」要真能看见字数变化：脚本用 `__wordCountApply` 预置
+    // 「这次把哪几篇算成多少字」，应用一次即清空（真机是落库，这里落预览对象）
+    const pending = window.__wordCountApply;
+    if (Array.isArray(pending) && pending.length) {
+      pending.forEach((item) => {
+        const work = previewWorks.find((entry) => entry.id === item.id) || previewWorkPool().find((entry) => entry.id === item.id);
+        if (work) work.wordCount = item.wordCount;
+      });
+      window.__wordCountApply = null;
+      return { updated: pending.length, remaining: 0 };
+    }
+    return { updated: 0, remaining: 0 };
+  }
   if (command === "set_work_series") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.seriesId = args.seriesId; work.seriesTitle = "雾海档案短篇系列"; work.seriesOrder = args.seriesOrder; } return; }
   if (command === "leave_work_series") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.seriesId = ""; work.seriesTitle = ""; work.seriesOrder = 0; } return; }
   if (command === "backfill_work_covers") return { fixedCount: 0, failedCount: 0, skippedCount: 0, failedTitles: [] };
@@ -762,10 +788,18 @@ async function invoke(command, args = {}) {
     previewCharacterGames = previewCharacterGames.filter((game) => game !== args.game);
     return;
   }
+  if (command === "restore_builtin_characters") {
+    // 预览里没有真正的内置表；脚本要断言"补回 N 个"就预置这个数字
+    return typeof window.__restoreBuiltinResult === "number" ? window.__restoreBuiltinResult : 0;
+  }
+  if (command === "list_missing_author_ids") {
+    // 预览里没有"销号"这个概念；脚本要验灰卡片就预置这个数组
+    return Array.isArray(window.__missingAuthorIds) ? window.__missingAuthorIds : [];
+  }
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
-    return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, lastSyncAt: new Date().toISOString() };
+    return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, authorMissing: false, lastSyncAt: new Date().toISOString() };
   }
   if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.isNew = false; if (work.readState === 0) work.readState = 1; } return; }
   if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
@@ -980,6 +1014,8 @@ function syncLabel(value) {
 
 async function refreshAuthors() {
   state.authors = await invoke("list_authors");
+  // 「主页打不开」的作者 id：单独一条轻量命令，免得塞进 AuthorSummary 连累那两处查询的取列顺序
+  state.missingAuthorIds = new Set(await invoke("list_missing_author_ids"));
 }
 
 /**
@@ -1083,18 +1119,32 @@ function ensureLoadMoreObserver() {
  * 字数后台补算（v1.2.8）。一次要读几 MB 正文，所以放在启动后慢慢跑、不挡界面。
  * 传 0 只问「还剩几篇」，用这个把进度显示出来；算完就不再调了。
  * 失败就当没这回事 —— 卡片的字数、字数档筛选顶多少点东西，不该弹错误。
+ *
+ * `interactive`（v1.2.21）：同步刚补进来一批作品时传 true。那些作品的 `word_count`
+ * 还是 -1（路径一变触发器就标回未算），而补算原本只在启动时跑一次 ——
+ * 结果就是新同步的作品要等下次开软件才有字数。传 true 时算完重拉一遍当前列表，
+ * 并把字数外科式补到卡片上（不整页重绘，理由见 `patchWorkWordCounts`）。
  */
-async function fillWordCountsInBackground() {
+async function fillWordCountsInBackground(interactive = false) {
   try {
+    let changed = false;
     for (;;) {
       const progress = await invoke("refresh_word_counts", { limit: 120 });
       const remaining = Number(progress?.remaining ?? 0);
+      const updated = Number(progress?.updated ?? 0);
+      if (updated > 0) changed = true;
       if (remaining !== state.wordCountPending) {
         state.wordCountPending = remaining;
         // 只在筛选面板正开着的时候重画，免得平白把用户正在看的列表刷一遍
         if (state.filterPanelOpen && state.homeView !== "missingFull") render();
       }
-      if (!progress || remaining <= 0 || !Number(progress.updated)) return;
+      if (!progress || remaining <= 0 || !updated) break;
+    }
+    // 启动那次不刷屏；同步收尾那次才把字数补到卡片上，让它当场出现。
+    // 注意是「重拉数据 + 外科式补 DOM」，**不是**整页 render() —— 见 patchWorkWordCounts 的注释。
+    if (interactive && changed) {
+      await refreshVisibleList();
+      patchWorkWordCounts();
     }
   } catch (error) {
     console.log("字数补算跳过:", error);
@@ -1349,6 +1399,12 @@ function floaterFootButton(task) {
   return `<button class="quiet-button" data-action="${action}" data-floater-foot ${task.cancelling ? "disabled" : ""}>${task.cancelling ? busy : idle}</button>`;
 }
 
+// 单作者同步浮层里那行说明：还没进正文抓取时，显示的就是「检查作者主页」这一步 ——
+// 后端的第一跳（拿作者作品列表）同时也是「作者还在不在」的检测，404 就等于销号。
+function syncTaskTitle(task) {
+  return task.title || (task.phase === "checking" ? "检查作者主页…" : "正在读取作品列表...");
+}
+
 // 后台同步进度浮层：同步不阻塞主界面，用户可继续浏览，右下角显示进度并可随时终止
 // 单作者同步＝一根进度条；「同步所有作者」＝每位作者一行、各自一根进度条
 function syncFloater() {
@@ -1362,7 +1418,7 @@ function syncFloater() {
     </div>
     <progress id="sync-progress-bar" value="${task.current}" max="${Math.max(task.total, 1)}"></progress>
     <div class="sync-floater-foot">
-      <p id="sync-progress-title" title="${escapeHtml(task.title || "")}">${escapeHtml(task.title || "正在读取作品列表...")}</p>
+      <p id="sync-progress-title" title="${escapeHtml(syncTaskTitle(task))}">${escapeHtml(syncTaskTitle(task))}</p>
       <div class="sync-floater-foot-row">
         <span class="sync-floater-eta" id="sync-progress-eta"></span>
         ${floaterFootButton(task)}
@@ -1376,11 +1432,19 @@ function syncFloater() {
 // 或者「核对中」，看着像没跑完。收尾了就改说状态本身。
 function syncCountText(task) {
   if (task.status === "pending") return "等待中";
+  if (task.status === "checking") return "检查主页";
   if (task.status === "done") return "核对完成";
   if (task.status === "throttled") return "已中断";
   if (task.status === "cancelled") return "已终止";
+  if (task.status === "missing") return "已销号";
   if (task.status === "failed") return "失败";
   return task.total ? `${task.current} / ${task.total}` : "核对中";
+}
+
+// 这一行跑完了没有。等待中 / 正在检查作者主页 / 正在同步，都不算跑完 ——
+// 尤其 `checking` 是同步的前置阶段，它要是被当成跑完，进度条会一路填满绿。
+function syncRowSettled(item) {
+  return item.status !== "pending" && item.status !== "running" && item.status !== "checking";
 }
 
 // 进度条的填充量。**跑完的行一律填满** ——
@@ -1389,16 +1453,17 @@ function syncCountText(task) {
 // 首帧渲染和后续增量更新都走这里，免得两处各写一份、改一处漏一处。
 function syncRowProgress(item) {
   const max = Math.max(item.total, 1);
-  const finished = item.status !== "pending" && item.status !== "running";
-  return { value: finished ? max : Math.min(item.current, max), max };
+  return { value: syncRowSettled(item) ? max : Math.min(item.current, max), max };
 }
 
 // 批量同步时每一行的状态说明文字
 function syncRowStatusText(item) {
   if (item.status === "pending") return "等待中";
+  if (item.status === "checking") return item.note || "检查作者主页…";
   if (item.status === "running") return item.title || (item.total ? "正在读取作品列表..." : "正在核对作品列表...");
   if (item.status === "throttled") return item.note || "疑似被限流，已提前停止";
   if (item.status === "cancelled") return item.note || "已终止";
+  if (item.status === "missing") return item.note || "主页 404（已销号），已跳过同步";
   if (item.status === "failed") return item.note || "同步失败";
   if (!item.total) return "已是最新，无新作品";
   return item.note || "已完成";
@@ -1424,7 +1489,7 @@ function batchSyncFloater(task) {
       <p class="sync-row-title" data-sync-title title="${escapeHtml(syncRowStatusText(item))}">${escapeHtml(syncRowStatusText(item))}</p>
     </div>`;
   }).join("");
-  const finished = task.authors.filter((item) => item.status !== "pending" && item.status !== "running").length;
+  const finished = task.authors.filter(syncRowSettled).length;
   return `<div class="sync-floater is-batch" id="sync-floater">
     <div class="sync-floater-head">
       <strong>${icon("sync", 16)}<span id="sync-progress-label">${escapeHtml(task.label)}</span></strong>
@@ -1451,7 +1516,7 @@ function updateSyncFloater() {
     foot.textContent = task.cancelling && !task.cancelAction ? "正在终止…" : task.cancelText || "终止同步";
   }
   if (task.authors) {
-    const finished = task.authors.filter((item) => item.status !== "pending" && item.status !== "running").length;
+    const finished = task.authors.filter(syncRowSettled).length;
     box.querySelector("#sync-progress-count").textContent = `${finished} / ${task.authors.length}`;
     box.querySelector("#sync-progress-label").textContent = task.label;
     task.authors.forEach((item) => {
@@ -1474,7 +1539,7 @@ function updateSyncFloater() {
   bar.value = task.current;
   box.querySelector("#sync-progress-count").textContent = `${task.current} / ${task.total}`;
   const title = box.querySelector("#sync-progress-title");
-  title.textContent = task.title || "正在读取作品列表...";
+  title.textContent = syncTaskTitle(task);
   title.title = task.title || "";
   // 抓取间隔拉长时把「还要等多久」报出来 —— 否则进度条半天不动，看着像卡死了
   const eta = box.querySelector("#sync-progress-eta");
@@ -1707,10 +1772,11 @@ function renderAuthors() {
   const query = state.authorQuery.trim().toLowerCase();
   const authors = state.authors.filter((author) => (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
   const cards = authors.map((author) => `
-    <article class="author-card${author.starred ? " is-starred" : ""}" data-author-id="${author.id}" tabindex="0">
+    <article class="author-card${author.starred ? " is-starred" : ""}${state.missingAuthorIds.has(author.id) ? " is-missing" : ""}" data-author-id="${author.id}" tabindex="0">
       <div class="author-avatar-wrap">
         ${authorAvatar(author)}
         ${author.newCount > 0 ? `<span class="author-new-badge" title="上次同步之后新收进来、还没点开看过的 ${author.newCount} 篇作品">${author.newCount > 99 ? "99+" : author.newCount}</span>` : ""}
+        ${state.missingAuthorIds.has(author.id) ? `<span class="author-missing-badge" title="Pixiv 上找不到这个作者主页（多半是销号了）。下次同步若能读到作品列表，会自动摘掉这个标记。">已销号</span>` : ""}
       </div>
       <div class="author-card-body">
         <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2><div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="${author.starred ? "取消特别关注" : "设为特别关注"}" data-action="toggle-author-starred" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>
@@ -2902,14 +2968,61 @@ async function refreshVisibleList() {
 }
 
 /**
+ * 把「字数」补到**已经在屏幕上**的那几张作品卡上（v1.2.21）。
+ *
+ * 为什么不省事直接 `render()`：字数补算是后台异步落地的，落地那一刻用户很可能正在
+ * 搜索框里打字 —— 一次重绘就把焦点和刚敲进去的字全抹了（v1.2.15 踩过同一类）。
+ * 所以只做外科式修补：换掉每张卡 `.work-meta` 里 `.work-word-count` 的文本，
+ * 原来没有这块（字数从 -1 变成真数字）就在日期后面插一个。
+ * 算不出字数的（0 / -1，比如 EPUB）保持原样 —— 那格该显示的还是格式名。
+ */
+function patchWorkWordCounts() {
+  document.querySelectorAll(".work-card[data-work-id]").forEach((card) => {
+    const work = findWork(Number(card.dataset.workId));
+    const label = work ? wordCountLabel(Number(work.wordCount) || 0) : "";
+    if (!label) return;
+    const meta = card.querySelector(".work-meta");
+    if (!meta) return;
+    const holder = meta.querySelector(".work-word-count");
+    if (holder) { holder.textContent = label; return; }
+    const span = document.createElement("span");
+    span.className = "work-word-count";
+    span.textContent = label;
+    const date = meta.querySelector(".work-date");
+    if (date) date.insertAdjacentElement("afterend", span);
+    else meta.appendChild(span);
+  });
+}
+
+/**
  * 详情弹窗里做完「会影响卡片显示」的改动之后收尾：
  * 刷新当前这一页的列表 + 重画详情（**不关弹窗**）。
  */
 async function refreshAfterDetailChange() {
   await refreshActiveAuthor();
+  // 绑定完整版 / 切完整版预览版 / 重新下载阅读版都会改文件路径，SQL 触发器顺手把
+  // word_count 标回 -1。这里就地把当前详情这篇补算掉 —— 否则卡片上要等下次开软件
+  // 那轮全库补算才有字数。
+  await recountWorkWordCount(state.workDetailId);
   await refreshVisibleList();
   render();
   refreshDetailDom();
+}
+
+/**
+ * 只补算这一篇的字数（详情里改完文件路径后调）。
+ *
+ * 走的是同一个后台命令，只是带上 workId —— 库里还有别的未算作品时，不至于因为
+ * 「改了一篇」就把整库重新扫一遍。正文读不出来的（EPUB / HTML）会落成 0，
+ * 按既有规矩显示格式名，不会变成空白。
+ */
+async function recountWorkWordCount(workId) {
+  if (!workId) return;
+  try {
+    await invoke("refresh_word_counts", { limit: 1, workId });
+  } catch (error) {
+    console.log("单篇字数补算跳过:", error);
+  }
 }
 
 /** 详情里切「完整版 / 预览版」：不关弹窗，改完原地刷新（原来的菜单版是关掉弹窗再刷） */
@@ -3016,6 +3129,7 @@ function workDetailBody() {
         <p class="detail-author">${authorName ? `<button class="work-author is-link" data-action="detail-open-author" data-author-id="${work.authorId}">${escapeHtml(authorName)}</button>` : "未知作者"}${meta.map((item) => `<span class="detail-sep">·</span><span>${escapeHtml(item)}</span>`).join("")}</p>
         <div class="detail-quick">
           <button class="primary-button" data-action="detail-open-work" data-work-id="${work.id}">${icon("arrow", 18)}<span>打开${work.purchasedPath ? "完整版" : "预览版"}</span></button>
+          ${pixivUrl ? `<button class="detail-pixiv-button" data-action="detail-open-pixiv" data-url="${escapeHtml(pixivUrl)}" title="在浏览器里打开 Pixiv 原页" aria-label="在浏览器里打开 Pixiv 原页">${icon("link", 18)}</button>` : ""}
         </div>
       </div>
     </div>
@@ -3091,6 +3205,8 @@ function workDetailBody() {
  */
 async function openDetailPicker(workId) {
   state.pickerWorkId = workId;
+  // 收藏夹列表平时只有进「我的收藏」页才拉；详情面板从任何页面都能开，先补齐免得弹窗里是空的
+  if (!state.collections.length) await refreshCollections();
   state.pickerSelected = await invoke("work_collections", { workId });
   showModal(modal("收藏到…", `<div id="collection-picker-body">${collectionPickerBody()}</div>`, '<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="picker-save">确定</button>'));
 }
@@ -3302,6 +3418,9 @@ function refreshPickerDom() {
 
 async function openCollectionPicker(workId) {
   state.pickerWorkId = workId;
+  // 收藏夹列表平时只有进「我的收藏」页才拉；作品卡的收藏按钮在任何页面都能点，
+  // 先补齐免得弹窗里是空的（批量那条路一直有这行，单篇这条漏了）。
+  if (!state.collections.length) await refreshCollections();
   state.pickerSelected = await invoke("work_collections", { workId });
   showModal(modal("收藏到…", `<div id="collection-picker-body">${collectionPickerBody()}</div>`, `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="picker-save">确定</button>`));
 }
@@ -4542,6 +4661,7 @@ async function bindEvents() {
       if (action === "delete-character") await deleteCharacter(Number(element.dataset.id));
       if (action === "rename-character-game") await renameCharacterGame(element.dataset.game, element);
       if (action === "delete-character-game") deleteCharacterGame(element.dataset.game);
+      if (action === "restore-builtin-characters") restoreBuiltinCharacters();
       if (action === "confirm-auto-group-author") await confirmAutoGroupAuthor();
       if (action === "confirm-pixiv-sync") await syncPixivWorks();
       if (action === "cancel-pixiv-sync") await cancelPixivSync();
@@ -4870,6 +4990,7 @@ async function scanPurchased(mode = "title") {
     toast(`没有角色的名字能对上，换个方式或用「匹配标题」试试${otherNote}`, "info");
   } else toast(`已自动绑定 ${result.boundCount} 个完整版作品${skipNote}${otherNote}`, "success");
   await refreshWorks(); await refreshActiveAuthor(); render();
+  fillWordCountsInBackground(true); // 刚绑上的文件是新的，字数要当场补上
 }
 
 // 自动分组：authorId 为空＝全库匹配；传入作者 id 时只在这位作者的作品里匹配
@@ -4897,6 +5018,7 @@ async function autoGroupPurchasedFiles(authorId = null, authorName = "", mode = 
     }
     await refreshAuthors();
     render();
+    fillWordCountsInBackground(true); // 自动移动/绑定后文件路径变了，字数要当场补上
   } catch (error) {
     toast(`自动分组失败: ${error}`, "error");
   }
@@ -5730,6 +5852,8 @@ async function downloadSelectedReadings(format) {
   state.selectedWorkIds.clear();
   // 批量下完同样要点亮封面上的带图版角标，走统一收尾才能覆盖所有列表页
   await refreshAfterDetailChange();
+  // 这里是「一次换了一批作品的路径」，统一收尾只会补算当前打开的那一篇，再踢一次整批补算
+  fillWordCountsInBackground(true);
   const failed = result.failedCount ? `，${result.failedCount} 篇失败` : "";
   const skipped = result.skippedCount ? `，跳过 ${result.skippedCount} 篇（已绑定）` : "";
   const names = result.failedTitles.length ? `（${result.failedTitles.slice(0, 3).join("、")}${result.failedTitles.length > 3 ? "…" : ""}）` : "";
@@ -5866,6 +5990,7 @@ async function confirmMatches() {
     }
   }
   closeModal(); await refreshWorks(); await refreshActiveAuthor(); render();
+  fillWordCountsInBackground(true); // 绑定完整版会改路径，字数要当场补上
   if (renamedCount > 0) {
     toast(`已确认绑定 ${selections.length} 个完整版作品，其中 ${renamedCount} 个文件已重命名`, "success");
   } else {
@@ -5892,6 +6017,7 @@ async function confirmManualGroup() {
     closeModal();
     await refreshAuthors();
     render();
+    fillWordCountsInBackground(true); // 分组会移动/复制文件并重新绑定，字数要当场补上
     const dupNote = result.duplicatedCount ? `，其中 ${result.duplicatedCount} 个文件复制了多份` : "";
     const skipNote = result.skippedCount ? `，跳过 ${result.skippedCount} 个已存在同名文件的作品` : "";
     const failNote = result.failed?.length ? `，${result.failed.length} 个文件处理失败` : "";
@@ -6107,11 +6233,14 @@ async function syncPixivWorks() {
   const authorName = state.activeAuthor.name;
   // 同步放后台跑：先关掉弹窗，主界面右下角显示进度，用户可以继续浏览其他内容
   closeModal();
-  state.syncTask = { authorId, label: `正在同步 ${authorName}`, title: "", current: 0, total: 0, cancelling: false };
+  // phase 先停在 "checking"：同步的第一跳是拉作者作品列表，这一步同时也是「作者还在不在」
+  // 的检测（404＝销号）。收到第一帧正文进度，才说明过了检测、真的在看作品了。
+  state.syncTask = { authorId, label: `正在同步 ${authorName}`, title: "", phase: "checking", current: 0, total: 0, cancelling: false };
   render();
   const unlisten = await listen("pixiv-sync-progress", (event) => {
     const { total = 0, current = 0, title = "" } = event.payload || {};
     if (!state.syncTask) return;
+    state.syncTask.phase = "downloading";
     state.syncTask.total = total;
     state.syncTask.current = current;
     state.syncTask.title = title;
@@ -6133,6 +6262,14 @@ async function syncPixivWorks() {
   state.activeAuthor = state.authors.find((author) => author.id === authorId) || state.activeAuthor;
   await refreshWorks();
   render();
+  // 主页 404（多半是销号）时后端会带这个标记回来，别再报「已下载 0 篇」那种没意义的收尾
+  if (result.authorMissing) {
+    toast("这个作者的主页在 Pixiv 上打不开（404，多半是销号了），已跳过同步，卡片也标灰了。", "error");
+    return;
+  }
+  // 刚同步进来的作品字数还是 -1（路径一变触发器就标回未算），重新踢一次后台补算，
+  // 否则要等下次开软件卡片上才有字数。算完它会自己刷新列表。
+  fillWordCountsInBackground(true);
   const summaryParts = [
     `已下载 ${result.downloadedCount} 篇`,
     `已关联 ${result.reusedPreviewCount || 0} 篇已有预览版`,
@@ -6176,7 +6313,9 @@ async function syncAllAuthors() {
     if (!authors) return;
     // 按 authorId 精确落到对应作者那一行；万一没带 authorId 就退回当前正在跑的那位
     const row = authors.find((item) => item.authorId === Number(authorId)) || authors.find((item) => item.status === "running");
-    if (!row || row.status !== "running") return;
+    if (!row || !(row.status === "running" || row.status === "checking")) return;
+    // 第一帧正文进度说明作者主页查通了，从「检查作者主页」切到正式同步
+    if (row.status === "checking") { row.status = "running"; row.note = ""; }
     row.total = total;
     row.current = current;
     row.title = title;
@@ -6187,6 +6326,7 @@ async function syncAllAuthors() {
   let downloaded = 0;
   let stopped = false;
   const failures = [];
+  const missingAuthors = [];
 
   for (let index = 0; index < targets.length; index++) {
     const author = targets[index];
@@ -6195,7 +6335,9 @@ async function syncAllAuthors() {
     const row = state.syncTask.authors.find((item) => item.authorId === author.id);
     state.syncTask.authorId = author.id;
     state.syncTask.label = `同步 ${index + 1} / ${targets.length}：${author.name}`;
-    if (row) { row.status = "running"; row.title = ""; row.current = 0; row.total = 0; }
+    // 先标成「检查作者主页」：第一跳就是拉作者作品列表，销号的话这一跳就 404、
+    // 直接落到 missing，不会再有别的进度。真开始看作品了，进度事件再把它切回 running。
+    if (row) { row.status = "checking"; row.note = ""; row.title = ""; row.current = 0; row.total = 0; }
     updateSyncFloater();
     try {
       const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "" });
@@ -6210,6 +6352,10 @@ async function syncAllAuthors() {
           // 后端识别出疑似限流、主动踩了刹车，这一位要单独标出来
           row.status = "throttled";
           row.note = "疑似被限流，已提前停止";
+        } else if (result.authorMissing) {
+          // 主页 404（多半销号）：独立状态，既不是「失败」也不是「完成」，别让它顶着绿的过去
+          row.status = "missing";
+          row.note = "主页 404（已销号），已跳过同步";
         } else if (result.failedCount) {
           row.status = "done";
           const why = failureReasonText(result.failedReasons, result.failedCount);
@@ -6226,8 +6372,15 @@ async function syncAllAuthors() {
         updateSyncFloater();
         break;
       }
-      doneAuthors += 1;
-      if (result.failedCount) failures.push(`${author.name}（${result.failedCount} 篇失败${failureReasonText(result.failedReasons, result.failedCount) ? `：${failureReasonText(result.failedReasons, result.failedCount)}` : ""}）`);
+      if (result.authorMissing) {
+        // 主页 404（多半销号）：既不算「已同步」也不算「失败」，单独报一行。
+        // 本轮到此为止（第一跳就没过去）；**但下一轮不跳过** —— 照样试：真销号了还是会灰，
+        // 暂时性故障（Pixiv 抽风 / 代理）也能自己好。
+        missingAuthors.push(author.name);
+      } else {
+        doneAuthors += 1;
+        if (result.failedCount) failures.push(`${author.name}（${result.failedCount} 篇失败${failureReasonText(result.failedReasons, result.failedCount) ? `：${failureReasonText(result.failedReasons, result.failedCount)}` : ""}）`);
+      }
     } catch (error) {
       doneAuthors += 1;
       if (row) { row.status = "failed"; row.note = String(error); }
@@ -6244,14 +6397,21 @@ async function syncAllAuthors() {
     await refreshWorks();
   }
   render();
+  // 这一轮同步进来的作品字数还是 -1，重新踢一次后台补算（算完它会自己刷新列表）
+  fillWordCountsInBackground(true);
 
   const head = stopped ? `批量同步已终止（完成 ${doneAuthors} / ${targets.length} 位作者）` : `已同步 ${doneAuthors} / ${targets.length} 位作者，共下载 ${downloaded} 篇`;
+  const missingNote = missingAuthors.length
+    ? `${missingAuthors.length} 位作者主页返回 404、多半已销号（已跳过同步，卡片已标灰）：${missingAuthors.slice(0, 3).join("、")}${missingAuthors.length > 3 ? " 等" : ""}`
+    : "";
   if (failures.length) {
     const detail = failures.slice(0, 3).join("；");
     // 限流是「整轮别再点」的信号，单独提一句，跟个别作品的失败区分开
     const limited = stopped && failures.some((text) => text.includes("疑似限流"));
     const tail = limited ? "。疑似被 Pixiv 限流，建议过一会儿再同步，或把设置里的抓取间隔调大。" : "";
-    toast(`${head}；${failures.length} 位有失败：${detail}${failures.length > 3 ? " 等" : ""}${tail}`, limited ? "error" : "info");
+    toast(`${head}；${failures.length} 位有失败：${detail}${failures.length > 3 ? " 等" : ""}${tail}${missingNote ? `；${missingNote}` : ""}`, limited ? "error" : "info");
+  } else if (missingNote) {
+    toast(`${head}；${missingNote}`, "info");
   } else {
     toast(stopped ? `${head}，共下载 ${downloaded} 篇` : head, stopped ? "info" : "success");
   }
@@ -6418,7 +6578,7 @@ async function settingsModal() {
     </div>
     <div class="settings-fields is-single">
       <div class="form-field char-setting">
-        <div class="char-setting-head"><span class="field-title">常见角色名列表</span><span class="settings-group-hint">「匹配角色」的依据</span></div>
+        <div class="char-setting-head"><span class="field-title">常见角色名列表</span><span class="settings-group-hint">「匹配角色」的依据</span><button type="button" class="quiet-button char-restore-button" data-action="restore-builtin-characters" title="把内置表里有、你库里没有的角色补回来；已改过的名字 / 别名、被停用的、自己加的都不动">恢复内置角色</button></div>
         <small>作品标题和文件名里出现这些角色名就算候选。按游戏分组，游戏名只负责归类、不参与匹配。内置 8 款热门游戏的热门角色，可以自己增删；点角色名可以临时停用（划掉的那个不参与匹配），点 × 删除。</small>
         <div id="character-editor" class="char-editor"></div><div class="char-add-row"><input id="character-add-game" list="character-game-list" placeholder="游戏名" autocomplete="off"><datalist id="character-game-list"></datalist><input id="character-add-name" placeholder="角色名" autocomplete="off"><input id="character-add-aliases" placeholder="别名，用 | 分隔（可留空）" autocomplete="off"><button type="button" class="quiet-button" data-action="add-character">添加角色</button></div><div class="char-add-row"><input id="character-add-new-game" placeholder="新建一个空的游戏分组" autocomplete="off"><button type="button" class="quiet-button" data-action="add-character-game">新建分组</button></div>
       </div>
@@ -6809,6 +6969,21 @@ function deleteCharacterGame(game) {
       toast(`已删除分组「${game}」`, "success");
     } catch (error) {
       toast(`删除失败：${error}`, "error");
+    }
+  }, true);
+}
+
+// 「恢复内置角色」：把内置表里有、这个库里没有的角色补回来。
+// 只补缺失的条目 —— 已改过的名字 / 别名、被停用的、自己加的，都不动（后端是只插不改）。
+function restoreBuiltinCharacters() {
+  confirmAction("恢复内置角色", "会把内置表里有、你库里没有的角色补回来。已经改过的名字 / 别名、被停用的，以及你自己加的角色都不会动。", "恢复", async () => {
+    try {
+      const restored = await invoke("restore_builtin_characters");
+      await renderCharacterEditor();
+      if (restored > 0) toast(`已补回 ${restored} 个内置角色`, "success");
+      else toast("没有需要补回的角色：内置里的都已经在库里", "info");
+    } catch (error) {
+      toast(`恢复失败：${error}`, "error");
     }
   }, true);
 }
