@@ -418,9 +418,58 @@ struct PixivSyncResult {
     failed_reasons: Vec<String>,
     /// 疑似被 Pixiv 限流、提前中止
     throttled: bool,
-    /// 作者主页在 Pixiv 上打不开（HTTP 404，多半是作者销号了）。
-    /// 前端据此把作者卡变灰 —— 所以它不是一个「失败」，而是一个独立状态。
-    author_missing: bool,
+}
+
+/// 「同步前作者状态探测」的结果。
+///
+/// **判据来自 2026-10-04 真机实测，别照直觉改**：
+/// - `/ajax/user/{uid}` 对**已退会**作者返回 HTTP 404，正常作者返回 200。
+/// - 这是**唯一**可靠的销号信号。`/ajax/user/{uid}/profile/all`（同步的第一跳）
+///   对退会作者照旧返回 200、还带着一百多个作品 id，拿它当判据永远不会命中 ——
+///   v1.2.22 就是这么错的。
+/// - 该接口**不需要 Cookie**：不带 Cookie / 带失效 Cookie 时，正常作者仍 200、
+///   退会作者仍 404，所以不会因为 Cookie 失效把整库作者误判成「已销号」。
+/// - 退会作者的作品**正文和封面都已经取不到**（`/ajax/novel/{id}` 404、响应里
+///   连 coverUrl 都没有），所以检测到退会就跳过同步既省事、也省下 N 次注定失败的请求。
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PixivAuthorStatus {
+    /// `ok` / `retired` / `unreachable` / `noUid`
+    status: String,
+    /// 给用户看的一句话（retired / unreachable / noUid 时有值）
+    message: String,
+}
+
+/// 状态码 → 状态判定。抽成纯函数是为了能单测：网络请求本身没法在单测里发。
+///
+/// **只有 404 算退会**。其余一律 `unreachable` 且不标灰 —— 401 是 Cookie 失效、
+/// 403/429 是风控、超时是网络问题，把任何一个当成销号都会让作者卡成片变灰。
+fn classify_author_status(code: Option<u16>) -> &'static str {
+    match code {
+        Some(404) => "retired",
+        Some(status) if (200..300).contains(&status) => "ok",
+        _ => "unreachable",
+    }
+}
+
+/// 把探测结果落到 `authors` 表。
+///
+/// - `retired` → 记下时间，作者卡据此变灰；
+/// - `ok` → 之前若被标过「已销号」就摘掉（就是用户要的「下次同步成功自动摘掉」）；
+/// - 其余 → **什么都不做**：连不上只是「不知道」，不该去动已有的标记。
+fn apply_author_status(conn: &Connection, author_id: i64, status: &str) {
+    match status {
+        "retired" => {
+            let _ = conn.execute(
+                "UPDATE authors SET missing_since=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), author_id],
+            );
+        }
+        "ok" => {
+            let _ = conn.execute("UPDATE authors SET missing_since='' WHERE id=?1", [author_id]);
+        }
+        _ => {}
+    }
 }
 
 struct PixivDownloadCandidate {
@@ -5222,19 +5271,10 @@ fn pixiv_sync_impl(
             .get(list_url)
             .send()
             .map_err(|e| format!("无法读取 Pixiv 作者作品列表：{e}"))?;
-        // 作者销号 / 主页被删时 Pixiv 给 404 —— 单独认出来，记一笔好让作者卡变灰。
-        // **只认 404**：Cookie 失效给的是 401，要是也算进来，整库作者都会被打成「销号」。
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            let _ = conn.execute(
-                "UPDATE authors SET missing_since=?1 WHERE id=?2",
-                params![Utc::now().to_rfc3339(), author_id],
-            );
-            return Ok(PixivSyncResult {
-                last_sync_at: last_sync.map(|date| date.to_rfc3339()).unwrap_or_default(),
-                author_missing: true,
-                ..PixivSyncResult::default()
-            });
-        }
+        // 这里**不再**做「作者还在不在」的判断。原来这段是拿本接口的 404 当销号判据，
+        // 但实测（2026-10-04）证明它对退会作者照旧返回 200、还带着作品 id，
+        // 这段永远不会命中 —— 已挪到独立的 `check_pixiv_author` 命令里，
+        // 判据是 `/ajax/user/{uid}` 的 404。此处只管拿列表。
         let listing: Value = response
             .error_for_status()
             .map_err(|e| format!("读取 Pixiv 作者作品列表失败：{e}"))?
@@ -5249,8 +5289,10 @@ fn pixiv_sync_impl(
             .map(|items| items.keys().cloned().collect())
             .unwrap_or_default()
     };
-    // 能正常读到作品列表 ⇒ 之前若被标过「主页打不开」，这一笔要摘掉
-    let _ = conn.execute("UPDATE authors SET missing_since='' WHERE id=?1", [author_id]);
+    // 这里**不能**顺手把「主页打不开」标记摘掉。「能读到作品列表」不等于「作者还在」——
+    // 实测退会作者的 /profile/all 照样返回 200。这段原来会在这里清掉标记，
+    // 于是检测刚标上的灰立刻被同步擦掉，用户看到的就是「同步一切正常」。
+    // 现在缺失标记的唯一管理者是 check_pixiv_author。
     // profile/all intentionally only contains IDs for novels. Process newer IDs
     // first; the submission-time filter is applied after loading each detail.
     novels.sort_by(|left, right| right.cmp(left));
@@ -5272,7 +5314,6 @@ fn pixiv_sync_impl(
         last_sync_at: last_sync.map(|date| date.to_rfc3339()).unwrap_or_default(),
         failed_reasons: Vec::new(),
         throttled: false,
-        author_missing: false,
     };
     let _total = novels.len();
     // ── 前置过滤（v1.2.20）──────────────────────────────────────────────
@@ -5739,6 +5780,73 @@ fn pixiv_sync_impl(
         .map_err(|e| e.to_string())?;
     }
     Ok(result)
+}
+
+/// 同步前的「作者主页体检」：只发一次 `/ajax/user/{uid}`，判作者还在不在。
+///
+/// 前端在**单作者同步**和**批量同步**的每位作者开跑前各调一次；判到 `retired`
+/// 就跳过同步、把作者卡标灰（理由与实测依据见 `PixivAuthorStatus` 的注释）。
+///
+/// **返回状态而不是 Err**：连不上属于「不确定」，前端要照常往下同步 ——
+/// 不能因为一次网络抖动就把整轮同步打断，更不能顺手把作者判成销号。
+#[tauri::command]
+fn check_pixiv_author(author_id: i64) -> Result<PixivAuthorStatus, String> {
+    let conn = db()?;
+    let (homepage, cookie): (String, String) = conn
+        .query_row(
+            "SELECT a.homepage, COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), '') FROM authors a WHERE a.id=?1",
+            [author_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(check_pixiv_author_impl(&conn, author_id, &homepage, &cookie))
+}
+
+/// 探测本体。判据走纯函数 `classify_author_status`，这里只负责发请求和落库。
+fn check_pixiv_author_impl(
+    conn: &Connection,
+    author_id: i64,
+    homepage: &str,
+    cookie: &str,
+) -> PixivAuthorStatus {
+    let Ok(user_id) = pixiv_user_id(homepage) else {
+        return PixivAuthorStatus {
+            status: "noUid".into(),
+            message: "作者主页里解析不出用户 ID，没法检测（同步会照常进行）。".into(),
+        };
+    };
+    let cookie = if cookie.trim().is_empty() {
+        None
+    } else {
+        normalize_pixiv_cookie(cookie).ok()
+    };
+    let Ok(client) = pixiv_client(cookie) else {
+        return PixivAuthorStatus {
+            status: "unreachable".into(),
+            message: "无法建立 Pixiv 连接，已跳过检测。".into(),
+        };
+    };
+    let code = match client
+        .get(format!("https://www.pixiv.net/ajax/user/{user_id}"))
+        .send()
+    {
+        Ok(response) => Some(response.status().as_u16()),
+        Err(_) => None,
+    };
+    let status = classify_author_status(code);
+    apply_author_status(conn, author_id, status);
+    let message = match status {
+        "retired" => "这个作者的主页在 Pixiv 上已经打不开了（该用户已退会）。".to_string(),
+        "ok" => String::new(),
+        _ => match code {
+            Some(code) => format!("这次没连上 Pixiv（HTTP {code}），已跳过检测，同步会照常进行。"),
+            None => "这次没连上 Pixiv，已跳过检测，同步会照常进行。".to_string(),
+        },
+    };
+    PixivAuthorStatus {
+        status: status.to_string(),
+        message,
+    }
 }
 
 #[tauri::command]
@@ -12007,6 +12115,7 @@ pub fn run() {
             read_import_file,
             read_import_folder,
             sync_pixiv_novels,
+            check_pixiv_author,
             cancel_pixiv_sync,
             sync_pixiv_author_profile,
             check_pixiv_cookie,
@@ -12098,6 +12207,7 @@ mod tests {
         EXPORT_COL_READ, EXPORT_COL_NOTE, EXPORT_COL_PIXIV_URL, EXPORT_COL_TEXT_PATH,
         EXPORT_COL_COVER_PATH, EXPORT_COL_NOVEL_ID, EXPORT_COL_IMAGES, EXPORT_COL_SYNOPSIS,
         text_word_count, is_text_body_path, TEXT_BODY_EXTENSIONS,
+        apply_author_status, check_pixiv_author_impl, classify_author_status,
         title_indicates_images, unique_target_path, write_reading_output,
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
@@ -12112,6 +12222,84 @@ mod tests {
         path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// 销号判据**只认 404**。
+    ///
+    /// 这条是这次修 bug 的核心：原判据挂在 `/profile/all` 上，而实测它对退会作者
+    /// 照旧返回 200（还带一百多个作品 id），所以永远判不出销号。反过来说，
+    /// 401（Cookie 失效）、403/429（风控）、超时（None）要是也算销号，
+    /// 用户整库作者会成片变灰 —— 比判不出来更难用。
+    #[test]
+    fn only_404_means_the_author_retired() {
+        assert_eq!(classify_author_status(Some(404)), "retired");
+        assert_eq!(classify_author_status(Some(200)), "ok");
+        for code in [301, 401, 403, 429, 500, 503] {
+            assert_eq!(
+                classify_author_status(Some(code)),
+                "unreachable",
+                "HTTP {code} 不该被判成销号"
+            );
+        }
+        assert_eq!(
+            classify_author_status(None),
+            "unreachable",
+            "超时 / 断网不该被判成销号"
+        );
+    }
+
+    /// 探测结果的落库规则：退会标记、恢复摘掉、连不上**什么都不动**。
+    #[test]
+    fn author_status_is_persisted_but_a_failed_probe_changes_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE authors (
+                 id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL DEFAULT '',
+                 missing_since TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO authors (id, name) VALUES (1, '甲');",
+        )
+        .unwrap();
+        let missing = |conn: &Connection| -> String {
+            conn.query_row("SELECT missing_since FROM authors WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+
+        // 退会 → 记下时间，作者卡据此变灰
+        apply_author_status(&conn, 1, "retired");
+        assert!(!missing(&conn).is_empty(), "判到退会就该留标记");
+
+        // 恢复 → 摘掉（就是「下次同步成功就自动摘掉」）
+        apply_author_status(&conn, 1, "ok");
+        assert_eq!(missing(&conn), "", "探测通过就该摘掉标记");
+
+        // 连不上 → **保持原样**。网络抖一下既不能把好作者标灰，也不能把灰擦掉
+        apply_author_status(&conn, 1, "retired");
+        apply_author_status(&conn, 1, "unreachable");
+        assert!(!missing(&conn).is_empty(), "连不上时已有标记要保持原样");
+    }
+
+    /// 作者主页里解析不出 uid：不发请求、也不动库里的标记。
+    #[test]
+    fn probe_without_a_user_id_leaves_everything_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, missing_since TEXT NOT NULL DEFAULT '');
+             INSERT INTO authors (id) VALUES (1);",
+        )
+        .unwrap();
+
+        let status = check_pixiv_author_impl(&conn, 1, "https://example.com/author", "");
+        assert_eq!(status.status, "noUid");
+        let missing: String = conn
+            .query_row("SELECT missing_since FROM authors WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(missing, "", "解析不出 uid 时不该动车上的标记");
+    }
 
     /// 封面重压：产物必须是更小的 JPEG，且**像素尺寸一点不能动** —— 尺寸变了卡片会变形。
     #[test]

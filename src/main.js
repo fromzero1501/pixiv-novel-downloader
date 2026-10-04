@@ -796,10 +796,17 @@ async function invoke(command, args = {}) {
     // 预览里没有"销号"这个概念；脚本要验灰卡片就预置这个数组
     return Array.isArray(window.__missingAuthorIds) ? window.__missingAuthorIds : [];
   }
+  // 同步前的作者状态探测。脚本用 window.__authorStatusById 预置某位作者的结果
+  // （比如 { "3": { status: "retired", message: "…" } }）；没预置的一律当「正常」，
+  // 否则预览里每次同步都会在第一步被拦下来。
+  if (command === "check_pixiv_author") {
+    const table = window.__authorStatusById || {};
+    return table[args.authorId] || { status: "ok", message: "" };
+  }
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
-    return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, authorMissing: false, lastSyncAt: new Date().toISOString() };
+    return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, lastSyncAt: new Date().toISOString() };
   }
   if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.isNew = false; if (work.readState === 0) work.readState = 1; } return; }
   if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
@@ -1400,7 +1407,7 @@ function floaterFootButton(task) {
 }
 
 // 单作者同步浮层里那行说明：还没进正文抓取时，显示的就是「检查作者主页」这一步 ——
-// 后端的第一跳（拿作者作品列表）同时也是「作者还在不在」的检测，404 就等于销号。
+// 这一步真的会连一次作者主页（`check_pixiv_author`），404 就等于「该用户已退会」。
 function syncTaskTitle(task) {
   return task.title || (task.phase === "checking" ? "检查作者主页…" : "正在读取作品列表...");
 }
@@ -1463,7 +1470,7 @@ function syncRowStatusText(item) {
   if (item.status === "running") return item.title || (item.total ? "正在读取作品列表..." : "正在核对作品列表...");
   if (item.status === "throttled") return item.note || "疑似被限流，已提前停止";
   if (item.status === "cancelled") return item.note || "已终止";
-  if (item.status === "missing") return item.note || "主页 404（已销号），已跳过同步";
+  if (item.status === "missing") return item.note || "主页打不开（该用户已退会），已跳过同步";
   if (item.status === "failed") return item.note || "同步失败";
   if (!item.total) return "已是最新，无新作品";
   return item.note || "已完成";
@@ -6225,18 +6232,51 @@ function pixivSyncModal() {
   });
 }
 
+// 同步前探一次作者主页：后端只发一次 `/ajax/user/{uid}`，404 就是「该用户已退会」。
+//
+// **探测本身失败不算错误** —— 连不上只代表「不知道」，照常往下同步：不能因为一次
+// 网络抖动就把整轮同步打断，更不能顺手把作者判成销号。判据为什么是 404、为什么
+// 不能复用同步的第一跳，见后端 `PixivAuthorStatus` 的注释。
+async function probeAuthorStatus(authorId) {
+  try {
+    const result = await invoke("check_pixiv_author", { authorId });
+    // 只有拿到明确状态才算数：后端没回、或回了空对象，都按「不知道」处理，
+    // 让同步照常往下走 —— 宁可多跑一次同步，也不能凭空把作者判成销号。
+    return result && result.status ? result : { status: "unreachable", message: "" };
+  } catch (error) {
+    return { status: "unreachable", message: String(error) };
+  }
+}
+
 async function syncPixivWorks() {
   const form = document.querySelector("#pixiv-sync-form");
   if (!form) return;
   const { startDate = "", endDate = "", novelUrl = "" } = Object.fromEntries(new FormData(form).entries());
   const authorId = state.activeAuthor.id;
   const authorName = state.activeAuthor.name;
+  // 填了单篇链接时不必（也没法）查作者主页 —— 这一趟同步的就是那一篇
+  const probeAuthor = !isPixivNovelUrl(novelUrl);
   // 同步放后台跑：先关掉弹窗，主界面右下角显示进度，用户可以继续浏览其他内容
   closeModal();
-  // phase 先停在 "checking"：同步的第一跳是拉作者作品列表，这一步同时也是「作者还在不在」
-  // 的检测（404＝销号）。收到第一帧正文进度，才说明过了检测、真的在看作品了。
-  state.syncTask = { authorId, label: `正在同步 ${authorName}`, title: "", phase: "checking", current: 0, total: 0, cancelling: false };
+  // phase 先停在 "checking"：这一步会真的连一次作者主页（`check_pixiv_author`），
+  // 判到退会就直接收尾、连同步都不发起。过了这一步才切到 downloading。
+  state.syncTask = { authorId, label: `正在同步 ${authorName}`, title: "", phase: probeAuthor ? "checking" : "downloading", current: 0, total: 0, cancelling: false };
   render();
+  if (probeAuthor) {
+    const probe = await probeAuthorStatus(authorId);
+    // 探测期间用户点了「终止同步」：任务已被清掉，安静退出
+    if (!state.syncTask) return;
+    if (probe.status === "retired") {
+      state.syncTask = null;
+      await refreshAuthors();
+      state.activeAuthor = state.authors.find((author) => author.id === authorId) || state.activeAuthor;
+      render();
+      toast(`「${authorName}」的主页在 Pixiv 上已经打不开了（该用户已退会），已跳过同步，卡片已标灰。`, "error");
+      return;
+    }
+    state.syncTask.phase = "downloading";
+    updateSyncFloater();
+  }
   const unlisten = await listen("pixiv-sync-progress", (event) => {
     const { total = 0, current = 0, title = "" } = event.payload || {};
     if (!state.syncTask) return;
@@ -6262,11 +6302,7 @@ async function syncPixivWorks() {
   state.activeAuthor = state.authors.find((author) => author.id === authorId) || state.activeAuthor;
   await refreshWorks();
   render();
-  // 主页 404（多半是销号）时后端会带这个标记回来，别再报「已下载 0 篇」那种没意义的收尾
-  if (result.authorMissing) {
-    toast("这个作者的主页在 Pixiv 上打不开（404，多半是销号了），已跳过同步，卡片也标灰了。", "error");
-    return;
-  }
+  // 销号在发起同步之前就判掉了（见上面的 `check_pixiv_author`），这里不必再收尾判断。
   // 刚同步进来的作品字数还是 -1（路径一变触发器就标回未算），重新踢一次后台补算，
   // 否则要等下次开软件卡片上才有字数。算完它会自己刷新列表。
   fillWordCountsInBackground(true);
@@ -6335,10 +6371,18 @@ async function syncAllAuthors() {
     const row = state.syncTask.authors.find((item) => item.authorId === author.id);
     state.syncTask.authorId = author.id;
     state.syncTask.label = `同步 ${index + 1} / ${targets.length}：${author.name}`;
-    // 先标成「检查作者主页」：第一跳就是拉作者作品列表，销号的话这一跳就 404、
-    // 直接落到 missing，不会再有别的进度。真开始看作品了，进度事件再把它切回 running。
+    // 先标成「检查作者主页」：这一步真的会连一次作者主页（`check_pixiv_author`），
+    // 判到退会就直接落到 missing、跳过同步；真开始看作品了，进度事件再把它切回 running。
     if (row) { row.status = "checking"; row.note = ""; row.title = ""; row.current = 0; row.total = 0; }
     updateSyncFloater();
+    const probe = await probeAuthorStatus(author.id);
+    if (!state.syncTask || state.syncTask.cancelling) { stopped = true; break; }
+    if (probe.status === "retired") {
+      if (row) { row.status = "missing"; row.note = "主页打不开（该用户已退会），已跳过同步"; }
+      missingAuthors.push(author.name);
+      updateSyncFloater();
+      continue;
+    }
     try {
       const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "" });
       downloaded += result.downloadedCount || 0;
@@ -6352,10 +6396,6 @@ async function syncAllAuthors() {
           // 后端识别出疑似限流、主动踩了刹车，这一位要单独标出来
           row.status = "throttled";
           row.note = "疑似被限流，已提前停止";
-        } else if (result.authorMissing) {
-          // 主页 404（多半销号）：独立状态，既不是「失败」也不是「完成」，别让它顶着绿的过去
-          row.status = "missing";
-          row.note = "主页 404（已销号），已跳过同步";
         } else if (result.failedCount) {
           row.status = "done";
           const why = failureReasonText(result.failedReasons, result.failedCount);
@@ -6372,15 +6412,8 @@ async function syncAllAuthors() {
         updateSyncFloater();
         break;
       }
-      if (result.authorMissing) {
-        // 主页 404（多半销号）：既不算「已同步」也不算「失败」，单独报一行。
-        // 本轮到此为止（第一跳就没过去）；**但下一轮不跳过** —— 照样试：真销号了还是会灰，
-        // 暂时性故障（Pixiv 抽风 / 代理）也能自己好。
-        missingAuthors.push(author.name);
-      } else {
-        doneAuthors += 1;
-        if (result.failedCount) failures.push(`${author.name}（${result.failedCount} 篇失败${failureReasonText(result.failedReasons, result.failedCount) ? `：${failureReasonText(result.failedReasons, result.failedCount)}` : ""}）`);
-      }
+      doneAuthors += 1;
+      if (result.failedCount) failures.push(`${author.name}（${result.failedCount} 篇失败${failureReasonText(result.failedReasons, result.failedCount) ? `：${failureReasonText(result.failedReasons, result.failedCount)}` : ""}）`);
     } catch (error) {
       doneAuthors += 1;
       if (row) { row.status = "failed"; row.note = String(error); }
@@ -6402,7 +6435,7 @@ async function syncAllAuthors() {
 
   const head = stopped ? `批量同步已终止（完成 ${doneAuthors} / ${targets.length} 位作者）` : `已同步 ${doneAuthors} / ${targets.length} 位作者，共下载 ${downloaded} 篇`;
   const missingNote = missingAuthors.length
-    ? `${missingAuthors.length} 位作者主页返回 404、多半已销号（已跳过同步，卡片已标灰）：${missingAuthors.slice(0, 3).join("、")}${missingAuthors.length > 3 ? " 等" : ""}`
+    ? `${missingAuthors.length} 位作者的主页在 Pixiv 上已经打不开了（已退会，已跳过同步、卡片标灰）：${missingAuthors.slice(0, 3).join("、")}${missingAuthors.length > 3 ? " 等" : ""}`
     : "";
   if (failures.length) {
     const detail = failures.slice(0, 3).join("；");
