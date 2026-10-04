@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header class="page">
-  <span class="eyebrow">v1.2.17 · Windows</span>
+  <span class="eyebrow">v1.2.35 · Windows</span>
   <h1>Pixiv小说下载管理器</h1>
   <p class="lede">Windows 本地作品管理软件：按作者管理 Pixiv 小说的预览版与完整版文件，记录购买状态、封面、标签、系列、收藏与阅读记录。</p>
   <div class="links">
@@ -172,6 +172,7 @@
     <li><a href="#settings">首次设置</a></li>
     <li><a href="#cookie">获取 Pixiv Cookie</a></li>
     <li><a href="#author">作者库</a></li>
+    <li><a href="#bookmarks">Pixiv 收藏与散篇</a></li>
     <li><a href="#sync">同步 Pixiv 小说</a></li>
     <li><a href="#bind">关联本地文件</a></li>
     <li><a href="#card">作品卡与作品详情</a></li>
@@ -223,7 +224,7 @@
   <p>每块里都有什么：</p>
   <ul>
     <li><strong>1 · Pixiv 账号</strong>：Pixiv Cookie、排除标签、<strong>抓取间隔</strong>、<strong>Cookie 体检</strong>。</li>
-    <li><strong>2 · 文件与目录</strong>：最小文件大小、预览版 / 完整版默认目录、完整版自动分组文件夹、自动创建作者目录。</li>
+    <li><strong>2 · 文件与目录</strong>：最小文件大小、预览版 / 完整版默认目录、完整版自动分组文件夹、自动创建作者目录，以及两个自动同步开关 —— <strong>新建作者时同步其所有作品</strong>、<strong>散篇转正时同步其所有作品</strong>。开了之后，新增作者 / 从 Pixiv 收藏新增作者 / 添加散篇 / 散篇转正只要能拿到作者主页，就顺手把他的全部作品同步一遍，右下角有进度条、随时能终止。</li>
     <li><strong>3 · 匹配与关联</strong>：关联相似度阈值、最小相似度阈值、匹配作品名长度、常见角色名列表。</li>
     <li><strong>4 · 下载与图文</strong>：配图画质、同步图文小说时自动保存为 HTML 还是 EPUB。</li>
     <li><strong>5 · 搜索网站</strong>：作品卡右键菜单里的搜索入口。</li>
@@ -295,14 +296,54 @@
   </figure>
   <ul>
     <li><strong>新增作者</strong>：填 Pixiv 作者主页后点「同步作者信息」，会自动读取作者名和头像。配好默认目录并打开「自动创建作者目录」时，保存就会自动建好预览版、完整版两个目录。</li>
+    <li><strong>顶栏那排按钮</strong>：完整版自动分组、指定作者自动分组、同步所有作者、<strong>从pixiv收藏新增作者</strong>、<strong>添加散篇</strong>、新增作者 —— 后两个和「散篇」有关，见 <a class="inline" href="#bookmarks">第 5 节</a>。</li>
     <li><strong>新增角标</strong>：作者头像右上角出现橙色数字，表示上次同步之后新发现的、还没打开过的作品数；超过 99 显示 <code>99+</code>，鼠标停上去能看到完整说明。卡上还会带一句「上次同步 …」。</li>
-    <li><strong>作者收藏</strong>：把常看的作者点星星标上（等于收藏这位作者，会出现在「我的收藏」页的收藏作者里），一键筛出来。</li>
+    <li><strong>作者收藏</strong>：作者卡右上角的星星点开是一份「<strong>收藏到…</strong>」选择器 —— 跟收藏作品一样，把作者收进<strong>作者收藏夹</strong>（可以建多个夹子，一位作者能同时进几个），也可以在选择器里就地新建。作者收藏夹和作品收藏夹<strong>相互独立</strong>，两套都列在「我的收藏」页。工具栏的【作者收藏】按钮一键筛出收藏过的作者。</li>
     <li><strong>拖动排序</strong>：每张卡名字右边有一个六点<strong>拖动按钮</strong>，按住约 0.2 秒卡片会被「拿起来」——一张跟着鼠标走的浮层卡片出现在最上层（微微倾斜、带投影），原位置留下半透明虚位；挪到别处时其余卡片会顺势滑开让位，松手放下就排好了，顺序会存进库里。<br>轻轻点一下（不到 0.2 秒）不会触发拖动，也不会误进作品库。没拖过的作者按名字排，并一律排在拖过的作者后面。</li>
   </ul>
 </section>
 
+<section id="bookmarks">
+  <h2><span class="no">05</span>Pixiv 收藏与散篇</h2>
+  <p class="hint">「Pixiv 收藏」是本地库的对照表；「散篇」是作者还没建档的作品暂存区。</p>
+
+  <h3>Pixiv 收藏：本地库的对照表</h3>
+  <p>左侧栏的心形图标。这一页把你在 <strong>Pixiv 账号里收藏的小说</strong>拉下来，跟本地库逐篇对照，看哪些收过、哪些还没下 ——<strong>它本身只是对照表，不会自动下载</strong>。</p>
+  <ul>
+    <li><strong>更新</strong>：右上角「更新」拉一次收藏列表（需要先在设置里填好 Pixiv Cookie）。本地已经有的作品显示成普通作品卡，点开来和别处一样用；封面旁边不带圆点的就是这类。</li>
+    <li><strong>本地没有的</strong>带一枚小圆点，只显示封面、标题、作者名、标签、投稿日期、系列名和字符数 —— 这些是收藏请求顺手带回来的，<strong>不会为它多发一个请求</strong>。</li>
+    <li>工具栏上可以<strong>搜索标题或作者名</strong>，并三档过滤：<strong>全部 / 本地已有 / 本地没有</strong>。</li>
+    <li>Pixiv 上已经删掉的收藏：只有<strong>本地还留着的那几篇</strong>才列出来。每次进这一页都会重新核对一遍本地库。</li>
+  </ul>
+
+  <h3>从 Pixiv 收藏新增作者</h3>
+  <p>在<strong>作者库</strong>工具栏点【从pixiv收藏新增作者】：把收藏列表里出现过的作者列出来，每位配一句他收藏里的第一篇作品名，方便你认人。</p>
+  <ul>
+    <li><strong>默认全选</strong>，勾掉不想留下的就行；顶上还有【全选】【取消全选】两个按钮一次拉全或清空。</li>
+    <li>列表里只有<strong>库里还没有的作者</strong>，以及现在是散篇、可以借这次转正的作者；已经是正式作者的不再列出。</li>
+    <li>确认后逐位去 Pixiv 取昵称和头像，右下角显示进度，随时可以终止。取完他们就是正式作者，之后同步作品和别处一样。</li>
+  </ul>
+
+  <h3>散篇：作者还没建档的作品</h3>
+  <p>作者库里最后那张<strong>「散篇」卡</strong>（写着「N 篇 · M 位作者」，有散篇时才出现）点进去，就是散篇页。贴链接下作品时，如果那位作者还没在库里正式建档，软件会先给他一个「散篇」身份，作品集中放在这里 —— 等他转正，作品一起回作者库。</p>
+  <ul>
+    <li><strong>添加散篇</strong>：右上角【添加散篇】，贴一个 Pixiv 作品链接，软件会先给这位作者建一个「散篇」身份，再把这一篇<strong>完整下下来</strong> —— 正文、封面、配图和阅读版，跟普通同步是同一套。</li>
+    <li>散篇页和作品库<strong>共用同一套浏览方式</strong>：搜索、排序、高级筛选、连载折叠、批量操作全都能用；卡片上点标题开文件、加收藏夹、开详情也都在。</li>
+    <li><strong>散篇不参与「同步所有作者」</strong>：没转正的作者不进整库同步、也不出现在作者库里。只有你明确把他转正，他才算正式作者。</li>
+  </ul>
+
+  <h3>散篇转正</h3>
+  <p><strong>转正＝把这位作者正式建进作者库</strong>（<strong>不是下载</strong>，正文早就在本地了）。转正是<strong>按作者算</strong>的：他名下的散篇作品会一起回到作者库。</p>
+  <ul>
+    <li><strong>单篇转正</strong>：散篇页每张作品卡封面上有个【散篇转正】按钮，点一下就把这篇的作者转正（有二次确认）。</li>
+    <li><strong>批量转正</strong>：右上角【批量转正】进入批量操作模式，用同一套<strong>点勾选 / 按住鼠标拖框选 / 全选本页</strong>挑作品，再点批量条上新出现的【转正 N 位作者】（紫色，只在散篇页有），确认后一次转正。勾中的多篇若同属一位作者，只算 1 位。</li>
+    <li>批量模式下左上角的箭头是<strong>退出批量操作</strong>（不离开这一页）；非批量时它才是返回作者库。</li>
+    <li>开了设置里的「散篇转正时同步其所有作品」，转正后会顺手把他的全部作品同步一遍，右下角有进度条。</li>
+  </ul>
+</section>
+
 <section id="sync">
-  <h2><span class="no">05</span>同步 Pixiv 小说</h2>
+  <h2><span class="no">06</span>同步 Pixiv 小说</h2>
   <p class="hint">正文、封面、投稿日期、标签、系列一次拿下来。</p>
   <figure>
     <img src="images/05-sync.png" alt="作品同步窗口：单篇小说地址、开始日期、结束日期、开始同步按钮">
@@ -335,7 +376,7 @@
 </section>
 
 <section id="bind">
-  <h2><span class="no">06</span>关联本地文件</h2>
+  <h2><span class="no">07</span>关联本地文件</h2>
   <p class="hint">把磁盘上已有的文件跟作品对上号。</p>
   <figure>
     <img src="images/06-match.png" alt="关联完整版文件的弹窗：候选作品下拉框、作者不在库里的分组">
@@ -378,7 +419,7 @@
 </section>
 
 <section id="card">
-  <h2><span class="no">07</span>作品卡与作品详情</h2>
+  <h2><span class="no">08</span>作品卡与作品详情</h2>
   <p class="hint">日常操作基本都在这张卡和它背后的详情页上。</p>
   <figure>
     <img src="images/02-works.png" alt="作者作品库：作品卡片网格，封面上有状态、收藏、带图版徽标">
@@ -391,6 +432,7 @@
     <li>封面<strong>左下角</strong>那个圆钮是「<strong>标为已读</strong>」—— 未读和已读之间一步切换（鼠标停上去或已读时才显示）。和状态徽标的区别是：状态徽标从「已读」再点会掉回「未读」，想连着标一批时不好用；这个只往前不往回。</li>
     <li>作品卡右上角的<strong>带图角标</strong>显示这个作品有几张配图。下载过配图就是实际张数；作品绑定的是 EPUB / HTML 时软件会直接数文件里的插图（封面不算），所以外面带进来的电子书也有角标。老作品可以到「设置 → 维护与数据 → 阅读版图片数」点「立即重算」补一遍。</li>
     <li><strong>链接徽标</strong>（第二排）只在作品有 Pixiv 作品 ID 时出现，点它用默认浏览器打开这篇作品的 Pixiv 页面，回去看原帖、看评论都方便。</li>
+    <li><strong>稍后再看</strong>：封面左下角那个小书签按钮把作品放进左侧栏的「稍后再看」队列（再点一下移出）。它跟收藏夹不是一回事 —— 稍后再看是一份临时的待读清单，不分夹子。</li>
     <li>标题下面那行小字是<strong>日期 · 字数或格式 · 带图张数 · 已读状态 · 评分</strong>；再下面是系列名（如果有）和标签。</li>
   </ul>
 
@@ -402,7 +444,7 @@
   </figure>
   <p>详情页从上到下是一块一块的：</p>
   <ul>
-    <li><strong>头部</strong>：封面、标题、作者（可以点，直接跳到那位作者的作品库）、日期 / 完整版还是预览版 / 格式 / 配图张数，以及唯一那个<strong>「打开完整版」/「打开预览版」</strong>按钮。</li>
+    <li><strong>头部</strong>：封面、标题、作者（可以点，直接跳到那位作者的作品库）、日期 / 完整版还是预览版 / 格式 / 配图张数，以及一排按钮 —— 主按钮<strong>「打开完整版」/「打开预览版」</strong>，右边跟着两个小链接按钮：<strong>Pixiv 原页</strong>（作品有 Pixiv ID 时才出现）、<strong>作者主页</strong>（带一枚「作者」药丸，作者填了主页时才出现），两个都走系统浏览器打开。</li>
     <li><strong>简介</strong>：超过三行会折叠，点「展开全文」看全。简介里 Pixiv 那边带的链接会还原成可点的链接，点了走系统浏览器。<br>空简介有两种情况分开说：<strong>「作者没写简介」</strong>＝已经问过 Pixiv，那边本来就没有；<strong>「这篇还没有简介」</strong>＝还没问过，去「补抓作品简介」能拉一次。</li>
     <li><strong>标签</strong>：就地编辑 —— 每个标签右边有个 × 直接删，下方输入框敲回车就加。改一下存一下，没有「保存」按钮。</li>
     <li><strong>系列</strong>：显示「系列名 · 第 N 篇」，点「调整系列」加入系列、改序号，或者<strong>退出这个系列</strong>（红色按钮，只在作品本来就在系列里时出现）。</li>
@@ -445,7 +487,7 @@
 </section>
 
 <section id="browse">
-  <h2><span class="no">08</span>浏览、搜索与排序</h2>
+  <h2><span class="no">09</span>浏览、搜索与排序</h2>
   <p class="hint">「所有作品」汇总全部作者，作者作品库只管一位作者。</p>
   <figure>
     <img src="images/08-all-works.png" alt="所有作品页面：汇总全部作者的作品卡片，卡片上带作者名">
@@ -455,7 +497,7 @@
     <li><strong>点作者名</strong>直接跳到那位作者的作品库（会清掉当前的搜索词和筛选，落到干净的列表）；跳进去以后左上角返回箭头会回到「所有作品」，并把离开前的搜索词原样还原。</li>
     <li>封面上的徽标在这里也能点，和作者作品库共用同一份数据 —— 在这里收藏完，用作者作品库的「仅看收藏」就能筛出来。</li>
     <li><strong>「仅看收藏」</strong>在作者作品库和「所有作品」里分别保存，互不影响。</li>
-    <li><strong>搜索范围</strong>可以选五档：<strong>标题</strong>（默认）、<strong>标题 + 简介</strong>、<strong>标题 + 简介 + 标签</strong>、<strong>标签</strong>、<strong>正文内容</strong>。库里存的是 Pixiv 上的整篇简介，想按设定、情节找作品时，后两档比只搜标题有用得多。选「正文内容」时要按回车（扫描本地文件，见 <a class="inline" href="#textsearch">第 12 节</a>）。</li>
+    <li><strong>搜索范围</strong>可以选五档：<strong>标题</strong>（默认）、<strong>标题 + 简介</strong>、<strong>标题 + 简介 + 标签</strong>、<strong>标签</strong>、<strong>正文内容</strong>。库里存的是 Pixiv 上的整篇简介，想按设定、情节找作品时，后两档比只搜标题有用得多。选「正文内容」时要按回车（扫描本地文件，见 <a class="inline" href="#textsearch">第 13 节</a>）。</li>
     <li><strong>排序</strong>可选：日期从新到旧 / 从旧到新、名称 A-Z、<strong>字数从多到少</strong>、<strong>评分从高到低</strong>。字数这条把 <strong>EPUB、HTML 这类阅读版按配图张数</strong>排，并且<strong>整体排在 TXT 前面</strong>（图文作品通常就是最想先看的），TXT 之间再按字数排。</li>
     <li><strong>连载只看最新</strong>：同一前缀的连载作品只保留章节号最大的那一篇。按钮上会写清折叠掉了几篇。</li>
     <li><strong>列表分页加载</strong>：「所有作品」库里上千篇时不会一次全铺出来，先显示一批，滚到底自动接着加载（页脚也有「再加载」按钮兜底）。页脚会写「已显示 N / 共 M」。改筛选条件后会退回第一批。</li>
@@ -482,7 +524,7 @@
 </section>
 
 <section id="filter">
-  <h2><span class="no">09</span>高级筛选与筛选模板</h2>
+  <h2><span class="no">10</span>高级筛选与筛选模板</h2>
   <p class="hint">筛选面板在每个列表页的工具栏右侧，就地展开，不是弹窗。</p>
   <figure>
     <img src="images/10-filter-panel.png" alt="高级筛选面板：阅读状态、版本、配图、评分、字数、收藏夹六行档位">
@@ -502,7 +544,7 @@
   <h3>筛选模板：把一套条件存下来</h3>
   <p>条件调好之后，点面板底部的「<strong>存为筛选模板</strong>」给它起个名字。之后再点一下就能整套套回去。</p>
   <div class="note">
-    <p><strong>模板存的是「条件」，不是「作品」。</strong>点开是按当初那套条件现算一遍，所以「未读」这类数字会随着阅读自然变少。想把作品真正攒起来，用「我的收藏」里的收藏夹（见 <a class="inline" href="#collections">第 10 节</a>）。</p>
+    <p><strong>模板存的是「条件」，不是「作品」。</strong>点开是按当初那套条件现算一遍，所以「未读」这类数字会随着阅读自然变少。想把作品真正攒起来，用「我的收藏」里的收藏夹（见 <a class="inline" href="#collections">第 11 节</a>）。</p>
   </div>
   <ul>
     <li><strong>在哪个页面存、在哪个页面套</strong>：在作者作品库的筛选面板里点模板 chip，条件就落在<strong>这个作者的列表</strong>上，人不会被甩到「所有作品」。同理，存模板时存的也是当前这一页的搜索词。</li>
@@ -512,13 +554,15 @@
 </section>
 
 <section id="collections">
-  <h2><span class="no">10</span>我的收藏</h2>
-  <p class="hint">左侧栏的心形图标。收藏夹可以建多个，一篇作品能同时放进几个。</p>
+  <h2><span class="no">11</span>我的收藏</h2>
+  <p class="hint">左侧栏的心形图标。这一页上下分两块：上面是<strong>作者收藏夹</strong>，下面是<strong>作品收藏夹</strong> —— 两套夹子相互独立。</p>
   <figure>
     <img src="images/12-collections.png" alt="我的收藏页：收藏夹卡片墙，每张卡显示名字和作品数">
     <figcaption>收藏夹墙：每张卡显示名字和篇数，卡片右下角「⋯」能重命名或删除。</figcaption>
   </figure>
   <ul>
+    <li><strong>作者收藏夹（上半）</strong>：收藏的<strong>作者</strong>。右上角【新建作者收藏夹】建夹子；到作者库点作者卡上的星标「收藏到…」把作者放进来。点开一张夹子看里面的作者卡（点卡进他的作品库，右边的 × 从本夹移出），夹子里右上角能重命名或删夹子。</li>
+    <li><strong>作品收藏夹（下半）</strong>：收藏的<strong>作品</strong>，下面这些条说的都是它。</li>
     <li><strong>新建收藏夹</strong>：这一页右上角，或者在作品卡点小心形时用选择器底部那一行「新建」就地建，建完自动勾上。</li>
     <li><strong>怎么往里放作品</strong>：作品卡封面的<strong>心形徽标</strong>打开收藏夹选择器，勾选即生效；详情页「收藏夹」块的「调整」也是同一个选择器；批量操作里还能一次把一批作品并进指定夹子。</li>
     <li><strong>同一篇可以进多个夹子</strong>，夹子之间互不影响，删夹子也不会删作品。</li>
@@ -529,11 +573,12 @@
   </ul>
   <div class="note">
     <p>老的「收藏」开关升级成收藏夹时，程序会自动建一个叫<strong>「我的收藏」</strong>的夹子，把当时收藏过的作品全放进去。作者卡上的收藏数仍然是「在任意收藏夹里」的意思。</p>
+    <p><strong>作者收藏夹是另一套、跟作品收藏夹互不影响</strong>：夹子各自独立，收藏一位作者不会动到任何作品收藏夹，反过来也一样。作者卡右上角的星标亮着，就表示这位作者在至少一个作者收藏夹里。</p>
   </div>
 </section>
 
 <section id="history">
-  <h2><span class="no">11</span>浏览历史</h2>
+  <h2><span class="no">12</span>浏览历史</h2>
   <p class="hint">左侧栏的时钟图标。</p>
   <ul>
     <li>打开作品正文<strong>或阅读版</strong>时自动记一笔，按时间倒序排。同一篇重复看只叠次数，不会堆成好几条。</li>
@@ -544,7 +589,7 @@
 </section>
 
 <section id="textsearch">
-  <h2><span class="no">12</span>正文搜索</h2>
+  <h2><span class="no">13</span>正文搜索</h2>
   <p class="hint">左侧栏的书本图标。想找「那句台词在哪篇里」，用这一页。</p>
   <figure>
     <img src="images/11-text-search.png" alt="正文搜索页：搜索框下面先列标题/简介/标签的命中，再列正文命中并带上下文片段">
@@ -567,7 +612,7 @@
 </section>
 
 <section id="series">
-  <h2><span class="no">13</span>系列作品</h2>
+  <h2><span class="no">14</span>系列作品</h2>
   <p>在作者作品库的顶栏点「<strong>系列作品</strong>」进入这位作者的系列总览。每张系列卡显示作品数、完整版 / 预览版数量，以及：</p>
   <ul>
     <li><strong>读过 N / M</strong>：这个系列里打开过（已读或在读都算）的篇数。因为软件打开一篇只会标成「在读」，等你在详情页手动标已读当然更准。</li>
@@ -576,11 +621,11 @@
   <p>进入某个系列后按序号显示作品，序号不可重复。系列详情顶部有「<strong>继续读</strong>」按钮 —— 它接着打开这个系列里第一篇完全没碰过的作品；打开后进度会自动往前挪一格。一篇都没读过时按钮写的是「从头读」。</p>
   <p><strong>怎么把作品放进系列</strong>：打开作品详情，「系列」块点「调整系列」——可以加入已有系列、修改系列序号，或者退出当前系列。</p>
   <h3>合成一本 EPUB</h3>
-  <p>系列详情右上角有「合成一本 EPUB」，把这个系列的作品按序号打成一整本，步骤和选项跟收藏夹那本一样（见 <a class="inline" href="#collections">第 10 节</a>）。合集里的<strong>作品顺序由列表本身决定</strong>（系列按序号、收藏夹按收藏时间）。</p>
+  <p>系列详情右上角有「合成一本 EPUB」，把这个系列的作品按序号打成一整本，步骤和选项跟收藏夹那本一样（见 <a class="inline" href="#collections">第 11 节</a>）。合集里的<strong>作品顺序由列表本身决定</strong>（系列按序号、收藏夹按收藏时间）。</p>
 </section>
 
 <section id="missingfull">
-  <h2><span class="no">14</span>待补完整版</h2>
+  <h2><span class="no">15</span>待补完整版</h2>
   <p class="hint">左侧栏的归档图标。专门盯「只有预览版、还没有完整版」的作品。</p>
   <p>分两层看：</p>
   <ol>
@@ -602,7 +647,7 @@
 </section>
 
 <section id="cleanup">
-  <h2><span class="no">15</span>清理多余预览版</h2>
+  <h2><span class="no">16</span>清理多余预览版</h2>
   <p class="hint">「设置 → 维护与数据 → 清理多余预览版」</p>
   <p>同一篇作品一旦拿到完整版，预览版就没必要留着了（一个作品只占一边）。这个功能<strong>先给你看数量再动手</strong>：先只扫不删，报出「有几篇同时挂着预览版和完整版」「其中几篇的完整版文件确认在磁盘上、可以安全清」，你确认后才真清。完整版文件找不到的作品一律跳过，绝不冒险。</p>
   <p>清理时不会暴力删文件：</p>
@@ -615,7 +660,7 @@
 </section>
 
 <section id="backup">
-  <h2><span class="no">16</span>备份与迁移</h2>
+  <h2><span class="no">17</span>备份与迁移</h2>
   <h3>自动备份</h3>
   <ul>
     <li>每天第一次打开软件时，自动把数据库备份一份到 <code>data/backup/auto</code> 下。</li>
@@ -636,7 +681,7 @@
 </section>
 
 <section id="update">
-  <h2><span class="no">17</span>软件自动更新</h2>
+  <h2><span class="no">18</span>软件自动更新</h2>
   <p class="hint">查版本、下新版、换掉旧的 —— 都在程序里做完。</p>
   <p>程序每次启动都会去发布页问一句「现在最新是哪个版本」。有新的会在左下角把版本号变成一个<strong>带 ↑ 箭头的按钮</strong>并弹一条提示，<strong>不会自己偷偷下载或替换</strong>。点那个按钮，或者「设置 → 6 维护与数据 → 软件更新 → 检查更新」，就能打开更新弹窗。</p>
 
@@ -646,7 +691,7 @@
 
   <h3>点「立即更新」之后发生什么</h3>
   <ol>
-    <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.2.17.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
+    <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.2.35.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
     <li>下载完自动启动新版，程序重启。</li>
     <li>新版启动时发现上一个版本的 exe 还躺在旁边，把它<strong>移进 Windows 回收站</strong>（可以还原），并提示一句「已把旧版本文件移入回收站」。</li>
   </ol>
@@ -671,7 +716,7 @@
 </section>
 
 <section id="keys">
-  <h2><span class="no">18</span>键盘与快捷键</h2>
+  <h2><span class="no">19</span>键盘与快捷键</h2>
   <p class="hint">在软件里按 <kbd>?</kbd> 随时能调出这份说明。</p>
   <ul>
     <li><kbd>Ctrl</kbd> + <kbd>1</kbd> ~ <kbd>7</kbd>：切到第 1~7 个导航页（作者库 / 所有作品 / 收藏 / 历史 / 待补 / 筛选模板 / 正文搜索）。</li>
@@ -690,7 +735,7 @@
 </section>
 
 <section id="faq">
-  <h2><span class="no">19</span>常见问题</h2>
+  <h2><span class="no">20</span>常见问题</h2>
   <details class="faq" open>
     <summary>同步失败 / 提示未登录</summary>
     <p>先看有没有 Cookie —— <strong>没有 Cookie 是同步不了任何东西的</strong>，第一次用必须先去 <a class="inline" href="#cookie">第 3 节</a> 导一份填上。已经填过还失败，基本是过期了：Pixiv 的 Cookie 通常 1–2 周失效，按同一套步骤重新导一份覆盖掉即可。下载 R-18 内容必须用已登录账号的 Cookie。</p>
@@ -710,7 +755,7 @@
   </details>
   <details class="faq">
     <summary>怎么找「那句话在哪篇作品里」？</summary>
-    <p>用左侧栏的「正文搜索」（见 <a class="inline" href="#textsearch">第 12 节</a>）—— 它扫的是本地正文文件，命中的前后文直接列出来。如果只是想按设定、情节找，用列表页搜索范围里的「标题 + 简介」通常更快。</p>
+    <p>用左侧栏的「正文搜索」（见 <a class="inline" href="#textsearch">第 13 节</a>）—— 它扫的是本地正文文件，命中的前后文直接列出来。如果只是想按设定、情节找，用列表页搜索范围里的「标题 + 简介」通常更快。</p>
   </details>
   <details class="faq">
     <summary>「关联完整版文件」扫不到我那些文件</summary>
@@ -738,7 +783,7 @@
   </details>
   <details class="faq">
     <summary>换电脑 / 重装系统后数据还在吗？</summary>
-    <p>把 exe 所在的<strong>整个文件夹</strong>复制过去就在。数据在 exe 同级的 <code>data</code> 文件夹里，不写注册表、不写系统目录，卸载就是删文件夹。程序每天第一次启动还会自动备份一份数据库（见 <a class="inline" href="#backup">第 16 节</a>）。</p>
+    <p>把 exe 所在的<strong>整个文件夹</strong>复制过去就在。数据在 exe 同级的 <code>data</code> 文件夹里，不写注册表、不写系统目录，卸载就是删文件夹。程序每天第一次启动还会自动备份一份数据库（见 <a class="inline" href="#backup">第 17 节</a>）。</p>
   </details>
   <details class="faq">
     <summary>软件会自动删我的文件吗？</summary>
@@ -746,16 +791,16 @@
   </details>
   <details class="faq">
     <summary>更新失败怎么办？</summary>
-    <p>看它提示哪一句：<strong>「程序所在文件夹不能写入」</strong>就把程序挪到桌面或文档这类位置再更新（便携版放哪儿都能跑）；<strong>「所有下载源都失败了」</strong>说明内置镜像这会儿都不通，去「设置 → 6 维护与数据 → 更新加速镜像」换几条，或者点弹窗里的「打开发布页」手动下载替换。详见 <a class="inline" href="#update">第 17 节</a>。</p>
+    <p>看它提示哪一句：<strong>「程序所在文件夹不能写入」</strong>就把程序挪到桌面或文档这类位置再更新（便携版放哪儿都能跑）；<strong>「所有下载源都失败了」</strong>说明内置镜像这会儿都不通，去「设置 → 6 维护与数据 → 更新加速镜像」换几条，或者点弹窗里的「打开发布页」手动下载替换。详见 <a class="inline" href="#update">第 18 节</a>。</p>
   </details>
   <details class="faq">
     <summary>更新弹窗里没显示更新说明？</summary>
-    <p>两种可能：那一版发布时确实没写更新说明，或者说明这会儿取不回来（网络 / 镜像的问题）。都不影响更新本身，点弹窗里的「打开发布页」在浏览器里就能看到这一版改了什么。详见 <a class="inline" href="#update">第 17 节</a>。</p>
+    <p>两种可能：那一版发布时确实没写更新说明，或者说明这会儿取不回来（网络 / 镜像的问题）。都不影响更新本身，点弹窗里的「打开发布页」在浏览器里就能看到这一版改了什么。详见 <a class="inline" href="#update">第 18 节</a>。</p>
   </details>
 </section>
 
 <footer class="page">
-  <span>Pixiv小说下载管理器 v1.2.17 · 本文档随版本更新</span>
+  <span>Pixiv小说下载管理器 v1.2.35 · 本文档随版本更新</span>
   <span><a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader">GitHub</a> · <a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader/issues">反馈</a></span>
 </footer>
 
