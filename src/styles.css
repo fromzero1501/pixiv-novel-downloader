@@ -847,6 +847,13 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
  * ------------------------------------------------------------------------- */
 /* 页头那句「上次更新 … · N 篇，本地已有 M 篇」 */
 .bookmark-status { color: #5e84ac; font-size: 12px; font-weight: 650; white-space: nowrap; }
+/* Pixiv 收藏页的更新进度条（v1.2.28）：首次更新要下一百多张封面，得让用户看见在动。 */
+.bookmark-progress { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+.bookmark-progress-track { flex: 1 1 auto; height: 6px; overflow: hidden; background: #e7eef6; border-radius: 999px; }
+.bookmark-progress-fill { height: 100%; width: 0; background: #4b8bd6; border-radius: 999px; transition: width .25s ease; }
+.bookmark-progress-text { flex: 0 0 auto; color: #5e84ac; font-size: 12px; font-weight: 650; white-space: nowrap; }
+.bookmark-progress.is-indeterminate .bookmark-progress-fill { width: 40%; animation: bookmark-progress-scan 1.1s ease-in-out infinite; }
+@keyframes bookmark-progress-scan { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
 /* 本地库里没有的那张卡：只展示封面、标题和作者名，不给任何入口。
    连悬停的抬升也去掉，免得看上去像能点开。 */
 .work-card.is-bookmark-ghost { cursor: default; }

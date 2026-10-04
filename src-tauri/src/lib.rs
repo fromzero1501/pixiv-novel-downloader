@@ -6553,6 +6553,33 @@ struct PixivBookmarksRefresh {
     fetched_at: String,
 }
 
+/// 收藏刷新过程中的进度（前端页头那条进度条用）。
+///
+/// 耗时的**大头全在给「本地没有」的作品下封面**：一张张抓、每张之间还留间隔，
+/// 一百多张就是一分钟。翻列表本身只有几次请求，几乎是一瞬间。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PixivBookmarkProgress {
+    /// 当前阶段要处理的总数。0 = 还没数出来（前端显示成不确定进度条）
+    total: usize,
+    current: usize,
+    /// 当前在做什么，例如「正在下载封面」
+    title: String,
+}
+
+const PIXIV_BOOKMARK_PROGRESS_EVENT: &str = "pixiv-bookmark-progress";
+
+fn emit_pixiv_bookmark_progress(app: &AppHandle, total: usize, current: usize, title: String) {
+    let _ = app.emit(
+        PIXIV_BOOKMARK_PROGRESS_EVENT,
+        PixivBookmarkProgress {
+            total,
+            current,
+            title,
+        },
+    );
+}
+
 /// 收藏页要用的「本地库里有哪些 Pixiv 作品」集合。
 ///
 /// 判据**只有** `works.pixiv_novel_id` 精确相等（2026-10-04 用户拍板）：
@@ -6576,7 +6603,14 @@ fn local_novel_ids(conn: &Connection) -> Result<HashSet<String>, String> {
 ///
 /// 封面是**增量**缓存的：已经落到 `data/bookmark_covers/` 的那份会复用，文件被删了才重抓，
 /// 否则每开一次软件都要把一百多张图重下一遍（首次刷新就是这个量级，所以放在后台跑）。
-fn refresh_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarksRefresh, String> {
+///
+/// `progress(current, total, title)` 会在两个阶段被回调：翻列表时按「已读到的条数 / 总数」报，
+/// 下封面时按「已处理张数 / 待处理张数」报。`total == 0` 表示总数还没数出来。
+/// 抽成回调而不是直接读 `AppHandle`，是为了让这个函数保持可单测（不需要起 Tauri runtime）。
+fn refresh_pixiv_bookmarks_impl(
+    conn: &Connection,
+    progress: &mut dyn FnMut(usize, usize, String),
+) -> Result<PixivBookmarksRefresh, String> {
     let cookie = setting(conn, "pixiv_cookie")?;
     if cookie.trim().is_empty() {
         return Err("还没填 Pixiv Cookie —— 读取 Pixiv 收藏需要它。".into());
@@ -6614,6 +6648,7 @@ fn refresh_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarksRefre
     let mut total = 0usize;
     let mut offset = 0usize;
     let mut masked_dropped = 0usize;
+    progress(0, 0, "正在读取收藏列表".into());
     loop {
         let url = format!(
             "https://www.pixiv.net/ajax/user/{uid}/novels/bookmarks?tag=&offset={offset}&limit={PIXIV_BOOKMARK_PAGE}&rest=show&lang=zh"
@@ -6666,6 +6701,7 @@ fn refresh_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarksRefre
             });
         }
         offset += works.len();
+        progress(offset, total, "正在读取收藏列表".into());
         if (total > 0 && offset >= total) || works.len() < PIXIV_BOOKMARK_PAGE {
             break;
         }
@@ -6673,6 +6709,19 @@ fn refresh_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarksRefre
 
     // ---- 2. 封面：只给「本地库没有、又还没缓存过」的有效作品抓 ----
     let cover_dir = app_data_dir()?.join("bookmark_covers");
+    // 先把「这一轮要下多少张」数出来，进度条才有分母。
+    // 判据和下面循环里那份是同一个口径，改一处要记得改另一处。
+    let need_cover_total = fetched
+        .iter()
+        .filter(|item| {
+            !item.is_masked
+                && !local_ids.contains(&item.novel_id)
+                && !cached_covers.contains_key(&item.novel_id)
+                && !item.cover_url.is_empty()
+        })
+        .count();
+    let mut cover_done = 0usize;
+    progress(0, need_cover_total, "正在下载封面".into());
     let mut covers_cached = 0usize;
     let fetched_at = Utc::now().to_rfc3339();
     let mut rows: Vec<(String, String, String, String, String, String, i64, i64, String)> =
@@ -6704,6 +6753,9 @@ fn refresh_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarksRefre
             }
             // 一次刷几十上百张，别把 Pixiv 惹毛
             std::thread::sleep(Duration::from_millis(150));
+            // 成功失败都算「处理过一张」—— 否则有一张抓不到进度条就永远差一格
+            cover_done += 1;
+            progress(cover_done, need_cover_total, "正在下载封面".into());
         }
         rows.push((
             item.novel_id.clone(),
@@ -6823,11 +6875,17 @@ fn list_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarkList, Str
 }
 
 /// 刷新收藏列表（联网）。封面是一张张抓的，放在后台线程里跑。
+///
+/// 中间通过 `pixiv-bookmark-progress` 往前端推进度 —— 首次刷新要下一百多张封面，
+/// 没有进度条的话页面看着就像卡死了。
 #[tauri::command]
-async fn refresh_pixiv_bookmarks() -> Result<PixivBookmarksRefresh, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn refresh_pixiv_bookmarks(app: AppHandle) -> Result<PixivBookmarksRefresh, String> {
+    tauri::async_runtime::spawn_blocking(move || {
         let conn = db()?;
-        refresh_pixiv_bookmarks_impl(&conn)
+        let mut on_progress = |current: usize, total: usize, title: String| {
+            emit_pixiv_bookmark_progress(&app, total, current, title);
+        };
+        refresh_pixiv_bookmarks_impl(&conn, &mut on_progress)
     })
     .await
     .map_err(|e| e.to_string())?

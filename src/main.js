@@ -221,6 +221,11 @@ const state = {
   pixivBookmarksFetchedAt: "",
   /** 正在刷新收藏列表（防重复点击，页面上也要显示「更新中…」） */
   pixivBookmarksUpdating: false,
+  /**
+   * 更新的实时进度（来自后端的 `pixiv-bookmark-progress` 事件）。
+   * `null` = 没在更新。形状 `{ total, current, title }`，`total` 为 0 表示还没数出总数。
+   */
+  pixivBookmarksProgress: null,
 };
 
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "D:\\头像\\雾海.png", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
@@ -867,7 +872,11 @@ async function invoke(command, args = {}) {
   }
   if (command === "refresh_pixiv_bookmarks") {
     window.__previewBookmarksFetchedAt = new Date().toISOString();
-    return { total: 5, kept: 5, maskedKept: 1, maskedDropped: 0, coversCached: 0, fetchedAt: window.__previewBookmarksFetchedAt };
+    const result = { total: 5, kept: 5, maskedKept: 1, maskedDropped: 0, coversCached: 0, fetchedAt: window.__previewBookmarksFetchedAt };
+    // 预览里可以让这次刷新「挂着不返回」，好观察更新进度条（无头校验用）。
+    const hold = Number(window.__previewBookmarkRefreshHold) || 0;
+    if (hold > 0) return new Promise((resolve) => window.setTimeout(() => resolve(result), hold));
+    return result;
   }
   if (command === "bookmark_author_status") return window.__previewBookmarkAuthorStatus || { total: 4, pending: 2, existing: 2, empty: false };
   if (command === "import_authors_from_bookmarks") return { total: 4, created: 2, skipped: 2, failed: 0, failedNames: [], cancelled: false };
@@ -3510,6 +3519,9 @@ async function refreshPixivBookmarks() {
 async function updatePixivBookmarks({ silent = false } = {}) {
   if (state.pixivBookmarksUpdating) return;
   state.pixivBookmarksUpdating = true;
+  // 先摆上「正在读取收藏列表」这一格 —— 后端第一条进度事件要等第一次请求回来才到，
+  // 中间那段空窗期不能什么都不显示。
+  state.pixivBookmarksProgress = { total: 0, current: 0, title: "正在读取收藏列表" };
   if (state.homeView === "pixivBookmarks" && !state.activeAuthor) render();
   try {
     await invoke("refresh_pixiv_bookmarks");
@@ -3523,6 +3535,7 @@ async function updatePixivBookmarks({ silent = false } = {}) {
     else toast(String(error), "error");
   } finally {
     state.pixivBookmarksUpdating = false;
+    state.pixivBookmarksProgress = null;
     if (state.homeView === "pixivBookmarks" && !state.activeAuthor) render();
   }
 }
@@ -3533,6 +3546,60 @@ async function updatePixivBookmarks({ silent = false } = {}) {
  */
 function refreshPixivBookmarksOnStartup() {
   window.setTimeout(() => { updatePixivBookmarks({ silent: true }); }, 3000);
+}
+
+/**
+ * 页头那条更新进度条。
+ *
+ * 后端推来的进度分两段：「读取收藏列表」（条数 / 总数）和「下载封面」（张数 / 待下张数）。
+ * `total` 为 0 表示总数还没数出来 —— 这时画一条来回扫的不确定进度条，别硬凑个百分比。
+ * 没在更新、或还没收到进度时返回空串。
+ */
+function bookmarkProgressHtml() {
+  const progress = state.pixivBookmarksProgress;
+  if (!state.pixivBookmarksUpdating || !progress) return "";
+  const total = Number(progress.total) || 0;
+  const current = Number(progress.current) || 0;
+  const known = total > 0;
+  const percent = known ? Math.min(100, Math.round((current / total) * 100)) : 0;
+  const count = known ? ` ${Math.min(current, total)} / ${total}` : "";
+  const aria = known
+    ? `role="progressbar" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${Math.min(current, total)}"`
+    : 'role="progressbar"';
+  return `
+    <div class="bookmark-progress${known ? "" : " is-indeterminate"}" ${aria}>
+      <div class="bookmark-progress-track"><div class="bookmark-progress-fill"${known ? ` style="width:${percent}%"` : ""}></div></div>
+      <span class="bookmark-progress-text">${escapeHtml(String(progress.title || "正在更新"))}${count}</span>
+    </div>`;
+}
+
+/**
+ * 把后端推来的进度写进状态，并**只重画那条进度条**。
+ *
+ * 这里刻意不整页 `render()`：首次更新要下一百多张封面、能跑一分钟，用户期间照样能
+ * 搜索 / 筛选 / 滚动，整页重画会把输入框焦点和滚动位置一起冲掉。
+ */
+function onPixivBookmarkProgress(payload) {
+  if (!state.pixivBookmarksUpdating) return;
+  state.pixivBookmarksProgress = {
+    total: Number(payload?.total) || 0,
+    current: Number(payload?.current) || 0,
+    title: String(payload?.title || "正在更新"),
+  };
+  const box = document.querySelector("#bookmark-progress");
+  if (box) box.innerHTML = bookmarkProgressHtml();
+}
+
+/**
+ * 挂上进度事件的监听。事件是全局的、和当前在哪个页面无关：
+ * 用户不在收藏页时状态照样记着，切回来第一眼就能看到当前进度。
+ */
+async function listenPixivBookmarkProgress() {
+  try {
+    await listen("pixiv-bookmark-progress", (event) => onPixivBookmarkProgress(event.payload));
+  } catch (error) {
+    console.log("监听收藏更新进度失败:", error);
+  }
 }
 
 /** 页头上那句「上次更新」 */
@@ -3603,6 +3670,7 @@ function renderPixivBookmarks() {
         <button class="primary-button" data-action="refresh-pixiv-bookmarks" ${state.pixivBookmarksUpdating ? "disabled" : ""}>${icon("sync", 18)}<span>${state.pixivBookmarksUpdating ? "更新中…" : "更新"}</span></button>
       </div>
     </section>
+    <div id="bookmark-progress">${bookmarkProgressHtml()}</div>
     <section class="library-content">
       <div class="library-tools">
         <label class="search-field"><span>${icon("search", 19)}</span><input id="bookmark-search" type="search" placeholder="搜索标题或作者名" value="${escapeHtml(state.pixivBookmarksQuery)}" autocomplete="off"></label>
@@ -8187,6 +8255,8 @@ async function bootstrap() {
     fillWordCountsInBackground();
 
     // Pixiv 收藏（v1.2.27）：每次打开软件自动更新一次（用户要求）。同样不 await。
+    // 进度监听要**先**挂上 —— 更新在 3 秒后才起跑，那时必须已经能收到进度事件。
+    listenPixivBookmarkProgress();
     refreshPixivBookmarksOnStartup();
 
     // 上一版更新完留下的旧 exe，扫一遍送回收站。
