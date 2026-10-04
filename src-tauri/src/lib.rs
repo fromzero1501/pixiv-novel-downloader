@@ -629,7 +629,7 @@ fn db() -> Result<Connection, String> {
           sort_order INTEGER NOT NULL DEFAULT 0,
           -- v1.2.30：「散篇」作者 —— 下作品时系统为陌生作者**自动**建的行。
           -- 作者库列表里不画它的卡（前端按这个字段滤掉），作品照常出现在
-          -- 「所有作品」和「散篇」入口里。「批量新建作者」碰到它会复用这行、把标记翻回 0。
+          -- 「所有作品」和「散篇」入口里。「从 Pixiv 收藏新增作者」碰到它会复用这行、把标记翻回 0。
           stray INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS works (
@@ -7247,7 +7247,7 @@ fn store_author_avatar(
 /// 散篇只是「软件里看不见这张卡」，磁盘上和普通作者一样按作者名分目录。
 ///
 /// 碰到**已经有**的行直接复用、不改标记：正式作者不会被降级成散篇；
-/// 散篇转正由「批量新建作者」那条路单独翻标记。
+/// 散篇转正由「从 Pixiv 收藏新增作者」那条路单独翻标记。
 fn ensure_author_by_homepage(
     conn: &Connection,
     client: &Client,
@@ -7718,7 +7718,7 @@ async fn add_stray_from_url(
     .map_err(|e| e.to_string())
 }
 
-/// 「批量新建作者」弹窗里的一行：收藏里的一位作者，可勾选。
+/// 「从 Pixiv 收藏新增作者」弹窗里的一行：收藏里的一位作者，可勾选。
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 struct BookmarkAuthorOption {
@@ -7730,6 +7730,9 @@ struct BookmarkAuthorOption {
     existing: bool,
     /// 已有的那一行是散篇 ⇒ 勾它 = 把它转成正式作者
     stray: bool,
+    /// 他收藏里的**第一篇**作品标题（清单里跟在名字右边，超长由前端省略号截断）。
+    /// 多位作品只给第一篇 —— 用户要的是「能认出是谁」，不是列全。
+    first_title: String,
 }
 
 fn list_bookmark_author_options_impl(
@@ -7737,7 +7740,10 @@ fn list_bookmark_author_options_impl(
 ) -> Result<Vec<BookmarkAuthorOption>, String> {
     let mut statement = conn
         .prepare(
-            "SELECT user_id, user_name, COUNT(*) FROM pixiv_bookmarks
+            // SQLite 的 min()/max() 有个明确特性：查询里只有一个 min/max 聚合时，
+            // 同一行的裸列取的就是那一行的值。所以这里的 title 就是 sort_index 最小
+            // （收藏顺序最先）那一篇 —— 正好是「他收藏里的第一篇」。
+            "SELECT user_id, user_name, COUNT(*), title, MIN(sort_index) FROM pixiv_bookmarks
              WHERE user_id <> '' AND user_id <> '0'
              GROUP BY user_id ORDER BY COUNT(*) DESC, MIN(sort_index)",
         )
@@ -7748,12 +7754,13 @@ fn list_bookmark_author_options_impl(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })
         .map_err(|e| e.to_string())?;
     let mut options = Vec::new();
     for row in rows {
-        let (user_id, name, bookmark_count) = row.map_err(|e| e.to_string())?;
+        let (user_id, name, bookmark_count, first_title) = row.map_err(|e| e.to_string())?;
         let homepage = format!("https://www.pixiv.net/users/{user_id}");
         let stray: Option<i64> = conn
             .query_row(
@@ -7769,12 +7776,13 @@ fn list_bookmark_author_options_impl(
             bookmark_count,
             existing: stray.is_some(),
             stray: stray.unwrap_or(0) == 1,
+            first_title,
         });
     }
     Ok(options)
 }
 
-/// 给「批量新建作者」弹窗用：收藏里的作者清单（按收藏篇数从多到少）。
+/// 给「从 Pixiv 收藏新增作者」弹窗用：收藏里的作者清单（按收藏篇数从多到少）。
 #[tauri::command]
 fn list_bookmark_author_options() -> Result<Vec<BookmarkAuthorOption>, String> {
     let conn = db()?;
@@ -12145,7 +12153,7 @@ fn query_works_with(conn: &Connection, sql: &str) -> Result<Vec<Work>, String> {
         .map_err(|e| e.to_string())
 }
 
-// 特别关注：只翻转 authors.starred 标记，不动其他字段（保存作者、同步作者信息都不会覆盖它）
+// 收藏作者（作者收藏）：只翻转 authors.starred 标记，不动其他字段（保存作者、同步作者信息都不会覆盖它）
 #[tauri::command]
 fn toggle_author_starred(author_id: i64) -> Result<bool, String> {
     let conn = db()?;
@@ -15141,7 +15149,7 @@ mod tests {
         assert_eq!(summary.author_count, 2);
     }
 
-    /// 「批量新建作者」弹窗的清单要能区分三种状态：库里没有 / 已是正式 / 是散篇（勾了会转正）。
+    /// 「从 Pixiv 收藏新增作者」弹窗的清单要能区分三种状态：库里没有 / 已是正式 / 是散篇（勾了会转正）。
     #[test]
     fn bookmark_author_options_flag_existing_and_stray() {
         let conn = Connection::open_in_memory().unwrap();

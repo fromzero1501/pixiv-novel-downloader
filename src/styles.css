@@ -890,3 +890,24 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .bookmark-author-row:hover { background: #f2f8ff; }
 .bookmark-author-name { overflow: hidden; color: #33495f; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .bookmark-author-meta { color: #77899c; font-size: 12px; white-space: nowrap; }
+
+/* ============ v1.2.32：「我的收藏」上半栏 · 收藏作者 ============ */
+.favorite-author-heading { display: flex; align-items: baseline; gap: 11px; margin: 22px 0 14px; }
+.favorite-author-heading strong { color: #34618e; font-size: 14px; }
+.favorite-author-heading span { color: #6e87a1; font-size: 13px; }
+.favorite-author-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.favorite-author-card { position: relative; display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: #fff; border: 1px solid #dce6f1; border-radius: 9px; transition: border-color .16s ease, box-shadow .16s ease; }
+.favorite-author-card:hover, .favorite-author-card:focus-visible { border-color: #9dc6f4; box-shadow: 0 8px 20px rgba(42,84,129,.10); outline: 0; }
+.favorite-author-open { display: flex; align-items: center; gap: 10px; flex: 1 1 auto; min-width: 0; padding: 0; background: none; border: 0; text-align: left; color: inherit; cursor: pointer; }
+.favorite-author-card .author-avatar { width: 40px; height: 40px; font-size: 15px; }
+.favorite-author-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.favorite-author-copy strong { overflow: hidden; color: #2a3d55; font-size: 14px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.favorite-author-copy small { color: #77899c; font-size: 12px; }
+.favorite-author-remove { flex: 0 0 auto; width: 26px; height: 26px; border-radius: 6px; color: #d8a531; }
+.favorite-author-remove:hover { color: #c33c5b; background: #fff5f7; }
+.favorite-author-remove svg { fill: currentColor; }
+
+/* 「从 Pixiv 收藏新增作者」清单：名字右边跟一条作品标题，放不下就省略号 */
+.bookmark-author-main { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.bookmark-author-main .bookmark-author-name { flex: 0 1 auto; }
+.bookmark-author-work { flex: 1 1 auto; min-width: 0; overflow: hidden; color: #8b9db0; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
