@@ -1929,6 +1929,15 @@ function workCharacterNames(work) {
 }
 
 /**
+ * 工具栏上的「显示角色名」开关。作者作品库 / 所有作品 / 收藏夹 / 浏览历史 / 稍后再看 / 待补工作台
+ * 都指向同一个 `state.showCharacterNames`，点哪个都一起变 —— 所以模板抽成一份，
+ * 免得以后新加列表页时漏掉一处、或者几处各写一份改一处漏一处。
+ */
+function characterNameToggle() {
+  return `<button class="icon-text-button favorite-filter character-name-filter ${state.showCharacterNames ? "is-active" : ""}" data-action="toggle-character-names" title="在作品封面上常显匹配到的角色名（按标题和标签匹配）">${icon("user", 17)}<span>显示角色名</span></button>`;
+}
+
+/**
  * 封面第一排的徽标（状态 / 收藏 / 带图版）——作者作品库、系列作品、所有作品三处共用，
  * 免得以后改一个地方漏掉另外两个。
  */
@@ -2663,7 +2672,7 @@ function renderWorks() {
         <button class="icon-text-button favorite-filter ${state.authorFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <button class="icon-text-button favorite-filter images-filter ${state.imagesFilter === "has" ? "is-active" : ""}" data-action="images-only" title="只看有配图的作品（等同高级筛选里的「配图 · 有图」）">${icon("image", 17)}<span>仅看带图版</span></button>
         ${serialFilterButton(state.works)}
-        <button class="icon-text-button favorite-filter character-name-filter ${state.showCharacterNames ? "is-active" : ""}" data-action="toggle-character-names" title="在作品封面上常显匹配到的角色名（按标题和标签匹配）">${icon("user", 17)}<span>显示角色名</span></button>
+        ${characterNameToggle()}
         ${filterButton()}
         ${sortSelect(state.sort)}
       </div>
@@ -2705,6 +2714,7 @@ function renderAllWorks() {
         <button class="icon-text-button favorite-filter ${state.allWorksFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <button class="icon-text-button favorite-filter images-filter ${state.imagesFilter === "has" ? "is-active" : ""}" data-action="images-only" title="只看有配图的作品（等同高级筛选里的「配图 · 有图」）">${icon("image", 17)}<span>仅看带图版</span></button>
         ${serialFilterButton(state.allWorks)}
+        ${characterNameToggle()}
         ${filterButton()}
         ${sortSelect(state.sort)}
       </div>
@@ -3259,6 +3269,7 @@ function renderCollectionWorks() {
         <div class="filter-group" role="group" aria-label="版本状态">${STATUS_FILTERS.map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button images-filter ${state.imagesFilter === "has" ? "is-active" : ""}" data-action="images-only" title="只看有配图的作品（等同高级筛选里的「配图 · 有图」）">${icon("image", 17)}<span>仅看带图版</span></button>
         ${serialFilterButton(state.collectionWorks)}
+        ${characterNameToggle()}
         ${filterButton()}
         <select class="sort-select" id="collection-sort" aria-label="排序"><option value="added_desc" ${state.collectionSort === "added_desc" ? "selected" : ""}>最近收藏</option><option value="date_desc" ${state.collectionSort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.collectionSort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.collectionSort === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${state.collectionSort === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="rating_desc" ${state.collectionSort === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>
       </div>
@@ -3317,6 +3328,7 @@ function renderHistory() {
     <section class="library-content">
       <div class="library-tools">
         <label class="search-field"><span>${icon("search", 19)}</span><input id="history-search" type="search" placeholder="搜索标题或标签" value="${escapeHtml(state.historyQuery)}" autocomplete="off"></label>
+        ${characterNameToggle()}
       </div>
       <div class="read-only-note">打开作品或阅读版时自动记一笔，最多保留最近 500 条。不想记可以去「设置 → 6 维护与数据 → 浏览历史」关掉。</div>
       ${body || `<div class="empty-state works-empty"><h2>${state.historyQuery ? "没有匹配的记录" : "还没有浏览记录"}</h2><p>打开任意作品后，这里会按时间排出来。</p></div>`}
@@ -3361,6 +3373,7 @@ function renderWatchLater() {
     <section class="library-content">
       <div class="library-tools">
         <label class="search-field"><span>${icon("search", 19)}</span><input id="watch-later-search" type="search" placeholder="搜索标题或标签" value="${escapeHtml(state.watchLaterQuery)}" autocomplete="off"></label>
+        ${characterNameToggle()}
       </div>
       <div class="read-only-note">在作品封面上点左下角的书签按钮就能加进来，按加入时间倒序排。它和「浏览历史」是两回事 —— 历史是打开过就自动记一笔，这里是你主动标了想晚点看。</div>
       ${items || `<div class="empty-state works-empty"><h2>${state.watchLaterQuery ? "没有匹配的作品" : "还没有要稍后再看的作品"}</h2><p>鼠标移到作品封面上，点左下角的书签按钮就收进来。</p></div>`}
@@ -3606,6 +3619,7 @@ function renderMissingFull() {
     <section class="library-content">
       <div class="library-tools">
         <div class="filter-group" role="group" aria-label="处理状态">${MISSING_FULL_FILTERS.map(([value, label]) => `<button class="filter-button ${filter === value ? "is-active" : ""}" data-action="missing-full-filter" data-filter="${value}">${label} (${counts[value]})</button>`).join("")}</div>
+        ${characterNameToggle()}
       </div>
       ${state.missingFullBulk ? missingBulkBar(visible) : ""}
       <div class="read-only-note">这位作者有 <strong>${mine.length}</strong> 篇只有预览版，其中 <strong>${minePending}</strong> 篇还没处理。标过「已找过·没有」或「不打算补」的就不会再混在待办里。${state.missingFullBulk ? "（批量标记模式：点卡片勾选，也可以按住鼠标在列表上拖框选，然后点上面的按钮一次标一批。）" : ""}</div>

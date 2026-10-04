@@ -950,11 +950,25 @@ fn merge_builtin_characters(conn: &Connection) -> usize {
                 continue;
             }
             let heat = item.get("heat").and_then(|v| v.as_i64()).unwrap_or(0);
+            // 内置表里可选的 aliases 数组 → 落库时拼成 `|` 分隔（与用户自己编辑的格式一致）。
+            // 有了它，「夏洛特·伊佐阿尔」才能被标签里的「夏洛特」匹配到。
+            let aliases = item
+                .get("aliases")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty() && *s != name)
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .unwrap_or_default();
             // 同名同游戏的行已存在时被 UNIQUE 拦下（affected = 0）—— 不动它，但照样记一笔账
             let added = conn
                 .execute(
-                    "INSERT OR IGNORE INTO characters (game, name, aliases, heat, source) VALUES (?1, ?2, '', ?3, 'builtin')",
-                    params![game, name, heat],
+                    "INSERT OR IGNORE INTO characters (game, name, aliases, heat, source) VALUES (?1, ?2, ?3, ?4, 'builtin')",
+                    params![game, name, aliases, heat],
                 )
                 .map(|affected| affected > 0)
                 .unwrap_or(false);
@@ -12561,6 +12575,27 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM characters WHERE name='钟离'", [], |row| row.get(0))
             .unwrap();
         assert_eq!(zhongli, 1);
+    }
+
+    /// 内置表里的 aliases 数组要落成 `|` 分隔 —— 不然「夏洛特」这种标签匹配不到
+    /// 「夏洛特·伊佐阿尔」，等于白加一条。
+    #[test]
+    fn builtin_aliases_land_in_the_database() {
+        let conn = character_test_conn();
+        merge_builtin_characters(&conn);
+        let aliases: String = conn
+            .query_row(
+                "SELECT aliases FROM characters WHERE name='夏洛特·伊佐阿尔'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(aliases, "夏洛特");
+        // 没写 aliases 的条目要保持空串（不能被拼成 "null"、空白之类）
+        let plain: String = conn
+            .query_row("SELECT aliases FROM characters WHERE name='甘雨'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(plain, "");
     }
 
     #[test]
