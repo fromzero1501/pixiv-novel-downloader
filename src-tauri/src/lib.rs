@@ -395,6 +395,12 @@ struct AppSettings {
     /// 自动备份保留最近几份。
     #[serde(default = "default_backup_keep")]
     auto_backup_keep: usize,
+    /// v1.2.33：新建作者后，若这位作者有 Pixiv 主页，自动把他所有作品同步下来。
+    #[serde(default)]
+    sync_works_on_new_author: bool,
+    /// v1.2.33：散篇转正后，若这位作者有 Pixiv 主页，自动把他所有作品同步下来。
+    #[serde(default)]
+    sync_works_on_stray_promote: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -684,6 +690,21 @@ fn db() -> Result<Connection, String> {
           work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
           added_at TEXT NOT NULL DEFAULT '',
           PRIMARY KEY (collection_id, work_id)
+        );
+        -- v1.2.33：「作者收藏夹」—— 收藏作者也能进夹子，和作品收藏夹**相互独立**。
+        -- 结构照搬作品那两张表，但成员是 authors.id；`authors.starred` 从此退化成
+        -- 「在任意作者收藏夹里」的缓存位（与 works.favorite 同构）。
+        CREATE TABLE IF NOT EXISTS author_collections (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS author_collection_authors (
+          collection_id INTEGER NOT NULL REFERENCES author_collections(id) ON DELETE CASCADE,
+          author_id INTEGER NOT NULL REFERENCES authors(id) ON DELETE CASCADE,
+          added_at TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY (collection_id, author_id)
         );
         CREATE TABLE IF NOT EXISTS work_history (
           work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
@@ -1528,6 +1549,8 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
                 value.min(50)
             }
         },
+        sync_works_on_new_author: setting(conn, "sync_works_on_new_author")? == "1",
+        sync_works_on_stray_promote: setting(conn, "sync_works_on_stray_promote")? == "1",
     })
 }
 
@@ -2157,6 +2180,22 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
                 settings.auto_backup_keep.min(50)
             }
             .to_string(),
+        ),
+        (
+            "sync_works_on_new_author",
+            if settings.sync_works_on_new_author {
+                "1".into()
+            } else {
+                "0".into()
+            },
+        ),
+        (
+            "sync_works_on_stray_promote",
+            if settings.sync_works_on_stray_promote {
+                "1".into()
+            } else {
+                "0".into()
+            },
         ),
     ];
     for (key, value) in values {
@@ -7116,21 +7155,10 @@ struct BookmarkAuthorImportResult {
     failed: usize,
     /// 失败的作者名，最多几条 —— 光报「失败 3 位」用户没法处理
     failed_names: Vec<String>,
+    /// 这次真正新建 / 转正、*有主页* 的作者 id —— 设置里开了「新建作者或散篇转正时
+    /// 同步其所有作品」时，前端拿它逐位补一次整库同步。
+    new_author_ids: Vec<i64>,
     cancelled: bool,
-}
-
-/// 点按钮之前先看一眼：有多少位可加、多少位已经有了。
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct BookmarkAuthorImportStatus {
-    /// 收藏里出现的作者总数（去重）
-    total: usize,
-    /// 本地作者库里还没有的
-    pending: usize,
-    /// 已经在库里的
-    existing: usize,
-    /// 收藏列表本身是不是空的（空的话该先更新收藏）
-    empty: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -7165,16 +7193,6 @@ fn collect_bookmark_authors(conn: &Connection) -> Result<Vec<(String, String)>, 
         }
     }
     Ok(authors)
-}
-
-fn author_homepage_exists(conn: &Connection, homepage: &str) -> bool {
-    conn.query_row(
-        "SELECT COUNT(*) FROM authors WHERE homepage = ?1",
-        [homepage],
-        |row| row.get::<_, i64>(0),
-    )
-    .unwrap_or(0)
-        > 0
 }
 
 fn author_name_exists(conn: &Connection, name: &str) -> bool {
@@ -7296,25 +7314,6 @@ fn ensure_author_by_homepage(
     Ok(author_id)
 }
 
-#[tauri::command]
-fn bookmark_author_status() -> Result<BookmarkAuthorImportStatus, String> {
-    let conn = db()?;
-    let authors = collect_bookmark_authors(&conn)?;
-    let mut pending = 0usize;
-    for (user_id, _) in &authors {
-        let homepage = format!("https://www.pixiv.net/users/{user_id}");
-        if !author_homepage_exists(&conn, &homepage) {
-            pending += 1;
-        }
-    }
-    Ok(BookmarkAuthorImportStatus {
-        total: authors.len(),
-        pending,
-        existing: authors.len() - pending,
-        empty: authors.is_empty(),
-    })
-}
-
 /// 按收藏里的作者批量建作者条目。
 ///
 /// 判据和「本地库有没有」一致：**作者主页 `.../users/<uid>` 对得上就算已有**，跳过。
@@ -7377,6 +7376,7 @@ fn import_authors_from_bookmarks_impl(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut failed_names: Vec<String> = Vec::new();
+    let mut new_author_ids: Vec<i64> = Vec::new();
     let mut cancelled = false;
 
     for (index, (user_id, fallback_name)) in bookmark_authors.iter().enumerate() {
@@ -7412,6 +7412,7 @@ fn import_authors_from_bookmarks_impl(
                     ) {
                         let (_, avatar_url) = fetch_pixiv_author_profile(&client, user_id);
                         let _ = store_author_avatar(&conn, &client, author_id, &avatar_url);
+                        new_author_ids.push(author_id);
                     }
                 }
                 Err(_) => {
@@ -7424,7 +7425,10 @@ fn import_authors_from_bookmarks_impl(
             // 库里没有：建一位正式作者（顺带抓昵称和头像）
             None => {
                 match ensure_author_by_homepage(&conn, &client, &homepage, fallback_name, false) {
-                    Ok(_) => created += 1,
+                    Ok(author_id) => {
+                        created += 1;
+                        new_author_ids.push(author_id);
+                    }
                     Err(_) => {
                         failed += 1;
                         if failed_names.len() < 5 {
@@ -7456,22 +7460,12 @@ fn import_authors_from_bookmarks_impl(
         skipped,
         failed,
         failed_names,
+        new_author_ids,
         cancelled,
     })
 }
 
 // ==================== 散篇下载（v1.2.30） ====================
-
-/// 「散篇」批量下载的进度。前端拿它画右下角那层浮层。
-#[derive(Serialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-struct BookmarkDownloadProgress {
-    total: usize,
-    current: usize,
-    downloaded: usize,
-    failed: usize,
-    eta_seconds: u64,
-}
 
 /// 「散篇」下载的收尾统计。
 #[derive(Serialize, Clone, Debug, Default)]
@@ -7484,6 +7478,8 @@ struct BookmarkDownloadResult {
     failed: usize,
     /// 失败原因（带标题与作品 id），最多记 20 条
     failed_names: Vec<String>,
+    /// 「添加散篇」新建 / 命中到的作者 id（0 = 没有）。设置里开了自动同步时前端拿它补整库。
+    author_id: i64,
     cancelled: bool,
 }
 
@@ -7571,127 +7567,6 @@ fn download_one_bookmark(
     result
 }
 
-/// 批量下「本地还没有的收藏作品」。进度走 `bookmark-download-progress`，取消键用 **0**
-/// （整库任务，和「从收藏新增作者」同一套）。
-fn download_bookmark_novels_impl(
-    app: tauri::AppHandle,
-    novel_ids: Vec<String>,
-) -> Result<BookmarkDownloadResult, String> {
-    let conn = db()?;
-    let delay_seconds: u64 = setting(&conn, "pixiv_delay_seconds")?
-        .trim()
-        .parse()
-        .ok()
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
-    // 收藏表里现成的 user_id / user_name / title：省掉每篇一次作者反查，
-    // 失败清单也能直接写出标题（用户对着收藏页就能认出来是哪几篇）
-    let mut hints: HashMap<String, (String, String, String)> = HashMap::new();
-    {
-        let mut statement = conn
-            .prepare("SELECT novel_id, user_id, user_name, title FROM pixiv_bookmarks")
-            .map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            let (novel_id, user_id, user_name, title) = row.map_err(|e| e.to_string())?;
-            hints.insert(novel_id, (user_id, user_name, title));
-        }
-    }
-    drop(conn);
-
-    let total = novel_ids.len();
-    let mut result = BookmarkDownloadResult {
-        total,
-        ..Default::default()
-    };
-    for (index, novel_id) in novel_ids.iter().enumerate() {
-        if pixiv_sync_cancelled(0) {
-            result.cancelled = true;
-            break;
-        }
-        let (user_id, user_name, title) = hints.get(novel_id).cloned().unwrap_or_default();
-        match download_bookmark_novel_impl(&app, novel_id, &user_id, &user_name) {
-            Ok(true) => result.downloaded += 1,
-            Ok(false) => result.skipped += 1,
-            Err(error) => {
-                result.failed += 1;
-                // 失败原因钉上标题与作品 id —— 用户只看到「失败 6 篇」时根本没法查是哪几篇
-                if result.failed_names.len() < 20 {
-                    let label = if title.trim().is_empty() {
-                        novel_id.clone()
-                    } else {
-                        format!("{}（{novel_id}）", title.trim())
-                    };
-                    result.failed_names.push(format!("{label}：{error}"));
-                }
-            }
-        }
-        let current = index + 1;
-        let _ = app.emit(
-            "bookmark-download-progress",
-            BookmarkDownloadProgress {
-                total,
-                current,
-                downloaded: result.downloaded,
-                failed: result.failed,
-                eta_seconds: total.saturating_sub(current) as u64 * delay_seconds,
-            },
-        );
-        if current < total {
-            std::thread::sleep(Duration::from_millis(delay_seconds * 400));
-        }
-    }
-    Ok(result)
-}
-
-/// 收藏页单篇：「新建作者（若需要）并下载这一篇」。作者不存在就建散篇。
-#[tauri::command]
-async fn download_bookmark(
-    app: tauri::AppHandle,
-    novel_id: String,
-) -> Result<BookmarkDownloadResult, String> {
-    let conn = db()?;
-    let hint: (String, String) = conn
-        .query_row(
-            "SELECT user_id, user_name FROM pixiv_bookmarks WHERE novel_id = ?1",
-            [novel_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
-    drop(conn);
-    tauri::async_runtime::spawn_blocking(move || {
-        download_one_bookmark(&app, &novel_id, &hint.0, &hint.1)
-    })
-    .await
-    .map_err(|e| e.to_string())
-}
-
-/// 收藏页批量：本地还没有的那些，一次下完。
-#[tauri::command]
-async fn download_bookmark_novels(
-    app: tauri::AppHandle,
-    novel_ids: Vec<String>,
-) -> Result<BookmarkDownloadResult, String> {
-    clear_pixiv_sync_cancel(0);
-    let result =
-        tauri::async_runtime::spawn_blocking(move || download_bookmark_novels_impl(app, novel_ids))
-            .await
-            .map_err(|e| e.to_string())?;
-    clear_pixiv_sync_cancel(0);
-    result
-}
-
 /// 作者库「添加散篇」：贴一个**作品链接**，把它下成本地的一篇散篇。
 #[tauri::command]
 async fn add_stray_from_url(
@@ -7711,11 +7586,26 @@ async fn add_stray_from_url(
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
     drop(conn);
-    tauri::async_runtime::spawn_blocking(move || {
+    let lookup_id = novel_id.clone();
+    let mut result = tauri::async_runtime::spawn_blocking(move || {
         download_one_bookmark(&app, &novel_id, &hint.0, &hint.1)
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // 刚下进来的这篇挂在哪位作者名下 —— 设置里开了「新建作者时同步其所有作品」
+    // 时，前端要拿这个 id 去给这位作者补一次整库同步。
+    if let Ok(conn) = db() {
+        result.author_id = conn
+            .query_row(
+                "SELECT author_id FROM works WHERE pixiv_novel_id = ?1 LIMIT 1",
+                [lookup_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+    }
+    Ok(result)
 }
 
 /// 「从 Pixiv 收藏新增作者」弹窗里的一行：收藏里的一位作者，可勾选。
@@ -7819,26 +7709,368 @@ fn stray_summary() -> Result<StraySummary, String> {
     stray_summary_impl(&conn)
 }
 
-/// 散篇里的作品（投稿时间倒序）。搜索判据复用「所有作品」那一套，两处规则不会漂。
+// ============================ 作者收藏夹（v1.2.33） ============================
+//
+// 和「作品收藏夹」完全平行、但**相互独立**（各自两张表）。`authors.starred`
+// 从此退化成「在任意作者收藏夹里」的缓存位 —— 作者库那张「作者收藏」筛选读它。
+
+/// 作者收藏夹列表用的一份摘要（作者数 + 一个当封面的头像）。
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct AuthorCollectionSummary {
+    id: i64,
+    name: String,
+    author_count: i64,
+    cover_path: String,
+    created_at: String,
+}
+
+const AUTHOR_COLLECTION_SELECT: &str = "SELECT c.id, c.name,
+    (SELECT COUNT(*) FROM author_collection_authors ca WHERE ca.collection_id = c.id),
+    COALESCE((SELECT a.avatar_path FROM author_collection_authors ca JOIN authors a ON a.id = ca.author_id
+       WHERE ca.collection_id = c.id AND a.avatar_path <> '' ORDER BY ca.added_at DESC LIMIT 1), ''),
+    c.created_at
+  FROM author_collections c";
+
+fn map_author_collection(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorCollectionSummary> {
+    Ok(AuthorCollectionSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        author_count: row.get(2)?,
+        cover_path: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+/// 作者库那套取列原样复用（作者收藏夹里的作者卡和作者库同一形状）。
+const AUTHOR_SELECT_COLUMNS: &str = "a.id, a.name, a.homepage, a.avatar_path, a.notes, a.preview_dir, a.purchased_dir, a.match_threshold, a.pixiv_last_sync_at, a.avatar_managed,
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.purchased_path <> ''),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1),
+          a.aliases,
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1),
+          a.starred,
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1),
+          a.stray";
+
+fn map_author_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorSummary> {
+    Ok(AuthorSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        homepage: row.get(2)?,
+        avatar_path: row.get(3)?,
+        notes: row.get(4)?,
+        preview_dir: row.get(5)?,
+        purchased_dir: row.get(6)?,
+        match_threshold: row.get(7)?,
+        pixiv_last_sync_at: row.get(8)?,
+        avatar_managed: row.get::<_, i64>(9)? == 1,
+        work_count: row.get(10)?,
+        purchased_count: row.get(11)?,
+        favorite_count: row.get(12)?,
+        aliases: row.get(13)?,
+        images_count: row.get(14)?,
+        starred: row.get::<_, i64>(15)? == 1,
+        new_count: row.get(16)?,
+        stray: row.get::<_, i64>(17)? == 1,
+    })
+}
+
+/// 作者收藏夹成员变动后回写 `authors.starred` 缓存位（与 sync_work_favorite 同构）。
+fn sync_author_starred(conn: &Connection, author_id: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE authors SET starred = (SELECT COUNT(*) FROM author_collection_authors WHERE author_id=?1) > 0 WHERE id=?1",
+        [author_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn author_collection_summary(conn: &Connection, id: i64) -> Result<AuthorCollectionSummary, String> {
+    conn.query_row(
+        &format!("{AUTHOR_COLLECTION_SELECT} WHERE c.id=?1"),
+        [id],
+        map_author_collection,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
-fn list_stray_works(query: String) -> Result<Vec<Work>, String> {
+fn list_author_collections() -> Result<Vec<AuthorCollectionSummary>, String> {
     let conn = db()?;
-    let condition = search_match_clause("all", "w.", "?1", "?2");
+    let mut statement = conn
+        .prepare(&format!("{AUTHOR_COLLECTION_SELECT} ORDER BY c.sort_order ASC, c.id ASC"))
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], map_author_collection)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_author_collection(name: String) -> Result<AuthorCollectionSummary, String> {
+    let name = clean_collection_name(&name)?;
+    let conn = db()?;
+    let used: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM author_collections WHERE name=?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if used > 0 {
+        return Err(format!("已经有一个叫「{name}」的作者收藏夹了"));
+    }
+    let order: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM author_collections",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+    conn.execute(
+        "INSERT INTO author_collections (name, sort_order, created_at) VALUES (?1, ?2, ?3)",
+        params![name, order, Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    author_collection_summary(&conn, conn.last_insert_rowid())
+}
+
+#[tauri::command]
+fn rename_author_collection(id: i64, name: String) -> Result<AuthorCollectionSummary, String> {
+    let name = clean_collection_name(&name)?;
+    let conn = db()?;
+    let used: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM author_collections WHERE name=?1 AND id<>?2",
+            params![name, id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if used > 0 {
+        return Err(format!("已经有一个叫「{name}」的作者收藏夹了"));
+    }
+    conn.execute(
+        "UPDATE author_collections SET name=?1 WHERE id=?2",
+        params![name, id],
+    )
+    .map_err(|e| e.to_string())?;
+    author_collection_summary(&conn, id)
+}
+
+#[tauri::command]
+fn delete_author_collection(id: i64) -> Result<(), String> {
+    let conn = db()?;
+    // 先记下夹子里的作者：删完要回写它们的 starred 缓存位
+    let mut statement = conn
+        .prepare("SELECT author_id FROM author_collection_authors WHERE collection_id=?1")
+        .map_err(|e| e.to_string())?;
+    let author_ids = statement
+        .query_map([id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM author_collections WHERE id=?1", [id])
+        .map_err(|e| e.to_string())?;
+    for author_id in author_ids {
+        sync_author_starred(&conn, author_id)?;
+    }
+    Ok(())
+}
+
+/// 这位作者现在在哪几个作者收藏夹里（弹窗勾选状态靠它）。
+#[tauri::command]
+fn author_collections_of(author_id: i64) -> Result<Vec<i64>, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare("SELECT collection_id FROM author_collection_authors WHERE author_id=?1")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([author_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 一次性替换这位作者在各作者收藏夹里的归属（弹窗勾完点确定走的就是这条路）。
+#[tauri::command]
+fn set_author_collections(author_id: i64, collection_ids: Vec<i64>) -> Result<(), String> {
+    let mut conn = db()?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM author_collection_authors WHERE author_id=?1",
+        [author_id],
+    )
+    .map_err(|e| e.to_string())?;
+    let now = Utc::now().to_rfc3339();
+    for collection_id in collection_ids {
+        tx.execute(
+            "INSERT OR IGNORE INTO author_collection_authors (collection_id, author_id, added_at) VALUES (?1, ?2, ?3)",
+            params![collection_id, author_id, now],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "UPDATE authors SET starred = (SELECT COUNT(*) FROM author_collection_authors WHERE author_id=?1) > 0 WHERE id=?1",
+        [author_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 批量把作者**移出**若干作者收藏夹。
+#[tauri::command]
+fn remove_authors_from_author_collections(
+    author_ids: Vec<i64>,
+    collection_ids: Vec<i64>,
+) -> Result<usize, String> {
+    if author_ids.is_empty() || collection_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = db()?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for author_id in &author_ids {
+        for collection_id in &collection_ids {
+            tx.execute(
+                "DELETE FROM author_collection_authors WHERE collection_id=?1 AND author_id=?2",
+                params![collection_id, author_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "UPDATE authors SET starred = (SELECT COUNT(*) FROM author_collection_authors WHERE author_id=?1) > 0 WHERE id=?1",
+            [author_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(author_ids.len())
+}
+
+/// 某个作者收藏夹里的作者（排序沿用作者库）。
+#[tauri::command]
+fn list_author_collection_authors(collection_id: i64) -> Result<Vec<AuthorSummary>, String> {
+    let conn = db()?;
     let sql = format!(
-        "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id = w.author_id
-         WHERE a.stray = 1 AND {condition}
-         ORDER BY w.release_date DESC, w.id DESC"
+        "SELECT {AUTHOR_SELECT_COLUMNS}
+         FROM author_collection_authors ca JOIN authors a ON a.id = ca.author_id
+         WHERE ca.collection_id = ?1{AUTHOR_ORDER_BY}"
     );
+    let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([collection_id], map_author_summary)
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 把散篇作者「转正」：去掉 stray 标记，并补上头像（散篇建档时故意没抓）。
+///
+/// 转正是**作者级**的 —— 他名下那些散篇作品会一起回到作者库。
+/// 没有 Pixiv 主页（或已有头像）的只翻标记，不再打网络。
+#[tauri::command]
+async fn promote_stray_authors(author_ids: Vec<i64>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || promote_stray_authors_impl(author_ids))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn promote_stray_authors_impl(author_ids: Vec<i64>) -> Result<usize, String> {
+    let conn = db()?;
+    if author_ids.is_empty() {
+        return Ok(0);
+    }
+    let cookie = setting(&conn, "pixiv_cookie")?;
+    let client = pixiv_client(if cookie.trim().is_empty() {
+        None
+    } else {
+        Some(normalize_pixiv_cookie(&cookie)?)
+    })?;
+    let delay_seconds: u64 = setting(&conn, "pixiv_delay_seconds")?
+        .trim()
+        .parse()
+        .unwrap_or(1);
+    let mut promoted = 0usize;
+    for (index, author_id) in author_ids.iter().enumerate() {
+        let profile: (String, String) = conn
+            .query_row(
+                "SELECT homepage, avatar_path FROM authors WHERE id=?1",
+                [author_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_default();
+        conn.execute("UPDATE authors SET stray=0 WHERE id=?1", [author_id])
+            .map_err(|e| e.to_string())?;
+        let (homepage, avatar_path) = profile;
+        if avatar_path.trim().is_empty() && !homepage.trim().is_empty() {
+            if let Ok(user_id) = pixiv_user_id(&homepage) {
+                if index > 0 && delay_seconds > 0 {
+                    std::thread::sleep(Duration::from_secs(delay_seconds));
+                }
+                let (_, avatar_url) = fetch_pixiv_author_profile(&client, &user_id);
+                let _ = store_author_avatar(&conn, &client, *author_id, &avatar_url);
+            }
+        }
+        promoted += 1;
+    }
+    Ok(promoted)
+}
+
+/// 散篇里的作品。筛选/排序口径与「作者作品库」**完全一致**（v1.2.33）——
+/// 散篇页的工具栏就是作品库那排（搜索、版本档、仅看收藏、仅看带图版、高级筛选、排序），
+/// 条件一律按同一份 SQL 规则筛，两处才不会漂。
+#[tauri::command]
+fn list_stray_works(
+    query: String,
+    search_field: String,
+    status: String,
+    favorites_only: bool,
+    images_filter: String,
+    collection_id: i64,
+    sort: String,
+) -> Result<Vec<Work>, String> {
+    let conn = db()?;
+    let condition = search_match_clause(&search_field, "w.", "?1", "?2");
+    let mut sql = format!(
+        "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id = w.author_id
+         WHERE a.stray = 1 AND {condition}"
+    );
+    match status.as_str() {
+        "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
+        "unpurchased" => sql.push_str(" AND w.purchased_path = ''"),
+        _ => {}
+    }
+    if favorites_only {
+        sql.push_str(" AND w.favorite = 1");
+    }
+    sql.push_str(&images_filter_clause(&images_filter, "w."));
+    sql.push_str(&collection_filter_clause("w.id", "cw2", "?3"));
+    sql.push_str(match sort.as_str() {
+        "date_asc" => " ORDER BY w.release_date ASC, w.id ASC",
+        "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
+        // 「字数从多到少」要读文件才知道，SQL 排不了：先按日期打底，取回后在 Rust 里重排
+        "words_desc" => " ORDER BY w.release_date DESC, w.id DESC",
+        "rating_desc" => " ORDER BY w.rating DESC, w.release_date DESC, w.id DESC",
+        _ => " ORDER BY w.release_date DESC, w.id DESC",
+    });
     let raw_query = query.trim();
     let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = statement
-        .query_map(params![raw_query, format!("%{raw_query}%")], map_work)
+        .query_map(
+            params![raw_query, format!("%{raw_query}%"), collection_id],
+            map_work,
+        )
         .map_err(|e| e.to_string())?;
     let mut works = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     for work in &mut works {
         populate_work_display_info(work);
+    }
+    if sort == "words_desc" {
+        sort_works_by_content_size(&mut works);
     }
     Ok(works)
 }
@@ -12153,23 +12385,6 @@ fn query_works_with(conn: &Connection, sql: &str) -> Result<Vec<Work>, String> {
         .map_err(|e| e.to_string())
 }
 
-// 收藏作者（作者收藏）：只翻转 authors.starred 标记，不动其他字段（保存作者、同步作者信息都不会覆盖它）
-#[tauri::command]
-fn toggle_author_starred(author_id: i64) -> Result<bool, String> {
-    let conn = db()?;
-    conn.execute(
-        "UPDATE authors SET starred = CASE starred WHEN 1 THEN 0 ELSE 1 END WHERE id=?1",
-        [author_id],
-    )
-    .map_err(|e| e.to_string())?;
-    let starred: i64 = conn
-        .query_row("SELECT starred FROM authors WHERE id=?1", [author_id], |row| {
-            row.get(0)
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(starred == 1)
-}
-
 #[tauri::command]
 fn set_has_images(work_ids: Vec<i64>, has_images: bool) -> Result<(), String> {
     if work_ids.is_empty() {
@@ -13836,7 +14051,6 @@ pub fn run() {
             delete_work,
             delete_works,
             toggle_has_images,
-            toggle_author_starred,
             list_collections,
             create_collection,
             rename_collection,
@@ -13904,15 +14118,22 @@ pub fn run() {
             // v1.2.27：Pixiv 收藏页
             refresh_pixiv_bookmarks,
             list_pixiv_bookmarks,
-            bookmark_author_status,
             import_authors_from_bookmarks,
             // v1.2.30：收藏作者勾选列表 + 散篇
             list_bookmark_author_options,
-            download_bookmark,
-            download_bookmark_novels,
             add_stray_from_url,
             stray_summary,
             list_stray_works,
+            // v1.2.33：作者收藏夹 + 散篇转正
+            list_author_collections,
+            create_author_collection,
+            rename_author_collection,
+            delete_author_collection,
+            author_collections_of,
+            set_author_collections,
+            remove_authors_from_author_collections,
+            list_author_collection_authors,
+            promote_stray_authors,
             check_pixiv_cookie,
             update_work_tags,
             export_backup,

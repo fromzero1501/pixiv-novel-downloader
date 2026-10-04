@@ -868,11 +868,12 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
    改用右上角一枚小圆点标出来。 */
 .work-card.is-bookmark-ghost { position: relative; }
 .stray-dot { position: absolute; top: 9px; right: 9px; z-index: 2; width: 9px; height: 9px; border-radius: 50%; background: #e08a1e; box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
-/* 封面悬停才露出来的「下载」：灰卡唯一的入口 */
-.bookmark-download-button { position: absolute; left: 50%; top: 50%; z-index: 2; transform: translate(-50%, -50%); display: inline-flex; align-items: center; gap: 5px; padding: 7px 13px; color: #fff; background: rgba(23,100,197,.94); border: 0; border-radius: 7px; font-size: 12px; font-weight: 700; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity .15s ease; }
-.work-card.is-bookmark-ghost .work-cover:hover .bookmark-download-button,
-.bookmark-download-button:focus-visible { opacity: 1; pointer-events: auto; }
-.bookmark-download-button:hover { background: #1764c5; }
+/* v1.2.33 散篇页：封面悬停才露出来的「散篇转正」（取代原来的「下载」—— 转正是去掉作者 stray 标记，不是下载） */
+.stray-promote-button { position: absolute; left: 50%; top: 50%; z-index: 2; transform: translate(-50%, -50%); display: inline-flex; align-items: center; gap: 5px; padding: 7px 13px; color: #fff; background: rgba(122,93,176,.95); border: 0; border-radius: 7px; font-size: 12px; font-weight: 700; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity .15s ease; }
+.work-card:hover .stray-promote-button,
+.stray-promote-button:focus-visible { opacity: 1; pointer-events: auto; }
+.stray-promote-button:hover { background: #6b45b8; }
+.stray-promote-button svg { fill: currentColor; }
 /* 灰卡上的系列名是纯文字（没有作者 id 可跳），别做成按钮 */
 .work-series-text { display: flex; align-items: center; gap: 4px; margin: 6px 0 0; color: #087b73; overflow: hidden; font-size: 12px; font-weight: 700; }
 .work-series-text span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -911,3 +912,28 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .bookmark-author-main { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .bookmark-author-main .bookmark-author-name { flex: 0 1 auto; }
 .bookmark-author-work { flex: 1 1 auto; min-width: 0; overflow: hidden; color: #8b9db0; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ============ v1.2.33：作者收藏夹（和作品收藏夹相互独立）============ */
+/* 「我的收藏」页上半栏：作者收藏夹卡 —— 和作品收藏夹卡同形，用暖紫调区分 */
+.author-collection-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(236px, 1fr)); gap: 16px; margin-bottom: 26px; }
+.author-collection-grid .works-empty { grid-column: 1 / -1; }
+.author-collection-card { position: relative; min-width: 0; background: #fff; border: 1px solid #e4d9f1; border-radius: 9px; transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }
+.author-collection-card:hover { border-color: #c2a8e2; box-shadow: 0 10px 22px rgba(88,60,129,.13); transform: translateY(-2px); }
+.author-collection-card:focus-visible { outline: 2px solid #c2a8e2; outline-offset: 3px; }
+.author-collection-open { width: 100%; display: flex; align-items: center; gap: 14px; padding: 14px; color: inherit; text-align: left; background: transparent; border: 0; cursor: pointer; }
+.author-collection-cover { flex: 0 0 auto; width: 62px; height: 82px; display: grid; place-items: center; overflow: hidden; color: #7a5db0; background: #f5f0fc; border: 1px solid #e7dbf7; border-radius: 7px; }
+.author-collection-cover img { width: 100%; height: 100%; display: block; object-fit: cover; }
+.author-collection-copy { min-width: 0; }
+.author-collection-copy h2 { margin: 0 0 6px; color: #2a3d55; font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+.author-collection-copy p { margin: 0; color: #6e87a1; font-size: 12.5px; }
+.author-collection-card .work-menu { top: 11px; right: 10px; bottom: auto; }
+.author-collection-card:hover .work-menu, .author-collection-card:focus-within .work-menu { opacity: 1; }
+
+/* 「从 Pixiv 收藏新增作者」清单上方的 全选 / 取消全选 */
+.bookmark-author-tools { display: flex; gap: 8px; margin-top: 14px; }
+.bookmark-author-tools .quiet-button { min-height: 30px; padding: 0 12px; font-size: 12.5px; }
+
+/* 详情面板：作者主页链接按钮（比只放图标的 Pixiv 按钮宽一点，带一枚「作者」药丸） */
+.detail-author-home { width: auto; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; color: #7a5db0; background: #f5f0fc; border-color: #e7dbf7; }
+.detail-author-home:hover { color: #5f3fa0; background: #ece0fa; border-color: #cdb4ee; }
+.detail-link-pill { padding: 1px 7px; color: #7a5db0; background: #fff; border: 1px solid #e7dbf7; border-radius: 999px; font-size: 11px; font-weight: 750; line-height: 1.6; }
