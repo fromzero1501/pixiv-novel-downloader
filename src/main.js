@@ -232,6 +232,18 @@ const state = {
    * 完全不知道刚才那轮出了错。这一行就是给那种情况准备的。
    */
   pixivBookmarksError: "",
+  /**
+   * 「散篇」入口卡上的两个数（`{ workCount, authorCount }`）。
+   * 散篇 = 下作品时给陌生作者**自动**建的落脚点，作者库里不画它们的卡。
+   */
+  straySummary: { workCount: 0, authorCount: 0 },
+  /** 散篇页当前列出的作品 */
+  strayWorks: [],
+  strayQuery: "",
+  /** 正在把收藏里「本地没有的」作品下到散篇（防重复点击） */
+  bookmarkDownloading: false,
+  /** 「批量新建作者」弹窗里的可勾选清单（打开弹窗时才去拉） */
+  bookmarkAuthorOptions: [],
 };
 
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "D:\\头像\\雾海.png", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
@@ -279,10 +291,21 @@ function previewBookmarks() {
     };
   });
   const missing = [
-    { novelId: "27784467", title: "本地还没下载过的收藏（只展示）", userId: "123771005", userName: "某位作者", coverPath: "", isMasked: false, work: null },
-    { novelId: "27195463", title: "另一篇本地没有的收藏", userId: "123771006", userName: "另一位作者", coverPath: "", isMasked: false, work: null },
+    // 这几个字段是那一趟收藏请求白拿的（tags / publishDate / series / textCount），
+    // 灰卡上要显示它们 —— 预览数据得跟真机同形，否则无头校验验的是另一个形状。
+    { novelId: "27784467", title: "本地还没下载过的收藏（只展示）", userId: "123771005", userName: "某位作者", coverPath: "", isMasked: false, tags: ["纯爱", "校园", "R-18"], publishDate: "2026-05-02T00:13:13+09:00", seriesId: "", seriesTitle: "", seriesOrder: 0, textCount: 32157, work: null },
+    { novelId: "27195463", title: "另一篇本地没有的收藏", userId: "123771006", userName: "另一位作者", coverPath: "", isMasked: false, tags: ["奇幻"], publishDate: "2026-03-11T10:20:00+09:00", seriesId: "999", seriesTitle: "某部长篇", seriesOrder: 3, textCount: 8820, work: null },
   ];
   return [...local, ...missing];
+}
+
+/** 散篇页的预览数据：拿两篇本地作品冒充散篇作品（作者是被自动建档的那种）。 */
+function previewStrayWorks() {
+  return previewWorkPool().slice(0, 2).map((work, index) => ({
+    ...work,
+    authorId: 900 + index,
+    authorName: index ? "散篇作者乙" : "散篇作者甲",
+  }));
 }
 
 previewWorks.forEach((work, index) => {
@@ -888,8 +911,30 @@ async function invoke(command, args = {}) {
     if (hold > 0) return new Promise((resolve) => window.setTimeout(() => resolve(result), hold));
     return result;
   }
-  if (command === "bookmark_author_status") return window.__previewBookmarkAuthorStatus || { total: 4, pending: 2, existing: 2, empty: false };
-  if (command === "import_authors_from_bookmarks") return { total: 4, created: 2, skipped: 2, failed: 0, failedNames: [], cancelled: false };
+  if (command === "list_bookmark_author_options") {
+    if (Array.isArray(window.__previewBookmarkAuthorOptions)) return window.__previewBookmarkAuthorOptions;
+    return [
+      { userId: "123771005", name: "某位作者", bookmarkCount: 3, existing: false, stray: false },
+      { userId: "123771006", name: "另一位作者", bookmarkCount: 1, existing: false, stray: false },
+      { userId: "16208053", name: "雾海档案", bookmarkCount: 5, existing: true, stray: false },
+      { userId: "99900001", name: "散篇作者甲", bookmarkCount: 2, existing: true, stray: true },
+    ];
+  }
+  if (command === "import_authors_from_bookmarks") {
+    // 按勾了几位报数 —— 无头校验要能看出「勾掉的确实没被处理」
+    const picked = (args.userIds || []).length;
+    return { total: picked, created: Math.max(0, picked - 2), promoted: 1, skipped: 2, failed: 0, failedNames: [], cancelled: false };
+  }
+  if (command === "stray_summary") return window.__previewStraySummary || { workCount: 4, authorCount: 3 };
+  if (command === "list_stray_works") {
+    if (Array.isArray(window.__previewStrayWorks)) return window.__previewStrayWorks;
+    return previewStrayWorks();
+  }
+  if (command === "download_bookmark" || command === "download_bookmark_novels" || command === "add_stray_from_url") {
+    if (window.__previewBookmarkDownloadError) return Promise.reject(new Error(String(window.__previewBookmarkDownloadError)));
+    const count = command === "download_bookmark_novels" ? (args.novelIds || []).length : 1;
+    return { total: count, downloaded: count, skipped: 0, failed: 0, failedNames: [], cancelled: false };
+  }
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
@@ -1321,6 +1366,7 @@ function render() {
       : state.homeView === "filterViews" ? renderFilterViews()
       : state.homeView === "textSearch" ? renderTextSearch()
       : state.homeView === "pixivBookmarks" ? renderPixivBookmarks()
+      : state.homeView === "stray" ? renderStray()
       : state.homeView === "help" ? renderHelp() : renderAuthors());
   document.body.classList.toggle("is-bulk", Boolean(state.bulkMode));
   mountHelpDocument();
@@ -1866,7 +1912,9 @@ async function commitAuthorOrder(visibleIds) {
 
 function renderAuthors() {
   const query = state.authorQuery.trim().toLowerCase();
-  const authors = state.authors.filter((author) => (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
+  // 「散篇」作者不画卡（用户要求）：它们只是下作品时给陌生作者建的落脚点，
+  // 统一归到列表末尾那张「散篇」卡里，别把作者库塞满一次性作者。
+  const authors = state.authors.filter((author) => !author.stray && (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
   const cards = authors.map((author) => `
     <article class="author-card${author.starred ? " is-starred" : ""}${state.missingAuthorIds.has(author.id) ? " is-missing" : ""}" data-author-id="${author.id}" tabindex="0">
       <div class="author-avatar-wrap">
@@ -1891,7 +1939,8 @@ function renderAuthors() {
         <button class="icon-text-button" data-action="auto-group">${icon("upload", 18)}<span>完整版自动分组</span></button>
         <button class="icon-text-button" data-action="auto-group-by-author">${icon("folder", 18)}<span>指定作者自动分组</span></button>
         <button class="icon-text-button" data-action="sync-all-authors">${icon("sync", 18)}<span>同步所有作者</span></button>
-        <button class="icon-text-button" data-action="import-bookmark-authors">${icon("heart", 18)}<span>从 Pixiv 收藏新增作者</span></button>
+        <button class="icon-text-button" data-action="import-bookmark-authors">${icon("heart", 18)}<span>批量新建作者</span></button>
+        <button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button>
         <button class="primary-button" data-action="new-author">${icon("plus", 18)}<span>新增作者</span></button>
       </div>
     </section>
@@ -1901,8 +1950,25 @@ function renderAuthors() {
         <button class="icon-text-button star-filter${state.authorsStarredOnly ? " is-active" : ""}" data-action="authors-starred-only" title="只显示已设为特别关注的作者">${icon(state.authorsStarredOnly ? "starFilled" : "star", 17)}<span>只看特别关注</span></button>
       </div>
       <div class="section-row"><p>${authors.length ? `共 ${authors.length} 位作者${state.authorsStarredOnly ? "（已筛选特别关注）" : ""}` : ""}</p></div>
-      <div class="author-grid">${cards || (state.authors.length ? renderNoMatchedAuthors() : renderEmptyAuthors())}</div>
+      <div class="author-grid">${cards || (state.authors.length ? renderNoMatchedAuthors() : renderEmptyAuthors())}${query || state.authorsStarredOnly ? "" : strayCard()}</div>
     </section>`);
+}
+
+/** 作者库末尾那张「散篇」入口卡：下作品时自动给陌生作者建的位置。 */
+function strayCard() {
+  const workCount = Number(state.straySummary?.workCount) || 0;
+  const authorCount = Number(state.straySummary?.authorCount) || 0;
+  if (!workCount) return "";
+  return `
+    <article class="author-card is-stray-card" data-action="open-stray" tabindex="0" role="button" title="这些作品所属的作者还没建成正式作者，先放在这里">
+      <div class="author-avatar-wrap"><span class="stray-card-icon">${icon("folder", 24)}</span></div>
+      <div class="author-card-body">
+        <div class="author-card-title-row"><h2>散篇</h2></div>
+        <p class="author-stray-note">下作品时自动给陌生作者建的位置。想正式留下哪位，去「批量新建作者」把他转正。</p>
+        <dl class="author-stats"><div><dt>作品</dt><dd>${workCount}</dd></div><div><dt>作者</dt><dd>${authorCount}</dd></div></dl>
+      </div>
+      <div class="card-enter">${icon("arrow", 18)}</div>
+    </article>`;
 }
 
 function renderEmptyAuthors() {
@@ -2098,6 +2164,15 @@ function workTags(work) {
   const shown = tags.slice(0, 3);
   const rest = tags.length - shown.length;
   return `<div class="work-tags">${shown.map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag)}</span>`).join("")}${rest > 0 ? `<span class="work-tags-more" title="${escapeHtml(tags.slice(3).join("、"))}">+${rest}</span>` : ""}</div>`;
+}
+
+/** 收藏灰卡上的标签。后端直接给数组 —— 标签自己可能带 `|`，不能当分隔符切。 */
+function bookmarkTags(tags) {
+  const list = Array.isArray(tags) ? tags.map((tag) => String(tag).trim()).filter(Boolean) : [];
+  if (!list.length) return "";
+  const shown = list.slice(0, 3);
+  const rest = list.length - shown.length;
+  return `<div class="work-tags">${shown.map((tag) => `<span>${icon("tag", 12)}${escapeHtml(tag)}</span>`).join("")}${rest > 0 ? `<span class="work-tags-more" title="${escapeHtml(list.slice(3).join("、"))}">+${rest}</span>` : ""}</div>`;
 }
 
 /**
@@ -3652,10 +3727,24 @@ function pixivBookmarkCard(item) {
   const cover = item.coverPath
     ? `<img src="${asset(item.coverPath)}" alt="" loading="lazy" onerror="this.closest('.work-cover')?.classList.add('is-missing');this.remove()">`
     : `<div class="cover-placeholder"><span>${icon("image", 28)}</span><small>暂无封面</small></div>`;
+  // 标签、投稿日期、系列名、字符数 —— 全是那一趟收藏请求白给的，不额外发请求
+  const meta = [
+    item.publishDate ? `<p class="work-date">${dateLabel(item.publishDate)}</p>` : "",
+    item.textCount > 0 ? `<span class="work-word-count">${wordCountLabel(item.textCount)}</span>` : "",
+  ].join("");
   return `
-    <article class="work-card is-read-only is-unpurchased is-bookmark-ghost" title="本地没有这篇，只显示封面、标题和作者名">
-      <div class="work-cover">${cover}</div>
-      <div class="work-copy"><p class="work-author">${escapeHtml(item.userName || "未知作者")}</p><div class="work-meta"><p class="work-date">本地没有</p></div><h2 title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h2></div>
+    <article class="work-card is-read-only is-bookmark-ghost" title="本地还没有这一篇 —— 只显示封面、标题和作者名，不会自动下载">
+      <span class="stray-dot" title="散篇：这一篇本地还没有"></span>
+      <div class="work-cover">${cover}
+        <button class="bookmark-download-button" data-action="download-bookmark" data-novel-id="${escapeHtml(item.novelId)}" title="把这一篇下进本地；作者没建过档的会先建一个「散篇」作者">${icon("download", 15)}<span>散篇转正</span></button>
+      </div>
+      <div class="work-copy">
+        <p class="work-author">${escapeHtml(item.userName || "未知作者")}</p>
+        <div class="work-meta">${meta || '<p class="work-date">本地没有</p>'}</div>
+        <h2 title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h2>
+        ${item.seriesTitle ? `<p class="work-series-text">${icon("series", 13)}<span>${escapeHtml(item.seriesTitle)}${item.seriesOrder > 0 ? ` · 第 ${item.seriesOrder} 篇` : ""}</span></p>` : ""}
+        ${bookmarkTags(item.tags)}
+      </div>
     </article>`;
 }
 
@@ -3672,6 +3761,7 @@ function renderPixivBookmarks() {
   });
   const total = state.pixivBookmarks.length;
   const localCount = state.pixivBookmarks.filter((item) => item.work).length;
+  const missingCount = total - localCount;
   const cards = items.map((item) => pixivBookmarkCard(item)).join("");
   const empty = total
     ? '<div class="empty-state works-empty"><h2>没有符合条件的收藏</h2></div>'
@@ -3681,6 +3771,7 @@ function renderPixivBookmarks() {
       <div><p class="section-kicker">来自 Pixiv 账号的收藏</p><h1>Pixiv 收藏</h1></div>
       <div class="topbar-actions">
         <span class="bookmark-status">${bookmarkFetchedLabel()}${total ? ` · ${total} 篇，本地已有 ${localCount} 篇` : ""}</span>
+        ${missingCount ? `<button class="icon-text-button" data-action="download-missing-bookmarks" ${state.bookmarkDownloading ? "disabled" : ""} title="把「本地没有」的这些一次下进来。作者没建过档的，会先建一个「散篇」作者（不进作者库列表）">${icon("download", 18)}<span>${state.bookmarkDownloading ? "转正中…" : `散篇批量转正（${missingCount} 篇）`}</span></button>` : ""}
         <button class="primary-button" data-action="refresh-pixiv-bookmarks" ${state.pixivBookmarksUpdating ? "disabled" : ""}>${icon("sync", 18)}<span>${state.pixivBookmarksUpdating ? "更新中…" : "更新"}</span></button>
       </div>
     </section>
@@ -3691,9 +3782,188 @@ function renderPixivBookmarks() {
         <label class="search-field"><span>${icon("search", 19)}</span><input id="bookmark-search" type="search" placeholder="搜索标题或作者名" value="${escapeHtml(state.pixivBookmarksQuery)}" autocomplete="off"></label>
         <div class="filter-group" role="group" aria-label="本地库状态">${[["all", "全部"], ["inLibrary", "本地已有"], ["missing", "本地没有"]].map(([value, label]) => `<button class="filter-button ${state.pixivBookmarksFilter === value ? "is-active" : ""}" data-action="bookmark-filter" data-filter="${value}">${label}</button>`).join("")}</div>
       </div>
-      <div class="read-only-note">本地库已经有的显示成作品卡，打开来和别处一样用；本地没有的只显示封面、标题和作者名（封面变灰），不会下载正文。Pixiv 上已经删掉的收藏里，只有本地还留着的那几篇才列出来。每次进这一页都会重新核对一遍本地库。</div>
+      <div class="read-only-note">本地库已经有的显示成作品卡，打开来和别处一样用；本地没有的带一枚「散篇」角标，只显示封面、标题、作者名、标签、投稿日期和字符数 —— 把鼠标移到封面上点「散篇转正」就能把它下进本地；也可以点右上角「散篇批量转正」一次全下。作者还没建过档时，会先建一个「散篇」作者（不进作者库列表，也不参与整库同步）。Pixiv 上已经删掉的收藏里，只有本地还留着的那几篇才列出来。每次进这一页都会重新核对一遍本地库。</div>
       <div class="works-grid">${cards || empty}</div>
     </section>`);
+}
+
+/**
+ * 「散篇」页：作者还没建档的那些作品。
+ *
+ * 卡片直接复用「所有作品」那一套 —— 散篇作品本来就是普通作品，只是它的作者
+ * 没有作者卡。所以点标题开文件、稍后再看、加收藏夹、开详情全都能用。
+ */
+function renderStray() {
+  const query = state.strayQuery.trim().toLowerCase();
+  // 作品全在 state 里，搜索纯前端过滤 —— 每敲一下都重查后端没必要，还会跟焦点较劲
+  const works = query
+    ? state.strayWorks.filter((work) => `${work.title} ${work.authorName || ""} ${work.tags || ""}`.toLowerCase().includes(query))
+    : state.strayWorks;
+  const cards = works.map((work) => `
+    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
+      <div class="work-cover">${workCover(work)}
+        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
+        ${workBadges(work)}
+        ${workCharacterNames(work)}
+        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
+      </div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+    </article>`).join("");
+  const empty = state.straySummary.workCount
+    ? '<div class="empty-state works-empty"><h2>没有匹配的作品</h2></div>'
+    : '<div class="empty-state works-empty"><h2>散篇还是空的</h2><p>在「Pixiv 收藏」页下载本地没有的作品时，作者没建过档的那些会落到这里。也可以点右上角「添加散篇」，直接贴一个作品链接。</p></div>';
+  return renderShell(`
+    <section class="topbar work-topbar">
+      <div><p class="section-kicker">作者还没建成正式作者的作品</p><h1>散篇</h1></div>
+      <div class="topbar-actions">
+        <span class="bookmark-status">${state.straySummary.workCount || 0} 篇 · ${state.straySummary.authorCount || 0} 位作者</span>
+        <button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button>
+        <button class="icon-text-button" data-action="import-bookmark-authors">${icon("heart", 18)}<span>批量新建作者</span></button>
+      </div>
+    </section>
+    <section class="library-content">
+      <div class="library-tools">
+        <label class="search-field"><span>${icon("search", 19)}</span><input id="stray-search" type="search" placeholder="搜索标题、作者或标签" value="${escapeHtml(state.strayQuery)}" autocomplete="off"></label>
+      </div>
+      <div class="read-only-note">这里的作品是「下下来的时候，作者还没在库里」自动建档收进来的 —— 作者不占作者库的卡，作品本身和别处一样能用。想让哪位作者正式留下，点右上角「批量新建作者」把他转正，作品会跟着他一起回到作者库里。</div>
+      <div class="works-grid">${cards || empty}</div>
+    </section>`);
+}
+
+/**
+ * 「添加散篇」：贴一个 Pixiv 作品链接，把它完整下成本地的一篇散篇。
+ *
+ * 和收藏页那个「下载」是同一条后端链路，区别只有一个：作者 uid 不是从收藏表拿的，
+ * 而是现去作品详情里反查（那个接口公开，不需要 Cookie）。
+ */
+function addStrayFromUrl() {
+  showModal(modal("添加散篇", `
+    <form id="stray-form" class="form-stack">
+      <label>作品链接 <input name="url" required placeholder="https://www.pixiv.net/novel/show.php?id=…" autocomplete="off"></label>
+      <p class="form-hint">贴 Pixiv 作品链接就行。作者还没在库里的话，会先把他建成本地的一位「散篇」作者（不进作者库列表、也不参与整库同步），然后把这一篇完整下下来 —— 正文、封面、配图和阅读版，和普通同步是同一套。</p>
+    </form>`,
+    `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="submit-stray">下载</button>`));
+}
+
+async function runAddStray(url) {
+  state.bookmarkDownloading = true;
+  render();
+  try {
+    const result = await invoke("add_stray_from_url", { url });
+    if (result.downloaded) toast("已下载到本地（作者归入散篇）", "success");
+    else if (result.skipped) toast("本地已经有这一篇了", "info");
+    else toast(result.failedNames?.[0] || "这一篇没能下下来", "error");
+    await refreshAfterBookmarkDownload();
+  } catch (error) {
+    toast(String(error), "error");
+  } finally {
+    state.bookmarkDownloading = false;
+    render();
+  }
+}
+
+/**
+ * 收藏页单篇「散篇转正」：把它下进本地。
+ * 作者没建过档时后端会顺手建一个「散篇」作者（不进作者库列表）。
+ */
+async function downloadOneBookmark(novelId) {
+  if (!novelId || state.bookmarkDownloading) return;
+  state.bookmarkDownloading = true;
+  render();
+  try {
+    const result = await invoke("download_bookmark", { novelId });
+    if (result.downloaded) toast("已下载到本地（作者归入散篇）", "success");
+    else if (result.skipped) toast("本地已经有这一篇了", "info");
+    else toast(result.failedNames?.[0] || "这一篇没能下下来", "error");
+    await refreshAfterBookmarkDownload();
+  } catch (error) {
+    toast(String(error), "error");
+  } finally {
+    state.bookmarkDownloading = false;
+    render();
+  }
+}
+
+/** 收藏页「散篇批量转正」：先确认，再逐篇下。 */
+async function downloadMissingBookmarks() {
+  const missing = state.pixivBookmarks.filter((item) => !item.work);
+  if (!missing.length) {
+    toast("本地已经有了全部收藏", "info");
+    return;
+  }
+  const sample = missing.slice(0, 3).map((item) => item.title).join("、");
+  confirmAction(
+    "散篇批量转正",
+    `本地还没有 ${missing.length} 篇，会一篇篇下进来 —— 正文、封面、配图和阅读版，走的都是和普通同步完全一样的那套。作者还没建过档的，会先建一个「散篇」作者（不进作者库列表，也不参与整库同步）。从「${sample}」${missing.length > 3 ? " 等" : ""}开始，右下角显示进度，随时可以终止。`,
+    "开始转正",
+    () => runBookmarkDownload(missing.map((item) => item.novelId)),
+  );
+}
+
+/** 真正的批量下载：挂浮层 → 听 `bookmark-download-progress` → 收尾报数。 */
+async function runBookmarkDownload(novelIds) {
+  state.bookmarkDownloading = true;
+  // 整库任务用 0 当取消键（和「整库补抓简介」「补齐正文插图」同一套）
+  state.syncTask = { authorId: 0, cancelAuthorId: 0, cancelText: "终止下载", cancelBusyLabel: "正在终止下载", label: "正在下载收藏作品", title: "", current: 0, total: novelIds.length, cancelling: false };
+  render();
+  const unlisten = await listen("bookmark-download-progress", (event) => {
+    const { total = 0, current = 0, downloaded = 0, failed = 0 } = event.payload || {};
+    if (!state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    state.syncTask.title = `已下载 ${downloaded} 篇${failed ? ` · 失败 ${failed} 篇` : ""}`;
+    updateSyncFloater();
+  });
+  let result = null;
+  try {
+    result = await invoke("download_bookmark_novels", { novelIds });
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    state.bookmarkDownloading = false;
+    render();
+    toast(String(error), "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  state.bookmarkDownloading = false;
+  await refreshAfterBookmarkDownload();
+  render();
+  const parts = [`下载 ${result.downloaded} 篇`];
+  if (result.skipped) parts.push(`本地已有 ${result.skipped} 篇`);
+  if (result.failed) parts.push(`失败 ${result.failed} 篇`);
+  toast(`${result.cancelled ? "已终止 —— " : ""}${parts.join(" · ")}`, result.failed ? "info" : "success");
+}
+
+/**
+ * 下完之后把各处数据对齐：收藏页（「散篇」卡 → 正常作品卡）、散篇统计、作者库、所有作品。
+ * 「所有作品」只在已经加载过时才重查 —— 没进过那一页就不必白拉一次。
+ */
+async function refreshAfterBookmarkDownload() {
+  await refreshPixivBookmarks();
+  await refreshAuthors();
+  await refreshStray();
+  if (state.homeView === "stray") await refreshStrayWorks();
+  if (state.allWorks.length) await refreshAllWorks();
+}
+
+/** 作者库那张「散篇」卡上的计数（几篇 · 几位作者）。 */
+async function refreshStray() {
+  try {
+    state.straySummary = (await invoke("stray_summary")) || { workCount: 0, authorCount: 0 };
+  } catch (error) {
+    console.log("读取散篇统计失败:", error);
+    return;
+  }
+  // 拿到数字，作者库那张「散篇」卡才知道要不要出现 —— 启动时它总落在首屏之后，
+  // 所以这里自己补一次渲染（只在作者库列表页，进到具体作者里就别打断）。
+  if (state.homeView === "authors" && !state.activeAuthor) render();
+}
+
+/** 散篇页：重拉作品列表（拉全量；搜索是前端过滤，不用重查后端）。 */
+async function refreshStrayWorks() {
+  state.strayWorks = (await invoke("list_stray_works", { query: "" })) || [];
 }
 
 /**
@@ -3702,33 +3972,36 @@ function renderPixivBookmarks() {
  * 判据和后端一致 —— 作者主页 `.../users/<uid>` 对得上就算已经有，跳过。
  */
 async function importBookmarkAuthors() {
-  let status = null;
+  let options = null;
   try {
-    status = await invoke("bookmark_author_status");
+    options = await invoke("list_bookmark_author_options");
   } catch (error) {
     toast(String(error), "error");
     return;
   }
-  if (!status || status.empty) {
+  if (!options || !options.length) {
     toast("收藏列表还是空的 —— 先到「Pixiv 收藏」页点一次更新", "info");
     return;
   }
-  if (!status.pending) {
-    toast(`收藏里的 ${status.total} 位作者都已经在作者库里了`, "info");
-    return;
-  }
-  confirmAction(
-    "从 Pixiv 收藏新增作者",
-    `收藏里一共 ${status.total} 位作者，其中 ${status.pending} 位还没有、${status.existing} 位已经在库里（会跳过）。会逐位去 Pixiv 取昵称和头像，间隔跟设置里的抓取间隔一致；右下角浮层显示进度，随时可以终止。`,
-    "开始新增",
-    () => runBookmarkAuthorImport(),
-  );
+  state.bookmarkAuthorOptions = options;
+  const rows = options.map((option) => `
+    <label class="bookmark-author-row">
+      <input type="checkbox" checked data-role="bookmark-author-check" value="${escapeHtml(option.userId)}">
+      <span class="bookmark-author-name">${escapeHtml(option.name || `pixiv-${option.userId}`)}</span>
+      <span class="bookmark-author-meta">${option.bookmarkCount} 篇${option.existing ? (option.stray ? " · 已有（散篇，会转正）" : " · 已有，跳过") : " · 新作者"}</span>
+    </label>`).join("");
+  const pending = options.filter((option) => !option.existing).length;
+  const stray = options.filter((option) => option.existing && option.stray).length;
+  showModal(modal("批量新建作者", `
+    <p class="confirm-copy">收藏里一共 ${options.length} 位作者：${pending} 位还没有档、${stray} 位现在是散篇（会转成正式作者）、其余已经在库里了（勾着也会跳过）。默认全选，勾掉不想留下的；确认后逐位去 Pixiv 取昵称和头像，右下角显示进度，随时可以终止。</p>
+    <div class="bookmark-author-list">${rows}</div>`,
+    `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="submit-import-authors">开始新建</button>`));
 }
 
 /** 真正的导入流程：挂浮层 → 听 `bookmark-author-progress` → 收尾报数。 */
-async function runBookmarkAuthorImport() {
+async function runBookmarkAuthorImport(userIds) {
   // 整库任务用 0 当取消键（和「整库补抓简介」「补齐正文插图」同一套），终止按钮才真的能叫停
-  state.syncTask = { authorId: 0, cancelAuthorId: 0, cancelText: "终止新增", cancelBusyLabel: "正在终止新增", label: "正在按收藏新增作者", title: "", current: 0, total: 0, cancelling: false };
+  state.syncTask = { authorId: 0, cancelAuthorId: 0, cancelText: "终止新增", cancelBusyLabel: "正在终止新增", label: "正在按收藏新建作者", title: "", current: 0, total: userIds.length, cancelling: false };
   render();
   const unlisten = await listen("bookmark-author-progress", (event) => {
     const { total = 0, current = 0, title = "" } = event.payload || {};
@@ -3740,7 +4013,7 @@ async function runBookmarkAuthorImport() {
   });
   let result;
   try {
-    result = await invoke("import_authors_from_bookmarks");
+    result = await invoke("import_authors_from_bookmarks", { userIds });
   } catch (error) {
     unlisten();
     state.syncTask = null;
@@ -3753,13 +4026,16 @@ async function runBookmarkAuthorImport() {
   await refreshAuthors();
   render();
   const created = Number(result?.created) || 0;
+  const promoted = Number(result?.promoted) || 0;
   const skipped = Number(result?.skipped) || 0;
   const failed = Number(result?.failed) || 0;
   const failedNames = result?.failedNames || [];
   const names = failedNames.length ? `（${failedNames.slice(0, 3).join("、")}${failedNames.length > 3 ? "…" : ""}）` : "";
-  const failedText = failed ? `，${failed} 位没加成功${names}` : "";
-  if (result?.cancelled) toast(`已终止：新增 ${created} 位、跳过 ${skipped} 位${failedText}`, "info");
-  else toast(`新增作者 ${created} 位，跳过已有 ${skipped} 位${failedText}`, failed ? "info" : "success");
+  const parts = [`新增 ${created} 位`];
+  if (promoted) parts.push(`散篇转正 ${promoted} 位`);
+  if (skipped) parts.push(`跳过已有 ${skipped} 位`);
+  if (failed) parts.push(`${failed} 位没加成功${names}`);
+  toast(`${result?.cancelled ? "已终止 —— " : ""}${parts.join(" · ")}`, failed ? "info" : "success");
 }
 
 /* ============================ 收藏夹选择器 ============================ */
@@ -4601,6 +4877,26 @@ async function bindEvents() {
       commitBookmarkSearch(event.target.value);
     };
   }
+  // 散篇页同理，也是纯前端过滤
+  const straySearch = app.querySelector("#stray-search");
+  if (straySearch) {
+    const commitStraySearch = (query) => {
+      state.strayQuery = query;
+      render();
+      restoreSearchFocus("stray-search");
+    };
+    straySearch.oncompositionstart = () => { straySearch.dataset.composing = "true"; };
+    straySearch.oncompositionend = (event) => {
+      delete straySearch.dataset.composing;
+      straySearch.dataset.skipNextInput = "true";
+      commitStraySearch(event.target.value);
+    };
+    straySearch.oninput = (event) => {
+      if (event.isComposing || straySearch.dataset.composing) return;
+      if (straySearch.dataset.skipNextInput) { delete straySearch.dataset.skipNextInput; return; }
+      commitStraySearch(event.target.value);
+    };
+  }
   const textSearchBox = app.querySelector("#text-search-input");
   if (textSearchBox) {
     textSearchBox.oncompositionstart = () => { textSearchBox.dataset.composing = "true"; };
@@ -4766,7 +5062,26 @@ async function bindEvents() {
       if (action === "go-watch-later") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "watchLater"; state.seriesView = null; state.seriesItems = []; state.watchLaterQuery = ""; await refreshWatchLater(); render(); }
       // Pixiv 收藏：**每次点进来都重读一遍** —— 「本地库有没有」是后端现算的（用户要求）
       if (action === "go-pixiv-bookmarks") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "pixivBookmarks"; state.seriesView = null; state.seriesItems = []; await refreshPixivBookmarks(); render(); }
+      // 散篇：进页面时重拉一次列表（刚下完的作品要能立刻看到）
+      if (action === "open-stray") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "stray"; state.seriesView = null; state.seriesItems = []; state.strayQuery = ""; await refreshStray(); await refreshStrayWorks(); render(); }
+      if (action === "add-stray") await addStrayFromUrl();
       if (action === "refresh-pixiv-bookmarks") await updatePixivBookmarks();
+      if (action === "download-bookmark") await downloadOneBookmark(element.dataset.novelId);
+      if (action === "download-missing-bookmarks") await downloadMissingBookmarks();
+      // 「添加散篇」的提交：拿表单里的链接去下，下完自动关弹窗
+      if (action === "submit-stray") {
+        const url = document.querySelector('#stray-form [name="url"]')?.value.trim() || "";
+        if (!url) { toast("先贴一个作品链接", "info"); return; }
+        closeModal();
+        await runAddStray(url);
+      }
+      // 「批量新建作者」的提交：只做勾上的那些
+      if (action === "submit-import-authors") {
+        const checked = [...document.querySelectorAll('[data-role="bookmark-author-check"]:checked')].map((box) => box.value);
+        if (!checked.length) { toast("一位都没勾选，先勾上要建的", "info"); return; }
+        closeModal();
+        await runBookmarkAuthorImport(checked);
+      }
       if (action === "bookmark-filter") { state.pixivBookmarksFilter = element.dataset.filter || "all"; render(); }
       if (action === "import-bookmark-authors") await importBookmarkAuthors();
       if (action === "go-missing-full") { state.authorReturnTo = null; state.activeAuthor = null; state.seriesView = null; state.seriesItems = []; state.homeView = "missingFull"; state.missingFullAuthorId = null; await refreshMissingFull(); render(); }
@@ -6809,7 +7124,9 @@ async function syncPixivWorks() {
 // 作者库的「同步所有作者」：逐位串行同步，全程后台运行，右下角为每位作者各显示一根进度条
 async function syncAllAuthors() {
   if (state.syncTask) { toast("已有同步任务正在进行，请等待完成或先终止", "info"); return; }
-  const targets = state.authors.filter((author) => author.homepage && author.previewDir && author.purchasedDir);
+  // 「散篇」作者不参与整库同步（用户要求）：它们只是下载时的落脚点，
+  // 菜单里连卡都不显示，更不该去拉它们主页上的全部作品。
+  const targets = state.authors.filter((author) => !author.stray && author.homepage && author.previewDir && author.purchasedDir);
   if (!targets.length) {
     toast("没有可同步的作者：请先填写作者主页，并绑定预览版与完整版文件夹", "info");
     return;
@@ -8273,6 +8590,8 @@ async function bootstrap() {
     // 进度监听要**先**挂上 —— 更新在 3 秒后才起跑，那时必须已经能收到进度事件。
     listenPixivBookmarkProgress();
     refreshPixivBookmarksOnStartup();
+    // 作者库那张「散篇」卡的两个数。纯本地查询，很便宜，不用等。
+    refreshStray();
 
     // 上一版更新完留下的旧 exe，扫一遍送回收站。
     // 等两秒再扫：新版是被旧版拉起来的，旧进程可能还没退干净，那时删不掉。

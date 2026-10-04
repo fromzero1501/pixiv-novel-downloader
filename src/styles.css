@@ -864,3 +864,26 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .work-card.is-bookmark-ghost .work-cover:hover .work-menu { opacity: 0; }
 /* 「Pixiv 已删」小药丸：挂在「本地还有、但 Pixiv 那边已经删了」那几篇的 meta 行上 */
 .bookmark-flag { display: inline-block; margin-left: 6px; padding: 1px 6px; color: #b04a4a; background: #fdecec; border: 1px solid #f6d3d3; border-radius: 4px; font-size: 10px; font-weight: 750; line-height: 1.5; vertical-align: 1px; }
+/* v1.2.30 散篇：收藏页「本地没有」的那些不再变灰（.is-unpurchased 那套滤镜不套它们了），
+   改用右上角一枚小圆点标出来。 */
+.work-card.is-bookmark-ghost { position: relative; }
+.stray-dot { position: absolute; top: 9px; right: 9px; z-index: 2; width: 9px; height: 9px; border-radius: 50%; background: #e08a1e; box-shadow: 0 0 0 2px rgba(255,255,255,.9); }
+/* 封面悬停才露出来的「下载」：灰卡唯一的入口 */
+.bookmark-download-button { position: absolute; left: 50%; top: 50%; z-index: 2; transform: translate(-50%, -50%); display: inline-flex; align-items: center; gap: 5px; padding: 7px 13px; color: #fff; background: rgba(23,100,197,.94); border: 0; border-radius: 7px; font-size: 12px; font-weight: 700; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity .15s ease; }
+.work-card.is-bookmark-ghost .work-cover:hover .bookmark-download-button,
+.bookmark-download-button:focus-visible { opacity: 1; pointer-events: auto; }
+.bookmark-download-button:hover { background: #1764c5; }
+/* 灰卡上的系列名是纯文字（没有作者 id 可跳），别做成按钮 */
+.work-series-text { display: flex; align-items: center; gap: 4px; margin: 6px 0 0; color: #087b73; overflow: hidden; font-size: 12px; font-weight: 700; }
+.work-series-text span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.work-series-text svg { flex: 0 0 auto; }
+/* 作者库末尾那张「散篇」入口卡 */
+.author-card.is-stray-card { border-style: dashed; }
+.stray-card-icon { width: 100%; height: 100%; display: grid; place-items: center; color: #7b8ea4; background: #eef3f9; border-radius: 8px; }
+.author-stray-note { margin: 0 0 9px; color: #75879b; font-size: 12px; line-height: 1.5; }
+/* 「批量新建作者」弹窗里的勾选清单 */
+.bookmark-author-list { display: grid; gap: 2px; max-height: 320px; overflow-y: auto; margin-top: 14px; padding: 6px; border: 1px solid #e3ebf4; border-radius: 8px; }
+.bookmark-author-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 9px; min-height: 38px; padding: 0 8px; border-radius: 6px; cursor: pointer; }
+.bookmark-author-row:hover { background: #f2f8ff; }
+.bookmark-author-name { overflow: hidden; color: #33495f; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.bookmark-author-meta { color: #77899c; font-size: 12px; white-space: nowrap; }
