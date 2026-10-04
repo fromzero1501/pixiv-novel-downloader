@@ -666,6 +666,9 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .bulk-button { display: inline-flex; align-items: center; justify-content: center; color: #425b79; background: #fff; border: 1px solid #d9e3ef; border-radius: 7px; font-weight: 650; }
 .bulk-button:hover { color: #1764c5; border-color: #b8d3ef; background: #fafdff; }
 .bulk-button:disabled { color: #a9b6c6; background: #f4f7fb; border-color: #e4ebf3; }
+.bulk-button.is-promote { color: #6b45b8; border-color: #d9c9f0; background: #f7f2fd; }
+.bulk-button.is-promote:hover { color: #fff; background: #6b45b8; border-color: #6b45b8; }
+.bulk-button.is-promote:disabled { color: #b3a3cf; background: #f6f2fb; border-color: #e7ddf5; }
 .bulk-bar .danger-button { min-height: 32px; padding: 0 12px; font-size: 12px; }
 .bulk-bar .danger-button:disabled { opacity: .5; }
 .topbar-actions .bulk-count { margin-right: 4px; }

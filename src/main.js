@@ -3993,10 +3993,19 @@ function renderPixivBookmarks() {
  * 卡片直接复用「所有作品」那一套 —— 散篇作品本来就是普通作品，只是它的作者
  * 没有作者卡。所以点标题开文件、稍后再看、加收藏夹、开详情全都能用。
  */
+/**
+ * 散篇页当前可见的作品 —— 后端沿用作品库那一份 SQL，这里只补两种纯前端条件
+ *（阅读状态、评分 / 字数）和连载折叠，跟 `renderWorks` 完全一致。
+ *
+ * v1.2.34 抽成一个函数：渲染、批量条的「全选本页」、批量转正都读它，
+ * 免得三处各写一份筛法、选出来的和看见的对不上。
+ */
+function strayVisibleWorks() {
+  return collapseSerialWorks(state.strayWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+}
+
 function renderStray() {
-  // 和作品库同一套筛选（v1.2.33）：后端按同一份 SQL 规则筛好，这里只补两种纯前端条件
-  //（阅读状态、评分 / 字数）和连载折叠，跟 `renderWorks` 完全一致。
-  const works = collapseSerialWorks(state.strayWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+  const works = strayVisibleWorks();
   const cards = works.map((work) => `
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}
@@ -4017,7 +4026,7 @@ function renderStray() {
         <span class="bookmark-status">${state.straySummary.workCount || 0} 篇 · ${state.straySummary.authorCount || 0} 位作者</span>
         ${state.bulkMode
           ? `<strong class="bulk-count">已选 ${state.selectedWorkIds.size} 篇</strong>`
-          : `<button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button><button class="icon-text-button" data-action="promote-stray-batch" title="把当前列表里这些作品所属的作者一次转成正式作者">${icon("star", 18)}<span>批量转正</span></button><button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button>`}
+          : `<button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button><button class="icon-text-button" data-action="promote-stray-batch" title="批量转正：进选择模式，勾选 / 框选要转正的作品，再点批量条上的「转正」">${icon("star", 18)}<span>批量转正</span></button><button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button>`}
       </div>
     </section>
     ${state.bulkMode ? bulkBar(works) : ""}
@@ -5523,12 +5532,26 @@ async function bindEvents() {
         const promoteCount = state.strayWorks.filter((item) => item.authorId === promoteAuthorId).length;
         confirmAction("散篇转正", `把「${promoteName}」转成正式作者？他名下的 ${promoteCount} 篇作品会一起回到作者库，之后就会出现在作者库里（不是下载）。`, "转正", () => promoteStrayAuthors([promoteAuthorId], `已把「${promoteName}」转正`));
       }
-      // 「批量转正」：把**当前列表里**（筛选后）作品所属的作者一次转正 —— 先筛再转，就能只转一部分
+      // 「批量转正」（v1.2.34）：进批量操作模式，用同一套勾选 / 框选 / 全选挑要转正的作者，
+      // 再点批量条上的「转正 N 位作者」—— 不再是「当前列表全转」。
       if (action === "promote-stray-batch") {
-        const promoteWorks = collapseSerialWorks(state.strayWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
-        const promoteAuthorIds = [...new Set(promoteWorks.map((work) => work.authorId))];
-        if (!promoteAuthorIds.length) { toast("当前列表里没有作品", "info"); return; }
-        confirmAction("批量转正", `把当前这 ${promoteWorks.length} 篇作品所属的 ${promoteAuthorIds.length} 位作者一次转成正式作者？转正后他们的作品会回到作者库（不是下载）。`, "全部转正", () => promoteStrayAuthors(promoteAuthorIds, "已批量转正"));
+        state.bulkMode = true;
+        state.selectedWorkIds.clear();
+        render();
+        toast("点卡片勾选，或按住鼠标拖框选，再点批量条上的「转正」", "info");
+        return;
+      }
+      // 批量条上的「转正 N 位作者」：把勾选作品所属的作者（去重）一次转正
+      if (action === "promote-stray-selected") {
+        const picked = state.strayWorks.filter((work) => state.selectedWorkIds.has(work.id));
+        const promoteAuthorIds = [...new Set(picked.map((work) => work.authorId))];
+        if (!promoteAuthorIds.length) { toast("先勾选要转正的作品", "info"); return; }
+        confirmAction("批量转正", `把勾选的 ${picked.length} 篇作品所属的 ${promoteAuthorIds.length} 位作者一次转成正式作者？转正后他们的作品会回到作者库（不是下载）。`, "转正", async () => {
+          await promoteStrayAuthors(promoteAuthorIds, "已批量转正");
+          state.bulkMode = false;
+          state.selectedWorkIds.clear();
+          render();
+        });
       }
       if (action === "picker-toggle") {
         const id = Number(element.dataset.collectionId);
@@ -6100,6 +6123,13 @@ function bulkBar(works) {
   const disabled = count ? "" : "disabled";
   const allSelected = works.length > 0 && works.every((work) => state.selectedWorkIds.has(work.id));
   const group = (label, buttons) => `<div class="bulk-bar-group"><span class="bulk-bar-label">${label}</span>${buttons}</div>`;
+  // 「散篇」这一组只在散篇页出现（v1.2.34）：勾选作品所属作者去重后转正。
+  // 读的是 state.strayWorks ∩ 已选，和「已选 N 篇」各自独立，但都被同一份选择驱动。
+  const promotePicked = state.homeView === "stray" ? state.strayWorks.filter((work) => state.selectedWorkIds.has(work.id)) : [];
+  const promoteAuthors = new Set(promotePicked.map((work) => work.authorId)).size;
+  const promoteGroup = state.homeView === "stray"
+    ? `<div class="bulk-bar-group"><span class="bulk-bar-label">散篇</span><button class="bulk-button is-promote" data-action="promote-stray-selected" ${disabled}>转正 ${promoteAuthors} 位作者</button></div>`
+    : "";
   return `
     <section class="bulk-bar" aria-label="批量操作">
       <div class="bulk-bar-group is-lead">
@@ -6107,6 +6137,7 @@ function bulkBar(works) {
         <button class="quiet-button" data-action="select-all" ${works.length ? "" : "disabled"}>${allSelected ? "取消全选" : "全选本页"}</button>
         <button class="quiet-button" data-action="bulk-mode">退出批量</button>
       </div>
+      ${promoteGroup}
       ${group("版本", `<button class="bulk-button" data-action="copy-selected-full" ${disabled}>设为完整版</button><button class="bulk-button" data-action="set-images-selected" ${disabled}>设为带图版</button>`)}
       ${group("整理", `<button class="bulk-button" data-action="bulk-read-state" data-read-state="2" ${disabled}>设已读</button><button class="bulk-button" data-action="bulk-read-state" data-read-state="0" ${disabled}>设未读</button><button class="bulk-button" data-action="bulk-rating-modal" ${disabled}>设评分</button><button class="bulk-button" data-action="bulk-add-collection" ${disabled}>加入收藏夹</button><button class="bulk-button" data-action="bulk-remove-collection" ${disabled}>移出收藏夹</button><button class="bulk-button" data-action="bulk-tag-modal" ${disabled}>改标签</button>`)}
       ${group("文件", `<button class="bulk-button" data-action="backfill-images" title="按设置里选的格式，给勾选的作品重新下载阅读版并绑定" ${disabled}>补下配图</button><button class="bulk-button" data-action="download-selected-reading" data-format="epub" ${disabled}>重新下载 EPUB 版</button>`)}
@@ -6122,7 +6153,8 @@ function toggleWorkSelection(workId) {
 }
 
 function toggleSelectAll() {
-  const works = collapseSerialWorks(state.homeView === "stray" ? state.strayWorks : state.works);
+  // 散篇页用「当前可见」的那份（含阅读状态 / 高级筛选），别拿没筛过的整表
+  const works = state.homeView === "stray" ? strayVisibleWorks() : collapseSerialWorks(state.works);
   const areAllSelected = works.length > 0 && works.every((work) => state.selectedWorkIds.has(work.id));
   if (areAllSelected) state.selectedWorkIds.clear();
   else works.forEach((work) => state.selectedWorkIds.add(work.id));
