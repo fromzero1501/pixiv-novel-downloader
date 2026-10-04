@@ -9,7 +9,8 @@
     "prebuild": "node scripts/sync-version.mjs",
     "build": "node scripts/build-help-doc.mjs && node scripts/reset-dist.mjs && vite build",
     "tauri": "tauri",
-    "portable": "tauri build && node scripts/pack-portable.mjs"
+    "portable": "tauri build && node scripts/pack-portable.mjs",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

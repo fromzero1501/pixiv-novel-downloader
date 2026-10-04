@@ -9,6 +9,9 @@ public/help/
 
 # Rust dependencies and build output
 .cargo-home/
+# 本机编译习惯（把 dev/test 的调试信息降到 line-tables-only，target/ 从 5.9GB 压下来）。
+# 只影响本机构建产物体积，不改变程序行为、也影响不到 release 打包产物，故不入库。
+.cargo/
 src-tauri/target/
 
 # Portable application data and local releases
