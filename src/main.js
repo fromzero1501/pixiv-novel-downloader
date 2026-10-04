@@ -808,13 +808,17 @@ async function invoke(command, args = {}) {
     return table[args.authorId] || { status: "ok", message: "" };
   }
   // 补齐正文插图（设置页的维护工具）。脚本要验这条路就预置
-  // window.__novelImageBackfillPending（待补篇数）和 window.__novelImageBackfillResult
+  // window.__novelImageBackfillPending（待转换篇数）/ __novelImageBackfillOrphans（待清理目录数）
+  // / __novelImageBackfillResult
   if (command === "novel_image_backfill_status") {
-    return { pending: Number(window.__novelImageBackfillPending) || 0 };
+    return {
+      pending: Number(window.__novelImageBackfillPending) || 0,
+      orphans: Number(window.__novelImageBackfillOrphans) || 0,
+    };
   }
   if (command === "backfill_novel_images") {
     if (typeof window.__novelImageBackfillResult === "function") return window.__novelImageBackfillResult();
-    return window.__novelImageBackfillResult || { total: 0, updated: 0, failed: 0, imageCount: 0, cancelled: false, throttled: false, failedTitles: [] };
+    return window.__novelImageBackfillResult || { total: 0, updated: 0, cleaned: 0, failed: 0, imageCount: 0, cancelled: false, throttled: false, failedTitles: [] };
   }
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") {
@@ -5747,26 +5751,35 @@ async function runSynopsisBackfill(recheck) {
  * 「补齐正文插图」。
  *
  * 配图功能是 v1.0.0 才进来的，在那之前下载的作品正文里还留着 Pixiv 的原始插图标记
- * （`[uploadedimage:…]` / `[pixivimage:…]`），磁盘上也没有 `{正文名}_images` 目录，
- * 库里连「带图版」角标都不会有。这里按 Pixiv 作品 ID 重新抓一遍正文和配图，
- * 把标记换成 `[插图 N：…]` 指引。
+ * （`[uploadedimage:…]` / `[pixivimage:…]`），磁盘上也没有 `{正文名}_images` 目录。
  *
- * 判据在后端（**只看盘上那份正文**有没有原始标记），所以补过的作品不会被重复跑，
- * 已经补好的作品再点一次就是「没有需要补齐的」。
+ * v1.2.25 那版只是把图下到正文旁边、在正文里留一行 `[插图 N：…]` 指引 —— 纯文本里
+ * 根本看不见图（用户 2026-10-04 报的「光补图没用」）。v1.2.26 改成：
+ * **把带图作品转成带图阅读版（按设置里的 EPUB / HTML 格式）并绑定**，打开就是带图电子书；
+ * EPUB 生成后旁边那份冗余的 `{正文名}_images` 配图目录会送进回收站（EPUB 把图打进包里了；
+ * HTML 阅读版要靠这份目录显示图，那种情况不清）。
+ *
+ * 判据全在后端，转过的作品不会再进来，再点一次就是「没有需要处理的」。
  */
 async function backfillNovelImages() {
   let pending = 0;
+  let orphans = 0;
   try {
-    pending = Number((await invoke("novel_image_backfill_status"))?.pending) || 0;
+    const status = await invoke("novel_image_backfill_status");
+    pending = Number(status?.pending) || 0;
+    orphans = Number(status?.orphans) || 0;
   } catch { /* 数不出来也照常往下问，后端那边还会再判一次 */ }
-  if (!pending) {
-    toast("没有需要补齐插图的正文", "info");
+  if (!pending && !orphans) {
+    toast("没有需要处理的正文插图", "info");
     return;
   }
+  const parts = [];
+  if (pending) parts.push(`${pending} 篇作品的正文里有插图、但还只绑着 txt`);
+  if (orphans) parts.push(`${orphans} 篇 EPUB 作品旁边还留着多余的配图目录`);
   confirmAction(
     "补齐正文插图",
-    `还有 ${pending} 篇作品的正文里留着 Pixiv 原始的插图标记（这些是配图功能上线前下载的），磁盘上也还没有对应配图。会按 Pixiv 作品 ID 重新抓一次正文和配图，把标记换成「[插图 N：…]」指引；已经补好的会跳过。一篇接一篇请求、间隔跟设置里的抓取间隔一致（防触发 Pixiv 风控），右下角浮层显示进度，随时可以终止。`,
-    "开始补齐",
+    `${parts.join("；")}。会把带图作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定 —— 图直接打进电子书里，打开就能看；EPUB 生成后那一份「正文名_images」配图目录会送进回收站（不是硬删，随时能捞回来）。一篇接一篇请求、间隔跟设置里的抓取间隔一致（防触发 Pixiv 风控），右下角浮层显示进度，随时可以终止。`,
+    "开始处理",
     () => runNovelImageBackfill(),
   );
 }
@@ -5804,10 +5817,12 @@ async function runNovelImageBackfill() {
   const names = titles.length ? `（${titles.slice(0, 3).join("、")}${titles.length > 3 ? "…" : ""}）` : "";
   const failedText = failed ? `，${failed} 篇失败${names}` : "";
   const updated = Number(result?.updated) || 0;
+  const cleaned = Number(result?.cleaned) || 0;
   const images = Number(result?.imageCount) || 0;
-  if (result?.cancelled) toast(`已终止：补齐 ${updated} 篇、配图 ${images} 张${failedText}`, "info");
-  else if (!updated) toast(`没有补到配图${failedText}`, failed ? "info" : "success");
-  else toast(`已补齐 ${updated} 篇、配图 ${images} 张${failedText}`, failed ? "info" : "success");
+  const cleanedText = cleaned ? `、清理配图目录 ${cleaned} 个` : "";
+  if (result?.cancelled) toast(`已终止：转换 ${updated} 篇、配图 ${images} 张${cleanedText}${failedText}`, "info");
+  else if (!updated && !cleaned) toast(`没有需要处理的正文插图${failedText}`, failed ? "info" : "success");
+  else toast(`已转换 ${updated} 篇、配图 ${images} 张${cleanedText}${failedText}`, failed ? "info" : "success");
 }
 
 /** 文件体检：核对绑定的文件在不在，并统计磁盘占用 */
@@ -6769,7 +6784,7 @@ async function settingsModal() {
     <div class="menu-list settings-actions">
       <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>
       <button type="button" data-action="backfill-covers">${icon("image", 18)}补齐失效封面<span class="settings-action-hint">作品搬过家、目录被整理过之后，封面可能指向已经找不到的文件（卡片显示「暂无封面」）。这里按 Pixiv 作品 ID 重新取一次，下载到正文旁边</span></button>
-      <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">配图功能上线前下载的作品，正文里还留着 Pixiv 的原始插图标记、磁盘上没有配图。这里按 Pixiv 作品 ID 重抓正文和配图，把标记换成插图指引；一篇一篇请求，随时可以终止</span></button>
+      <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">把「正文里有插图、却还只绑着 txt」的作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定，图直接打进电子书里；EPUB 生成后旁边多余的配图目录会送进回收站。一篇一篇请求，随时可以终止</span></button>
       <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
