@@ -6594,6 +6594,62 @@ fn local_novel_ids(conn: &Connection) -> Result<HashSet<String>, String> {
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
+/// 「Pixiv 收藏」落库用的一行（封面路径还没定）。
+#[derive(Debug)]
+struct BookmarkFetched {
+    novel_id: String,
+    title: String,
+    user_id: String,
+    user_name: String,
+    cover_url: String,
+    is_masked: bool,
+}
+
+/// 从接口给的一页 `works` 里挑出该留下的条目。
+///
+/// 两条规矩：
+/// - **已删 / 非公开（`isMasked`）只在本地有对应作品时才留下**，否则丢掉、也不抓封面；
+/// - **同一个 `novel_id` 只留第一次出现的那个**。Pixiv 的收藏接口确实会重复返回同一篇
+///   （2026-10-04 实测：219 条里 `22726701` 出现了两次），而 `pixiv_bookmarks.novel_id` 是主键 ——
+///   重复一次就会让整批落库事务回滚：表被 DELETE 清空、一条也留不下。界面上看到的就是
+///   「封面一张张全下完了，收藏页却还是空的」。**这一条跟「本地有没有」无关**，
+///   那次重复的那篇本地恰恰没有。
+///
+/// `seen` 跨页共用（重复也可能正好落在相邻两页的边界上）。
+/// 返回 (留下的条目, 因为已删且本地没有而丢掉的条数)。
+fn collect_bookmark_entries(
+    works: &[Value],
+    local_ids: &HashSet<String>,
+    seen: &mut HashSet<String>,
+) -> (Vec<BookmarkFetched>, usize) {
+    let mut kept = Vec::new();
+    let mut dropped = 0usize;
+    for item in works {
+        let novel_id = json_id_string(item, "id");
+        // 见过的直接跳过：重复条目正是让整批落库失败的那个主键冲突
+        if novel_id.is_empty() || !seen.insert(novel_id.clone()) {
+            continue;
+        }
+        let is_masked = item
+            .get("isMasked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_masked && !local_ids.contains(&novel_id) {
+            dropped += 1;
+            continue;
+        }
+        kept.push(BookmarkFetched {
+            novel_id,
+            title: json_string(item, "title"),
+            user_id: json_id_string(item, "userId"),
+            user_name: json_string(item, "userName"),
+            cover_url: json_string(item, "url"),
+            is_masked,
+        });
+    }
+    (kept, dropped)
+}
+
 /// 拉一遍「我在 Pixiv 收藏的小说」并落库。
 ///
 /// 两条规矩（2026-10-04 用户拍板）：
@@ -6636,15 +6692,9 @@ fn refresh_pixiv_bookmarks_impl(
     };
 
     // ---- 1. 翻页拉列表 ----
-    struct Fetched {
-        novel_id: String,
-        title: String,
-        user_id: String,
-        user_name: String,
-        cover_url: String,
-        is_masked: bool,
-    }
-    let mut fetched: Vec<Fetched> = Vec::new();
+    let mut fetched: Vec<BookmarkFetched> = Vec::new();
+    // 跨页共用，用来把接口重复返回的同一篇挡掉
+    let mut seen: HashSet<String> = HashSet::new();
     let mut total = 0usize;
     let mut offset = 0usize;
     let mut masked_dropped = 0usize;
@@ -6680,26 +6730,9 @@ fn refresh_pixiv_bookmarks_impl(
         if works.is_empty() {
             break;
         }
-        for item in &works {
-            let novel_id = json_id_string(item, "id");
-            if novel_id.is_empty() {
-                continue;
-            }
-            let is_masked = item.get("isMasked").and_then(Value::as_bool).unwrap_or(false);
-            // 已删 / 非公开：只在本地有对应作品时才留下
-            if is_masked && !local_ids.contains(&novel_id) {
-                masked_dropped += 1;
-                continue;
-            }
-            fetched.push(Fetched {
-                novel_id,
-                title: json_string(item, "title"),
-                user_id: json_id_string(item, "userId"),
-                user_name: json_string(item, "userName"),
-                cover_url: json_string(item, "url"),
-                is_masked,
-            });
-        }
+        let (entries, dropped) = collect_bookmark_entries(&works, &local_ids, &mut seen);
+        masked_dropped += dropped;
+        fetched.extend(entries);
         offset += works.len();
         progress(offset, total, "正在读取收藏列表".into());
         if (total > 0 && offset >= total) || works.len() < PIXIV_BOOKMARK_PAGE {
@@ -6777,8 +6810,11 @@ fn refresh_pixiv_bookmarks_impl(
         .map_err(|e| e.to_string())?;
     for row in &rows {
         transaction
+            // `OR REPLACE` 是兜底：上游已经按 novel_id 去过重，但万一还有漏网的重复，
+            // 主键冲突会让**整批**回滚 —— 表被清空、一条也留不下（v1.2.28 的真机故障）。
+            // 重复时后一条覆盖前一条，比整体失败强得多。
             .execute(
-                "INSERT INTO pixiv_bookmarks (novel_id, title, user_id, user_name, cover_url, cover_path, is_masked, sort_index, fetched_at)
+                "INSERT OR REPLACE INTO pixiv_bookmarks (novel_id, title, user_id, user_name, cover_url, cover_path, is_masked, sort_index, fetched_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8],
             )
@@ -13287,7 +13323,8 @@ mod tests {
         add_watch_later_impl, remove_watch_later_impl, list_watch_later_impl,
         list_watch_later_ids_impl,
         // v1.2.27：Pixiv 收藏页
-        collect_bookmark_authors, list_pixiv_bookmarks_impl,
+        collect_bookmark_authors, list_pixiv_bookmarks_impl, refresh_pixiv_bookmarks_impl,
+        collect_bookmark_entries,
         migrate_word_counts_for_non_text_files,
         add_works_to_collections_impl, update_works_tags_impl,
         set_works_rating_impl, set_works_need_full_state_impl,
@@ -14321,6 +14358,74 @@ mod tests {
         conn.execute("DELETE FROM works", []).unwrap();
         let list = list_pixiv_bookmarks_impl(&conn).unwrap();
         assert!(list.items.iter().all(|item| item.work.is_none()));
+    }
+
+    /// 真机探针（要联网 + 本机便携库，默认 `#[ignore]`）：
+    /// 在**便携库的副本**上完整跑一遍收藏刷新，直接看它返回 Ok 还是 Err、写完剩几行。
+    ///
+    /// 为什么要它：「封面都下完了、收藏页却还是空的」是两次实机现象 —— 封面写盘发生在
+    /// 落库**之前**，所以只要落库那一步出问题，症状就长这样。这个探针把 Err 的原话打出来
+    /// （前端那条链在静默模式下只 console.log，界面上看不到）。
+    ///
+    /// 跑法：`cargo test -- --ignored probe_refresh_bookmarks_real --nocapture`
+    #[test]
+    #[ignore]
+    fn probe_refresh_bookmarks_real() {
+        let source = std::path::PathBuf::from(
+            r"D:\500 工作\Program\收藏记录软件\发布\藏集\PixivNovelDownloader\data\library.db",
+        );
+        if !source.is_file() {
+            println!("SKIP：找不到便携库 {source:?}");
+            return;
+        }
+        let copy = std::env::temp_dir().join("probe-refresh-bookmarks.db");
+        let _ = std::fs::remove_file(&copy);
+        std::fs::copy(&source, &copy).unwrap();
+        let conn = Connection::open(&copy).unwrap();
+
+        let mut seen = 0usize;
+        let result =
+            refresh_pixiv_bookmarks_impl(&conn, &mut |current: usize, total: usize, title: String| {
+                seen += 1;
+                if seen % 20 == 0 || current == 0 {
+                    println!("progress[{seen}]: {title} {current}/{total}");
+                }
+            });
+        match &result {
+            Ok(value) => println!("RESULT OK: {value:?}"),
+            Err(error) => println!("RESULT ERR: {error}"),
+        }
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pixiv_bookmarks", [], |row| row.get(0))
+            .unwrap();
+        println!("rows in copy after run: {rows}");
+    }
+
+    /// 收藏接口会重复返回同一篇（实测 219 条里 `22726701` 出现两次）——
+    /// 落库前必须去重，否则主键冲突会让**整批**事务回滚、表被清空成 0 行。
+    #[test]
+    fn bookmark_entries_drop_repeat_novel_ids() {
+        use std::collections::HashSet;
+        let works = vec![
+            json!({ "id": "111", "title": "本地没有、会重复的一篇", "userId": "9", "userName": "某人", "isMasked": false }),
+            json!({ "id": "222", "title": "已删且本地没有", "isMasked": true }),
+            json!({ "id": "111", "title": "重复来一次", "userId": "9", "userName": "某人", "isMasked": false }),
+            json!({ "id": "333", "title": "已删但本地留着", "isMasked": true }),
+        ];
+        let local: HashSet<String> = ["333".to_string()].into_iter().collect();
+        let mut seen = HashSet::new();
+        let (kept, dropped) = collect_bookmark_entries(&works, &local, &mut seen);
+
+        assert_eq!(kept.len(), 2, "111 只留一次、333 留下、222 丢掉");
+        assert_eq!(kept[0].novel_id, "111");
+        assert_eq!(kept[0].title, "本地没有、会重复的一篇", "留下的该是第一次出现的那条");
+        assert_eq!(kept[1].novel_id, "333");
+        assert_eq!(dropped, 1, "只有「已删且本地没有」的 222 被丢");
+
+        // 重复也可能正好落在相邻两页的边界上：`seen` 是跨页传下去的
+        let next_page = vec![json!({ "id": "111", "title": "下一页又来", "isMasked": false })];
+        let (kept_next, _) = collect_bookmark_entries(&next_page, &local, &mut seen);
+        assert!(kept_next.is_empty(), "上一页见过的 id，下一页不能再留");
     }
 
     /// 「带图版」判据：详情里的 `textEmbeddedImages` 比标题关键词准，

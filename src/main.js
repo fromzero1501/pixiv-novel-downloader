@@ -226,6 +226,12 @@ const state = {
    * `null` = 没在更新。形状 `{ total, current, title }`，`total` 为 0 表示还没数出总数。
    */
   pixivBookmarksProgress: null,
+  /**
+   * 上一次更新失败的原因（空串 = 没出错）。
+   * 自动更新是静默的、失败只写 console —— 不留痕的话用户看到的只是「收藏页空着」，
+   * 完全不知道刚才那轮出了错。这一行就是给那种情况准备的。
+   */
+  pixivBookmarksError: "",
 };
 
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "D:\\头像\\雾海.png", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
@@ -871,6 +877,10 @@ async function invoke(command, args = {}) {
     return { items: previewBookmarks(), fetchedAt: window.__previewBookmarksFetchedAt || "" };
   }
   if (command === "refresh_pixiv_bookmarks") {
+    // 预览里可以让这次刷新直接失败，用来验「失败要看得见」（无头校验用）。
+    if (window.__previewBookmarkRefreshError) {
+      return Promise.reject(new Error(String(window.__previewBookmarkRefreshError)));
+    }
     window.__previewBookmarksFetchedAt = new Date().toISOString();
     const result = { total: 5, kept: 5, maskedKept: 1, maskedDropped: 0, coversCached: 0, fetchedAt: window.__previewBookmarksFetchedAt };
     // 预览里可以让这次刷新「挂着不返回」，好观察更新进度条（无头校验用）。
@@ -3526,11 +3536,15 @@ async function updatePixivBookmarks({ silent = false } = {}) {
   try {
     await invoke("refresh_pixiv_bookmarks");
     await refreshPixivBookmarks();
+    state.pixivBookmarksError = "";
     if (!silent) {
       const localCount = state.pixivBookmarks.filter((item) => item.work).length;
       toast(`收藏已更新：共 ${state.pixivBookmarks.length} 篇，本地已有 ${localCount} 篇`, "success");
     }
   } catch (error) {
+    // 失败**必须留痕**：自动更新是静默的，不留的话用户只会看到「收藏页空着」，
+    // 完全不知道刚才那轮报了错（v1.2.28 的两次真机故障就是这么被埋掉的）。
+    state.pixivBookmarksError = String(error).slice(0, 200);
     if (silent) console.log("Pixiv 收藏自动更新失败:", error);
     else toast(String(error), "error");
   } finally {
@@ -3671,6 +3685,7 @@ function renderPixivBookmarks() {
       </div>
     </section>
     <div id="bookmark-progress">${bookmarkProgressHtml()}</div>
+    ${state.pixivBookmarksError ? `<div class="bookmark-error">上次更新没成功：${escapeHtml(state.pixivBookmarksError)}</div>` : ""}
     <section class="library-content">
       <div class="library-tools">
         <label class="search-field"><span>${icon("search", 19)}</span><input id="bookmark-search" type="search" placeholder="搜索标题或作者名" value="${escapeHtml(state.pixivBookmarksQuery)}" autocomplete="off"></label>

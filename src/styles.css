@@ -854,6 +854,8 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .bookmark-progress-text { flex: 0 0 auto; color: #5e84ac; font-size: 12px; font-weight: 650; white-space: nowrap; }
 .bookmark-progress.is-indeterminate .bookmark-progress-fill { width: 40%; animation: bookmark-progress-scan 1.1s ease-in-out infinite; }
 @keyframes bookmark-progress-scan { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+/* 更新失败要看得见：自动更新是静默的，这行是它唯一的出口（v1.2.29）。 */
+.bookmark-error { margin-top: 10px; color: #b04a4a; font-size: 12px; line-height: 1.5; }
 /* 本地库里没有的那张卡：只展示封面、标题和作者名，不给任何入口。
    连悬停的抬升也去掉，免得看上去像能点开。 */
 .work-card.is-bookmark-ghost { cursor: default; }
