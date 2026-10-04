@@ -933,7 +933,9 @@ async function invoke(command, args = {}) {
   if (command === "download_bookmark" || command === "download_bookmark_novels" || command === "add_stray_from_url") {
     if (window.__previewBookmarkDownloadError) return Promise.reject(new Error(String(window.__previewBookmarkDownloadError)));
     const count = command === "download_bookmark_novels" ? (args.novelIds || []).length : 1;
-    return { total: count, downloaded: count, skipped: 0, failed: 0, failedNames: [], cancelled: false };
+    // `__previewBookmarkFailures` 用来注入失败清单，测「有 N 篇没下进来」那个弹窗
+    const failedNames = Array.isArray(window.__previewBookmarkFailures) ? window.__previewBookmarkFailures.slice(0, count) : [];
+    return { total: count, downloaded: count - failedNames.length, skipped: 0, failed: failedNames.length, failedNames, cancelled: false };
   }
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") {
@@ -1132,8 +1134,16 @@ function toast(message, tone = "info") {
   window.setTimeout(() => element.remove(), 3200);
 }
 
+/**
+ * 日期显示：库里 `works.release_date` 存的已经是 `YYYY-MM-DD`，但收藏接口给的 `createDate`
+ * 是带时区的完整 ISO（`2025-05-16T20:30:20+09:00`）—— 不处理就会把整串原样画到卡片上。
+ * 统一只取日期那一段；**不做时区换算**（Pixiv 自己按 JST 显示，跟它对齐）。
+ */
 function dateLabel(value) {
-  return value || "未解析日期";
+  const raw = String(value ?? "").trim();
+  if (!raw) return "未解析日期";
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})(?:[T ]|$)/);
+  return match ? match[1] : raw;
 }
 
 function wordCountLabel(value) {
@@ -3906,14 +3916,19 @@ async function runBookmarkDownload(novelIds) {
   // 整库任务用 0 当取消键（和「整库补抓简介」「补齐正文插图」同一套）
   state.syncTask = { authorId: 0, cancelAuthorId: 0, cancelText: "终止下载", cancelBusyLabel: "正在终止下载", label: "正在下载收藏作品", title: "", current: 0, total: novelIds.length, cancelling: false };
   render();
-  const unlisten = await listen("bookmark-download-progress", (event) => {
-    const { total = 0, current = 0, downloaded = 0, failed = 0 } = event.payload || {};
-    if (!state.syncTask) return;
-    state.syncTask.total = total;
-    state.syncTask.current = current;
-    state.syncTask.title = `已下载 ${downloaded} 篇${failed ? ` · 失败 ${failed} 篇` : ""}`;
-    updateSyncFloater();
-  });
+  // 浏览器预览里没有 Tauri 事件系统，`listen` 会直接抛 —— 和「补抓简介」那边一样兜住，
+  // 流程照跑，只是没有实时进度（无头校验要靠这条路才跑得完）
+  let unlisten = () => {};
+  try {
+    unlisten = await listen("bookmark-download-progress", (event) => {
+      const { total = 0, current = 0, downloaded = 0, failed = 0 } = event.payload || {};
+      if (!state.syncTask) return;
+      state.syncTask.total = total;
+      state.syncTask.current = current;
+      state.syncTask.title = `已下载 ${downloaded} 篇${failed ? ` · 失败 ${failed} 篇` : ""}`;
+      updateSyncFloater();
+    });
+  } catch { unlisten = () => {}; }
   let result = null;
   try {
     result = await invoke("download_bookmark_novels", { novelIds });
@@ -3934,6 +3949,18 @@ async function runBookmarkDownload(novelIds) {
   if (result.skipped) parts.push(`本地已有 ${result.skipped} 篇`);
   if (result.failed) parts.push(`失败 ${result.failed} 篇`);
   toast(`${result.cancelled ? "已终止 —— " : ""}${parts.join(" · ")}`, result.failed ? "info" : "success");
+  // 光说「失败 6 篇」等于没说 —— 是哪几篇、卡在哪，摆出来（后端已经带上标题与原因）
+  const failures = Array.isArray(result.failedNames) ? result.failedNames.filter(Boolean) : [];
+  if (result.failed && failures.length) {
+    const more = result.failed > failures.length
+      ? `<p class="read-only-note">下面只列了前 ${failures.length} 篇，还有 ${result.failed - failures.length} 篇没列。</p>`
+      : "";
+    showModal(modal(
+      `有 ${result.failed} 篇没下进来`,
+      `<ul class="failed-list">${failures.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>${more}`,
+      `<button class="primary-button" data-action="close-modal">知道了</button>`,
+    ));
+  }
 }
 
 /**

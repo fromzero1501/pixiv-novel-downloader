@@ -5277,6 +5277,22 @@ fn existing_sync_target(
         .map(|(id, _)| *id))
 }
 
+/// 「这篇要不要因为正文太小而跳过」。
+///
+/// 只有**列表式**同步（整库 / 按作者，可能带日期范围）才吃这条下限 —— 它防的是残篇与公告。
+/// 给了具体作品链接的属于「点名下载」：散篇转正 / 添加散篇 / 作者卡里贴链接都是，
+/// 用户指哪篇就下哪篇，再短也下。
+///
+/// 实测（2026-10-04）：收藏里最短的 6 篇是 174–3359 字，全被 10KB 这条悄悄跳过，
+/// 还被当成「失败」报出去（默认文案还说「作品可能已删除」），作品其实好好的。
+fn should_skip_small_content(
+    is_single_sync: bool,
+    content_bytes: usize,
+    minimum_file_size_bytes: u64,
+) -> bool {
+    !is_single_sync && (content_bytes as u64) < minimum_file_size_bytes
+}
+
 fn pixiv_sync_impl(
     author_id: i64,
     start_date: String,
@@ -5637,6 +5653,7 @@ fn pixiv_sync_impl(
             .unwrap_or_default();
         if title.is_empty() {
             result.failed_count += 1;
+            note_sync_failure(&mut result.failed_reasons, "作品取不到标题（可能已删除）".into());
             continue;
         }
         if let Some(existing_id) = existing_sync_target(&conn, author_id, &novel_id, &title)? {
@@ -5710,10 +5727,16 @@ fn pixiv_sync_impl(
             continue;
         }
         if content.is_empty() || cover_url.is_empty() {
+            // 别只记「失败」：正文/封面取不到是这条路上最常见的原因，写清楚才有的查
             result.failed_count += 1;
+            note_sync_failure(
+                &mut result.failed_reasons,
+                "正文或封面取不到（可能已删除或转为私密）".into(),
+            );
             continue;
         }
-        if (content.len() as u64) < minimum_file_size_bytes {
+        // 点名下载不吃这条下限，见 `should_skip_small_content`
+        if should_skip_small_content(is_single_sync, content.len(), minimum_file_size_bytes) {
             result.skipped_size_count += 1;
             continue;
         }
@@ -7459,7 +7482,7 @@ struct BookmarkDownloadResult {
     /// 本地已经有这一篇，没重下
     skipped: usize,
     failed: usize,
-    /// 失败原因（带作品 id），最多记 5 条
+    /// 失败原因（带标题与作品 id），最多记 20 条
     failed_names: Vec<String>,
     cancelled: bool,
 }
@@ -7510,9 +7533,15 @@ fn download_bookmark_novel_impl(
         if result.throttled {
             return Err("被 Pixiv 限流了，停一会儿再试".into());
         }
+        // 「这位作者名下已有同名作品」也会落到这儿：`existing_sync_target` 在 novel_id
+        // 匹配不上时会退回按标题匹配。那属于**本地已经有**，不是失败 ——
+        // 报成失败会让用户以为这篇下不下来，其实库里就躺着一份。
+        if result.skipped_existing_count > 0 {
+            return Ok(false);
+        }
         let reason = result.failed_reasons.first().cloned().unwrap_or_default();
         return Err(if reason.is_empty() {
-            "这一篇没能下下来（作品可能已删除，或需要登录 Cookie）".into()
+            "这一篇没能下下来（正文或封面取不到，也可能本地写入失败）".into()
         } else {
             reason
         });
@@ -7555,11 +7584,12 @@ fn download_bookmark_novels_impl(
         .ok()
         .filter(|value| *value > 0)
         .unwrap_or(1);
-    // 收藏表里现成的 user_id / user_name，省掉每篇一次作者反查
-    let mut hints: HashMap<String, (String, String)> = HashMap::new();
+    // 收藏表里现成的 user_id / user_name / title：省掉每篇一次作者反查，
+    // 失败清单也能直接写出标题（用户对着收藏页就能认出来是哪几篇）
+    let mut hints: HashMap<String, (String, String, String)> = HashMap::new();
     {
         let mut statement = conn
-            .prepare("SELECT novel_id, user_id, user_name FROM pixiv_bookmarks")
+            .prepare("SELECT novel_id, user_id, user_name, title FROM pixiv_bookmarks")
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([], |row| {
@@ -7567,12 +7597,13 @@ fn download_bookmark_novels_impl(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
         for row in rows {
-            let (novel_id, user_id, user_name) = row.map_err(|e| e.to_string())?;
-            hints.insert(novel_id, (user_id, user_name));
+            let (novel_id, user_id, user_name, title) = row.map_err(|e| e.to_string())?;
+            hints.insert(novel_id, (user_id, user_name, title));
         }
     }
     drop(conn);
@@ -7587,15 +7618,20 @@ fn download_bookmark_novels_impl(
             result.cancelled = true;
             break;
         }
-        let (user_id, user_name) = hints.get(novel_id).cloned().unwrap_or_default();
+        let (user_id, user_name, title) = hints.get(novel_id).cloned().unwrap_or_default();
         match download_bookmark_novel_impl(&app, novel_id, &user_id, &user_name) {
             Ok(true) => result.downloaded += 1,
             Ok(false) => result.skipped += 1,
             Err(error) => {
                 result.failed += 1;
-                // 失败原因钉上作品 id，回头能从收藏页对上是哪一篇
-                if result.failed_names.len() < 5 {
-                    result.failed_names.push(format!("{novel_id}：{error}"));
+                // 失败原因钉上标题与作品 id —— 用户只看到「失败 6 篇」时根本没法查是哪几篇
+                if result.failed_names.len() < 20 {
+                    let label = if title.trim().is_empty() {
+                        novel_id.clone()
+                    } else {
+                        format!("{}（{novel_id}）", title.trim())
+                    };
+                    result.failed_names.push(format!("{label}：{error}"));
                 }
             }
         }
@@ -13923,7 +13959,7 @@ mod tests {
         render_novel_xhtml, resolve_cover_path, rewrite_novel_txt,
         sanitize_file_name,
         select_argument,
-        should_import_folder_entry, similarity_percent, similarity_with_title_limit,
+        should_import_folder_entry, should_skip_small_content, similarity_percent, similarity_with_title_limit,
         sort_works_by_content_size,
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
         probe_latest_version, probe_update_asset, update_asset_names, update_client,
@@ -15044,6 +15080,30 @@ mod tests {
         let next_page = vec![json!({ "id": "111", "title": "下一页又来", "isMasked": false })];
         let (kept_next, _) = collect_bookmark_entries(&next_page, &local, &mut seen);
         assert!(kept_next.is_empty(), "上一页见过的 id，下一页不能再留");
+    }
+
+    /// v1.2.30 那 6 篇「失败」的真因：正文比设置里的「最小正文体积」短，被**列表式**同步
+    /// 的过滤悄悄跳过了，还被报成失败。点名下载（散篇转正 / 添加散篇 / 贴链接）必须照下 ——
+    /// 用户指了哪一篇，就下哪一篇。
+    #[test]
+    fn point_named_download_ignores_the_minimum_size() {
+        const LIMIT: u64 = 10240;
+        // 实测那 6 篇的字节数：432 / 1286 / 4370 / 6564 / 7173 / 9943
+        for bytes in [432usize, 1286, 4370, 6564, 7173, 9943] {
+            assert!(
+                should_skip_small_content(false, bytes, LIMIT),
+                "整库同步该跳过 {bytes} 字节的残篇"
+            );
+            assert!(
+                !should_skip_small_content(true, bytes, LIMIT),
+                "点名下载不能跳过 {bytes} 字节这一篇"
+            );
+        }
+        // 够大的：两边都不跳
+        assert!(!should_skip_small_content(false, 20480, LIMIT));
+        assert!(!should_skip_small_content(true, 20480, LIMIT));
+        // 下限设成 0（用户关掉了）时谁都不跳
+        assert!(!should_skip_small_content(false, 1, 0));
     }
 
     /// 标签：落库存 JSON、读出来是**数组**。标签自己带 `|` 也要原样还原 ——
