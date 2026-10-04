@@ -5570,7 +5570,7 @@ fn pixiv_sync_impl(
             // 标题命中「插画 / 图文」时补标记为带图版；未命中则保持原值，不会清掉已有标记
             conn.execute(
                 "UPDATE works SET pixiv_novel_id=CASE WHEN pixiv_novel_id='' THEN ?1 ELSE pixiv_novel_id END, series_id=?2, series_title=?3, series_order=?4, has_images=CASE WHEN ?6=1 THEN 1 ELSE has_images END, synopsis=CASE WHEN ?7='' THEN synopsis ELSE ?7 END WHERE id=?5",
-                params![novel_id, series_id, series_title, series_order, existing_id, title_indicates_images(&title) as i64, description],
+                params![novel_id, series_id, series_title, series_order, existing_id, (title_indicates_images(&title) || detail_has_embedded_images(body)) as i64, description],
             )
             .map_err(|e| e.to_string())?;
             result.skipped_existing_count += 1;
@@ -5629,7 +5629,7 @@ fn pixiv_sync_impl(
                     }
                 }
             };
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, title_indicates_images(&title) as i64, description]).is_err() {
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, (title_indicates_images(&title) || detail_has_embedded_images(body)) as i64, description]).is_err() {
                 result.failed_count += 1;
                 continue;
             }
@@ -5756,7 +5756,11 @@ fn pixiv_sync_impl(
             // 配图真的下下来了就以它为准：正文里 `[pixivimage:...]` 引用的插画很常见，
             // 光看标题里有没有「插画 / 图文」会漏掉一大批带图版
             //（「重新下载」那条路本来就是按实际张数盖 has_images 的，这里对齐）。
-            let has_images = image_saved > 0 || title_indicates_images(&work.title);
+            // 2026-10-04 再补一档：详情响应里 `textEmbeddedImages` 非空也算带图版 ——
+            // 这个数据本来就在手上，比标题关键词准，漏了它会让一批图文作品连角标都没有。
+            let has_images = image_saved > 0
+                || title_indicates_images(&work.title)
+                || detail_has_embedded_images(&work.embedded_images);
             if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, has_images as i64, image_saved as i64, work.synopsis]).is_err() {
             result.failed_count += 1;
             continue;
@@ -8323,6 +8327,235 @@ async fn redownload_novel_txt(work_id: i64) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || redownload_novel_txt_impl(work_id))
         .await
         .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// 补齐正文插图（历史欠账）
+//
+// 配图那条链（`[uploadedimage:ID]` → 落到 `{正文名}_images/`、正文里的占位符改写成
+// `[插图 N：…]`）是 v1.0.0（2026-09-15）才进来的。在那之前下载的作品，正文里还是
+// Pixiv 的原始占位符、磁盘上没有 `_images` 目录，库里也不会有「带图版」角标 ——
+// 用户 2026-10-04 报的 novel 27784467 就是这一类（便携库当时 1457 篇里有 148 篇）。
+// 设置页那个「补齐正文插图」拿的就是下面这套。
+// ---------------------------------------------------------------------------
+
+/// 正文里还留着 Pixiv **原始**插图占位符吗？
+///
+/// 只看落盘前的那两个前缀；跟着落盘的友好标记形如 `[插图 3：标题_images/003.jpg]`，
+/// 两者不会互相误伤。
+fn text_has_raw_novel_image_tokens(text: &str) -> bool {
+    text.contains("[uploadedimage:") || text.contains("[pixivimage:")
+}
+
+/// 详情响应里这篇作品**本身带内嵌插图**（`textEmbeddedImages` 非空）。
+///
+/// 判「带图版」它比标题关键词准得多。老代码只看标题，于是正文里一堆
+/// `[uploadedimage:…]`、标题却没写「插画 / 插图 / 图文」的作品全被漏掉。
+/// 数据本来就在手边（同步抓详情时同一个响应体里），没有不用的道理。
+fn detail_has_embedded_images(body: &Value) -> bool {
+    body.get("textEmbeddedImages")
+        .and_then(Value::as_object)
+        .map(|images| !images.is_empty())
+        .unwrap_or(false)
+}
+
+/// 这篇作品「正文 txt」的落点：绑在 txt 上就是它自己，绑在 html / epub 上就是旁边同名 txt。
+/// 文件不存在就返回 `None` —— 补插图只认真正躺在盘上的正文。
+fn novel_text_path_of_bound(bound: &str) -> Option<PathBuf> {
+    if bound.trim().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(bound);
+    let is_txt = path
+        .extension()
+        .map(|ext| ext.eq_ignore_ascii_case("txt"))
+        .unwrap_or(false);
+    if is_txt {
+        return path.is_file().then_some(path);
+    }
+    novel_text_path_beside(&path)
+}
+
+/// 补插图时正文最多读多少 —— 只看有没有占位符，没必要把一本巨著整个吞进内存。
+const NOVEL_BACKFILL_MAX_TEXT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 找出「正文里还留着 Pixiv 原始插图占位符」的作品（id + 标题），按 id 升序。
+///
+/// 判据**只看磁盘上那份正文**，不看 `has_images`：历史作品的这个字段本来就不可信
+/// （老版本只按标题关键词盖，正文里有多少图它一概不知道）。
+/// 没有 Pixiv 作品 ID 的跳过 —— 没 ID 就抓不到详情，补不了。
+fn collect_novel_image_backfill_targets(conn: &Connection) -> Vec<(i64, String)> {
+    // 先整表捞出来再逐篇看正文：查库要借连接，读文件是纯 IO，分开写省得跟借用较劲。
+    let mut rows: Vec<(i64, String, String, String)> = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT id, title, ifnull(preview_path,''), ifnull(purchased_path,'') \
+         FROM works WHERE ifnull(pixiv_novel_id,'') <> '' ORDER BY id",
+    ) {
+        if let Ok(mapped) = statement.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        }) {
+            for row in mapped {
+                if let Ok(value) = row {
+                    rows.push(value);
+                }
+            }
+        }
+    }
+    rows.into_iter()
+        .filter_map(|(work_id, title, preview_path, purchased_path)| {
+            // 完整版优先，跟界面上「绑定的那一份」保持一致
+            let bound = if purchased_path.trim().is_empty() {
+                preview_path
+            } else {
+                purchased_path
+            };
+            let text_path = novel_text_path_of_bound(&bound)?;
+            if fs::metadata(&text_path).ok()?.len() > NOVEL_BACKFILL_MAX_TEXT_BYTES {
+                return None;
+            }
+            let bytes = fs::read(&text_path).ok()?;
+            let text = String::from_utf8_lossy(&bytes);
+            text_has_raw_novel_image_tokens(&text).then_some((work_id, title))
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NovelImageBackfillStatus {
+    /// 正文里还留着原始插图占位符的作品数
+    pending: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NovelImageBackfillResult {
+    total: usize,
+    updated: usize,
+    failed: usize,
+    /// 反查库里落地后的配图总张数
+    image_count: usize,
+    cancelled: bool,
+    throttled: bool,
+    failed_titles: Vec<String>,
+}
+
+/// 「补齐正文插图」要跑多少篇。设置页弹确认框之前先问一次。
+#[tauri::command]
+fn novel_image_backfill_status() -> Result<NovelImageBackfillStatus, String> {
+    let conn = db()?;
+    Ok(NovelImageBackfillStatus {
+        pending: collect_novel_image_backfill_targets(&conn).len(),
+    })
+}
+
+/// 整库「补齐正文插图」。
+#[tauri::command]
+async fn backfill_novel_images(app: tauri::AppHandle) -> Result<NovelImageBackfillResult, String> {
+    // 和「整库补抓简介」共用 0 这个取消键（见 cancel_pixiv_sync）
+    clear_pixiv_sync_cancel(0);
+    let result = tauri::async_runtime::spawn_blocking(move || backfill_novel_images_impl(&app))
+        .await
+        .map_err(|e| e.to_string())?;
+    clear_pixiv_sync_cancel(0);
+    result
+}
+
+/// 逐篇串行补插图。**故意不吃并发**：一篇要发 1 次详情 + N 张图，比补简介重得多，
+/// 并发起来必撞风控。间隔直接读设置里的抓取间隔（和同步、补简介同一套）。
+fn backfill_novel_images_impl(app: &AppHandle) -> Result<NovelImageBackfillResult, String> {
+    let (targets, base_delay) = {
+        let conn = db()?;
+        let targets = collect_novel_image_backfill_targets(&conn);
+        let base_delay = setting(&conn, "pixiv_delay_seconds")?
+            .parse::<u64>()
+            .unwrap_or(1);
+        (targets, base_delay)
+    };
+    let total = targets.len();
+    let mut result = NovelImageBackfillResult {
+        total,
+        updated: 0,
+        failed: 0,
+        image_count: 0,
+        cancelled: false,
+        throttled: false,
+        failed_titles: Vec::new(),
+    };
+    emit_reading_progress(app, total, 0, format!("准备补齐 {total} 篇的正文插图"), false);
+    for (index, (work_id, title)) in targets.iter().enumerate() {
+        if pixiv_sync_cancelled(0) {
+            result.cancelled = true;
+            break;
+        }
+        if index > 0 && base_delay > 0 {
+            std::thread::sleep(Duration::from_secs(base_delay));
+        }
+        let label = if title.trim().is_empty() {
+            format!("作品 {work_id}")
+        } else {
+            title.clone()
+        };
+        emit_reading_progress(app, total, index, format!("正在补齐插图：{label}"), false);
+        match backfill_novel_images_for_work(*work_id) {
+            Ok(saved) => {
+                result.updated += 1;
+                result.image_count += saved;
+            }
+            Err(_) => {
+                result.failed += 1;
+                if result.failed_titles.len() < 8 {
+                    result.failed_titles.push(label.clone());
+                }
+            }
+        }
+        emit_reading_progress(app, total, index + 1, label, false);
+    }
+    emit_reading_progress(
+        app,
+        total,
+        total,
+        format!("已补齐 {} 篇", result.updated),
+        true,
+    );
+    Ok(result)
+}
+
+/// 给一篇历史作品补插图：重抓 Pixiv 详情 → 按设置画质下配图 → 把正文里的原始占位符
+/// 改写成 `[插图 N：…]`，再把 `image_count` / `has_images` 盖准。
+///
+/// 复用现成的两条路，不另写一套渲染：
+/// - 作品绑在 `.epub` / `.html` 上 → 走 `download_reading_version_impl`，顺手把阅读版重打包
+///   （不然电子书里还是没图）；
+/// - 绑在 `.txt` 上（或只有 txt）→ 走 `redownload_novel_txt_impl`，重抓正文落回原处。
+///
+/// 两条路都是**原地覆盖 + 原侧重绑**，所以作品不会在两版之间搬家。
+/// 返回这篇落库后的配图张数（用来报数）。
+fn backfill_novel_images_for_work(work_id: i64) -> Result<usize, String> {
+    let bound = bound_path_of(work_id);
+    let extension = Path::new(&bound)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "epub" => {
+            download_reading_version_impl(work_id, ReadingFormat::Epub)?;
+        }
+        "html" | "htm" => {
+            download_reading_version_impl(work_id, ReadingFormat::Html)?;
+        }
+        // 绑在 txt 上、或者压根没扩展名 —— 都按「重下 TXT」走
+        _ => {
+            redownload_novel_txt_impl(work_id)?;
+        }
+    }
+    let conn = db()?;
+    let count: i64 = conn
+        .query_row("SELECT image_count FROM works WHERE id=?1", [work_id], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    Ok(count.max(0) as usize)
 }
 
 /// 单篇作品的「重新下载阅读版并绑定」：抓详情 → 下配图（已有的跳过）→ 改写 txt 里的
@@ -12108,6 +12341,8 @@ pub fn run() {
             download_reading_version,
             download_reading_versions,
             redownload_novel_txt,
+            novel_image_backfill_status,
+            backfill_novel_images,
             cleanup_redundant_previews,
             backfill_work_covers,
             refresh_reading_image_counts,
@@ -12223,6 +12458,8 @@ mod tests {
         text_word_count, is_text_body_path, TEXT_BODY_EXTENSIONS,
         apply_author_status, check_pixiv_author_impl, classify_author_status,
         title_indicates_images, unique_target_path, write_reading_output,
+        text_has_raw_novel_image_tokens, detail_has_embedded_images,
+        collect_novel_image_backfill_targets, novel_text_path_of_bound,
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
         SyncPreviewEntry, Work,
@@ -13111,6 +13348,77 @@ mod tests {
         let txt = root.join("书.txt");
         fs::write(&txt, b"text").unwrap();
         assert_eq!(novel_text_path_beside(&epub), Some(txt));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 补插图只认「落盘前」的原始占位符 —— 补过的正文里是 `[插图 N：…]`，
+    /// 不能再被当成欠账，否则每次点都会把同一批作品重跑一遍。
+    #[test]
+    fn raw_novel_image_tokens_are_told_apart_from_the_rewritten_markers() {
+        assert!(text_has_raw_novel_image_tokens("开头[uploadedimage:24193243]结尾"));
+        assert!(text_has_raw_novel_image_tokens("[pixivimage:147243201-59]"));
+        assert!(!text_has_raw_novel_image_tokens("开头[插图 3：标题_images/003.jpg]结尾"));
+        assert!(!text_has_raw_novel_image_tokens("普通正文，一张图都没有"));
+    }
+
+    /// 「带图版」判据：详情里的 `textEmbeddedImages` 比标题关键词准，
+    /// 空对象 / 字段缺失 / 给成 null 都要当成「没有」——不能凭空把作品标成带图版。
+    #[test]
+    fn the_embedded_image_map_decides_the_has_images_flag() {
+        assert!(detail_has_embedded_images(&json!({
+            "textEmbeddedImages": { "24193243": { "urls": {} } }
+        })));
+        assert!(!detail_has_embedded_images(&json!({ "textEmbeddedImages": {} })));
+        assert!(!detail_has_embedded_images(&json!({})));
+        assert!(!detail_has_embedded_images(&json!({ "textEmbeddedImages": null })));
+    }
+
+    /// 补插图的候选名单：**只看盘上那份正文**有没有原始占位符。
+    /// 已经补过的、没有 Pixiv ID 的、正文丢了的，一个都不能进。
+    #[test]
+    fn image_backfill_finds_only_works_with_raw_tokens_left() {
+        let suffix = std::process::id();
+        let root = std::env::temp_dir().join(format!("novel-image-backfill-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        let raw = root.join("还没补过.txt");
+        fs::write(&raw, "开头[uploadedimage:24193243]中间[pixivimage:123-2]结尾").unwrap();
+        let done = root.join("已经补过.txt");
+        fs::write(&done, "开头[插图 1：还没补过_images/001.jpg]中间").unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE works (
+                 id INTEGER PRIMARY KEY, title TEXT, preview_path TEXT,
+                 purchased_path TEXT, pixiv_novel_id TEXT
+             );",
+        )
+        .unwrap();
+        let raw_path = raw.to_string_lossy().to_string();
+        let done_path = done.to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO works (id, title, preview_path, purchased_path, pixiv_novel_id) VALUES
+                 (1, '还没补过', ?1, '', '27784467'),
+                 (2, '已经补过', ?2, '', '111'),
+                 (3, '没有 Pixiv ID', ?1, '', ''),
+                 (4, '正文不在盘上', '/definitely/not/here.txt', '', '222')",
+            rusqlite::params![raw_path, done_path],
+        )
+        .unwrap();
+
+        let targets = collect_novel_image_backfill_targets(&conn);
+        assert_eq!(targets.len(), 1, "只该命中「正文里还留着原始占位符」的那一篇");
+        assert_eq!(targets[0].0, 1);
+        assert_eq!(targets[0].1, "还没补过");
+
+        // 绑在 epub / html 上时看旁边那份同名 txt：补插图要改写的正是它
+        assert_eq!(novel_text_path_of_bound(&raw_path), Some(raw.clone()));
+        let epub = root.join("还没补过.epub");
+        fs::write(&epub, b"epub").unwrap();
+        assert_eq!(
+            novel_text_path_of_bound(&epub.to_string_lossy()),
+            Some(raw.clone())
+        );
 
         fs::remove_dir_all(&root).ok();
     }

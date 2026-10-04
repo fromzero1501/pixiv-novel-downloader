@@ -765,9 +765,13 @@ async function invoke(command, args = {}) {
     };
   }
   if (command === "list_characters") {
+    // 脚本要验角色名匹配的边角情况（典型是「长名吃掉短名」）时，用 `window.__extraCharacters`
+    // 临时追加几条（形如 { game, name, aliases, enabled }）；内置这几条一个字都不动。
+    const extra = Array.isArray(window.__extraCharacters) ? window.__extraCharacters : [];
+    const all = previewCharacters.concat(extra);
     const games = previewCharacterGames.slice();
-    previewCharacters.forEach((entry) => { if (!games.includes(entry.game)) games.push(entry.game); });
-    return games.map((game) => ({ game, characters: previewCharacters.filter((entry) => entry.game === game) }));
+    all.forEach((entry) => { if (!games.includes(entry.game)) games.push(entry.game); });
+    return games.map((game) => ({ game, characters: all.filter((entry) => entry.game === game) }));
   }
   if (command === "add_character") {
     if (previewCharacters.some((entry) => entry.game === args.game && entry.name === args.name)) throw new Error(`「${args.game}」里已经有「${args.name}」了`);
@@ -802,6 +806,15 @@ async function invoke(command, args = {}) {
   if (command === "check_pixiv_author") {
     const table = window.__authorStatusById || {};
     return table[args.authorId] || { status: "ok", message: "" };
+  }
+  // 补齐正文插图（设置页的维护工具）。脚本要验这条路就预置
+  // window.__novelImageBackfillPending（待补篇数）和 window.__novelImageBackfillResult
+  if (command === "novel_image_backfill_status") {
+    return { pending: Number(window.__novelImageBackfillPending) || 0 };
+  }
+  if (command === "backfill_novel_images") {
+    if (typeof window.__novelImageBackfillResult === "function") return window.__novelImageBackfillResult();
+    return window.__novelImageBackfillResult || { total: 0, updated: 0, failed: 0, imageCount: 0, cancelled: false, throttled: false, failedTitles: [] };
   }
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") {
@@ -1443,7 +1456,7 @@ function syncCountText(task) {
   if (task.status === "done") return "核对完成";
   if (task.status === "throttled") return "已中断";
   if (task.status === "cancelled") return "已终止";
-  if (task.status === "missing") return "已销号";
+  if (task.status === "missing") return "已销号或封号";
   if (task.status === "failed") return "失败";
   return task.total ? `${task.current} / ${task.total}` : "核对中";
 }
@@ -1470,7 +1483,7 @@ function syncRowStatusText(item) {
   if (item.status === "running") return item.title || (item.total ? "正在读取作品列表..." : "正在核对作品列表...");
   if (item.status === "throttled") return item.note || "疑似被限流，已提前停止";
   if (item.status === "cancelled") return item.note || "已终止";
-  if (item.status === "missing") return item.note || "主页打不开（该用户已退会），已跳过同步";
+  if (item.status === "missing") return item.note || "主页打不开（可能已销号或封号），已跳过同步";
   if (item.status === "failed") return item.note || "同步失败";
   if (!item.total) return "已是最新，无新作品";
   return item.note || "已完成";
@@ -1783,7 +1796,7 @@ function renderAuthors() {
       <div class="author-avatar-wrap">
         ${authorAvatar(author)}
         ${author.newCount > 0 ? `<span class="author-new-badge" title="上次同步之后新收进来、还没点开看过的 ${author.newCount} 篇作品">${author.newCount > 99 ? "99+" : author.newCount}</span>` : ""}
-        ${state.missingAuthorIds.has(author.id) ? `<span class="author-missing-badge" title="Pixiv 上找不到这个作者主页（多半是销号了）。下次同步若能读到作品列表，会自动摘掉这个标记。">已销号</span>` : ""}
+        ${state.missingAuthorIds.has(author.id) ? `<span class="author-missing-badge" title="Pixiv 上找不到这个作者主页（多半已销号或封号）。下次同步若能读到作品列表，会自动摘掉这个标记。">已销号或封号</span>` : ""}
       </div>
       <div class="author-card-body">
         <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2><div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="${author.starred ? "取消特别关注" : "设为特别关注"}" data-action="toggle-author-starred" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>
@@ -1900,6 +1913,11 @@ function serialFilterButton(works) {
  * 匹配口径和「扫描完整版 / 自动分组」那套按角色**不一样**：那边只扫标题，这里还要多扫标签，
  * 两套各自独立 —— 自动分组那套一个字都没动。
  * 角色表来自 `state.characterIndex`（启动时建一次、角色增删改后重建），所以匹配是同步的。
+ *
+ * **长名优先**：索引本来就按长名排前（见 `buildCharacterIndex`），所以某条命中名一旦
+ * 被前面某条更长的命中名包含，就说明它只是那个长名的一部分 —— 直接丢掉。
+ * 典型是库里同时收了「雷电芽衣」和「芽衣」，两个都在标题里命中时只留「雷电芽衣」。
+ * 反过来短名单独命中（没碰上任何长名）时照常显示，不受影响。
  */
 function matchedCharacterNames(work) {
   const index = state.characterIndex;
@@ -1907,6 +1925,7 @@ function matchedCharacterNames(work) {
   const haystack = `${work.title || ""} ${String(work.tags || "").replace(/\|/g, " ")}`;
   const hits = [];
   for (const name of index) {
+    if (hits.some((kept) => kept.includes(name))) continue;
     if (!hits.includes(name) && haystack.includes(name)) hits.push(name);
   }
   return hits;
@@ -4620,6 +4639,7 @@ async function bindEvents() {
       // 维护工具（v1.2.0）
       if (action === "backfill-synopses") await backfillSynopses();
       if (action === "backfill-covers") await backfillCovers();
+      if (action === "backfill-novel-images") await backfillNovelImages();
       if (action === "scan-work-files") await scanWorkFiles();
       if (action === "clear-missing-bindings") await clearMissingBindings();
       if (action === "download-selected-reading") { await downloadSelectedReadings(element.dataset.format === "epub" ? "epub" : ""); return; }
@@ -5723,6 +5743,73 @@ async function runSynopsisBackfill(recheck) {
   }
 }
 
+/**
+ * 「补齐正文插图」。
+ *
+ * 配图功能是 v1.0.0 才进来的，在那之前下载的作品正文里还留着 Pixiv 的原始插图标记
+ * （`[uploadedimage:…]` / `[pixivimage:…]`），磁盘上也没有 `{正文名}_images` 目录，
+ * 库里连「带图版」角标都不会有。这里按 Pixiv 作品 ID 重新抓一遍正文和配图，
+ * 把标记换成 `[插图 N：…]` 指引。
+ *
+ * 判据在后端（**只看盘上那份正文**有没有原始标记），所以补过的作品不会被重复跑，
+ * 已经补好的作品再点一次就是「没有需要补齐的」。
+ */
+async function backfillNovelImages() {
+  let pending = 0;
+  try {
+    pending = Number((await invoke("novel_image_backfill_status"))?.pending) || 0;
+  } catch { /* 数不出来也照常往下问，后端那边还会再判一次 */ }
+  if (!pending) {
+    toast("没有需要补齐插图的正文", "info");
+    return;
+  }
+  confirmAction(
+    "补齐正文插图",
+    `还有 ${pending} 篇作品的正文里留着 Pixiv 原始的插图标记（这些是配图功能上线前下载的），磁盘上也还没有对应配图。会按 Pixiv 作品 ID 重新抓一次正文和配图，把标记换成「[插图 N：…]」指引；已经补好的会跳过。一篇接一篇请求、间隔跟设置里的抓取间隔一致（防触发 Pixiv 风控），右下角浮层显示进度，随时可以终止。`,
+    "开始补齐",
+    () => runNovelImageBackfill(),
+  );
+}
+
+/** 真正的补齐流程：挂浮层 → 听进度（复用批量下载阅读版的进度事件）→ 收尾报数。 */
+async function runNovelImageBackfill() {
+  // cancelAuthorId 传 0：和「整库补抓简介」一样，后端用 0 当整库键，终止按钮才真的能叫停
+  state.syncTask = { authorId: 0, cancelAuthorId: 0, cancelText: "终止补齐", label: "正在补齐正文插图", title: "", current: 0, total: 0, cancelling: false };
+  render();
+  const unlisten = await listenReadingProgress((event) => {
+    const { total = 0, current = 0, title = "", done = false } = event.payload || {};
+    if (done || !state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    if (title) state.syncTask.title = title;
+    updateSyncFloater();
+  });
+  let result;
+  try {
+    result = await invoke("backfill_novel_images");
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(String(error), "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  // 配图刚落地：作者卡上的「带图版」篇数、列表里的带图角标都要跟着变
+  await refreshAuthors();
+  await refreshAfterDetailChange();
+  const failed = Number(result?.failed) || 0;
+  const titles = result?.failedTitles || [];
+  const names = titles.length ? `（${titles.slice(0, 3).join("、")}${titles.length > 3 ? "…" : ""}）` : "";
+  const failedText = failed ? `，${failed} 篇失败${names}` : "";
+  const updated = Number(result?.updated) || 0;
+  const images = Number(result?.imageCount) || 0;
+  if (result?.cancelled) toast(`已终止：补齐 ${updated} 篇、配图 ${images} 张${failedText}`, "info");
+  else if (!updated) toast(`没有补到配图${failedText}`, failed ? "info" : "success");
+  else toast(`已补齐 ${updated} 篇、配图 ${images} 张${failedText}`, failed ? "info" : "success");
+}
+
 /** 文件体检：核对绑定的文件在不在，并统计磁盘占用 */
 async function scanWorkFiles() {
   toast("正在核对文件…", "info");
@@ -6285,7 +6372,7 @@ async function syncPixivWorks() {
       await refreshAuthors();
       state.activeAuthor = state.authors.find((author) => author.id === authorId) || state.activeAuthor;
       render();
-      toast(`「${authorName}」的主页在 Pixiv 上已经打不开了（该用户已退会），已跳过同步，卡片已标灰。`, "error");
+      toast(`「${authorName}」的主页在 Pixiv 上已经打不开了（多半已销号或封号），已跳过同步，卡片已标灰。`, "error");
       return;
     }
     state.syncTask.phase = "downloading";
@@ -6392,7 +6479,7 @@ async function syncAllAuthors() {
     const probe = await probeAuthorStatus(author.id);
     if (!state.syncTask || state.syncTask.cancelling) { stopped = true; break; }
     if (probe.status === "retired") {
-      if (row) { row.status = "missing"; row.note = "主页打不开（该用户已退会），已跳过同步"; }
+      if (row) { row.status = "missing"; row.note = "主页打不开（可能已销号或封号），已跳过同步"; }
       missingAuthors.push(author.name);
       updateSyncFloater();
       continue;
@@ -6449,7 +6536,7 @@ async function syncAllAuthors() {
 
   const head = stopped ? `批量同步已终止（完成 ${doneAuthors} / ${targets.length} 位作者）` : `已同步 ${doneAuthors} / ${targets.length} 位作者，共下载 ${downloaded} 篇`;
   const missingNote = missingAuthors.length
-    ? `${missingAuthors.length} 位作者的主页在 Pixiv 上已经打不开了（已退会，已跳过同步、卡片标灰）：${missingAuthors.slice(0, 3).join("、")}${missingAuthors.length > 3 ? " 等" : ""}`
+    ? `${missingAuthors.length} 位作者的主页在 Pixiv 上已经打不开了（多半已销号或封号，已跳过同步、卡片标灰）：${missingAuthors.slice(0, 3).join("、")}${missingAuthors.length > 3 ? " 等" : ""}`
     : "";
   if (failures.length) {
     const detail = failures.slice(0, 3).join("；");
@@ -6682,6 +6769,7 @@ async function settingsModal() {
     <div class="menu-list settings-actions">
       <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>
       <button type="button" data-action="backfill-covers">${icon("image", 18)}补齐失效封面<span class="settings-action-hint">作品搬过家、目录被整理过之后，封面可能指向已经找不到的文件（卡片显示「暂无封面」）。这里按 Pixiv 作品 ID 重新取一次，下载到正文旁边</span></button>
+      <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">配图功能上线前下载的作品，正文里还留着 Pixiv 的原始插图标记、磁盘上没有配图。这里按 Pixiv 作品 ID 重抓正文和配图，把标记换成插图指引；一篇一篇请求，随时可以终止</span></button>
       <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>

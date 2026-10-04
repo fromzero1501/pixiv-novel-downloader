@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "collection-library"
-version = "1.2.24"
+version = "1.2.25"
 dependencies = [
  "calamine",
  "chrono",

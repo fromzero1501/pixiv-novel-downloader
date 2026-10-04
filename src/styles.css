@@ -47,7 +47,9 @@ body.is-author-dragging .card-drag { cursor: grabbing; }
 /* v1.2.21：作者主页在 Pixiv 上返回 404（多半销号）—— 卡片整体压灰压暗，但仍然能点开看已存的作品 */
 .author-card.is-missing { opacity: .6; filter: grayscale(.78); border-color: #d5dde6; background: #f7f9fb; }
 .author-card.is-missing:hover, .author-card.is-missing:focus { opacity: .85; border-color: #c4ceda; box-shadow: 0 10px 22px rgba(42,84,129,.09); }
-.author-missing-badge { position: absolute; left: -6px; bottom: -4px; z-index: 1; padding: 1px 6px; color: #fff; background: #7b8794; border: 1px solid #fff; border-radius: 999px; font-size: 10px; font-weight: 700; line-height: 1.5; white-space: nowrap; box-shadow: 0 1px 3px rgba(52,64,78,.3); }
+/* v1.2.25：文案从「已销号」改成「已销号或封号」（404 只说明主页打不开，两种都可能），
+   字数翻倍，字号和留白收一点才不至于从头像上溢出去压到右侧正文 */
+.author-missing-badge { position: absolute; left: -6px; bottom: -4px; z-index: 1; padding: 1px 5px; color: #fff; background: #7b8794; border: 1px solid #fff; border-radius: 999px; font-size: 9px; font-weight: 700; line-height: 1.5; white-space: nowrap; box-shadow: 0 1px 3px rgba(52,64,78,.3); }
 /* 作者库：搜索框与「只看特别关注」并排 */
 .authors-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .authors-toolbar .search-field { flex: 1 1 280px; }
