@@ -702,7 +702,25 @@ fn db() -> Result<Connection, String> {
           work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
           added_at TEXT NOT NULL DEFAULT ''
         );
-        CREATE INDEX IF NOT EXISTS work_watch_later_added_at ON work_watch_later(added_at DESC);",
+        CREATE INDEX IF NOT EXISTS work_watch_later_added_at ON work_watch_later(added_at DESC);
+        -- 「Pixiv 收藏」页（v1.2.27）：把我在 Pixiv 收藏的小说在本地留一份镜像，
+        -- 免得每次打开页面都重新联网抓一遍列表。封面只给「本地库没有这篇」的作品缓存
+        -- 一份到 data/bookmark_covers/（本地有的话直接用作品自己的封面）。
+        -- `is_masked` 就是接口的 isMasked（已删 / 非公开）：这类条目接口只保留 `id`，
+        -- 标题和作者全是 `-----`，所以**只在本地库有对应 novel id 时才留下来**。
+        -- 「本地库有没有」不落在这一列上，一律现查 `works.pixiv_novel_id`（用户拍板）。
+        CREATE TABLE IF NOT EXISTS pixiv_bookmarks (
+          novel_id TEXT PRIMARY KEY,
+          title TEXT NOT NULL DEFAULT '',
+          user_id TEXT NOT NULL DEFAULT '',
+          user_name TEXT NOT NULL DEFAULT '',
+          cover_url TEXT NOT NULL DEFAULT '',
+          cover_path TEXT NOT NULL DEFAULT '',
+          is_masked INTEGER NOT NULL DEFAULT 0,
+          sort_index INTEGER NOT NULL DEFAULT 0,
+          fetched_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS pixiv_bookmarks_sort ON pixiv_bookmarks(sort_index);",
     )
     .map_err(|e| e.to_string())?;
     // Older portable libraries do not have this per-author setting yet.
@@ -1889,6 +1907,10 @@ fn save_author(author: AuthorInput) -> Result<AuthorSummary, String> {
         return Err("作者名称不能为空".into());
     }
     let conn = db()?;
+    // 贴错成作品链接时别把作品 ID 当作者 UID 存下来 —— 让它走「同步作者信息」那条路反查
+    if pixiv_novel_id_from_url(&author.homepage).ok().flatten().is_some() {
+        return Err("这是 Pixiv 作品链接，不是作者主页。点「同步作者信息」会自动识别出作者。".into());
+    }
     let homepage = normalize_author_homepage(&author.homepage);
     let aliases = normalize_aliases(&author.aliases);
     if !homepage.is_empty() {
@@ -2863,6 +2885,9 @@ fn name_key(value: &str) -> String {
 /// 作者主页统一只保留到「/users/<数字>」为止。
 /// `https://www.pixiv.net/users/16208053/novels` → `https://www.pixiv.net/users/16208053`；
 /// 老式的 `.../member.php?id=16208053` 也会收敛成规范写法；识别不出的原样返回。
+///
+/// 作品链接（`.../novel/show.php?id=…`）不在这里收敛 —— 里面的 `id=` 是作品 ID，
+/// 会被下面那条规则误当成作者 UID。调用方要先用 `pixiv_novel_id_from_url` 拦下来反查作者。
 fn normalize_author_homepage(homepage: &str) -> String {
     let trimmed = homepage.trim();
     if trimmed.is_empty() {
@@ -2876,6 +2901,11 @@ fn normalize_author_homepage(homepage: &str) -> String {
         if !id.is_empty() {
             return format!("{}/users/{}", prefix.trim_end_matches('/'), id);
         }
+    }
+    // 作品链接原样留着：里面的 `id=` 是作品 ID，照下面那条规则会被误当成作者 UID。
+    // 真要用它得先反查作者（`sync_pixiv_author_profile` 会做）。
+    if pixiv_novel_id_from_url(trimmed).ok().flatten().is_some() {
+        return trimmed.to_string();
     }
     if let Some((_, suffix)) = trimmed.split_once("id=") {
         let id: String = suffix
@@ -6324,12 +6354,45 @@ fn backfill_synopses_impl(
     })
 }
 
+/// 拿小说 ID 反查作者主页。作品详情接口是公开的，不带 Cookie 也能拿到 `userId`。
+fn author_homepage_from_novel(client: &Client, novel_id: &str) -> Result<String, String> {
+    let response: Value = client
+        .get(format!("https://www.pixiv.net/ajax/novel/{novel_id}"))
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|_| "打不开这个作品链接 —— 作品可能已被删除，或者链接不对。".to_string())?
+        .json()
+        .map_err(|e| e.to_string())?;
+    let body = response.get("body").unwrap_or(&Value::Null);
+    // 这个字段 Pixiv 给过字符串、也给过数字，两种都收
+    let user_id = match body.get("userId") {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    };
+    if user_id.is_empty() {
+        return Err("从作品信息里没读到作者 ID，作品可能已被删除。".into());
+    }
+    Ok(format!("https://www.pixiv.net/users/{user_id}"))
+}
+
 fn sync_pixiv_author_profile_impl(
     author_id: Option<i64>,
     homepage: String,
 ) -> Result<PixivAuthorProfile, String> {
     let conn = db()?;
-    let homepage = normalize_author_homepage(&homepage);
+    let cookie = setting(&conn, "pixiv_cookie")?;
+    let client = pixiv_client(if cookie.trim().is_empty() {
+        None
+    } else {
+        Some(normalize_pixiv_cookie(&cookie)?)
+    })?;
+    // 贴的是作品链接时先反查作者：作品详情接口是公开的，不带 Cookie 也能拿到 userId。
+    let homepage = match pixiv_novel_id_from_url(&homepage).ok().flatten() {
+        Some(novel_id) => author_homepage_from_novel(&client, &novel_id)?,
+        None => normalize_author_homepage(&homepage),
+    };
     let user_id = pixiv_user_id(&homepage)?;
     let existing: Option<String> = conn
         .query_row(
@@ -6342,12 +6405,6 @@ fn sync_pixiv_author_profile_impl(
     if let Some(name) = existing {
         return Err(format!("作者主页已存在，名称为“{name}”"));
     }
-    let cookie = setting(&conn, "pixiv_cookie")?;
-    let client = pixiv_client(if cookie.trim().is_empty() {
-        None
-    } else {
-        Some(normalize_pixiv_cookie(&cookie)?)
-    })?;
     let response: Value = client
         .get(format!("https://www.pixiv.net/ajax/user/{user_id}"))
         .send()
@@ -6440,6 +6497,607 @@ async fn sync_pixiv_author_profile(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/* ============================ Pixiv 收藏页（v1.2.27） ============================ */
+
+/// 收藏接口一页拉多少条。48 是 Pixiv 网页版自己用的数，实测可用。
+const PIXIV_BOOKMARK_PAGE: usize = 48;
+
+/// 「Pixiv 收藏」页的一行。
+///
+/// 没派生 `Clone`：里面嵌的 `Work` 不是 `Clone`（作品结构一路都是按引用走的），
+/// 而这里也确实只需要序列化给前端。
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct PixivBookmark {
+    novel_id: String,
+    /// Pixiv 侧的标题。已删 / 非公开的作品这里是占位符 `-----`。
+    title: String,
+    user_id: String,
+    user_name: String,
+    /// 本地缓存的封面（只在「本地库没有这篇」时才去抓）。
+    cover_path: String,
+    /// 已删 / 非公开（接口的 `isMasked`）。
+    is_masked: bool,
+    /// 本地库里这一篇。None = 本地没有，前端按「灰封面只读卡」渲染。
+    work: Option<Work>,
+}
+
+/// 收藏页的一次读取：条目 + 「上次刷新是什么时候」。
+///
+/// 时间戳单独带出来而不是塞进每一条里 —— 前端 page 头上要显示它，
+/// 而每行都抄一份既浪费也容易不一致。
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct PixivBookmarkList {
+    items: Vec<PixivBookmark>,
+    /// 空串 = 从没刷过
+    fetched_at: String,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct PixivBookmarksRefresh {
+    /// 接口返回的收藏总数（含已删的）
+    total: usize,
+    /// 这次落库的条数
+    kept: usize,
+    /// 其中「已删但本地有」的条数
+    masked_kept: usize,
+    /// 「已删且本地没有」被丢掉的条数
+    masked_dropped: usize,
+    /// 这次新下载的封面数
+    covers_cached: usize,
+    /// 刷新时刻（RFC3339）
+    fetched_at: String,
+}
+
+/// 收藏页要用的「本地库里有哪些 Pixiv 作品」集合。
+///
+/// 判据**只有** `works.pixiv_novel_id` 精确相等（2026-10-04 用户拍板）：
+/// 收藏接口对已删作品只保留 `id`，标题和作者全是 `-----`，拿别的字段根本比不出来。
+fn local_novel_ids(conn: &Connection) -> Result<HashSet<String>, String> {
+    let mut statement = conn
+        .prepare("SELECT pixiv_novel_id FROM works WHERE pixiv_novel_id <> ''")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+/// 拉一遍「我在 Pixiv 收藏的小说」并落库。
+///
+/// 两条规矩（2026-10-04 用户拍板）：
+/// - **本地库有没有，只看 novel id 精确相等**；
+/// - **已删 / 非公开的作品只在本地有对应作品时才留下**，本地没有的直接丢掉 ——
+///   不抓封面，也不在页面上出现。
+///
+/// 封面是**增量**缓存的：已经落到 `data/bookmark_covers/` 的那份会复用，文件被删了才重抓，
+/// 否则每开一次软件都要把一百多张图重下一遍（首次刷新就是这个量级，所以放在后台跑）。
+fn refresh_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarksRefresh, String> {
+    let cookie = setting(conn, "pixiv_cookie")?;
+    if cookie.trim().is_empty() {
+        return Err("还没填 Pixiv Cookie —— 读取 Pixiv 收藏需要它。".into());
+    }
+    let cookie = normalize_pixiv_cookie(&cookie)?;
+    let uid = pixiv_uid_from_cookie(&cookie)
+        .ok_or("从 Cookie 里读不出账号 UID，请重新复制一次 Cookie。")?;
+    let client = pixiv_client(Some(cookie))?;
+
+    let local_ids = local_novel_ids(conn)?;
+    let cached_covers: HashMap<String, String> = {
+        let mut statement = conn
+            .prepare("SELECT novel_id, cover_path FROM pixiv_bookmarks WHERE cover_path <> ''")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|row| row.ok())
+            .filter(|(_, path)| Path::new(path).is_file())
+            .collect()
+    };
+
+    // ---- 1. 翻页拉列表 ----
+    struct Fetched {
+        novel_id: String,
+        title: String,
+        user_id: String,
+        user_name: String,
+        cover_url: String,
+        is_masked: bool,
+    }
+    let mut fetched: Vec<Fetched> = Vec::new();
+    let mut total = 0usize;
+    let mut offset = 0usize;
+    let mut masked_dropped = 0usize;
+    loop {
+        let url = format!(
+            "https://www.pixiv.net/ajax/user/{uid}/novels/bookmarks?tag=&offset={offset}&limit={PIXIV_BOOKMARK_PAGE}&rest=show&lang=zh"
+        );
+        let response: Value = client
+            .get(&url)
+            .send()
+            .map_err(|e| format!("读取 Pixiv 收藏失败：{e}"))?
+            .error_for_status()
+            .map_err(|e| format!("读取 Pixiv 收藏失败：{e}"))?
+            .json()
+            .map_err(|e| e.to_string())?;
+        if response
+            .get("error")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err("读取 Pixiv 收藏失败：Cookie 可能已失效，请重新登录后复制一次。".into());
+        }
+        let body = response.get("body").cloned().unwrap_or(Value::Null);
+        if offset == 0 {
+            total = json_i64(&body, "total").max(0) as usize;
+        }
+        let works = body
+            .get("works")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if works.is_empty() {
+            break;
+        }
+        for item in &works {
+            let novel_id = json_id_string(item, "id");
+            if novel_id.is_empty() {
+                continue;
+            }
+            let is_masked = item.get("isMasked").and_then(Value::as_bool).unwrap_or(false);
+            // 已删 / 非公开：只在本地有对应作品时才留下
+            if is_masked && !local_ids.contains(&novel_id) {
+                masked_dropped += 1;
+                continue;
+            }
+            fetched.push(Fetched {
+                novel_id,
+                title: json_string(item, "title"),
+                user_id: json_id_string(item, "userId"),
+                user_name: json_string(item, "userName"),
+                cover_url: json_string(item, "url"),
+                is_masked,
+            });
+        }
+        offset += works.len();
+        if (total > 0 && offset >= total) || works.len() < PIXIV_BOOKMARK_PAGE {
+            break;
+        }
+    }
+
+    // ---- 2. 封面：只给「本地库没有、又还没缓存过」的有效作品抓 ----
+    let cover_dir = app_data_dir()?.join("bookmark_covers");
+    let mut covers_cached = 0usize;
+    let fetched_at = Utc::now().to_rfc3339();
+    let mut rows: Vec<(String, String, String, String, String, String, i64, i64, String)> =
+        Vec::with_capacity(fetched.len());
+    for (index, item) in fetched.iter().enumerate() {
+        let mut cover_path = cached_covers
+            .get(&item.novel_id)
+            .cloned()
+            .unwrap_or_default();
+        let needs_cover = !item.is_masked
+            && !local_ids.contains(&item.novel_id)
+            && cover_path.is_empty()
+            && !item.cover_url.is_empty();
+        if needs_cover {
+            // 封面走防盗链，必须带 Referer（和头像那套一样）
+            if let Ok(bytes) = client
+                .get(&item.cover_url)
+                .header(reqwest::header::REFERER, "https://www.pixiv.net/")
+                .send()
+                .and_then(|response| response.error_for_status())
+                .and_then(|response| response.bytes())
+            {
+                fs::create_dir_all(&cover_dir).map_err(|e| e.to_string())?;
+                let path = cover_dir.join(format!("{}.jpg", item.novel_id));
+                if fs::write(&path, bytes).is_ok() {
+                    cover_path = path.to_string_lossy().to_string();
+                    covers_cached += 1;
+                }
+            }
+            // 一次刷几十上百张，别把 Pixiv 惹毛
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        rows.push((
+            item.novel_id.clone(),
+            item.title.clone(),
+            item.user_id.clone(),
+            item.user_name.clone(),
+            item.cover_url.clone(),
+            cover_path,
+            i64::from(item.is_masked),
+            index as i64,
+            fetched_at.clone(),
+        ));
+    }
+
+    // ---- 3. 整表替换（放进一个事务里，中途出错不会留下半份数据）----
+    let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    transaction
+        .execute("DELETE FROM pixiv_bookmarks", [])
+        .map_err(|e| e.to_string())?;
+    for row in &rows {
+        transaction
+            .execute(
+                "INSERT INTO pixiv_bookmarks (novel_id, title, user_id, user_name, cover_url, cover_path, is_masked, sort_index, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    transaction.commit().map_err(|e| e.to_string())?;
+
+    let masked_kept = rows.iter().filter(|row| row.6 == 1).count();
+    Ok(PixivBookmarksRefresh {
+        total,
+        kept: rows.len(),
+        masked_kept,
+        masked_dropped,
+        covers_cached,
+        fetched_at,
+    })
+}
+
+/// 读收藏页要显示的东西。
+///
+/// 「本地库有没有」**每次进页面现算**（不落库、不缓存）：收藏镜像表里只存 Pixiv 那一侧，
+/// 本地作品是现查 `works.pixiv_novel_id` 拼上来的 —— 用户随时可能下载 / 删掉一篇，
+/// 存下来的判据一定会过期。
+fn list_pixiv_bookmarks_impl(conn: &Connection) -> Result<PixivBookmarkList, String> {
+    let fetched_at: String = conn
+        .query_row(
+            "SELECT fetched_at FROM pixiv_bookmarks ORDER BY sort_index LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut statement = conn
+        .prepare(
+            "SELECT novel_id, title, user_id, user_name, cover_path, is_masked
+             FROM pixiv_bookmarks ORDER BY sort_index, novel_id",
+        )
+        .map_err(|e| e.to_string())?;
+    let base: Vec<PixivBookmark> = statement
+        .query_map([], |row| {
+            Ok(PixivBookmark {
+                novel_id: row.get(0)?,
+                title: row.get(1)?,
+                user_id: row.get(2)?,
+                user_name: row.get(3)?,
+                cover_path: row.get(4)?,
+                is_masked: row.get::<_, i64>(5)? == 1,
+                work: None,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|row| row.ok())
+        .collect();
+    drop(statement);
+
+    if base.is_empty() {
+        return Ok(PixivBookmarkList {
+            items: base,
+            fetched_at,
+        });
+    }
+
+    // 本地作品一次批量取回；分批是因为 SQLite 的变量上限（默认 999）
+    let mut works_by_novel: HashMap<String, Work> = HashMap::new();
+    for chunk in base.chunks(400) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id WHERE w.pixiv_novel_id IN ({placeholders})"
+        );
+        let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let ids: Vec<&str> = chunk.iter().map(|item| item.novel_id.as_str()).collect();
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(ids), map_work)
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let mut work = row.map_err(|e| e.to_string())?;
+            // 封面走本地文件、以及「EPUB / HTML」那个角标，都靠这一步补齐
+            populate_work_display_info(&mut work);
+            works_by_novel.insert(work.pixiv_novel_id.clone(), work);
+        }
+    }
+
+    Ok(PixivBookmarkList {
+        items: base
+            .into_iter()
+            .map(|mut item| {
+                item.work = works_by_novel.remove(&item.novel_id);
+                item
+            })
+            .collect(),
+        fetched_at,
+    })
+}
+
+/// 刷新收藏列表（联网）。封面是一张张抓的，放在后台线程里跑。
+#[tauri::command]
+async fn refresh_pixiv_bookmarks() -> Result<PixivBookmarksRefresh, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let conn = db()?;
+        refresh_pixiv_bookmarks_impl(&conn)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn list_pixiv_bookmarks() -> Result<PixivBookmarkList, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let conn = db()?;
+        list_pixiv_bookmarks_impl(&conn)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/* ---------- 按 Pixiv 收藏批量新增作者（v1.2.27） ---------- */
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BookmarkAuthorImportResult {
+    /// 收藏里出现的作者数（去重后）
+    total: usize,
+    /// 这次新加进来的
+    created: usize,
+    /// 本地已有、跳过的
+    skipped: usize,
+    /// 没加成功的（重名、写库失败）
+    failed: usize,
+    /// 失败的作者名，最多几条 —— 光报「失败 3 位」用户没法处理
+    failed_names: Vec<String>,
+    cancelled: bool,
+}
+
+/// 点按钮之前先看一眼：有多少位可加、多少位已经有了。
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BookmarkAuthorImportStatus {
+    /// 收藏里出现的作者总数（去重）
+    total: usize,
+    /// 本地作者库里还没有的
+    pending: usize,
+    /// 已经在库里的
+    existing: usize,
+    /// 收藏列表本身是不是空的（空的话该先更新收藏）
+    empty: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BookmarkAuthorImportProgress {
+    total: usize,
+    current: usize,
+    title: String,
+    eta_seconds: u64,
+}
+
+/// 收藏里出现过的作者（去重，按收藏顺序）。
+/// 已删条目的 `userId` 是 `0`，作者名是 `-----`，这种不是真作者，排掉。
+fn collect_bookmark_authors(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT user_id, user_name FROM pixiv_bookmarks
+             WHERE user_id <> '' AND user_id <> '0' ORDER BY sort_index",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut seen = HashSet::new();
+    let mut authors = Vec::new();
+    for row in rows {
+        let (user_id, user_name) = row.map_err(|e| e.to_string())?;
+        if seen.insert(user_id.clone()) {
+            authors.push((user_id, user_name));
+        }
+    }
+    Ok(authors)
+}
+
+fn author_homepage_exists(conn: &Connection, homepage: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM authors WHERE homepage = ?1",
+        [homepage],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+fn author_name_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM authors WHERE name = ?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+#[tauri::command]
+fn bookmark_author_status() -> Result<BookmarkAuthorImportStatus, String> {
+    let conn = db()?;
+    let authors = collect_bookmark_authors(&conn)?;
+    let mut pending = 0usize;
+    for (user_id, _) in &authors {
+        let homepage = format!("https://www.pixiv.net/users/{user_id}");
+        if !author_homepage_exists(&conn, &homepage) {
+            pending += 1;
+        }
+    }
+    Ok(BookmarkAuthorImportStatus {
+        total: authors.len(),
+        pending,
+        existing: authors.len() - pending,
+        empty: authors.is_empty(),
+    })
+}
+
+/// 按收藏里的作者批量建作者条目。
+///
+/// 判据和「本地库有没有」一致：**作者主页 `.../users/<uid>` 对得上就算已有**，跳过。
+/// 顺手把昵称和头像抓下来 —— 不然批量加完九十位全是灰底首字母，还得一个个去点「同步作者信息」。
+/// 取消标记复用同步那一套，整库任务用键 0（前端调 `cancel_pixiv_sync(0)`）。
+#[tauri::command]
+async fn import_authors_from_bookmarks(
+    app: tauri::AppHandle,
+) -> Result<BookmarkAuthorImportResult, String> {
+    clear_pixiv_sync_cancel(0);
+    let result =
+        tauri::async_runtime::spawn_blocking(move || import_authors_from_bookmarks_impl(app))
+            .await
+            .map_err(|e| e.to_string())?;
+    clear_pixiv_sync_cancel(0);
+    result
+}
+
+fn import_authors_from_bookmarks_impl(
+    app: tauri::AppHandle,
+) -> Result<BookmarkAuthorImportResult, String> {
+    let conn = db()?;
+    let bookmark_authors = collect_bookmark_authors(&conn)?;
+    if bookmark_authors.is_empty() {
+        return Err("收藏列表还是空的，先更新一次 Pixiv 收藏。".into());
+    }
+    let cookie = setting(&conn, "pixiv_cookie")?;
+    let client = pixiv_client(if cookie.trim().is_empty() {
+        None
+    } else {
+        Some(normalize_pixiv_cookie(&cookie)?)
+    })?;
+    // 每位作者要打两次 Pixiv（主页 + 头像），间隔跟同步那套走
+    let delay_seconds: u64 = setting(&conn, "pixiv_delay_seconds")?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+
+    let total = bookmark_authors.len();
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut failed_names: Vec<String> = Vec::new();
+    let mut cancelled = false;
+
+    for (index, (user_id, fallback_name)) in bookmark_authors.iter().enumerate() {
+        if pixiv_sync_cancelled(0) {
+            cancelled = true;
+            break;
+        }
+        let homepage = format!("https://www.pixiv.net/users/{user_id}");
+        if author_homepage_exists(&conn, &homepage) {
+            skipped += 1;
+        } else {
+            // 拿一次作者主页：准确昵称 + 头像地址。拿不到就用收藏列表里的名字兜底
+            let mut name = fallback_name.trim().to_string();
+            let mut avatar_url = String::new();
+            if let Ok(body) = client
+                .get(format!("https://www.pixiv.net/ajax/user/{user_id}"))
+                .send()
+                .and_then(|response| response.error_for_status())
+                .and_then(|response| response.json::<Value>())
+            {
+                let body = body.get("body").cloned().unwrap_or(Value::Null);
+                let fetched_name = json_string(&body, "name");
+                if !fetched_name.trim().is_empty() {
+                    name = fetched_name;
+                }
+                avatar_url = ["imageBig", "image", "profileImageUrl"]
+                    .iter()
+                    .map(|key| json_string(&body, key))
+                    .find(|value| !value.is_empty())
+                    .unwrap_or_default();
+            }
+            if name.is_empty() {
+                name = format!("pixiv-{user_id}");
+            }
+            // 重名是常事（不同作者可以叫同一个名字），加 uid 兜一层；
+            // 真进了这个分支说明库里已经有同名且同 uid 后缀的了，那就认栽跳过。
+            let mut final_name = name.clone();
+            if author_name_exists(&conn, &final_name) {
+                final_name = format!("{name} ({user_id})");
+            }
+            if author_name_exists(&conn, &final_name) {
+                failed += 1;
+                if failed_names.len() < 5 {
+                    failed_names.push(name);
+                }
+            } else {
+                match conn.execute(
+                    "INSERT INTO authors (name, homepage) VALUES (?1, ?2)",
+                    params![final_name, homepage],
+                ) {
+                    Ok(_) => {
+                        created += 1;
+                        let author_id = conn.last_insert_rowid();
+                        // 默认目录能建就建，省得批量加完之后还要一个个绑
+                        let _ = apply_default_dirs(&conn, author_id);
+                        if !avatar_url.is_empty() {
+                            if let Ok(bytes) = client
+                                .get(&avatar_url)
+                                .header(reqwest::header::REFERER, "https://www.pixiv.net/")
+                                .send()
+                                .and_then(|response| response.error_for_status())
+                                .and_then(|response| response.bytes())
+                            {
+                                let dir = app_data_dir()?.join("avatars");
+                                let _ = fs::create_dir_all(&dir);
+                                let path = dir.join(format!("pixiv-author-{author_id}.jpg"));
+                                if fs::write(&path, bytes).is_ok() {
+                                    let _ = conn.execute(
+                                        "UPDATE authors SET avatar_path=?1, avatar_managed=1 WHERE id=?2",
+                                        params![path.to_string_lossy().to_string(), author_id],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        if failed_names.len() < 5 {
+                            failed_names.push(name);
+                        }
+                    }
+                }
+            }
+        }
+        let current = index + 1;
+        let _ = app.emit(
+            "bookmark-author-progress",
+            BookmarkAuthorImportProgress {
+                total,
+                current,
+                title: format!("已新增 {created} 位 · 已有 {skipped} 位 · 失败 {failed} 位"),
+                eta_seconds: total.saturating_sub(current) as u64 * delay_seconds,
+            },
+        );
+        std::thread::sleep(Duration::from_millis(delay_seconds * 250));
+    }
+
+    Ok(BookmarkAuthorImportResult {
+        total,
+        created,
+        skipped,
+        failed,
+        failed_names,
+        cancelled,
+    })
 }
 
 /// Cookie 体检结果。设置面板的「测试 Cookie」和启动自检共用这一份。
@@ -12500,6 +13158,11 @@ pub fn run() {
             check_pixiv_author,
             cancel_pixiv_sync,
             sync_pixiv_author_profile,
+            // v1.2.27：Pixiv 收藏页
+            refresh_pixiv_bookmarks,
+            list_pixiv_bookmarks,
+            bookmark_author_status,
+            import_authors_from_bookmarks,
             check_pixiv_cookie,
             update_work_tags,
             export_backup,
@@ -12565,6 +13228,8 @@ mod tests {
         HISTORY_LIMIT, migrate_favorites_into_collections,
         add_watch_later_impl, remove_watch_later_impl, list_watch_later_impl,
         list_watch_later_ids_impl,
+        // v1.2.27：Pixiv 收藏页
+        collect_bookmark_authors, list_pixiv_bookmarks_impl,
         migrate_word_counts_for_non_text_files,
         add_works_to_collections_impl, update_works_tags_impl,
         set_works_rating_impl, set_works_need_full_state_impl,
@@ -13497,6 +14162,109 @@ mod tests {
         assert!(!text_has_raw_novel_image_tokens("普通正文，一张图都没有"));
     }
 
+    /// 「Pixiv 收藏」里那份作者名单：去重、按收藏顺序，并且把已删条目的占位用户
+    /// （`user_id = '0'`、名字 `-----`）排掉 —— 不然批量新增作者会凭空多出一个「-----」。
+    #[test]
+    fn bookmark_authors_drop_the_deleted_placeholder() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pixiv_bookmarks (
+               novel_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+               user_id TEXT NOT NULL DEFAULT '', user_name TEXT NOT NULL DEFAULT '',
+               cover_url TEXT NOT NULL DEFAULT '', cover_path TEXT NOT NULL DEFAULT '',
+               is_masked INTEGER NOT NULL DEFAULT 0, sort_index INTEGER NOT NULL DEFAULT 0,
+               fetched_at TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        for (novel_id, user_id, user_name, is_masked, sort_index) in [
+            ("1", "100", "甲", 0, 0),
+            ("2", "200", "乙", 0, 1),
+            // 已删 / 非公开的条目：接口只给 `0` 和 `-----`
+            ("3", "0", "-----", 1, 2),
+            ("4", "100", "甲", 0, 3),
+            ("5", "", "-----", 1, 4),
+        ] {
+            conn.execute(
+                "INSERT INTO pixiv_bookmarks (novel_id, user_id, user_name, is_masked, sort_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![novel_id, user_id, user_name, is_masked, sort_index],
+            )
+            .unwrap();
+        }
+        let authors = collect_bookmark_authors(&conn).unwrap();
+        assert_eq!(
+            authors,
+            vec![
+                ("100".to_string(), "甲".to_string()),
+                ("200".to_string(), "乙".to_string())
+            ]
+        );
+    }
+
+    /// 收藏页最核心的那条判据：**本地库有没有，只看 `works.pixiv_novel_id` 精确相等**
+    /// （用户 2026-10-04 拍板）。有作品的要带上 work（前端画成作品卡），没有的留空
+    /// （灰封面只读卡）；「已删但本地有」也要照常带 work —— 那是已删条目里唯一还显示的。
+    #[test]
+    fn bookmarks_pair_local_works_by_novel_id_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '');
+             CREATE TABLE works (
+               id INTEGER PRIMARY KEY, author_id INTEGER NOT NULL, title TEXT NOT NULL,
+               release_date TEXT NOT NULL DEFAULT '', preview_path TEXT NOT NULL DEFAULT '',
+               cover_path TEXT NOT NULL DEFAULT '', purchased_path TEXT NOT NULL DEFAULT '',
+               favorite INTEGER NOT NULL DEFAULT 0, has_images INTEGER NOT NULL DEFAULT 0,
+               image_count INTEGER NOT NULL DEFAULT 0, tags TEXT NOT NULL DEFAULT '',
+               pixiv_novel_id TEXT NOT NULL DEFAULT '', series_id TEXT NOT NULL DEFAULT '',
+               series_title TEXT NOT NULL DEFAULT '', series_order INTEGER NOT NULL DEFAULT 0,
+               is_new INTEGER NOT NULL DEFAULT 0, synopsis TEXT NOT NULL DEFAULT '',
+               synopsis_checked INTEGER NOT NULL DEFAULT 0, read_state INTEGER NOT NULL DEFAULT 0,
+               rating INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
+               need_full_state INTEGER NOT NULL DEFAULT 0,
+               need_full_marked_at TEXT NOT NULL DEFAULT '', word_count INTEGER NOT NULL DEFAULT -1);
+             CREATE TABLE pixiv_bookmarks (
+               novel_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '',
+               user_id TEXT NOT NULL DEFAULT '', user_name TEXT NOT NULL DEFAULT '',
+               cover_url TEXT NOT NULL DEFAULT '', cover_path TEXT NOT NULL DEFAULT '',
+               is_masked INTEGER NOT NULL DEFAULT 0, sort_index INTEGER NOT NULL DEFAULT 0,
+               fetched_at TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO authors (id, name) VALUES (1, '甲')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, pixiv_novel_id) VALUES (1, 1, '本地有的一篇', '111')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, pixiv_novel_id) VALUES (2, 1, 'Pixiv 已删但本地留着', '333')",
+            [],
+        )
+        .unwrap();
+        // 111 本地有；222 本地没有；333 在 Pixiv 已删但本地留着
+        for (novel_id, is_masked, sort_index) in [("111", 0, 0), ("222", 0, 1), ("333", 1, 2)] {
+            conn.execute(
+                "INSERT INTO pixiv_bookmarks (novel_id, title, user_id, user_name, is_masked, sort_index)
+                 VALUES (?1, 'x', '9', '某人', ?2, ?3)",
+                rusqlite::params![novel_id, is_masked, sort_index],
+            )
+            .unwrap();
+        }
+        let list = list_pixiv_bookmarks_impl(&conn).unwrap();
+        let by_id: Vec<Option<i64>> = list
+            .items
+            .iter()
+            .map(|item| item.work.as_ref().map(|work| work.id))
+            .collect();
+        assert_eq!(list.items.len(), 3);
+        assert_eq!(by_id, vec![Some(1), None, Some(2)]);
+        // 「本地有没有」是现算的：把作品删掉之后同一份收藏就不该再配上 work
+        conn.execute("DELETE FROM works", []).unwrap();
+        let list = list_pixiv_bookmarks_impl(&conn).unwrap();
+        assert!(list.items.iter().all(|item| item.work.is_none()));
+    }
+
     /// 「带图版」判据：详情里的 `textEmbeddedImages` 比标题关键词准，
     /// 空对象 / 字段缺失 / 给成 null 都要当成「没有」——不能凭空把作品标成带图版。
     #[test]
@@ -13656,6 +14424,30 @@ mod tests {
         assert_eq!(
             normalize_author_homepage("https://example.com/authors/abc"),
             "https://example.com/authors/abc"
+        );
+    }
+
+    /// 往「作者主页」里贴作品链接是很常见的误操作：
+    /// 那条链接里的 `id=` 是**作品** ID，不能被 `normalize_author_homepage` 当成作者 UID，
+    /// 得原样留到 `sync_pixiv_author_profile` 去反查真正的作者。
+    #[test]
+    fn novel_links_are_not_mistaken_for_author_pages() {
+        let novel = "https://www.pixiv.net/novel/show.php?id=27784467";
+        assert_eq!(normalize_author_homepage(novel), novel);
+        assert_eq!(
+            pixiv_novel_id_from_url(novel).unwrap(),
+            Some("27784467".to_string())
+        );
+        // 作者主页照旧收敛，而且不能被当成作品链接
+        assert_eq!(
+            normalize_author_homepage("https://www.pixiv.net/users/16208053"),
+            "https://www.pixiv.net/users/16208053"
+        );
+        assert_eq!(
+            pixiv_novel_id_from_url("https://www.pixiv.net/users/16208053")
+                .ok()
+                .flatten(),
+            None
         );
     }
 

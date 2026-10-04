@@ -207,6 +207,20 @@ const state = {
   filterViews: [],
   /** 设置页「自动备份」那段列出来的备份文件 */
   backups: [],
+  /**
+   * 「Pixiv 收藏」页（v1.2.27）：把我 Pixiv 上收藏的小说镜像到这儿显示。
+   *
+   * `work` 非空 = 本地库里有这篇（后端按 `pixiv_novel_id` **精确匹配**现算，每次进页面重算）；
+   * 为空 = 本地没有，只显示灰封面 + 标题 + 作者名，不下载正文。
+   */
+  pixivBookmarks: [],
+  pixivBookmarksQuery: "",
+  /** `all` / `inLibrary`（本地已有） / `missing`（本地没有） */
+  pixivBookmarksFilter: "all",
+  /** 上次刷新收藏列表的时刻（RFC3339）。空串 = 从没刷过 */
+  pixivBookmarksFetchedAt: "",
+  /** 正在刷新收藏列表（防重复点击，页面上也要显示「更新中…」） */
+  pixivBookmarksUpdating: false,
 };
 
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "D:\\头像\\雾海.png", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3 }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
@@ -231,6 +245,33 @@ function previewWorkPool() {
   const list = Array.from({ length: scale }, (_, copy) => previewWorks.map((work) => (copy === 0 ? work : { ...work, id: work.id + copy * previewWorks.length, title: `${work.title} ·第${copy + 1}册`, favorite: false }))).flat();
   previewWorkPoolCache = { scale, list };
   return list;
+}
+
+/**
+ * 「Pixiv 收藏」页的预览数据（v1.2.27）：三种卡各来一份 ——
+ * 本地有、本地没有（灰封面）、以及「Pixiv 已删但本地还留着」。
+ * 用的是预览作品池里**同一个对象**（不是复制），这样点开详情改状态能回写。
+ */
+function previewBookmarks() {
+  const pool = previewWorkPool();
+  const local = pool.slice(0, 3).map((work, index) => {
+    const author = previewAuthors[index % previewAuthors.length];
+    if (work.authorId === undefined) { work.authorId = author.id; work.authorName = author.name; }
+    return {
+      novelId: work.pixivNovelId || `preview-${work.id}`,
+      title: work.title,
+      userId: author.homepage.split("/").pop() || "16208053",
+      userName: author.name,
+      coverPath: "",
+      isMasked: index === 2,
+      work,
+    };
+  });
+  const missing = [
+    { novelId: "27784467", title: "本地还没下载过的收藏（只展示）", userId: "123771005", userName: "某位作者", coverPath: "", isMasked: false, work: null },
+    { novelId: "27195463", title: "另一篇本地没有的收藏", userId: "123771006", userName: "另一位作者", coverPath: "", isMasked: false, work: null },
+  ];
+  return [...local, ...missing];
 }
 
 previewWorks.forEach((work, index) => {
@@ -820,6 +861,16 @@ async function invoke(command, args = {}) {
     if (typeof window.__novelImageBackfillResult === "function") return window.__novelImageBackfillResult();
     return window.__novelImageBackfillResult || { total: 0, updated: 0, cleaned: 0, failed: 0, imageCount: 0, cancelled: false, throttled: false, failedTitles: [] };
   }
+  // Pixiv 收藏页（v1.2.27）：预览里给三种卡各一份样本，好看出作品卡 / 灰封面卡 / 已删卡的区别
+  if (command === "list_pixiv_bookmarks") {
+    return { items: previewBookmarks(), fetchedAt: window.__previewBookmarksFetchedAt || "" };
+  }
+  if (command === "refresh_pixiv_bookmarks") {
+    window.__previewBookmarksFetchedAt = new Date().toISOString();
+    return { total: 5, kept: 5, maskedKept: 1, maskedDropped: 0, coversCached: 0, fetchedAt: window.__previewBookmarksFetchedAt };
+  }
+  if (command === "bookmark_author_status") return window.__previewBookmarkAuthorStatus || { total: 4, pending: 2, existing: 2, empty: false };
+  if (command === "import_authors_from_bookmarks") return { total: 4, created: 2, skipped: 2, failed: 0, failedNames: [], cancelled: false };
   if (command === "bind_work_with_rename") return args.path;
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
@@ -1250,6 +1301,7 @@ function render() {
       : state.homeView === "missingFull" ? renderMissingFull()
       : state.homeView === "filterViews" ? renderFilterViews()
       : state.homeView === "textSearch" ? renderTextSearch()
+      : state.homeView === "pixivBookmarks" ? renderPixivBookmarks()
       : state.homeView === "help" ? renderHelp() : renderAuthors());
   document.body.classList.toggle("is-bulk", Boolean(state.bulkMode));
   mountHelpDocument();
@@ -1283,7 +1335,7 @@ function findWork(workId) {
   // 待补工作台和正文搜索结果也要算进来：那儿的卡片和别处长得一模一样，少了它点标题
   // 只会弹「没找到这篇作品」—— 明明就在眼前。（稍后再看页目前只走「打开文件」，
   // 用不到查对象，但一并留着，免得以后给它加个「开详情」就踩这个坑。）
-  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.textSearchPool, ...state.history.map((entry) => entry.work), ...state.watchLater.map((entry) => entry.work)].find((work) => work.id === target);
+  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.textSearchPool, ...state.history.map((entry) => entry.work), ...state.watchLater.map((entry) => entry.work), ...state.pixivBookmarks.filter((item) => item.work).map((item) => item.work)].find((work) => work.id === target);
 }
 
 async function openSeriesDetail(seriesId, seriesTitle, returnTo = "works") {
@@ -1359,6 +1411,7 @@ function renderShell(content) {
       </nav>
       <nav class="rail-nav rail-nav-secondary">
         <button class="rail-button ${state.homeView === "allWorks" && !state.activeAuthor ? "is-active" : ""}" title="\u6240\u6709\u4f5c\u54c1" data-action="go-all-works">${icon("database", 20)}</button>
+        <button class="rail-button ${state.homeView === "pixivBookmarks" && !state.activeAuthor ? "is-active" : ""}" title="Pixiv 收藏" aria-label="Pixiv 收藏" data-action="go-pixiv-bookmarks">${icon("heart", 20)}</button>
         <button class="rail-button ${state.homeView === "collections" && !state.activeAuthor ? "is-active" : ""}" title="我的收藏" aria-label="我的收藏" data-action="go-collections">${icon("folderHeart", 20)}</button>
         <button class="rail-button ${state.homeView === "history" && !state.activeAuthor ? "is-active" : ""}" title="浏览历史" aria-label="浏览历史" data-action="go-history">${icon("clock", 20)}</button>
         <button class="rail-button ${state.homeView === "watchLater" && !state.activeAuthor ? "is-active" : ""}" title="稍后再看" aria-label="稍后再看" data-action="go-watch-later">${icon("bookmark", 20)}</button>
@@ -1819,6 +1872,7 @@ function renderAuthors() {
         <button class="icon-text-button" data-action="auto-group">${icon("upload", 18)}<span>完整版自动分组</span></button>
         <button class="icon-text-button" data-action="auto-group-by-author">${icon("folder", 18)}<span>指定作者自动分组</span></button>
         <button class="icon-text-button" data-action="sync-all-authors">${icon("sync", 18)}<span>同步所有作者</span></button>
+        <button class="icon-text-button" data-action="import-bookmark-authors">${icon("heart", 18)}<span>从 Pixiv 收藏新增作者</span></button>
         <button class="primary-button" data-action="new-author">${icon("plus", 18)}<span>新增作者</span></button>
       </div>
     </section>
@@ -3433,6 +3487,198 @@ async function toggleWatchLater(workId) {
   toast(added ? "已移出稍后再看" : "已加入稍后再看", "success");
 }
 
+/* ============================ Pixiv 收藏页（v1.2.27） ============================ */
+
+/**
+ * 从本地镜像读收藏页要显示的东西（**不联网**）。
+ *
+ * 「本地库有没有这篇」是后端现算的（`works.pixiv_novel_id` 精确匹配），所以每次进页面都要
+ * 重读一遍 —— 用户可能刚下完一篇，把判据存下来一定会过期。
+ */
+async function refreshPixivBookmarks() {
+  const result = await invoke("list_pixiv_bookmarks");
+  state.pixivBookmarks = result?.items || [];
+  state.pixivBookmarksFetchedAt = result?.fetchedAt || "";
+}
+
+/**
+ * 联网刷一遍 Pixiv 收藏。
+ *
+ * 封面是后端增量缓存的（本地库已经有的那篇根本不抓），所以慢的只有「第一次」——
+ * 一百多张图要一张张下。`silent` 给「打开软件自动更新」用：不弹 toast、失败只写日志。
+ */
+async function updatePixivBookmarks({ silent = false } = {}) {
+  if (state.pixivBookmarksUpdating) return;
+  state.pixivBookmarksUpdating = true;
+  if (state.homeView === "pixivBookmarks" && !state.activeAuthor) render();
+  try {
+    await invoke("refresh_pixiv_bookmarks");
+    await refreshPixivBookmarks();
+    if (!silent) {
+      const localCount = state.pixivBookmarks.filter((item) => item.work).length;
+      toast(`收藏已更新：共 ${state.pixivBookmarks.length} 篇，本地已有 ${localCount} 篇`, "success");
+    }
+  } catch (error) {
+    if (silent) console.log("Pixiv 收藏自动更新失败:", error);
+    else toast(String(error), "error");
+  } finally {
+    state.pixivBookmarksUpdating = false;
+    if (state.homeView === "pixivBookmarks" && !state.activeAuthor) render();
+  }
+}
+
+/**
+ * 打开软件时自动更新一次收藏（用户要求：默认每次开软件更新一次）。
+ * 不 await、失败吞掉 —— 它要联网，绝不能挡在启动流程里；等几秒是避开启动那几件事。
+ */
+function refreshPixivBookmarksOnStartup() {
+  window.setTimeout(() => { updatePixivBookmarks({ silent: true }); }, 3000);
+}
+
+/** 页头上那句「上次更新」 */
+function bookmarkFetchedLabel() {
+  if (state.pixivBookmarksUpdating) return "正在更新收藏…";
+  const value = state.pixivBookmarksFetchedAt;
+  if (!value) return "还没更新过";
+  return `上次更新 ${value.replace("T", " ").slice(0, 16)}`;
+}
+
+/**
+ * 一张收藏卡。
+ *
+ * - **本地有这篇**：就是一张正常作品卡（点标题、开详情、稍后再看、加收藏夹都能用）；
+ *   它在 Pixiv 那边已经删了 / 转非公开的话，meta 行上挂一枚「Pixiv 已删」。
+ * - **本地没有**：灰封面只读卡 —— 只有封面、标题、作者名，没有正文、也不给任何入口
+ *   （用户要的就是「只展示」）。封面靠 `is-unpurchased` 那套规则自动变灰。
+ *
+ * ⚠️ 灰卡的标题**不能带 `work-open` 类**：卡片上的点击是认这个类打开文件的，
+ * 而它没有 `data-work-id`，点了只会弹「没找到这篇作品」。
+ */
+function pixivBookmarkCard(item) {
+  if (item.work) {
+    const work = item.work;
+    return `
+    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
+      <div class="work-cover">${workCover(work)}
+        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
+        ${workBadges(work)}
+        ${workCharacterNames(work)}
+        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
+      </div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${item.isMasked ? '<span class="bookmark-flag" title="这篇在 Pixiv 上已经删除或设为非公开了，本地库里还留着这一份。">Pixiv 已删</span>' : ""}${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+    </article>`;
+  }
+  const cover = item.coverPath
+    ? `<img src="${asset(item.coverPath)}" alt="" loading="lazy" onerror="this.closest('.work-cover')?.classList.add('is-missing');this.remove()">`
+    : `<div class="cover-placeholder"><span>${icon("image", 28)}</span><small>暂无封面</small></div>`;
+  return `
+    <article class="work-card is-read-only is-unpurchased is-bookmark-ghost" title="本地没有这篇，只显示封面、标题和作者名">
+      <div class="work-cover">${cover}</div>
+      <div class="work-copy"><p class="work-author">${escapeHtml(item.userName || "未知作者")}</p><div class="work-meta"><p class="work-date">本地没有</p></div><h2 title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</h2></div>
+    </article>`;
+}
+
+function renderPixivBookmarks() {
+  const query = state.pixivBookmarksQuery.trim().toLowerCase();
+  const items = state.pixivBookmarks.filter((item) => {
+    if (state.pixivBookmarksFilter === "inLibrary" && !item.work) return false;
+    if (state.pixivBookmarksFilter === "missing" && item.work) return false;
+    if (!query) return true;
+    const haystack = item.work
+      ? `${item.work.title} ${item.work.authorName}`.toLowerCase()
+      : `${item.title} ${item.userName}`.toLowerCase();
+    return haystack.includes(query);
+  });
+  const total = state.pixivBookmarks.length;
+  const localCount = state.pixivBookmarks.filter((item) => item.work).length;
+  const cards = items.map((item) => pixivBookmarkCard(item)).join("");
+  const empty = total
+    ? '<div class="empty-state works-empty"><h2>没有符合条件的收藏</h2></div>'
+    : `<div class="empty-state works-empty"><h2>还没有读到 Pixiv 收藏</h2><p>点右上角「更新」拉一次；读收藏需要先在设置里填好 Pixiv Cookie。</p></div>`;
+  return renderShell(`
+    <section class="topbar work-topbar">
+      <div><p class="section-kicker">来自 Pixiv 账号的收藏</p><h1>Pixiv 收藏</h1></div>
+      <div class="topbar-actions">
+        <span class="bookmark-status">${bookmarkFetchedLabel()}${total ? ` · ${total} 篇，本地已有 ${localCount} 篇` : ""}</span>
+        <button class="primary-button" data-action="refresh-pixiv-bookmarks" ${state.pixivBookmarksUpdating ? "disabled" : ""}>${icon("sync", 18)}<span>${state.pixivBookmarksUpdating ? "更新中…" : "更新"}</span></button>
+      </div>
+    </section>
+    <section class="library-content">
+      <div class="library-tools">
+        <label class="search-field"><span>${icon("search", 19)}</span><input id="bookmark-search" type="search" placeholder="搜索标题或作者名" value="${escapeHtml(state.pixivBookmarksQuery)}" autocomplete="off"></label>
+        <div class="filter-group" role="group" aria-label="本地库状态">${[["all", "全部"], ["inLibrary", "本地已有"], ["missing", "本地没有"]].map(([value, label]) => `<button class="filter-button ${state.pixivBookmarksFilter === value ? "is-active" : ""}" data-action="bookmark-filter" data-filter="${value}">${label}</button>`).join("")}</div>
+      </div>
+      <div class="read-only-note">本地库已经有的显示成作品卡，打开来和别处一样用；本地没有的只显示封面、标题和作者名（封面变灰），不会下载正文。Pixiv 上已经删掉的收藏里，只有本地还留着的那几篇才列出来。每次进这一页都会重新核对一遍本地库。</div>
+      <div class="works-grid">${cards || empty}</div>
+    </section>`);
+}
+
+/**
+ * 「从 Pixiv 收藏新增作者」：先数一遍有多少位可加，确认后开跑。
+ *
+ * 判据和后端一致 —— 作者主页 `.../users/<uid>` 对得上就算已经有，跳过。
+ */
+async function importBookmarkAuthors() {
+  let status = null;
+  try {
+    status = await invoke("bookmark_author_status");
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  if (!status || status.empty) {
+    toast("收藏列表还是空的 —— 先到「Pixiv 收藏」页点一次更新", "info");
+    return;
+  }
+  if (!status.pending) {
+    toast(`收藏里的 ${status.total} 位作者都已经在作者库里了`, "info");
+    return;
+  }
+  confirmAction(
+    "从 Pixiv 收藏新增作者",
+    `收藏里一共 ${status.total} 位作者，其中 ${status.pending} 位还没有、${status.existing} 位已经在库里（会跳过）。会逐位去 Pixiv 取昵称和头像，间隔跟设置里的抓取间隔一致；右下角浮层显示进度，随时可以终止。`,
+    "开始新增",
+    () => runBookmarkAuthorImport(),
+  );
+}
+
+/** 真正的导入流程：挂浮层 → 听 `bookmark-author-progress` → 收尾报数。 */
+async function runBookmarkAuthorImport() {
+  // 整库任务用 0 当取消键（和「整库补抓简介」「补齐正文插图」同一套），终止按钮才真的能叫停
+  state.syncTask = { authorId: 0, cancelAuthorId: 0, cancelText: "终止新增", cancelBusyLabel: "正在终止新增", label: "正在按收藏新增作者", title: "", current: 0, total: 0, cancelling: false };
+  render();
+  const unlisten = await listen("bookmark-author-progress", (event) => {
+    const { total = 0, current = 0, title = "" } = event.payload || {};
+    if (!state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    if (title) state.syncTask.title = title;
+    updateSyncFloater();
+  });
+  let result;
+  try {
+    result = await invoke("import_authors_from_bookmarks");
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(String(error), "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  await refreshAuthors();
+  render();
+  const created = Number(result?.created) || 0;
+  const skipped = Number(result?.skipped) || 0;
+  const failed = Number(result?.failed) || 0;
+  const failedNames = result?.failedNames || [];
+  const names = failedNames.length ? `（${failedNames.slice(0, 3).join("、")}${failedNames.length > 3 ? "…" : ""}）` : "";
+  const failedText = failed ? `，${failed} 位没加成功${names}` : "";
+  if (result?.cancelled) toast(`已终止：新增 ${created} 位、跳过 ${skipped} 位${failedText}`, "info");
+  else toast(`新增作者 ${created} 位，跳过已有 ${skipped} 位${failedText}`, failed ? "info" : "success");
+}
+
 /* ============================ 收藏夹选择器 ============================ */
 
 /** 弹窗正文单独抽出来：勾选后只换这一块，不重开弹窗（重开会把滚动位置丢掉） */
@@ -3944,7 +4190,7 @@ function authorModal(author = {}) {
         </div>
         <small>回车添加、点 × 删除；搜索作者时输入别名同样能搜到这位作者。</small>
       </div>
-      <label class="is-homepage-field">Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>填写有效主页后，点击"同步作者信息"会自动获取作者名称和头像。保存时只保留到作者 ID，例如 https://www.pixiv.net/users/16208053。</small></label>
+      <label class="is-homepage-field">Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>这栏填作者主页或任意一篇作品链接都行 —— 贴的是作品链接时，保存会自动识别出真正的作者。点"同步作者信息"能顺便取回作者名称和头像；保存时只保留到作者 ID。</small></label>
       <label>头像文件 <div class="path-input"><input name="avatarPath" value="${escapeHtml(author.avatarPath || "")}" readonly placeholder="尚未选择"><button type="button" class="quiet-button" data-action="pick-avatar">选择图片</button></div></label>
       <label>预览版文件夹 <div class="path-input"><input name="previewDir" value="${escapeHtml(author.previewDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-preview-dir">选择文件夹</button></div><small>在设置中配置默认目录并开启自动创建作者目录后，保存作者时会自动生成，无需手动选择。</small></label>
       <label>完整版文件夹 <div class="path-input"><input name="purchasedDir" value="${escapeHtml(author.purchasedDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-purchased-dir">选择文件夹</button></div><small>在设置中配置默认目录并开启自动创建作者目录后，保存作者时会自动生成，无需手动选择。</small></label>
@@ -4252,6 +4498,26 @@ async function bindEvents() {
       await commitWatchLaterSearch(event.currentTarget.value);
     };
   }
+  // Pixiv 收藏页的搜索是**纯前端过滤**（整份收藏已经在 state 里了），不用重查后端
+  const bookmarkSearch = app.querySelector("#bookmark-search");
+  if (bookmarkSearch) {
+    const commitBookmarkSearch = (query) => {
+      state.pixivBookmarksQuery = query;
+      render();
+      restoreSearchFocus("bookmark-search");
+    };
+    bookmarkSearch.oncompositionstart = () => { bookmarkSearch.dataset.composing = "true"; };
+    bookmarkSearch.oncompositionend = (event) => {
+      delete bookmarkSearch.dataset.composing;
+      bookmarkSearch.dataset.skipNextInput = "true";
+      commitBookmarkSearch(event.target.value);
+    };
+    bookmarkSearch.oninput = (event) => {
+      if (event.isComposing || bookmarkSearch.dataset.composing) return;
+      if (bookmarkSearch.dataset.skipNextInput) { delete bookmarkSearch.dataset.skipNextInput; return; }
+      commitBookmarkSearch(event.target.value);
+    };
+  }
   const textSearchBox = app.querySelector("#text-search-input");
   if (textSearchBox) {
     textSearchBox.oncompositionstart = () => { textSearchBox.dataset.composing = "true"; };
@@ -4415,6 +4681,11 @@ async function bindEvents() {
       if (action === "go-collections") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "collections"; state.seriesView = null; state.seriesItems = []; state.activeCollection = null; state.collectionQuery = ""; await refreshCollections(); render(); }
       if (action === "go-history") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "history"; state.seriesView = null; state.seriesItems = []; state.historyQuery = ""; await refreshHistory(); render(); }
       if (action === "go-watch-later") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "watchLater"; state.seriesView = null; state.seriesItems = []; state.watchLaterQuery = ""; await refreshWatchLater(); render(); }
+      // Pixiv 收藏：**每次点进来都重读一遍** —— 「本地库有没有」是后端现算的（用户要求）
+      if (action === "go-pixiv-bookmarks") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "pixivBookmarks"; state.seriesView = null; state.seriesItems = []; await refreshPixivBookmarks(); render(); }
+      if (action === "refresh-pixiv-bookmarks") await updatePixivBookmarks();
+      if (action === "bookmark-filter") { state.pixivBookmarksFilter = element.dataset.filter || "all"; render(); }
+      if (action === "import-bookmark-authors") await importBookmarkAuthors();
       if (action === "go-missing-full") { state.authorReturnTo = null; state.activeAuthor = null; state.seriesView = null; state.seriesItems = []; state.homeView = "missingFull"; state.missingFullAuthorId = null; await refreshMissingFull(); render(); }
       // 高级筛选面板：开合、三档条件、清空
       if (action === "toggle-filter-panel") {
@@ -4854,6 +5125,14 @@ async function bindEvents() {
         author.id = author.id ? Number(author.id) : null;
         author.avatarManaged = author.avatarManaged === "true";
         author.aliases = authorAliases().join("|");
+        // 主页那栏贴成作品链接是很常见的误操作。作品详情接口是公开的、能读出 userId，
+        // 所以先反查成作者主页再保存 —— 不然存下去的会是作品 ID 冒充的作者 UID。
+        if (isPixivNovelUrl(author.homepage)) {
+          const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage: author.homepage });
+          author.homepage = profile.homepage;
+          if (!String(author.name || "").trim()) author.name = profile.name;
+          if (!author.avatarPath) { author.avatarPath = profile.avatarPath || ""; author.avatarManaged = Boolean(profile.avatarManaged); }
+        }
         const saved = await invoke("save_author", { author });
         await refreshAuthors();
         if (state.activeAuthor?.id === saved.id) state.activeAuthor = saved;
@@ -6569,7 +6848,9 @@ async function syncAllAuthors() {
 async function cancelPixivSync() {
   if (!state.syncTask || state.syncTask.cancelling) return;
   state.syncTask.cancelling = true;
-  state.syncTask.label = "正在终止同步";
+  // 按钮上的这句话得跟着任务走：整库任务（补简介 / 补齐插图 / 按收藏新增作者）的
+  // 终止按钮文案本来就不是「终止同步」
+  state.syncTask.label = state.syncTask.cancelBusyLabel || "正在终止同步";
   updateSyncFloater();
   // 批量同步时可能还没轮到任何作者，此时靠 cancelling 标记停止后续循环
   // cancelAuthorId 是给「整库补抓简介」这类没有具体作者的任务用的（后端用 0 当整库键）
@@ -7647,6 +7928,8 @@ const VIEW_STATE_EXTRA_FIELDS = [
   ["missingFullFilter", "todo"],
   ["filterPanelOpen", false],
   ["allWorksShown", ALL_WORKS_PAGE],
+  ["pixivBookmarksQuery", ""],
+  ["pixivBookmarksFilter", "all"],
 ];
 
 /** 界面状态的全部字段：筛选模板那套 + 上面补的那几个，两边只在这里汇合一次 */
@@ -7902,6 +8185,9 @@ async function bootstrap() {
     // 字数后台补算（v1.2.8）：不 await、失败吞掉，界面该干嘛干嘛。
     // 全库要读 98 MB 正文，几千毫秒起步，绝不能挡在启动流程里。
     fillWordCountsInBackground();
+
+    // Pixiv 收藏（v1.2.27）：每次打开软件自动更新一次（用户要求）。同样不 await。
+    refreshPixivBookmarksOnStartup();
 
     // 上一版更新完留下的旧 exe，扫一遍送回收站。
     // 等两秒再扫：新版是被旧版拉起来的，旧进程可能还没退干净，那时删不掉。

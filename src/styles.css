@@ -841,3 +841,17 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .cookie-probe-result.is-pending { color: #7b8ea4; }
 .cookie-probe-result.is-ok { color: #1c7a4a; }
 .cookie-probe-result.is-bad { color: #c0392b; }
+
+/* -------------------------------------------------------------------------
+ * Pixiv 收藏页（v1.2.27）
+ * ------------------------------------------------------------------------- */
+/* 页头那句「上次更新 … · N 篇，本地已有 M 篇」 */
+.bookmark-status { color: #5e84ac; font-size: 12px; font-weight: 650; white-space: nowrap; }
+/* 本地库里没有的那张卡：只展示封面、标题和作者名，不给任何入口。
+   连悬停的抬升也去掉，免得看上去像能点开。 */
+.work-card.is-bookmark-ghost { cursor: default; }
+.work-card.is-bookmark-ghost .work-cover:hover,
+.work-card.is-bookmark-ghost:focus-visible .work-cover { transform: none; box-shadow: none; }
+.work-card.is-bookmark-ghost .work-cover:hover .work-menu { opacity: 0; }
+/* 「Pixiv 已删」小药丸：挂在「本地还有、但 Pixiv 那边已经删了」那几篇的 meta 行上 */
+.bookmark-flag { display: inline-block; margin-left: 6px; padding: 1px 6px; color: #b04a4a; background: #fdecec; border: 1px solid #f6d3d3; border-radius: 4px; font-size: 10px; font-weight: 750; line-height: 1.5; vertical-align: 1px; }
