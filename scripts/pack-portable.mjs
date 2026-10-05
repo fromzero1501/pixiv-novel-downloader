@@ -123,7 +123,12 @@ function writeZip(target, entries) {
 }
 
 if (process.env.PORTABLE_WITH_ZIP === "1") {
-  const zipPath = join(root, "发布", "藏集", "PixivNovelDownloader", `${ZIP_FOLDER}-v${version}.zip`);
+  // ⚠️ zip 的**文件名必须是 ASCII**：`gh release create` 上传时会把文件名里的非 ASCII
+  // 字符一律替换成 `.`（实测 `Pixiv小说下载管理器-v1.2.38.zip` 在 Release 页面上变成
+  // `Pixiv.-v1.2.38.zip`）。压缩包**内部**那一层目录名仍然是中文（ZIP 的 UTF-8 名不受影响），
+  // 用户解压出来照样是 `Pixiv小说下载管理器/`。
+  // 顺带一个好处：这个名字正好在自动更新的候选清单里（`update_asset_names()`）。
+  const zipPath = join(root, "发布", "藏集", "PixivNovelDownloader", `PixivNovelDownloader-v${version}.zip`);
   const count = writeZip(zipPath, [{ name: `${ZIP_FOLDER}/${baseName}`, source: src }]);
   console.log(`[portable] ${zipPath}  (${count} 个文件)`);
   console.log(`[portable] zip 解压即用：${ZIP_FOLDER}/ 里放 exe，数据落同级 data/。`);
