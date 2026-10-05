@@ -126,11 +126,22 @@ try {
 
   // ── 5. tag + Release（只有 --publish 才做）─────────────
   //  用提交说明当 Release 正文：应用内「更新说明」读的就是这一段。
+  //  **两个资产**：裸 exe 是自动更新唯一认的名字（`update_asset_names()` 只找
+  //  `PixivNovelDownloader-vX.Y.Z.exe` / `.zip`），zip 是给新用户手动下载的 ——
+  //  解压出来一层 `Pixiv小说下载管理器/`，exe 和 data 都收在里面。zip 的名字不影响更新链路。
   if (withRelease) {
-    const exe = path.join(root, "发布", "藏集", "PixivNovelDownloader", `PixivNovelDownloader-v${next}.exe`);
+    const dir = path.join(root, "发布", "藏集", "PixivNovelDownloader");
+    const exe = path.join(dir, `PixivNovelDownloader-v${next}.exe`);
+    const zip = path.join(dir, `Pixiv小说下载管理器-v${next}.zip`);
     run("git", ["tag", `v${next}`]);
     run("git", ["push", "origin", `v${next}`]);
-    run("gh", ["release", "create", `v${next}`, exe, "--title", `v${next}`, "--notes", commitMessage]);
+    run("gh", [
+      "release", "create", `v${next}`,
+      exe,
+      zip,
+      "--title", `v${next}`,
+      "--notes", commitMessage,
+    ]);
   }
 } catch (error) {
   restoreVersion();
@@ -139,8 +150,8 @@ try {
 
 log(`\n[release] 完成：v${next}${dryRun ? "（dry-run，什么都没改）" : ""}`);
 if (!dryRun && !withRelease) {
-  const exeRel = `发布/藏集/PixivNovelDownloader/PixivNovelDownloader-v${next}.exe`;
+  const dir = "发布/藏集/PixivNovelDownloader";
   log(`[release] 本次没建 Release（自动更新看不到 v${next}）。要对外发布时执行：`);
   log(`  git tag v${next} && git push origin v${next}`);
-  log(`  gh release create v${next} "${exeRel}" --title v${next} --notes "${commitMessage}"`);
+  log(`  gh release create v${next} "${dir}/PixivNovelDownloader-v${next}.exe" "${dir}/Pixiv小说下载管理器-v${next}.zip" --title v${next} --notes "${commitMessage}"`);
 }

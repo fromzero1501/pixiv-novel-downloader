@@ -120,6 +120,11 @@ const state = {
    * 「↑ v1.0.1」按钮；`progress` 是下载进度（下载中才非空）。
    */
   update: null,
+  /**
+   * 手动点左下角版本号检查更新的进行态：按钮当场变「检查中…」并禁用。
+   * 它只是给用户一个「点到了」的回执 —— 真正的探测在 `checkForUpdate()` 里。
+   */
+  updateChecking: false,
   updateProgress: null,
   updateDownloading: false,
   /**
@@ -5654,6 +5659,22 @@ async function bindEvents() {
       if (action === "submit-import") await submitImport();
       if (action === "settings") await settingsModal();
       if (action === "open-update") openUpdateModal();
+      // 左下角版本号 = 检查更新（v1.2.38）。**只是检查**：查到新版后由 openUpdateModal()
+      // 摆出确认框，真正下载要用户再点一下「下载并更新」，点版本号本身不会开始下载。
+      if (action === "check-update-badge") {
+        if (state.updateChecking) return;
+        state.updateChecking = true;
+        render(); // 立刻变「检查中…」——并发探直连+镜像要几秒，没有回执就像没点上
+        let result = null;
+        try {
+          result = await checkForUpdate();
+        } finally {
+          state.updateChecking = false;
+          render();
+        }
+        // 弹窗必须放在最后一次 render() **之后**：render 会重建整个 app 内容
+        if (result?.hasUpdate) openUpdateModal();
+      }
       if (action === "check-update") {
         // 先给反馈再等结果：以前探测要挨个排队试源，界面十几秒纹丝不动，看着就像「点了没反应」
         const button = element;
@@ -8246,12 +8267,24 @@ async function checkForUpdate({ silent = false } = {}) {
   }
 }
 
-/** 左侧栏底部的版本号：有新版时变成一个高亮按钮，平时就是一行灰字 */
+/**
+ * 左侧栏底部的版本号（就在「设置」按钮上方）。三种形态：
+ *
+ *  1. **正在检查**（刚手点了它）→「检查中…」+ 禁用。探测要并发问直连和几个镜像，
+ *     几秒才回结果，没有当场回执会让人以为没点上；
+ *  2. **已经查到新版** → 高亮「↑ vX.Y.Z」，点开更新弹窗（**确认后才下载**）；
+ *  3. **平时** → 版本号本身，但**照样可以点**：点它就等于「检查更新」
+ *     （2026-10-05 用户要求。以前这里是一行不可点的灰字，想查更新得进设置翻）。
+ *     查到新版会自动把更新确认框摆出来，没查到就提示已是最新版。
+ */
 function appVersionBadge() {
+  if (state.updateChecking) {
+    return `<button class="app-version is-checking" disabled title="正在检查更新…">检查中…</button>`;
+  }
   if (hasUpdateReady()) {
     return `<button class="app-version is-update-ready" title="有新版本 v${escapeHtml(state.update.latestVersion)}，点这里更新" data-action="open-update">↑ v${escapeHtml(state.update.latestVersion)}</button>`;
   }
-  return `<span class="app-version" title="当前版本">v${APP_VERSION}</span>`;
+  return `<button class="app-version" title="当前 v${APP_VERSION}，点一下检查更新" data-action="check-update-badge">v${APP_VERSION}</button>`;
 }
 
 function humanSize(bytes) {

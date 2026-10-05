@@ -518,13 +518,15 @@ struct CopyPreviewResult {
 /// 也就没有「目录正被占用、改名失败」这种坑。
 const DATA_FOLDER_STEM: &str = "Pixiv小说下载管理器";
 
-/// 数据目录。只有三种情况，判据一律是「这个目录**存不存在**」，没有任何按版本号新建的分支：
-///   ① `<程序目录>/<软件名>/data` 已经建过 ⇒ 就用它；
-///   ② 老布局 `<程序目录>/data` 已经建过（v1.2.36 及更早）⇒ **原地沿用**，不搬家、也不在旁边另建；
-///   ③ 都没有（全新安装）⇒ 才建 `<程序目录>/<软件名>/data`。
+/// 数据目录。判据一律是「这个目录**存不存在**」，没有任何按版本号新建的分支：
+///   ① `<程序目录>/<软件名>/data` 已经建过 ⇒ 就用它（**放第一位**，老用户的嵌套布局永远优先）；
+///   ② 程序自己就住在一个叫 `<软件名>` 的文件夹里（zip 解压出来的布局）⇒ 用 `<程序目录>/data`；
+///   ③ 老布局 `<程序目录>/data` 已经建过（v1.2.36 及更早）⇒ **原地沿用**，不搬家、也不在旁边另建；
+///   ④ 都没有（全新安装）⇒ 才建 `<程序目录>/<软件名>/data`。
 ///
 /// 所以升级永远只是换 exe，数据目录一个都不会多。全新安装把 `data` 收进一个以软件名命名的
-/// 文件夹里，是为了别让它在 exe 所在的位置（下载文件夹之类）直接散开。
+/// 文件夹里，是为了别让它在 exe 所在的位置（下载文件夹之类）直接散开；而 zip 分发包解出来
+/// 已经是一层 `<软件名>` 文件夹，再套一层就变成同名文件夹套同名文件夹了，故有 ②。
 fn app_data_dir() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let base = exe.parent().ok_or("无法定位程序目录")?;
@@ -535,6 +537,17 @@ fn resolve_data_dir_in(base: &Path) -> Result<PathBuf, String> {
     let nested = base.join(DATA_FOLDER_STEM).join("data");
     if nested.is_dir() {
         return Ok(nested);
+    }
+    // zip 分发：程序已经在 `<软件名>/` 里了（`<软件名>/PixivNovelDownloader-vX.Y.Z.exe`），
+    // 数据就直接放同级的 `data` —— 用户看到的是「软件和数据都在同一个文件夹里」。
+    // 因为嵌套布局在上面已经先判过，老用户（`<程序目录>/data`）一点不受影响。
+    if base.file_name().and_then(|name| name.to_str()) == Some(DATA_FOLDER_STEM) {
+        let inside = base.join("data");
+        if inside.is_dir() {
+            return Ok(inside);
+        }
+        fs::create_dir_all(&inside).map_err(|e| e.to_string())?;
+        return Ok(inside);
     }
     let legacy = base.join("data");
     if legacy.is_dir() {
@@ -1021,6 +1034,13 @@ fn merge_builtin_characters(conn: &Connection) -> usize {
     let Some(map) = root.as_object() else {
         return 0;
     };
+    // ⚠️ 整段必须包在**一个事务**里。629 条角色 × 3 条语句（查账本 + 插角色 + 记账本）
+    // ≈ 1900 条语句，不包事务时 SQLite 默认每条语句各自提交一次、各自 fsync 落盘，
+    // 实测（.workbuddy/probe/char-seed-timing.py）：全新库首次 **12609 ms**，包上事务 **11.6 ms**。
+    // 这段在 `db()` 里，空库第一次打开时会被首屏第一条命令撞上 —— 那十秒就是用户看到的白屏。
+    // 拿不到事务时（极罕见）退化按老样子跑：只慢，不会错。
+    // 注意 `BEGIN` 是在**同一个连接**上开的，所以下面继续用 `conn` 执行也一样在事务内。
+    let tx = conn.unchecked_transaction().ok();
     let mut inserted = 0usize;
     for (game, list) in map {
         let Some(items) = list.as_array() else {
@@ -1084,6 +1104,9 @@ fn merge_builtin_characters(conn: &Connection) -> usize {
     // 账本管不着** —— 账本只负责"不再回补"，不会替用户删已有的行，所以这里顺手清一道，
     // 含用户自己加的单字条目：判据就一条，名字只占一个字符。
     let _ = conn.execute("DELETE FROM characters WHERE length(trim(name)) <= 1", []);
+    if let Some(tx) = tx {
+        let _ = tx.commit();
+    }
     inserted
 }
 
@@ -15906,6 +15929,21 @@ mod tests {
         assert!(legacy.join("library.db").is_file(), "老数据必须原地不动");
         assert!(!old.join(DATA_FOLDER_STEM).exists(), "老用户不该被多出一个文件夹");
         fs::remove_dir_all(&old).unwrap();
+
+        // zip 分发：程序自己就住在 `<软件名>/` 里 ⇒ 数据放同级 `data`，不再套一层同名文件夹
+        let zipped = std::env::temp_dir()
+            .join(format!("app-data-zip-{suffix}"))
+            .join(DATA_FOLDER_STEM);
+        fs::create_dir_all(&zipped).unwrap();
+        let inside = resolve_data_dir_in(&zipped).unwrap();
+        assert_eq!(inside, zipped.join("data"));
+        assert!(inside.is_dir());
+        assert!(
+            !zipped.join(DATA_FOLDER_STEM).exists(),
+            "同名文件夹里不该再套一层同名文件夹"
+        );
+        assert_eq!(resolve_data_dir_in(&zipped).unwrap(), inside);
+        fs::remove_dir_all(zipped.parent().unwrap()).unwrap();
     }
 
     /// Cookie 体检的等待上限：没代理时要快点给结论，别让「正在测试…」一直转。

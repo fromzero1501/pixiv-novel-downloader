@@ -189,6 +189,10 @@ body.is-bulk button { cursor: pointer; }
 .homepage-link svg { display: block; }
 .size-input { display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 8px; }.size-input select { min-height: 38px; color: #354e6b; background: #fff; border: 1px solid #d6e1ed; border-radius: 6px; padding: 0 9px; outline: none; }.size-input select:focus { border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; }
 .app-version { margin: 0 0 10px; color: #7190b1; font-size: 10px; font-weight: 700; line-height: 1; }
+/* 版本号从 v1.2.38 起是**按钮**（点它＝检查更新）：清掉 UA 的按钮样式，保持原来那行灰字的样子 */
+button.app-version { width: auto; min-height: 0; padding: 0; background: none; border: 0; font-family: inherit; cursor: pointer; }
+button.app-version:hover { color: #1764c5; text-decoration: underline; }
+.app-version.is-checking { color: #8fa6bd; cursor: progress; text-decoration: none; }
 .sync-status { display: block; margin-top: 4px; color: #5e84ac; font-size: 12px; font-style: normal; }
 .work-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; min-height: 21px; }
 .work-tags span { display: inline-flex; align-items: center; gap: 3px; color: #5a7695; background: #eef5fc; border: 1px solid #d9e8f6; border-radius: 4px; padding: 2px 5px; font-size: 12px; line-height: 1.2; overflow-wrap: anywhere; }
