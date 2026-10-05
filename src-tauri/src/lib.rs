@@ -513,11 +513,35 @@ struct CopyPreviewResult {
     skipped_count: usize,
 }
 
+/// 数据目录外层的文件夹名（用户可见）。**定了就别再改** —— 一改名，程序就认不出老数据、
+/// 会当成新装再建一份，用户的库看起来就「没了」。也**故意不带版本号**：升级不用改名，
+/// 也就没有「目录正被占用、改名失败」这种坑。
+const DATA_FOLDER_STEM: &str = "Pixiv小说下载管理器";
+
+/// 数据目录。只有三种情况，判据一律是「这个目录**存不存在**」，没有任何按版本号新建的分支：
+///   ① `<程序目录>/<软件名>/data` 已经建过 ⇒ 就用它；
+///   ② 老布局 `<程序目录>/data` 已经建过（v1.2.36 及更早）⇒ **原地沿用**，不搬家、也不在旁边另建；
+///   ③ 都没有（全新安装）⇒ 才建 `<程序目录>/<软件名>/data`。
+///
+/// 所以升级永远只是换 exe，数据目录一个都不会多。全新安装把 `data` 收进一个以软件名命名的
+/// 文件夹里，是为了别让它在 exe 所在的位置（下载文件夹之类）直接散开。
 fn app_data_dir() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = exe.parent().ok_or("无法定位程序目录")?.join("data");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir)
+    let base = exe.parent().ok_or("无法定位程序目录")?;
+    resolve_data_dir_in(base)
+}
+
+fn resolve_data_dir_in(base: &Path) -> Result<PathBuf, String> {
+    let nested = base.join(DATA_FOLDER_STEM).join("data");
+    if nested.is_dir() {
+        return Ok(nested);
+    }
+    let legacy = base.join("data");
+    if legacy.is_dir() {
+        return Ok(legacy);
+    }
+    fs::create_dir_all(&nested).map_err(|e| e.to_string())?;
+    Ok(nested)
 }
 
 /// 老库里 `works.favorite=1` 的作品，升级时统一收进这个收藏夹（v1.1.0）。
@@ -3094,7 +3118,11 @@ fn normalize_pixiv_cookie(raw: &str) -> Result<String, String> {
     Err("Cookie 中未找到 Pixiv 登录所需的 PHPSESSID。".into())
 }
 
-fn pixiv_client(cookie: Option<String>) -> Result<Client, String> {
+fn build_pixiv_client(
+    connect: Option<Duration>,
+    total: Duration,
+    cookie: Option<String>,
+) -> Result<Client, String> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::REFERER,
@@ -3112,12 +3140,34 @@ fn pixiv_client(cookie: Option<String>) -> Result<Client, String> {
                 .map_err(|e| format!("Cookie 格式无效：{e}"))?,
         );
     }
-    Client::builder()
-        .timeout(Duration::from_secs(30))
+    let mut builder = Client::builder()
+        .timeout(total)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36")
-        .default_headers(headers)
-        .build()
-        .map_err(|e| e.to_string())
+        .default_headers(headers);
+    // `connect` 只管「TCP 建连」这一小段：没代理时它决定用户要等多久才看到「连不上」，
+    // 连上之后的读写不受它约束。传 None 表示用 reqwest 默认（不额外限制）。
+    if let Some(connect) = connect {
+        builder = builder.connect_timeout(connect);
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+fn pixiv_client(cookie: Option<String>) -> Result<Client, String> {
+    build_pixiv_client(None, Duration::from_secs(30), cookie)
+}
+
+/// Cookie 体检专用：一次只读请求。没网 / 没代理时要**快点**给结论 —— 沿用通用那 30 秒，
+/// 用户只会看到「正在测试…」一直转，还以为点了没反应。2 秒建连、6 秒整体：
+/// 能连通的完全不受影响，「连不上」大概 2 秒就报出来。
+const COOKIE_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const COOKIE_PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(6);
+
+fn pixiv_probe_client(cookie: &str) -> Result<Client, String> {
+    build_pixiv_client(
+        Some(COOKIE_PROBE_CONNECT_TIMEOUT),
+        COOKIE_PROBE_TOTAL_TIMEOUT,
+        Some(cookie.to_string()),
+    )
 }
 
 fn json_string(value: &Value, key: &str) -> String {
@@ -8193,7 +8243,7 @@ fn probe_pixiv_cookie(cookie: &str) -> PixivCookieProbe {
         user_name: None,
         checked_at_ms,
     };
-    let client = match pixiv_client(Some(cookie.to_string())) {
+    let client = match pixiv_probe_client(cookie) {
         Ok(client) => client,
         Err(error) => return unknown(error),
     };
@@ -8204,7 +8254,7 @@ fn probe_pixiv_cookie(cookie: &str) -> PixivCookieProbe {
                 ok: false,
                 status: "network".into(),
                 message: format!(
-                    "连不上 Pixiv（{error}）。这多半不是 Cookie 的问题，先确认浏览器/代理能打开 pixiv.net 再测一次。"
+                    "连不上 Pixiv（{error}）。这多半不是 Cookie 的问题，先确认浏览器/代理能打开 pixiv.net 再测一次 —— 体检最多等 6 秒就出结论。"
                 ),
                 user_name: None,
                 checked_at_ms,
@@ -14309,6 +14359,9 @@ mod tests {
         zip_crc32, zip_finish, zip_push, ConflictAction,
         DistributeTarget, NovelHtmlMeta, NovelImageSlot, ReadingFormat, ReadingWriteMeta,
         SyncPreviewEntry, Work,
+        // v1.2.37：数据目录解析（只在首次建、之后一律沿用）+ Cookie 体检的等待上限
+        DATA_FOLDER_STEM, resolve_data_dir_in,
+        COOKIE_PROBE_CONNECT_TIMEOUT, COOKIE_PROBE_TOTAL_TIMEOUT, pixiv_probe_client,
     };
     use chrono::{DateTime, NaiveDate, Utc};
     use rusqlite::Connection;
@@ -14317,7 +14370,7 @@ mod tests {
         fs,
         io::Write,
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     /// 销号判据**只认 404**。
@@ -15822,6 +15875,46 @@ mod tests {
         // 前缀不是纯数字：同样不认
         assert_eq!(pixiv_uid_from_cookie("PHPSESSID=abc_123").as_deref(), None);
         assert_eq!(pixiv_uid_from_cookie("").as_deref(), None);
+    }
+
+    /// 数据目录只建一次、且只建一个：升级只是换 exe，不该多出目录来。
+    #[test]
+    fn data_dir_is_created_once_under_a_named_folder() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // 全新安装：建在 `<软件名>/data`，而不是直接堆在程序目录下
+        let fresh = std::env::temp_dir().join(format!("app-data-fresh-{suffix}"));
+        fs::create_dir_all(&fresh).unwrap();
+        let created = resolve_data_dir_in(&fresh).unwrap();
+        assert_eq!(created, fresh.join(DATA_FOLDER_STEM).join("data"));
+        assert!(created.is_dir());
+        assert!(!fresh.join("data").exists(), "不该在程序目录下另建一个 data");
+        // 再跑多少次都还是那一个，不会越跑越多
+        assert_eq!(resolve_data_dir_in(&fresh).unwrap(), created);
+        assert_eq!(fs::read_dir(&fresh).unwrap().count(), 1);
+        fs::remove_dir_all(&fresh).unwrap();
+
+        // 老布局（v1.2.36 及更早，data 直接建在程序目录下）：原地沿用，不搬家也不另建
+        let old = std::env::temp_dir().join(format!("app-data-legacy-{suffix}"));
+        let legacy = old.join("data");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("library.db"), b"db").unwrap();
+        assert_eq!(resolve_data_dir_in(&old).unwrap(), legacy);
+        assert!(legacy.join("library.db").is_file(), "老数据必须原地不动");
+        assert!(!old.join(DATA_FOLDER_STEM).exists(), "老用户不该被多出一个文件夹");
+        fs::remove_dir_all(&old).unwrap();
+    }
+
+    /// Cookie 体检的等待上限：没代理时要快点给结论，别让「正在测试…」一直转。
+    #[test]
+    fn cookie_probe_waits_only_a_few_seconds() {
+        assert_eq!(COOKIE_PROBE_CONNECT_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(COOKIE_PROBE_TOTAL_TIMEOUT, Duration::from_secs(6));
+        // 体检专用客户端必须建得出来（两个超时都是构造参数）
+        assert!(pixiv_probe_client("PHPSESSID=1234567_abcdef").is_ok());
     }
 
     /// 真机联网验证 Cookie 体检的判据（默认 `#[ignore]`）。

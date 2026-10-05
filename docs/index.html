@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header class="page">
-  <span class="eyebrow">v1.2.36 · Windows</span>
+  <span class="eyebrow">v1.2.37 · Windows</span>
   <h1>Pixiv小说下载管理器</h1>
   <p class="lede">Windows 本地作品管理软件：按作者管理 Pixiv 小说的预览版与完整版文件，记录购买状态、封面、标签、系列、收藏与阅读记录。</p>
   <div class="links">
@@ -196,7 +196,7 @@
   <p class="hint">免安装，绿色便携。</p>
   <ol>
     <li>到 <a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader/releases">Releases</a> 下载最新版 exe，放到一个固定的文件夹里（别放桌面，容易误删）。</li>
-    <li>双击 exe 就能用。首次启动会在 exe 同级目录创建 <code>data</code> 文件夹，数据库和封面都存在里面。</li>
+    <li>双击 exe 就能用。首次启动会在 exe 同级新建一个以软件名命名的文件夹 <code>Pixiv小说下载管理器</code>，数据库和封面都存在它里面的 <code>data</code>。之前版本已经把 <code>data</code> 直接建在 exe 同级的，会<strong>原地继续用</strong> —— 不搬动、也不会多建一个。</li>
     <li>整份迁移到别的电脑时，<strong>把 exe 所在的整个文件夹一起复制</strong>过去，数据跟着走。</li>
   </ol>
   <p>系统要求：Windows 10 / 11，需要 <strong>Microsoft Edge WebView2 Runtime</strong>（Windows 11 通常自带；缺了程序会提示）。</p>
@@ -280,6 +280,7 @@
     <li>它拿<strong>当前框里填的那一份</strong>向 Pixiv 发一个只读请求（框里空着时测的是已保存的那份）。刚粘贴完就点，不用等自动保存那半秒。</li>
     <li>有效 → 绿字给出登录的<strong>账号名</strong>，方便确认换的是不是想要的那个号；同时当天不再弹启动提醒。</li>
     <li>失效 / 没填 / 连不上，分别给不同的说明：<strong>失效</strong>该重新导出一份，<strong>连不上</strong>该去查网络或代理，<strong>没填</strong>只是还没设置。不会一律糊成一句「失效了」让你白折腾。</li>
+    <li>点下去立刻变成「正在测试…」并禁用按钮；<strong>连不上也只等 6 秒就出结论</strong>（以前要干等 30 秒），不会让你以为点了没反应。</li>
   </ul>
   <div class="note">
     <p>程序每次启动也会自动验一次，<strong>只在「已失效」时提醒</strong>（每天最多一次）。从来没填过不会弹 —— 那属于还没设置，不是坏了。</p>
@@ -671,7 +672,7 @@
   <h3>手动导出 / 恢复</h3>
   <ul>
     <li>「设置 → 6 维护与数据」里可以<strong>导出数据库备份</strong>、以及从备份文件<strong>恢复</strong>（会覆盖当前数据库，需要重启）。</li>
-    <li>便携版的数据在 exe 同级的 <code>data</code> 文件夹。<strong>迁移到另一台电脑时，请一并备份该目录以及预览版、完整版文件目录。</strong></li>
+    <li>便携版的数据在 exe 同级的 <code>Pixiv小说下载管理器/data</code> 里（老版本直接放在同级的 <code>data</code>）。<strong>迁移到另一台电脑时，请一并备份该目录以及预览版、完整版文件目录。</strong></li>
     <li>数据库备份<strong>不等于</strong>文件备份 —— 只还原数据库不会把小说文件带回来。</li>
   </ul>
   <div class="note">
@@ -691,12 +692,12 @@
 
   <h3>点「立即更新」之后发生什么</h3>
   <ol>
-    <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.2.36.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
+    <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.2.37.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
     <li>下载完自动启动新版，程序重启。</li>
     <li>新版启动时发现上一个版本的 exe 还躺在旁边，把它<strong>移进 Windows 回收站</strong>（可以还原），并提示一句「已把旧版本文件移入回收站」。</li>
   </ol>
   <div class="note">
-    <p><strong>你的作品和数据库都不在 exe 里。</strong>数据在同级的 <code>data</code> 文件夹，换 exe 不碰它 —— 更新完作者、作品、收藏、设置全都在。</p>
+    <p><strong>你的作品和数据库都不在 exe 里。</strong>数据在同级的 <code>Pixiv小说下载管理器/data</code>（老版本则是同级的 <code>data</code>），换 exe 不碰它 —— 更新完作者、作品、收藏、设置全都在。</p>
   </div>
 
   <h3>打不开 GitHub 怎么办</h3>
@@ -740,7 +741,7 @@
   <details class="faq" open>
     <summary>同步失败 / 提示未登录</summary>
     <p>先看有没有 Cookie —— <strong>没有 Cookie 是同步不了任何东西的</strong>，第一次用必须先去 <a class="inline" href="#cookie">第 3 节</a> 导一份填上。已经填过还失败，基本是过期了：Pixiv 的 Cookie 通常 1–2 周失效，按同一套步骤重新导一份覆盖掉即可。下载 R-18 内容必须用已登录账号的 Cookie。</p>
-    <p>换完不用猜 —— 在「设置 → 1 · Pixiv 账号」点一下「测试 Cookie」，有效会直接把登录的账号名报给你。</p>
+    <p>换完不用猜 —— 在「设置 → 1 · Pixiv 账号」点一下「测试 Cookie」，有效会直接把登录的账号名报给你；连不上也最多等 6 秒就给结论，不会一直转圈。</p>
   </details>
   <details class="faq">
     <summary>提示「Cookie 已经不能用」，但我刚导出没多久</summary>
@@ -784,7 +785,7 @@
   </details>
   <details class="faq">
     <summary>换电脑 / 重装系统后数据还在吗？</summary>
-    <p>把 exe 所在的<strong>整个文件夹</strong>复制过去就在。数据在 exe 同级的 <code>data</code> 文件夹里，不写注册表、不写系统目录，卸载就是删文件夹。程序每天第一次启动还会自动备份一份数据库（见 <a class="inline" href="#backup">第 17 节</a>）。</p>
+    <p>把 exe 所在的<strong>整个文件夹</strong>复制过去就在。数据在 exe 同级的 <code>Pixiv小说下载管理器/data</code> 里（老版本是同级的 <code>data</code>），不写注册表、不写系统目录，卸载就是删文件夹。程序每天第一次启动还会自动备份一份数据库（见 <a class="inline" href="#backup">第 17 节</a>）。</p>
   </details>
   <details class="faq">
     <summary>软件会自动删我的文件吗？</summary>
@@ -801,7 +802,7 @@
 </section>
 
 <footer class="page">
-  <span>Pixiv小说下载管理器 v1.2.36 · 本文档随版本更新</span>
+  <span>Pixiv小说下载管理器 v1.2.37 · 本文档随版本更新</span>
   <span><a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader">GitHub</a> · <a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader/issues">反馈</a></span>
 </footer>
 

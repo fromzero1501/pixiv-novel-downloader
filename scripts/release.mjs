@@ -4,7 +4,7 @@
 //   npm run release -- "提交说明"          升末位（patch），说明可省
 //   npm run release -- "说明" --minor      升中间位
 //   npm run release -- "说明" --major      升首位
-//   npm run release -- --no-release        只推代码，不打 tag、不建 Release
+//   npm run release -- "说明" --publish    发布：多打 tag、建 Release、传 exe
 //   npm run release -- --dry-run           只预览会做什么：不改文件、不构建、不提交、不推送
 //
 // 几条约定（和项目原有流程对齐）：
@@ -12,9 +12,9 @@
 //     所以这里只改 package.json 一处。
 //   - 中途任何一步失败 → 立刻停，并把 package.json 的版本号还原，
 //     不留「升了号却没打包 / 没提交」的半成品状态。
-//   - tag / Release **默认就做**：升号 → 打包 → 提交 → 推送 → 打 tag → 建 Release → 传 exe。
-//     只想把代码推上去、不动 Release 时加 --no-release。
-//     （自动更新只认 releases/latest，漏建 Release 就等于更新链路断了。）
+//   - 默认只做「升号 → 打包 → 提交 → 推送」四步，不碰 tag / Release。
+//     明确要「发布」时再加 --publish：多打 tag、建 Release、传 exe。
+//     （自动更新只认 releases/latest，漏建 Release 就等于更新链路断了，所以真正对外发布时必须带 --publish；忘了会在末尾打出补建命令。）
 //   - 帮助文档不碰。
 import { execFileSync, execSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -28,8 +28,9 @@ const argv = process.argv.slice(2);
 const flags = new Set(argv.filter((a) => a.startsWith("--")));
 const message = argv.find((a) => !a.startsWith("--")) || "";
 const dryRun = flags.has("--dry-run");
-// Release 默认建（自动更新只认 releases/latest）；只想推代码时加 --no-release
-const withRelease = !flags.has("--no-release");
+// 默认只升号→打包→提交→推送；明确说「发布」时加 --publish 才打 tag + 建 Release。
+// （--release 保留为同义别名；旧的 --no-release 也接受，它本来就等于现在的默认行为。）
+const withRelease = flags.has("--publish") || flags.has("--release");
 const kind = flags.has("--major") ? "major" : flags.has("--minor") ? "minor" : "patch";
 
 const log = (line = "") => console.log(line);
@@ -85,10 +86,11 @@ const branch = read("git", ["rev-parse", "--abbrev-ref", "HEAD"]) || "master";
 log(`[release] ${current} → ${next}   (${kind})`);
 log(`[release] 提交说明：${commitMessage}`);
 log(`[release] 目标分支：${branch}`);
+log(`[release] 会打包便携 exe：发布/藏集/PixivNovelDownloader/PixivNovelDownloader-v${next}.exe`);
 if (withRelease) {
-  log(`[release] 会打 tag v${next}、建 Release 并上传 exe`);
+  log(`[release] --publish：会打 tag v${next}、建 Release 并上传 exe`);
 } else {
-  log(`[release] --no-release：只推代码，不打 tag、不建 Release`);
+  log(`[release] 不动 tag / Release：只升号 → 打包 → 提交 → 推送`);
 }
 if (dryRun) {
   log("[release] --dry-run：只预览，不改文件、不构建、不提交、不推送");
@@ -122,7 +124,7 @@ try {
   committed = true;
   run("git", ["push", "origin", branch]);
 
-  // ── 5. tag + Release（默认做，--no-release 跳过）─────────────
+  // ── 5. tag + Release（只有 --publish 才做）─────────────
   //  用提交说明当 Release 正文：应用内「更新说明」读的就是这一段。
   if (withRelease) {
     const exe = path.join(root, "发布", "藏集", "PixivNovelDownloader", `PixivNovelDownloader-v${next}.exe`);
@@ -136,3 +138,9 @@ try {
 }
 
 log(`\n[release] 完成：v${next}${dryRun ? "（dry-run，什么都没改）" : ""}`);
+if (!dryRun && !withRelease) {
+  const exeRel = `发布/藏集/PixivNovelDownloader/PixivNovelDownloader-v${next}.exe`;
+  log(`[release] 本次没建 Release（自动更新看不到 v${next}）。要对外发布时执行：`);
+  log(`  git tag v${next} && git push origin v${next}`);
+  log(`  gh release create v${next} "${exeRel}" --title v${next} --notes "${commitMessage}"`);
+}
