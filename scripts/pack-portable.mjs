@@ -1,9 +1,10 @@
-// 便携版打包后的归档脚本：把裸 EXE 复制成发布命名，放进发布归档目录；再打一个 zip。
+// 便携版打包后的归档脚本：把裸 EXE 复制成发布命名，放进发布归档目录。
 // 用 Node 写而不是 .bat，是为了正确处理含中文的路径（cmd 默认 GBK 会乱码）。
 // 用户要求（2026-09-14）：**只产出到发布归档目录**，项目根目录不再留副本。
-// 用户要求（2026-10-05）：另外发一个 zip —— 解压出来就是一层 `Pixiv小说下载管理器/` 文件夹，
-//   软件和数据都收在里面（数据目录规则见 lib.rs 的 resolve_data_dir_in：exe 所在文件夹名
-//   就叫软件名时，数据直接用同级 data，所以 zip 里**不需要**预置 data，首次运行会自己建）。
+// 用户要求（2026-10-05）：**压缩包版只在发布时才有** —— 平时（`npm run portable` / 自用升级）
+//   只出裸 exe；只有 `npm run release --publish` 会设 `PORTABLE_WITH_ZIP=1`，那时才多打一个 zip。
+//   zip 解压出来是一层 `Pixiv小说下载管理器/` 文件夹，exe 在里面，数据首次运行落在同级 data/
+//   （数据目录规则见 lib.rs 的 resolve_data_dir_in：exe 所在文件夹名 == 软件名时不再套同名层）。
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,10 +28,8 @@ for (const dest of destinations) {
   console.log(`[portable] ${dest}  (${mb} MB)`);
 }
 
-// ── zip 分发包 ────────────────────────────────────────────────────────────────
-// 解压出来是 `Pixiv小说下载管理器/PixivNovelDownloader-vX.Y.Z.exe`，双击即用、数据落在同级 data/。
+// ── zip 分发包（只在发布时产）─────────────────────────────────────────────────
 const ZIP_FOLDER = "Pixiv小说下载管理器";
-const zipPath = join(root, "发布", "藏集", "PixivNovelDownloader", `${ZIP_FOLDER}-v${version}.zip`);
 
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -123,8 +122,13 @@ function writeZip(target, entries) {
   return entries.length;
 }
 
-const count = writeZip(zipPath, [{ name: `${ZIP_FOLDER}/${baseName}`, source: src }]);
-console.log(`[portable] ${zipPath}  (${count} 个文件)`);
+if (process.env.PORTABLE_WITH_ZIP === "1") {
+  const zipPath = join(root, "发布", "藏集", "PixivNovelDownloader", `${ZIP_FOLDER}-v${version}.zip`);
+  const count = writeZip(zipPath, [{ name: `${ZIP_FOLDER}/${baseName}`, source: src }]);
+  console.log(`[portable] ${zipPath}  (${count} 个文件)`);
+  console.log(`[portable] zip 解压即用：${ZIP_FOLDER}/ 里放 exe，数据落同级 data/。`);
+} else {
+  console.log("[portable] 本次只出裸 exe（压缩包版只在发布时产）");
+}
 
 console.log(`[portable] v${version} portable build ready - double-click to run, no install needed.`);
-console.log(`[portable] zip 解压即用：${ZIP_FOLDER}/ 里放 exe，数据落同级 data/。`);

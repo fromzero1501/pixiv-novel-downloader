@@ -4,7 +4,7 @@
 //   npm run release -- "提交说明"          升末位（patch），说明可省
 //   npm run release -- "说明" --minor      升中间位
 //   npm run release -- "说明" --major      升首位
-//   npm run release -- "说明" --publish    发布：多打 tag、建 Release、传 exe
+//   npm run release -- "说明" --publish    发布：多打 tag、建 Release、传 zip + 裸 exe（zip 只在发布时产）
 //   npm run release -- --dry-run           只预览会做什么：不改文件、不构建、不提交、不推送
 //
 // 几条约定（和项目原有流程对齐）：
@@ -88,9 +88,9 @@ log(`[release] 提交说明：${commitMessage}`);
 log(`[release] 目标分支：${branch}`);
 log(`[release] 会打包便携 exe：发布/藏集/PixivNovelDownloader/PixivNovelDownloader-v${next}.exe`);
 if (withRelease) {
-  log(`[release] --publish：会打 tag v${next}、建 Release 并上传 exe`);
+  log(`[release] --publish：会打 tag v${next}、建 Release，并上传 zip（压缩包版）与裸 exe`);
 } else {
-  log(`[release] 不动 tag / Release：只升号 → 打包 → 提交 → 推送`);
+  log(`[release] 不动 tag / Release：只升号 → 打包（**不出 zip**）→ 提交 → 推送`);
 }
 if (dryRun) {
   log("[release] --dry-run：只预览，不改文件、不构建、不提交、不推送");
@@ -116,6 +116,9 @@ try {
   }
 
   // ── 3. 打包（内部先把新版本同步到其余 5 处，再编译、再把 exe 归档到发布目录）──
+  // **压缩包版（zip）只在发布时产**（用户要求 2026-10-05）：平时 `npm run release` 只出裸 exe，
+  // 只有 `--publish` 才多打一个 zip。pack-portable.mjs 读这个环境变量；shell() 不传 env ⇒ 子进程继承。
+  if (withRelease) process.env.PORTABLE_WITH_ZIP = "1";
   shell("npm run portable");
 
   // ── 4. 暂存 → 提交 → 推送 ───────────────────────────────────
