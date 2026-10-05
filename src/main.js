@@ -822,7 +822,7 @@ async function invoke(command, args = {}) {
     };
   }
   if (command === "cleanup_old_portable_builds") return { removed: [], failed: [] };
-  if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"];
+  if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh.monlor.com/", "https://ghfile.geekertao.top/", "https://gh-proxy.net/"];
   if (command === "refresh_reading_image_counts") return { scannedCount: 0, updatedCount: 0 };
   if (command === "read_pixiv_cookie_file") return "";
   if (command === "sync_pixiv_author_profile") return { id: args.authorId ?? null, name: "Pixiv 作者", homepage: args.homepage, avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, pixivLastSyncAt: "", avatarManaged: false };
@@ -5655,9 +5655,20 @@ async function bindEvents() {
       if (action === "settings") await settingsModal();
       if (action === "open-update") openUpdateModal();
       if (action === "check-update") {
-        const result = await checkForUpdate();
-        // 手点检查时查到新版就直接把更新弹窗摆出来，省得用户再去找左下角
-        if (result?.hasUpdate) openUpdateModal();
+        // 先给反馈再等结果：以前探测要挨个排队试源，界面十几秒纹丝不动，看着就像「点了没反应」
+        const button = element;
+        const label = button.textContent;
+        button.disabled = true;
+        button.textContent = "正在检查…";
+        toast("正在检查更新…", "info");
+        try {
+          const result = await checkForUpdate();
+          // 手点检查时查到新版就直接把更新弹窗摆出来，省得用户再去找左下角
+          if (result?.hasUpdate) openUpdateModal();
+        } finally {
+          button.disabled = false;
+          button.textContent = label;
+        }
       }
       if (action === "start-update") { await startUpdateDownload(); return; }
       if (action === "ignore-update") {
@@ -5668,10 +5679,11 @@ async function bindEvents() {
         toast(`已忽略 v${element.dataset.version}，出新的还会提醒`, "info");
       }
       if (action === "open-release-page") {
-        await openExternalUrl(state.update?.releaseUrl || RELEASE_PAGE_URL);
-      }
-      if (action === "open-release-mirror-page") {
+        // 默认走加速镜像：国内不挂代理也能直接打开（GitHub 直连入口见下一个 action）
         await openExternalUrl(state.update?.releaseMirrorUrl || `${DEFAULT_UPDATE_MIRROR}${RELEASE_PAGE_URL}`);
+      }
+      if (action === "open-release-direct-page") {
+        await openExternalUrl(state.update?.releaseUrl || RELEASE_PAGE_URL);
       }
       if (action === "reset-update-mirrors") {
         const list = await invoke("default_update_mirror_list");
@@ -7791,7 +7803,7 @@ async function settingsModal() {
         <small>查到新版本会把新版 exe 下载到程序所在的文件夹，下完自动重启到新版本；旧的那个文件在下次启动时移入回收站（可以还原）。你的作品文件和数据库都在旁边，不受影响。GitHub 直连不上时会自动换下面的加速镜像重试。</small>
         <div class="settings-button-row"><button type="button" class="quiet-button" data-action="check-update">检查更新</button><button type="button" class="quiet-button" data-action="open-release-page">打开发布页</button></div>
         <label class="check-row"><input name="autoCheckUpdate" type="checkbox" ${settings.autoCheckUpdate === false ? "" : "checked"}><span>启动时自动检查新版本</span><small>关掉之后程序不会主动联网查版本，想更新时点上面的「检查更新」。</small></label>
-        <label>更新加速镜像 <textarea name="updateMirrors" rows="4" placeholder="https://ghproxy.net/">${escapeHtml((settings.updateMirrors || []).join("\n"))}</textarea><button type="button" class="quiet-button" data-action="reset-update-mirrors">恢复默认</button><small>一行一个。直连 GitHub 失败后按这里的顺序重试（地址会直接接在 <code>https://github.com/...</code> 前面）。镜像失效时自己换一个即可，不用等新版。</small></label>
+        <label>更新加速镜像 <textarea name="updateMirrors" rows="4" placeholder="https://ghproxy.net/">${escapeHtml((settings.updateMirrors || []).join("\n"))}</textarea><button type="button" class="quiet-button" data-action="reset-update-mirrors">恢复默认</button><small>一行一个。检查更新会同时问直连和这里所有镜像、取报出的最高版本，下载时按这个顺序挨个重试（地址直接接在 <code>https://github.com/...</code> 前面）。镜像失效时自己换一个即可，不用等新版。</small></label>
       </div>
       <div class="form-field update-setting">
         <div class="char-setting-head"><span class="field-title">浏览历史</span><span class="settings-group-hint">最多 500 条</span></div>
@@ -8331,8 +8343,8 @@ function updateModal() {
   const footer = info.hasUpdate
     ? `<button class="quiet-button" data-action="ignore-update" data-version="${escapeHtml(info.latestVersion)}">忽略此版本</button>
        <span class="footer-spacer"></span>
-       <button class="quiet-button" data-action="open-release-mirror-page">镜像打开发布页</button>
-       <button class="quiet-button" data-action="open-release-page">打开发布页</button>
+       <button class="quiet-button" data-action="open-release-page">打开发布页（镜像）</button>
+       <button class="quiet-button" data-action="open-release-direct-page">GitHub 直连</button>
        <button class="primary-button" data-action="start-update" ${asset && !downloading ? "" : "disabled"}>${downloading ? "正在下载…" : "立即更新"}</button>`
     : `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>`;
   return modal("软件更新", body, footer, "is-roomy");

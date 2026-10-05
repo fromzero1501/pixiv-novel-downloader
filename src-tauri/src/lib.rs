@@ -1560,7 +1560,13 @@ fn read_update_mirrors(conn: &Connection) -> Result<Vec<String>, String> {
     if raw.trim().is_empty() {
         return Ok(default_update_mirrors());
     }
-    Ok(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_else(|_| default_update_mirrors()))
+    let parsed =
+        serde_json::from_str::<Vec<String>>(&raw).unwrap_or_else(|_| default_update_mirrors());
+    // 老默认那套里有三条早就失效了；用户没动过就自动换成新默认，改过就按用户的来
+    if parsed == legacy_default_update_mirrors() {
+        return Ok(default_update_mirrors());
+    }
+    Ok(parsed)
 }
 
 /// 把搜索词填进配置好的搜索页网址：约定「最后一个 `=` 之后」是搜索词的位置，
@@ -12598,8 +12604,23 @@ const PORTABLE_FILE_PREFIX: &str = "PixivNovelDownloader-v";
 /// 升级包小于这个大小一律当成镜像的错误页丢掉（正常包 20 MB 上下）。
 const MIN_UPDATE_BYTES: u64 = 1_000_000;
 
-/// 内置加速镜像：直连失败后按顺序试。用户可在「设置 → 维护与数据」里增删。
+/// 内置加速镜像。检查更新时直连和这里每一条**同时**探，下载时按这个顺序挨个重试。
+/// 用户可在「设置 → 维护与数据 → 软件更新」里增删。
+///
+/// 2026-10 实测：老那组基本全废（gh-proxy.com 403、ghfast.top 超时、gh.xxooo.cf 连不上），
+/// 换成下面这组当时实测能用的。
 fn default_update_mirrors() -> Vec<String> {
+    vec![
+        "https://ghproxy.net/".to_string(),
+        "https://gh.monlor.com/".to_string(),
+        "https://ghfile.geekertao.top/".to_string(),
+        "https://gh-proxy.net/".to_string(),
+    ]
+}
+
+/// 老版本的默认镜像（其中三条早已失效）。读到的列表**恰好还是这一套**时，
+/// 就当用户从没手动改过，自动换成新默认；自己改过的（少一条、加一条、换过顺序）一律保留。
+fn legacy_default_update_mirrors() -> Vec<String> {
     vec![
         "https://ghproxy.net/".to_string(),
         "https://gh-proxy.com/".to_string(),
@@ -12760,35 +12781,28 @@ fn url_host(url: &str) -> String {
 fn update_client(timeout: Duration) -> Result<Client, String> {
     Client::builder()
         .user_agent(format!("PixivNovelDownloader/{}", env!("CARGO_PKG_VERSION")))
-        // 直连 GitHub 不通时是「连不上」而不是「慢」，连接超时短一点，
-        // 免得启动时的自动检查卡在第一条源上半天才轮到镜像。
-        .connect_timeout(Duration::from_secs(8))
+        // 直连 GitHub 不通时是「连不上」而不是「慢」，连接超时压短一点：
+        // 现在直连和镜像是一起探的，但每失败一条也得尽快出结果，别让界面干等。
+        .connect_timeout(Duration::from_secs(3))
         .timeout(timeout)
         .build()
         .map_err(|e| format!("无法创建网络请求：{e}"))
 }
 
-/// 问发布页当前最新是哪个版本：GET `releases/latest`，看它最终落在哪个 tag 上。
-/// 返回 `(版本号, 成功的来源说明)`。
-fn probe_latest_version(client: &Client, mirrors: &[String]) -> Result<(String, String), String> {
+/// 探**一个**源能报出什么版本：先试 `releases/latest`（看它最终落在哪个 tag 上），
+/// 拿不到再退一步试 `releases.atom` 正文 —— 有的镜像不跟跳转、或者缓存了错误页，
+/// 而 atom 是静态文件、缓存更短，往往还能用。
+fn probe_source_version(client: &Client, label: &str, prefix: &str) -> Result<String, String> {
     let base = format!("https://github.com/{RELEASE_REPO}/releases/latest");
-    let mut last_error = String::from("没有可用的更新源");
-    for (label, prefix) in update_sources(mirrors) {
-        let url = if prefix.is_empty() {
-            base.clone()
-        } else {
-            join_mirror(&prefix, &base)
-        };
-        let response = match client.get(&url).send() {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = format!("{label}：{error}");
-                continue;
-            }
-        };
+    let latest_url = if prefix.is_empty() {
+        base
+    } else {
+        join_mirror(prefix, &base)
+    };
+    if let Ok(response) = client.get(&latest_url).send() {
         // 跟随跳转后地址里就带着 tag；有的镜像不跟随，会把 Location 露出来
         if let Some(version) = version_from_tag_text(&response.url().to_string()) {
-            return Ok((version, label));
+            return Ok(version);
         }
         if let Some(location) = response
             .headers()
@@ -12796,18 +12810,67 @@ fn probe_latest_version(client: &Client, mirrors: &[String]) -> Result<(String, 
             .and_then(|value| value.to_str().ok())
         {
             if let Some(version) = version_from_tag_text(location) {
-                return Ok((version, label));
+                return Ok(version);
             }
         }
         // 还有的镜像会自己跟到 tag 页并把整页 HTML 返回，从正文里再找一次
         let body = response.text().unwrap_or_default();
         let head = &body[..body.len().min(200_000)];
         if let Some(version) = version_from_tag_text(head) {
-            return Ok((version, label));
+            return Ok(version);
         }
-        last_error = format!("{label}：没找到版本号");
     }
-    Err(last_error)
+    let feed = format!("https://github.com/{RELEASE_REPO}/releases.atom");
+    let feed_url = if prefix.is_empty() {
+        feed
+    } else {
+        join_mirror(prefix, &feed)
+    };
+    let response = client
+        .get(&feed_url)
+        .send()
+        .map_err(|error| format!("{label}：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{label}：HTTP {}", response.status().as_u16()));
+    }
+    let body = response.text().unwrap_or_default();
+    let head = &body[..body.len().min(400_000)];
+    version_from_tag_text(head).ok_or_else(|| format!("{label}：没找到版本号"))
+}
+
+/// 问发布页当前最新是哪个版本：直连和所有镜像**同时**探，取报出来版本号最大的那个。
+/// 返回 `(版本号, 成功的来源说明)`。
+///
+/// 为什么不排队挨个试：直连在没代理的机器上要耗掉整个连接超时，轮到镜像时界面
+/// 已经「卡」了十几秒，看着就像点了没反应。为什么取最大值而不是第一个成功的：
+/// 有的镜像会缓存旧版本号（实测 ghproxy.net 报过旧 tag），取最大才不会被带偏。
+fn probe_latest_version(client: &Client, mirrors: &[String]) -> Result<(String, String), String> {
+    let sources = update_sources(mirrors);
+    let mirror_count = sources.len().saturating_sub(1);
+    let found: Vec<(String, String)> = std::thread::scope(move |scope| {
+        let handles: Vec<_> = sources
+            .into_iter()
+            .map(|(label, prefix)| {
+                scope.spawn(move || {
+                    probe_source_version(client, &label, &prefix).map(|version| (version, label))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .flatten()
+            .collect()
+    });
+    match found
+        .into_iter()
+        .max_by_key(|(version, _)| parse_version(version).unwrap_or((0, 0, 0)))
+    {
+        Some((version, label)) => Ok((version, label)),
+        None => Err(format!(
+            "直连 GitHub 和 {mirror_count} 个加速镜像都没探到版本号。可以打开系统代理后重试，或在「设置 → 维护与数据 → 软件更新」里换个镜像。"
+        )),
+    }
 }
 
 /// 新版发布包叫什么。正常是裸 exe；历史上发过 zip，所以两个都当候选。
@@ -13286,22 +13349,30 @@ async fn check_for_update() -> Result<UpdateCheck, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let conn = db()?;
         let mirrors = read_update_mirrors(&conn)?;
-        let client = update_client(Duration::from_secs(30))?;
+        // 探测的客户端超时压到 12 秒：并发探测下最慢的那条决定总耗时，
+        // 别让某个「连上了但不吐数据」的镜像把界面拖住太久
+        let client = update_client(Duration::from_secs(12))?;
         let current = env!("CARGO_PKG_VERSION").to_string();
         let (latest, source) = probe_latest_version(&client, &mirrors)?;
         let current_tuple = parse_version(&current).unwrap_or((0, 0, 0));
         let latest_tuple = parse_version(&latest).unwrap_or((0, 0, 0));
         let release_url = format!("https://github.com/{RELEASE_REPO}/releases/tag/v{latest}");
+        // 「打开发布页」优先用刚探通的那个源；探到的若是直连，就退回列表里第一条镜像
+        let release_mirror_url = if source == "直连 GitHub" {
+            mirrors
+                .iter()
+                .find(|mirror| !mirror.trim().is_empty())
+                .map(|mirror| join_mirror(mirror, &release_url))
+                .unwrap_or_else(|| release_url.clone())
+        } else {
+            join_mirror(&source, &release_url)
+        };
         Ok(UpdateCheck {
             has_update: latest_tuple > current_tuple,
             asset: (latest_tuple > current_tuple)
                 .then(|| probe_update_asset(&client, &latest, &mirrors))
                 .flatten(),
-            release_mirror_url: mirrors
-                .iter()
-                .find(|mirror| !mirror.trim().is_empty())
-                .map(|mirror| join_mirror(mirror, &release_url))
-                .unwrap_or_else(|| release_url.clone()),
+            release_mirror_url,
             release_url,
             latest_version: latest,
             current_version: current,

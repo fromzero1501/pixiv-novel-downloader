@@ -4,7 +4,7 @@
 //   npm run release -- "提交说明"          升末位（patch），说明可省
 //   npm run release -- "说明" --minor      升中间位
 //   npm run release -- "说明" --major      升首位
-//   npm run release -- --tag               额外打 tag + 建 GitHub Release
+//   npm run release -- --no-release        只推代码，不打 tag、不建 Release
 //   npm run release -- --dry-run           只预览会做什么：不改文件、不构建、不提交、不推送
 //
 // 几条约定（和项目原有流程对齐）：
@@ -12,7 +12,9 @@
 //     所以这里只改 package.json 一处。
 //   - 中途任何一步失败 → 立刻停，并把 package.json 的版本号还原，
 //     不留「升了号却没打包 / 没提交」的半成品状态。
-//   - tag / Release 默认**不做**，只有显式加 --tag 才做（与「发版要单独说」的约定一致）。
+//   - tag / Release **默认就做**：升号 → 打包 → 提交 → 推送 → 打 tag → 建 Release → 传 exe。
+//     只想把代码推上去、不动 Release 时加 --no-release。
+//     （自动更新只认 releases/latest，漏建 Release 就等于更新链路断了。）
 //   - 帮助文档不碰。
 import { execFileSync, execSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -26,7 +28,8 @@ const argv = process.argv.slice(2);
 const flags = new Set(argv.filter((a) => a.startsWith("--")));
 const message = argv.find((a) => !a.startsWith("--")) || "";
 const dryRun = flags.has("--dry-run");
-const withTag = flags.has("--tag");
+// Release 默认建（自动更新只认 releases/latest）；只想推代码时加 --no-release
+const withRelease = !flags.has("--no-release");
 const kind = flags.has("--major") ? "major" : flags.has("--minor") ? "minor" : "patch";
 
 const log = (line = "") => console.log(line);
@@ -82,7 +85,11 @@ const branch = read("git", ["rev-parse", "--abbrev-ref", "HEAD"]) || "master";
 log(`[release] ${current} → ${next}   (${kind})`);
 log(`[release] 提交说明：${commitMessage}`);
 log(`[release] 目标分支：${branch}`);
-if (withTag) log(`[release] 会额外打 tag v${next} 并建 Release`);
+if (withRelease) {
+  log(`[release] 会打 tag v${next}、建 Release 并上传 exe`);
+} else {
+  log(`[release] --no-release：只推代码，不打 tag、不建 Release`);
+}
 if (dryRun) {
   log("[release] --dry-run：只预览，不改文件、不构建、不提交、不推送");
   log("\n[release] 当前 git status（这些会被 git add -A 收走）：");
@@ -91,8 +98,11 @@ if (dryRun) {
 
 // ── 2. 写回 package.json ────────────────────────────────────────
 let bumped = false;
+let committed = false;
+// 只在**还没提交**时还原版本号：提交之后若在推 tag / 建 Release 上失败，
+// 还原会让工作区里留一个「版本号倒退」的脏文件，比不还原更糟。
 const restoreVersion = () => {
-  if (bumped && !dryRun) writeFileSync(pkgPath, original);
+  if (bumped && !committed && !dryRun) writeFileSync(pkgPath, original);
 };
 
 try {
@@ -109,18 +119,20 @@ try {
   // ── 4. 暂存 → 提交 → 推送 ───────────────────────────────────
   run("git", ["add", "-A"]);
   run("git", ["commit", "-m", commitMessage]);
+  committed = true;
   run("git", ["push", "origin", branch]);
 
-  // ── 5. 可选：tag + Release（默认不做）────────────────────────
-  if (withTag) {
+  // ── 5. tag + Release（默认做，--no-release 跳过）─────────────
+  //  用提交说明当 Release 正文：应用内「更新说明」读的就是这一段。
+  if (withRelease) {
     const exe = path.join(root, "发布", "藏集", "PixivNovelDownloader", `PixivNovelDownloader-v${next}.exe`);
     run("git", ["tag", `v${next}`]);
     run("git", ["push", "origin", `v${next}`]);
-    run("gh", ["release", "create", `v${next}`, exe, "--title", `v${next}`, "--notes", `v${next}`]);
+    run("gh", ["release", "create", `v${next}`, exe, "--title", `v${next}`, "--notes", commitMessage]);
   }
 } catch (error) {
   restoreVersion();
-  fail(`${error.message || error}${bumped ? "（package.json 的版本号已还原）" : ""}`);
+  fail(`${error.message || error}${bumped && !committed ? "（package.json 的版本号已还原）" : ""}`);
 }
 
 log(`\n[release] 完成：v${next}${dryRun ? "（dry-run，什么都没改）" : ""}`);

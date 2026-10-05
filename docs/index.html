@@ -155,7 +155,7 @@
 <div class="wrap">
 
 <header class="page">
-  <span class="eyebrow">v1.2.35 · Windows</span>
+  <span class="eyebrow">v1.2.36 · Windows</span>
   <h1>Pixiv小说下载管理器</h1>
   <p class="lede">Windows 本地作品管理软件：按作者管理 Pixiv 小说的预览版与完整版文件，记录购买状态、封面、标签、系列、收藏与阅读记录。</p>
   <div class="links">
@@ -691,7 +691,7 @@
 
   <h3>点「立即更新」之后发生什么</h3>
   <ol>
-    <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.2.35.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
+    <li>新版 exe 下到<strong>程序所在的文件夹</strong>，文件名跟发布页上一致（<code>PixivNovelDownloader-v1.2.36.exe</code>）。下载先落到 <code>.part</code>，确认是完整的可执行程序才改名 —— 下到一半、或者下回来是镜像的错误页，都不会被当成新版本。</li>
     <li>下载完自动启动新版，程序重启。</li>
     <li>新版启动时发现上一个版本的 exe 还躺在旁边，把它<strong>移进 Windows 回收站</strong>（可以还原），并提示一句「已把旧版本文件移入回收站」。</li>
   </ol>
@@ -700,7 +700,8 @@
   </div>
 
   <h3>打不开 GitHub 怎么办</h3>
-  <p>国内直连 <code>github.com</code> 常常不通，所以程序会<strong>自动换加速镜像重试</strong>：先直连，失败后按顺序试内置镜像（<code>ghproxy.net</code>、<code>gh-proxy.com</code>、<code>ghfast.top</code>、<code>gh.xxooo.cf</code>），哪条通就用哪条。查版本和下载<strong>整条链路都走这套回退</strong>，不需要你操作。</p>
+  <p>国内直连 <code>github.com</code> 常常不通，所以程序会<strong>同时问直连和所有内置镜像</strong>（<code>ghproxy.net</code>、<code>gh.monlor.com</code>、<code>ghfile.geekertao.top</code>、<code>gh-proxy.net</code>），谁先答出来算谁的；万一某个镜像缓存了旧版本号，也会取<strong>报出来最高的那个版本</strong>，不会被带偏。哪个源通、下载就走哪个，整条链路都自动完成，不需要你操作。</p>
+  <p>点「检查更新」会立刻变成「正在检查…」并弹一条提示，之后十几秒内出结果 —— 不会像以前那样点下去半天没动静。</p>
   <p>镜像失效是常事。万一全都不通，去「设置 → 6 维护与数据 → 更新加速镜像」自己换一批 —— 一行一个，地址会直接接在 <code>https://github.com/...</code> 前面，改完自动保存、立刻生效，<strong>不用等出新版本</strong>。点「恢复默认」可以填回内置的那几条。</p>
 
   <h3>几个常见情况</h3>
@@ -708,7 +709,7 @@
     <li><strong>下载慢</strong>：进度条会显示当前走的是哪条线路，耐心等或者换个镜像。</li>
     <li><strong>不想让它联网查版本</strong>：把「启动时自动检查新版本」的勾去掉，之后只在你手动点「检查更新」时才查。</li>
     <li><strong>不想被某个版本反复提醒</strong>：更新弹窗里点「忽略此版本」，同一个版本不再提示，出了新的照旧提醒。</li>
-    <li><strong>自动下载失败</strong>：弹窗里有「打开发布页」和「镜像打开发布页」，手动下来放进程序文件夹替换掉旧 exe 也一样，下次启动照样会把旧的收进回收站。</li>
+    <li><strong>自动下载失败</strong>：弹窗里有「打开发布页（镜像）」（国内可直接打开）和「GitHub 直连」两个按钮，手动下来放进程序文件夹替换掉旧 exe 也一样，下次启动照样会把旧的收进回收站。</li>
   </ul>
   <div class="warn">
     <p><strong>程序所在的文件夹要能写入。</strong>放在 <code>C:\Program Files</code> 里会被系统挡下来，这时程序会直接提示你把程序挪到桌面、文档这类有写入权限的位置 —— 本来就是免安装的便携版，放哪儿都行。</p>
@@ -800,7 +801,7 @@
 </section>
 
 <footer class="page">
-  <span>Pixiv小说下载管理器 v1.2.35 · 本文档随版本更新</span>
+  <span>Pixiv小说下载管理器 v1.2.36 · 本文档随版本更新</span>
   <span><a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader">GitHub</a> · <a class="inline" href="https://github.com/fromzero1501/pixiv-novel-downloader/issues">反馈</a></span>
 </footer>
 
