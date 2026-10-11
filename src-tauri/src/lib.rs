@@ -3246,6 +3246,47 @@ fn pixiv_published_at(value: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// 简介里出现这些域名 ⇒ 这份只是预览：完整版被作者放到赞助 / 售卖平台去了。
+///
+/// **只收「赞助 / 付费订阅 / 售卖」性质的站点**。刻意**不收**网盘（mega / Google Drive /
+/// 蓝奏云）、短链（bit.ly）、社交（t.me / X）—— 作者经常只是把配图包丢在网盘、正文其实发全了，
+/// 收进来会把全文误判成预览版（2026-10-11 用户拍板）。
+///
+/// 匹配用**域名子串**：Pixiv 简介里的外链会被编码成
+/// `/jump.php?https%3A%2F%2Fapp.aifans.fans%2Fposts%2F...`，只有 `://` 变成 `%3A%2F%2F`，
+/// 域名本身仍是明文（实测真实库确认），所以 `contains` 就够；也正因为斜杠会被编码成 `%2F`，
+/// 这里**不能**写成带 `/` 的形式。
+const PREVIEW_SPONSOR_DOMAINS: &[&str] = &[
+    // 用户点名指定的三个（2026-10-11）
+    "aifans.fans",
+    "allmylinks.com",
+    "fansky.co",
+    // 同族镜像域名（用户库里实际出现过）
+    "fansky.net",
+    // 粉丝订阅 / 赞助
+    "fanbox.cc",
+    "fantia.jp",
+    "ci-en.net",
+    "patreon.com",
+    "afdian.net",
+    "afdian.com",
+    "ifdian.net",
+    "ko-fi.com",
+    "buymeacoffee.com",
+    // 售卖平台
+    "booth.pm",
+    "dlsite.com",
+    "melonbooks.co.jp",
+    "gumroad.com",
+    // 用户库里在用的同类站（简介里写的正是「解锁链接」「赞助通道」）
+    "hmiko.com",
+    "ifanso.com",
+    "azz.net",
+    // 链接聚合页
+    "linktr.ee",
+    "lit.link",
+];
+
 fn synopsis_indicates_preview(description: &str) -> bool {
     let compact: String = description
         .chars()
@@ -3256,7 +3297,15 @@ fn synopsis_indicates_preview(description: &str) -> bool {
     if compact.contains("购买") {
         return true;
     }
-    compact.contains("全文") && !compact.contains("全文放出")
+    if compact.contains("全文") && !compact.contains("全文放出") {
+        return true;
+    }
+    // 赞助链接（2026-10-11）：很多作者根本不写「购买」，直接甩一个赞助 / 售卖页的链接。
+    // 域名可能大小写混写，先整体转小写再比（中文不受影响）。
+    let lowered = compact.to_lowercase();
+    PREVIEW_SPONSOR_DOMAINS
+        .iter()
+        .any(|domain| lowered.contains(domain))
 }
 
 /// Pixiv 小说标题前 15 个字里出现「插画」或「图文」时，判定为带图版。
@@ -14339,6 +14388,7 @@ mod tests {
         version_from_tag_text,
         atom_entries, atom_field, decode_entities, html_to_text, probe_release_notes, tidy_release_notes,
         synopsis_indicates_preview,
+        PREVIEW_SPONSOR_DOMAINS,
         clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
         HISTORY_LIMIT, migrate_favorites_into_collections,
         add_watch_later_impl, remove_watch_later_impl, list_watch_later_impl,
@@ -16726,6 +16776,35 @@ mod tests {
         assert!(synopsis_indicates_preview("购买 途径 \n ：某站有完整版"));
         assert!(synopsis_indicates_preview("完整版可在某站购买"));
         assert!(!synopsis_indicates_preview("本作已完结，感谢阅读"));
+    }
+
+    /// 赞助链接：简介里贴了赞助 / 售卖页 ⇒ 预览版（2026-10-11）。
+    /// 用户点名的三个站点必须在清单里；网盘 / 短链 / 社交 / Pixiv 自身**都不算**。
+    #[test]
+    fn synopsis_marks_sponsor_links_as_previews() {
+        assert!(PREVIEW_SPONSOR_DOMAINS.contains(&"aifans.fans"));
+        assert!(PREVIEW_SPONSOR_DOMAINS.contains(&"allmylinks.com"));
+        assert!(PREVIEW_SPONSOR_DOMAINS.contains(&"fansky.co"));
+
+        // 真机上的写法：外链被包在 pixiv 的 jump.php 里、`://` 被编码成 `%3A%2F%2F`
+        assert!(synopsis_indicates_preview(
+            "support link：<a href=\"/jump.php?https%3A%2F%2Fapp.aifans.fans%2Fposts%2F3aefb462\">点我</a>"
+        ));
+        assert!(synopsis_indicates_preview("https://kedaya.booth.pm/items/8868158"));
+        assert!(synopsis_indicates_preview("解锁链接：https://hmiko.com/p/10527"));
+        assert!(synopsis_indicates_preview("https://WWW.FANSKY.CO/yunibobo/156"));
+        // 中文站名也一样认（爱发电）
+        assert!(synopsis_indicates_preview("赞助：https://afdian.net/a/someone"));
+
+        // 网盘 / 短链 / 社交 / Pixiv 自身：作者常只是丢个配图包或作品链接，正文是全文，不能当预览
+        assert!(!synopsis_indicates_preview("配图包：https://mega.nz/file/abcdef"));
+        assert!(!synopsis_indicates_preview("备份：https://drive.google.com/file/d/abc"));
+        assert!(!synopsis_indicates_preview("下载链接：https://wwb.lanpv.com/i3jlN1osi1qj"));
+        assert!(!synopsis_indicates_preview("短链 https://bit.ly/abc123"));
+        assert!(!synopsis_indicates_preview("群 https://t.me/somewhere"));
+        assert!(!synopsis_indicates_preview(
+            "<a href=\"https://www.pixiv.net/novel/show.php?id=29235839\">相关作品</a>"
+        ));
     }
 
     fn sample_novel_slots() -> Vec<NovelImageSlot> {
