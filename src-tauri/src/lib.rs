@@ -7034,6 +7034,95 @@ fn author_homepage_from_novel(client: &Client, novel_id: &str) -> Result<String,
     Ok(format!("https://www.pixiv.net/users/{user_id}"))
 }
 
+/// 把旧名追加进别名串（`|` 分隔）：去空、去重，已经有了就不重复加。
+fn append_alias(aliases: &str, old_name: &str) -> String {
+    let mut list: Vec<String> = aliases
+        .split('|')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect();
+    let trimmed = old_name.trim();
+    if !trimmed.is_empty() && !list.iter().any(|item| item == trimmed) {
+        list.push(trimmed.to_string());
+    }
+    list.join("|")
+}
+
+/// 作者改名之后：把两个目录的**最后一层**改成新名字（`作者名(别名…)`），
+/// 再把作品里指着旧目录的路径跟着重写（逐条校验新位置真有文件）。
+///
+/// ⚠️ 目标目录已存在（多半是别的作者占着）就**立刻返回错误**，什么都不动 ——
+/// 硬合并两个目录会把别人的文件混进来，这种风险不冒。
+fn rename_author_dirs(
+    conn: &Connection,
+    author_id: i64,
+    new_name: &str,
+    aliases: &str,
+    old_preview: &str,
+    old_purchased: &str,
+) -> Result<(), String> {
+    let folder = author_folder_name(new_name, aliases);
+    let mut pairs: Vec<(String, String, &str)> = vec![];
+    for (old_dir, column) in [(old_preview, "preview_path"), (old_purchased, "purchased_path")] {
+        let old = old_dir.trim();
+        if old.is_empty() {
+            continue;
+        }
+        let old_path = Path::new(old);
+        let Some(parent) = old_path.parent() else {
+            continue;
+        };
+        let target = parent.join(&folder);
+        if target == old_path {
+            continue;
+        }
+        if target.exists() {
+            return Err(format!(
+                "「{folder}」这个名字的目录已经存在（多半是别的作者占着），没有自动改目录：{old}"
+            ));
+        }
+        fs::rename(old_path, &target).map_err(|e| format!("目录改名失败：{e}"))?;
+        pairs.push((target.to_string_lossy().to_string(), old.to_string(), column));
+    }
+
+    for (new_dir, old_dir, column) in pairs {
+        let rows: Vec<(i64, String)> = conn
+            .prepare(&format!(
+                "SELECT id, {column} FROM works WHERE author_id=?1 AND {column} != ''"
+            ))
+            .map_err(|e| e.to_string())?
+            .query_map([author_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        for (work_id, path) in rows {
+            let Ok(rest) = Path::new(&path).strip_prefix(&old_dir) else {
+                continue;
+            };
+            let candidate = Path::new(&new_dir).join(rest);
+            if !candidate.exists() {
+                continue;
+            }
+            conn.execute(
+                &format!("UPDATE works SET {column}=?1 WHERE id=?2"),
+                params![candidate.to_string_lossy().to_string(), work_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let dir_column = if column == "preview_path" {
+            "preview_dir"
+        } else {
+            "purchased_dir"
+        };
+        conn.execute(
+            &format!("UPDATE authors SET {dir_column}=?1 WHERE id=?2"),
+            params![new_dir, author_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn sync_pixiv_author_profile_impl(
     author_id: Option<i64>,
     homepage: String,
@@ -7076,11 +7165,31 @@ fn sync_pixiv_author_profile_impl(
         return Err("无法获取 Pixiv 作者名称。".into());
     }
     if let Some(id) = author_id {
+        // 改名处理（v1.2.56）：Pixiv 上的名字和库里不一样 ⇒ 旧名进别名、目录跟着改名、
+        // 作品路径跟着改。以前这里是**直接覆盖**名字的，旧名和旧目录就都丢了。
+        let (old_name, old_aliases, old_preview, old_purchased): (String, String, String, String) =
+            conn.query_row(
+                "SELECT name, aliases, preview_dir, purchased_dir FROM authors WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let renamed = !old_name.trim().is_empty() && old_name.trim() != name.trim();
+        let aliases = if renamed {
+            append_alias(&old_aliases, &old_name)
+        } else {
+            old_aliases
+        };
         conn.execute(
-            "UPDATE authors SET name=?1, homepage=?2 WHERE id=?3",
-            params![name, homepage, id],
+            "UPDATE authors SET name=?1, homepage=?2, aliases=?3 WHERE id=?4",
+            params![name, homepage, aliases, id],
         )
         .map_err(|e| e.to_string())?;
+        if renamed {
+            // 目录改不动（被占着 / 权限）不拦着保存 —— 名字和别名已经落库了，
+            // 把错误抛上去让前端提示"目录没动"就行
+            rename_author_dirs(&conn, id, &name, &aliases, &old_preview, &old_purchased)?;
+        }
     }
     let avatar_url = ["imageBig", "image", "profileImageUrl"]
         .iter()
