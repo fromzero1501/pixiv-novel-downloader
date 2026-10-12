@@ -1662,10 +1662,9 @@ fn safe_dir_name(value: &str) -> String {
 }
 
 fn apply_default_dirs(conn: &Connection, author_id: i64) -> Result<(), String> {
+    // v1.2.54：「自动创建作者目录」的开关撤了，行为**恒为自动创建**
+    // （用户要求：新建作者不再让你手选目录，就按默认目录建）
     let settings = read_settings(conn)?;
-    if !settings.auto_create_dirs {
-        return Ok(());
-    }
     let (name, preview, purchased): (String, String, String) = conn
         .query_row(
             "SELECT name, preview_dir, purchased_dir FROM authors WHERE id=?1",
@@ -2104,6 +2103,233 @@ fn update_author_path(
     )
     .map_err(|e| e.to_string())?;
     read_author(&conn, author_id)
+}
+
+/// 换盘 / 改目录之后的重定位报告（v1.2.53）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RelocateReport {
+    /// 按新目录重写、且新位置确实有文件的条数
+    moved: usize,
+    /// 还指着旧目录、但新位置没找到对应文件的条数（保持原样，等第二层来搜）
+    missing: usize,
+}
+
+/// **第一层**：改作者目录之后的自动重定位。
+///
+/// 把这些作品里还指着 `old_dir` 的路径按 `new_dir` 重写 —— **逐条校验新位置真有那个文件**
+/// 才改，找不到就原样留着（宁可留着，也别指到一个不存在的地方）。只动数据库，不搬文件。
+///
+/// ⚠️ 走的是"前缀替换"，所以要求换目录时**内部结构没变**（`旧\作者\文件` → `新\作者\文件`）。
+/// 结构变过的那些留给第二层的按文件名搜索。
+#[tauri::command]
+fn relocate_author_works(
+    author_id: i64,
+    field: String,
+    old_dir: String,
+    new_dir: String,
+) -> Result<RelocateReport, String> {
+    let mut conn = db()?;
+    let column = match field.as_str() {
+        "preview" => "preview_path",
+        "purchased" => "purchased_path",
+        _ => return Err("不支持的路径类型".into()),
+    };
+    let old_prefix = PathBuf::from(old_dir.trim());
+    let new_prefix = PathBuf::from(new_dir.trim());
+    if old_dir.trim().is_empty() || new_dir.trim().is_empty() || old_prefix == new_prefix {
+        return Ok(RelocateReport { moved: 0, missing: 0 });
+    }
+    let rows: Vec<(i64, String)> = conn
+        .prepare(&format!(
+            "SELECT id, {column} FROM works WHERE author_id=?1 AND {column} != ''"
+        ))
+        .map_err(|e| e.to_string())?
+        .query_map([author_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut moved = 0usize;
+    let mut missing = 0usize;
+    for (work_id, path) in rows {
+        let Ok(rest) = Path::new(&path).strip_prefix(&old_prefix) else {
+            continue;
+        };
+        let candidate = new_prefix.join(rest);
+        if !candidate.exists() {
+            missing += 1;
+            continue;
+        }
+        tx.execute(
+            &format!("UPDATE works SET {column}=?1 WHERE id=?2"),
+            params![candidate.to_string_lossy().to_string(), work_id],
+        )
+        .map_err(|e| e.to_string())?;
+        moved += 1;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    // 路径变了，SQL 触发器会把 word_count 标回 -1（项目里历来如此）——
+    // 这里不补算，交给既有的「后台补算字数」那一轮，省得一次改上千条卡住界面。
+    Ok(RelocateReport { moved, missing })
+}
+
+/// 全库重定位里的一条候选。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LostRelocateItem {
+    work_id: i64,
+    title: String,
+    kind: String,
+    from: String,
+    to: String,
+}
+
+/// **第二层**的报告：先 `apply=false` 拿预览，用户点头再 `apply=true` 真改。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LostRelocateReport {
+    /// 扫了几个目录根
+    roots: usize,
+    /// 全库有多少条"绑了路径但文件不在"
+    lost: usize,
+    /// 按文件名唯一命中的候选
+    matched: Vec<LostRelocateItem>,
+    /// 找不到同名的条数
+    unmatched: usize,
+    /// 有歧义（同名文件不止一处）的条数
+    ambiguous: usize,
+    /// 本次真改了几条（预览时恒为 0）
+    applied: usize,
+}
+
+/// 递归收集目录下的文件名索引（小写文件名 → 全部路径）。
+/// 有上限兜底：目录大得离谱时别把程序拖死。
+fn index_file_names(root: &Path, index: &mut HashMap<String, Vec<PathBuf>>, budget: &mut usize) {
+    if *budget == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            index_file_names(&path, index, budget);
+            continue;
+        }
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if let Some(name) = path.file_name().and_then(|item| item.to_str()) {
+            index.entry(name.to_lowercase()).or_default().push(path);
+        }
+    }
+}
+
+/// **第二层**：全库按文件名重新定位丢失的文件。
+///
+/// 适用场景：换盘后目录结构被动过，第一层的前缀替换对不上。做法是把你**设置过的所有目录**
+/// （各作者的预览版 / 完整版目录 + 全局默认目录）扫一遍，按**文件名**找同名文件：
+/// 唯一命中就给候选，找不到或找到多个都如实报出来（不猜）。
+#[tauri::command]
+fn relocate_lost_files(apply: bool) -> Result<LostRelocateReport, String> {
+    let mut conn = db()?;
+    let settings = read_settings(&conn)?;
+    let mut roots: Vec<PathBuf> = vec![];
+    let dir_rows: Vec<(String, String)> = conn
+        .prepare("SELECT preview_dir, purchased_dir FROM authors")
+        .map_err(|e| e.to_string())?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    for (preview, purchased) in dir_rows {
+        for value in [preview, purchased] {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                roots.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+    for value in [&settings.default_preview_dir, &settings.default_purchased_dir] {
+        let trimmed = value.trim().to_string();
+        if !trimmed.is_empty() {
+            roots.push(PathBuf::from(trimmed));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+
+    let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut budget: usize = 200_000;
+    for root in &roots {
+        if root.exists() {
+            index_file_names(root, &mut index, &mut budget);
+        }
+    }
+
+    let works = all_works(&conn)?;
+    let mut matched: Vec<LostRelocateItem> = vec![];
+    let mut unmatched = 0usize;
+    let mut ambiguous = 0usize;
+    let mut lost = 0usize;
+    for work in &works {
+        let bound = [
+            ("preview", work.preview_path.as_str()),
+            ("purchased", work.purchased_path.as_str()),
+        ];
+        for (kind, path) in bound {
+            if path.trim().is_empty() || Path::new(path).exists() {
+                continue;
+            }
+            lost += 1;
+            let Some(name) = Path::new(path).file_name().and_then(|item| item.to_str()) else {
+                unmatched += 1;
+                continue;
+            };
+            match index.get(&name.to_lowercase()) {
+                Some(hits) if hits.len() == 1 => matched.push(LostRelocateItem {
+                    work_id: work.id,
+                    title: work.title.clone(),
+                    kind: kind.to_string(),
+                    from: path.to_string(),
+                    to: hits[0].to_string_lossy().to_string(),
+                }),
+                Some(_) => ambiguous += 1,
+                None => unmatched += 1,
+            }
+        }
+    }
+
+    let mut applied = 0usize;
+    if apply && !matched.is_empty() {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for item in &matched {
+            let column = if item.kind == "preview" {
+                "preview_path"
+            } else {
+                "purchased_path"
+            };
+            tx.execute(
+                &format!("UPDATE works SET {column}=?1 WHERE id=?2"),
+                params![item.to, item.work_id],
+            )
+            .map_err(|e| e.to_string())?;
+            applied += 1;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+
+    Ok(LostRelocateReport {
+        roots: roots.len(),
+        lost,
+        matched,
+        unmatched,
+        ambiguous,
+        applied,
+    })
 }
 
 #[tauri::command]
@@ -14476,6 +14702,8 @@ pub fn run() {
             set_author_order,
             delete_author,
             update_author_path,
+            relocate_author_works,
+            relocate_lost_files,
             get_app_settings,
             save_app_settings,
             read_pixiv_cookie_file,

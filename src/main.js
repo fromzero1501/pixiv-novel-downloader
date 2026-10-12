@@ -1050,6 +1050,8 @@ async function invoke(command, args = {}) {
     return { total: 1, downloaded: 1, skipped: 0, failed: 0, failedNames: [], authorId: 901, cancelled: false };
   }
   if (command === "bind_work_moving_to_purchased") return args.path;
+  if (command === "relocate_author_works") return { moved: 0, missing: 0 };
+  if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
     return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, lastSyncAt: new Date().toISOString() };
@@ -5052,8 +5054,8 @@ function authorModal(author = {}) {
       </div>
       <label class="is-homepage-field">Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>这栏填作者主页或任意一篇作品链接都行 —— 贴的是作品链接时，保存会自动识别出真正的作者。点"同步作者信息"能顺便取回作者名称和头像；保存时只保留到作者 ID。</small></label>
       <label>头像文件 <div class="path-input"><input name="avatarPath" value="${escapeHtml(author.avatarPath || "")}" readonly placeholder="尚未选择"><button type="button" class="quiet-button" data-action="pick-avatar">选择图片</button></div></label>
-      <label>预览版文件夹 <div class="path-input"><input name="previewDir" value="${escapeHtml(author.previewDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-preview-dir">选择文件夹</button></div><small>在设置中配置默认目录并开启自动创建作者目录后，保存作者时会自动生成，无需手动选择。</small></label>
-      <label>完整版文件夹 <div class="path-input"><input name="purchasedDir" value="${escapeHtml(author.purchasedDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-purchased-dir">选择文件夹</button></div><small>在设置中配置默认目录并开启自动创建作者目录后，保存作者时会自动生成，无需手动选择。</small></label>
+      ${author.id ? `<label>预览版文件夹 <div class="path-input"><input name="previewDir" value="\${escapeHtml(author.previewDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-preview-dir">选择文件夹</button></div><small>留空时按「设置 → 文件与目录」里的默认目录自动创建。</small></label>
+      <label>完整版文件夹 <div class="path-input"><input name="purchasedDir" value="\${escapeHtml(author.purchasedDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-purchased-dir">选择文件夹</button></div><small>留空时按「设置 → 文件与目录」里的默认目录自动创建。</small></label>` : `<p class="read-only-note">预览版 / 完整版文件夹会在保存时按「设置 → 文件与目录」里的默认目录自动创建，不用在这里选。</p>`}
       <label>备注 <textarea name="notes" rows="3" placeholder="可记录来源、说明等">${escapeHtml(author.notes || "")}</textarea></label>
       <div class="form-note"><small>关联相似度阈值已在全局设置中配置，无需为每个作者单独设置。</small></div>
     </form>`, `${author.id ? `<button class="danger-button" data-action="delete-author" data-author-id="${author.id}">删除作者</button>` : ""}<span class="footer-spacer"></span><button class="quiet-button" data-action="sync-author-profile">同步作者信息</button><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" form="author-form" type="submit">保存作者</button>`));
@@ -5943,6 +5945,8 @@ async function bindEvents() {
       if (action === "backfill-synopses") await backfillSynopses();
       if (action === "backfill-covers") await backfillCovers();
       if (action === "backfill-novel-images") await backfillNovelImages();
+      if (action === "relocate-lost-files") await relocateLostFiles();
+      if (action === "relocate-lost-files-apply") await applyRelocateLostFiles();
       if (action === "scan-work-files") await scanWorkFiles();
       if (action === "clear-missing-bindings") await clearMissingBindings();
       if (action === "download-selected-reading") { await downloadSelectedReadings(element.dataset.format === "epub" ? "epub" : ""); return; }
@@ -6179,6 +6183,9 @@ async function bindEvents() {
       try {
         const form = new FormData(event.currentTarget);
         const author = Object.fromEntries(form.entries());
+        // 新建作者的表单里没有这两个输入了（v1.2.54）—— 补上空值，让后端按默认目录自动建
+        if (!("previewDir" in author)) author.previewDir = "";
+        if (!("purchasedDir" in author)) author.purchasedDir = "";
         author.id = author.id ? Number(author.id) : null;
         author.avatarManaged = author.avatarManaged === "true";
         author.aliases = authorAliases().join("|");
@@ -6191,9 +6198,38 @@ async function bindEvents() {
           if (!author.avatarPath) { author.avatarPath = profile.avatarPath || ""; author.avatarManaged = Boolean(profile.avatarManaged); }
         }
         const isNewAuthor = !author.id;
+        // 新建作者要求先配好两个默认目录（v1.2.54）：目录现在是**自动创建**的，
+        // 默认目录空着就建不出来，作者会变成一个没有目录的空壳 —— 直接拦下来
+        if (isNewAuthor) {
+          const appSettings = state.settings || {};
+          const missingDirs = [];
+          if (!String(appSettings.defaultPreviewDir || "").trim()) missingDirs.push("预览版文件夹默认目录");
+          if (!String(appSettings.defaultPurchasedDir || "").trim()) missingDirs.push("完整版文件夹默认目录");
+          if (missingDirs.length) {
+            toast(`请先到「设置 → 文件与目录」里填好${missingDirs.join("、")}`, "error");
+            return;
+          }
+        }
         const saved = await invoke("save_author", { author });
         // 新作者排到作者库最后（v1.2.49 用户要求）—— 注意是"最后"不是"最前"：
         // 往里加人和"我收藏了这位"是两回事，后者才置顶
+        // 换了作者目录 ⇒ **自动**重定位（v1.2.53）：把这些作品里还指着旧目录的路径按新目录
+        // 重写（后端逐条校验新位置真有那个文件）。必须在 refreshAuthors 之前取旧值。
+        const previousDirs = state.authors.find((item) => Number(item.id) === Number(saved.id));
+        for (const [field, oldDir, newDir] of [
+          ["preview", previousDirs?.previewDir || "", saved.previewDir || ""],
+          ["purchased", previousDirs?.purchasedDir || "", saved.purchasedDir || ""],
+        ]) {
+          if (!oldDir || !newDir || oldDir === newDir) continue;
+          try {
+            const report = await invoke("relocate_author_works", { authorId: saved.id, field, oldDir, newDir });
+            if (report?.moved) {
+              toast(`已自动重新定位 ${report.moved} 篇的${field === "preview" ? "预览版" : "完整版"}路径`, "success");
+            }
+          } catch (error) {
+            console.log("自动重定位跳过:", error);
+          }
+        }
         if (isNewAuthor) await moveAuthorsToEnd([saved.id]);
         await refreshAuthors();
         if (state.activeAuthor?.id === saved.id) state.activeAuthor = saved;
@@ -6324,6 +6360,49 @@ async function syncAuthorProfile() {
     button?.classList.remove("is-loading");
     if (button && previousMarkup) button.innerHTML = previousMarkup;
     throw error;
+  }
+}
+
+/**
+ * 「重新定位丢失的文件」（v1.2.53 第二层）。
+ *
+ * 换盘后目录结构被动过、前缀替换对不上时用它：让后端把您设置过的所有目录扫一遍，
+ * 按**文件名**给"绑了路径但文件不在"的作品找同名文件 —— 唯一命中的列成候选，
+ * 找不到或有好几处的如实报出来（不猜）。先预览，确认了再改。
+ */
+async function relocateLostFiles() {
+  let report = null;
+  try {
+    report = await invoke("relocate_lost_files", { apply: false });
+  } catch (error) {
+    toast(`扫描失败：${error}`, "error");
+    return;
+  }
+  if (!report) return;
+  if (!report.lost) { toast("没有丢失的文件，不用重定位", "success"); return; }
+  if (!report.matched.length) {
+    toast(`扫了 ${report.roots} 个目录，${report.lost} 条丢失的记录里没找到能唯一对上的同名文件`, "info");
+    return;
+  }
+  const rows = report.matched.slice(0, 30).map((item) => `<div class="group-item"><div class="group-file"><span class="group-file-main"><span class="group-file-name" title="${escapeHtml(item.from)}">${escapeHtml(item.title)}</span></span><span class="group-file-hint">${item.kind === "preview" ? "预览版" : "完整版"}</span></div><div class="group-options"><span class="read-only-note">${escapeHtml(item.to)}</span></div></div>`).join("");
+  const more = report.matched.length > 30 ? `<p class="match-note">还有 ${report.matched.length - 30} 条没列出来，确认后会一起改。</p>` : "";
+  showModal(modal("重新定位丢失的文件",
+    `<p class="match-note">扫了 <b>${report.roots}</b> 个目录，全库有 <b>${report.lost}</b> 条记录的文件不在原位置；其中 <b>${report.matched.length}</b> 条能按文件名唯一对上，准备改成下面这些新路径。<br>另有 ${report.unmatched} 条没找到同名文件、${report.ambiguous} 条同名文件不止一处（这两类都不动，免得改错）。</p>
+     <div class="match-list">${rows}</div>${more}`,
+    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">先不改</button><button class="primary-button" data-action="relocate-lost-files-apply">确认修改这 ${report.matched.length} 条</button>`,
+    "is-wide"));
+}
+
+async function applyRelocateLostFiles() {
+  try {
+    const report = await invoke("relocate_lost_files", { apply: true });
+    closeModal();
+    // 就地刷新当前列表 + 重画（和别的"批量改路径"的收尾一致）
+    await refreshVisibleList();
+    render();
+    toast(`已重新定位 ${report?.applied || 0} 条；另有 ${report?.unmatched || 0} 条没找到、${report?.ambiguous || 0} 条有重名`, "success");
+  } catch (error) {
+    toast(`重定位失败：${error}`, "error");
   }
 }
 
@@ -8002,7 +8081,9 @@ async function importPixivCookie() {
 /** 设置表单 → 提交给后端的对象；校验不过就抛错（自动保存时把错误写到页脚，不弹 toast 打断输入） */
 function collectSettings(form) {
   const values = Object.fromEntries(new FormData(form).entries());
-  values.autoCreateDirs = Boolean(form.querySelector('[name="autoCreateDirs"]')?.checked);
+  // 「自动创建作者目录」的开关已经撤了（v1.2.54）—— 行为恒为自动创建，
+  // 存下去照样写 true，老库里那个设置项就不会把新行为顶回去
+  values.autoCreateDirs = true;
   // 两个「自动同步作品」开关是纯勾选框，FormData 拿不到未勾选
   values.syncWorksOnNewAuthor = Boolean(form.querySelector('[name="syncWorksOnNewAuthor"]')?.checked);
   values.syncWorksOnStrayPromote = Boolean(form.querySelector('[name="syncWorksOnStrayPromote"]')?.checked);
@@ -8122,7 +8203,6 @@ async function settingsModal() {
       <label>预览版文件夹默认目录 <div class="path-input"><input name="defaultPreviewDir" value="${escapeHtml(settings.defaultPreviewDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-preview">选择目录</button></div></label>
       <label>完整版文件夹默认目录 <div class="path-input"><input name="defaultPurchasedDir" value="${escapeHtml(settings.defaultPurchasedDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-purchased">选择目录</button></div></label>
       <label>完整版自动分组文件夹 <div class="path-input"><input name="autoGroupDir" value="${escapeHtml(settings.autoGroupDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-auto-group-dir">选择目录</button></div><small>将此文件夹（含其子文件夹）中的文件自动移动到对应作者的完整版文件夹中。同一本书匹配到多个作品时会列入手动选择，勾选几个作品就复制几份。</small></label>
-      <label class="check-row"><input name="autoCreateDirs" type="checkbox" ${settings.autoCreateDirs ? "checked" : ""}><span>自动创建作者目录</span><small>新建或保存路径为空的作者时，在默认目录中创建以作者名称命名的文件夹。</small></label>
       <label class="check-row"><input name="syncWorksOnNewAuthor" type="checkbox" ${settings.syncWorksOnNewAuthor ? "checked" : ""}><span>新建作者时同步其所有作品</span><small>手动新增作者、从 Pixiv 收藏新增作者、添加散篇时，只要这位作者有 Pixiv 主页，就自动把他的全部作品同步一遍（右下角有进度条，可随时终止）。</small></label>
       <label class="check-row"><input name="syncWorksOnStrayPromote" type="checkbox" ${settings.syncWorksOnStrayPromote ? "checked" : ""}><span>散篇转正时同步其所有作品</span><small>把散篇作者转成正式作者时，只要他有 Pixiv 主页，就自动把他的全部作品同步一遍。</small></label>
     </div>
@@ -8207,6 +8287,7 @@ async function settingsModal() {
       <button type="button" data-action="backfill-covers">${icon("image", 18)}补齐失效封面<span class="settings-action-hint">作品搬过家、目录被整理过之后，封面可能指向已经找不到的文件（卡片显示「暂无封面」）。这里按 Pixiv 作品 ID 重新取一次，下载到正文旁边</span></button>
       <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">把「正文里有插图、却还只绑着 txt」的作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定，图直接打进电子书里；EPUB 生成后旁边多余的配图目录会送进回收站。一篇一篇请求，随时可以终止</span></button>
       <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
+      <button type="button" data-action="relocate-lost-files">${icon("sync", 18)}重新定位丢失的文件<span class="settings-action-hint">换盘 / 搬过目录之后用：到您设置过的所有目录里按文件名找同名文件，找到唯一一个就重新绑上（先给预览，再动手）</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
       <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>
