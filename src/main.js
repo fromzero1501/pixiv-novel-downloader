@@ -5045,11 +5045,6 @@ async function runConfirmedAction() {
   if (action) await action();
 }
 
-/** 这个作者对象是不是"还没存过的新作者"（author.id 在提交时被规范化成 null 或数字） */
-function isNewAuthorValue(author) {
-  return !author || !author.id;
-}
-
 function authorModal(author = {}) {
   showModal(modal(author.id ? "编辑作者" : "新增作者", `
     <form id="author-form" class="form-stack">
@@ -6203,12 +6198,16 @@ async function bindEvents() {
         if (!("previewDir" in author)) author.previewDir = "";
         if (!("purchasedDir" in author)) author.purchasedDir = "";
         author.id = author.id ? Number(author.id) : null;
+        // 「是不是新建」必须**在这儿**算好（v1.2.66）：下面是"同步作者信息"，撞上散篇时
+        // 后端会把库里已有行的 id 交回来、我们填进 author.id —— 要是等填完再算，
+        // 新建的作者就会被当成老作者，连带「自动同步他的作品」「排到最后」全被跳过。
+        const isNewAuthor = !author.id;
         author.avatarManaged = author.avatarManaged === "true";
         author.aliases = authorAliases().join("|");
         // 新建作者时**默认同步一次**（v1.2.55 用户要求）：以 Pixiv 上的为准 ——
         // 你填的名字只是拿来找人的线索，同步到了就用同步的覆盖它。
         // 同步失败不拦着保存，但要让你知道（按你填的先存下来）。
-        if (isNewAuthorValue(author) && String(author.homepage || "").trim()) {
+        if (isNewAuthor && String(author.homepage || "").trim()) {
           try {
             const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage: author.homepage });
             // 同步回来的 profile 带 id ⇒ 说明库里**已经有这位**（典型的：他还在「散篇」里，
@@ -6233,7 +6232,7 @@ async function bindEvents() {
           if (!String(author.name || "").trim()) author.name = profile.name;
           if (!author.avatarPath) { author.avatarPath = profile.avatarPath || ""; author.avatarManaged = Boolean(profile.avatarManaged); }
         }
-        const isNewAuthor = !author.id;
+        // （isNewAuthor 在前面的"收完表单"处就算好了 —— 见 v1.2.66 的注释）
         // 新建作者要求先配好两个默认目录（v1.2.54）：目录现在是**自动创建**的，
         // 默认目录空着就建不出来，作者会变成一个没有目录的空壳 —— 直接拦下来
         if (isNewAuthor) {
