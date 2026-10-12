@@ -1531,28 +1531,6 @@ function resetWorksListFilters() {
   state.filterPanelOpen = false;
 }
 
-/**
- * 作品库顶栏吸顶的偏移（v1.2.44）。
- *
- * `.work-topbar` 固定在最上面，下面的批量条和工具行（搜索 / 筛选）要**紧贴着它排**，
- * 所以得知道它此刻到底多高（作者名长短、按钮换行都会变）—— 每次 render 后量一次，
- * 写进 CSS 变量给 sticky 用。没有顶栏的页面（作者库首页等）把变量和 body 类都清掉，
- * 免得 `.library-tools` 在那些页面上白白吸顶。
- */
-function syncStickyOffsets() {
-  const root = document.documentElement;
-  const head = document.querySelector(".work-topbar");
-  document.body.classList.toggle("has-work-topbar", Boolean(head));
-  if (!head) {
-    root.style.removeProperty("--work-head-h");
-    root.style.removeProperty("--work-bulk-h");
-    return;
-  }
-  root.style.setProperty("--work-head-h", `${Math.round(head.getBoundingClientRect().height)}px`);
-  const bulk = document.querySelector(".bulk-bar");
-  root.style.setProperty("--work-bulk-h", bulk ? `${Math.round(bulk.getBoundingClientRect().height)}px` : "0px");
-}
-
 function render() {
   app.innerHTML = state.activeAuthor
     ? (state.seriesView ? renderSeriesView() : renderWorks())
@@ -1566,8 +1544,6 @@ function render() {
       : state.homeView === "pixivBookmarks" ? renderPixivBookmarks()
       : state.homeView === "stray" ? renderStray()
       : state.homeView === "help" ? renderHelp() : renderAuthors());
-  // 顶栏吸顶的偏移得在 DOM 落地之后量（v1.2.44）
-  syncStickyOffsets();
   document.body.classList.toggle("is-bulk", Boolean(state.bulkMode));
   mountHelpDocument();
   bindEvents();
@@ -1693,10 +1669,39 @@ function renderShell(content) {
       </div>
     </aside>
     <main class="workspace">${content}</main>
-  </div>${syncFloater()}${scrollJump()}`;
+  </div>${syncFloater()}${scrollJump()}${floatingBackButton()}`;
 }
 
 // 右下角的「回到顶部 / 滚到底部」：作者或作品很多时不用一路滚
+/**
+ * 左上角固定的「返回」（v1.2.45）。
+ *
+ * 之前试过把整个顶栏吸顶，太占竖向空间（用户 2026-10-12 否掉）—— 改成一个浮动按钮：
+ * 固定在左上角、不占布局，滚到哪儿都能点。只在**有明确返回目标**的页面出现。
+ */
+function floatingBackTarget() {
+  // 批量态下「返回」是退出批量（和顶栏那个按钮同一个语义，别让人在下面找不到）
+  if (state.activeAuthor) {
+    return state.bulkMode
+      ? { action: "bulk-mode", title: "退出批量操作" }
+      : { action: state.authorReturnTo === "allWorks" ? "back-to-all-works" : "go-home", title: "返回作者库" };
+  }
+  if (state.activeCollection) return { action: "back-to-collections", title: "返回收藏夹" };
+  if (state.homeView === "stray") {
+    return state.bulkMode
+      ? { action: "bulk-mode", title: "退出批量操作" }
+      : { action: "go-home", title: "返回作者库" };
+  }
+  // 作者库首页 / 所有作品 / 历史这些是侧栏的一级页，没有"上一级"，不显示
+  return null;
+}
+
+function floatingBackButton() {
+  const target = floatingBackTarget();
+  if (!target) return "";
+  return `<button class="back-floater" data-action="${target.action}" title="${escapeHtml(target.title)}" aria-label="${escapeHtml(target.title)}">${icon("back", 20)}</button>`;
+}
+
 function scrollJump() {
   return `<div class="scroll-jump is-hidden" id="scroll-jump">
     <button class="icon-button" title="回到顶部" aria-label="回到顶部" data-action="scroll-top">${icon("up", 18)}</button>
@@ -9075,6 +9080,11 @@ function saveViewState() {
       if (VIEW_STATE_VOLATILE_FIELDS.has(key)) return;
       fields[key] = state[key] === undefined ? fallback : state[key];
     });
+    // 顺手记一下「左上角那张卡是谁」—— 滚动监听里不取（卡片好几百张，每次滚动都遍历太亏），
+    // 这里是防抖后的落盘点，取一次就够（v1.2.45）
+    const bucket = viewStateBucket();
+    const anchor = topVisibleCardAnchor();
+    if (anchor) scrollAnchors[bucket] = anchor;
     window.localStorage.setItem(VIEW_STATE_KEY, JSON.stringify({
       version: 1,
       savedAt: Date.now(),
@@ -9085,6 +9095,7 @@ function saveViewState() {
       authorReturnTo: state.authorReturnTo === "allWorks" ? "allWorks" : null,
       fields,
       scrollTops,
+      scrollAnchors,
     }));
   } catch (error) {
     // 隐私模式 / 配额满了都可能写不进去。这只是界面记忆，安静跳过就好
@@ -9117,6 +9128,61 @@ function trackScrollPosition() {
  * 于是一点进作品库就停在半空（v1.2.19 修的）。
  */
 let scrollRestoreFrame = 0;
+/**
+ * 滚动锚点（v1.2.45）：记的是**「左上角那张卡是谁」**，不是像素位置。
+ *
+ * 为什么换：作品列表是分批渲染的（「所有作品」一次只画 `allWorksShown` 张），
+ * 上次滚到第 200 张、退出重进只画了前 60 张 ⇒ 页面根本没那么高，浏览器会把
+ * `scrollTop` **夹回去**，落点就跑到别处了。记卡片 id 就没这个问题 ——
+ * 恢复时先把那张卡所在的批次扩出来，再滚到它身上。
+ */
+const scrollAnchors = {};
+
+/** 当前视口里**最靠上且还没滚过去**的那张卡（作品卡或作者卡）；没有就返回 null */
+function topVisibleCardAnchor() {
+  const cards = document.querySelectorAll(".work-card[data-work-id], .author-card[data-author-id]");
+  let best = null;
+  for (const card of cards) {
+    const rect = card.getBoundingClientRect();
+    if (rect.bottom <= 0) continue;
+    if (!best || rect.top < best.top) best = { top: rect.top, card };
+  }
+  if (!best) return null;
+  const workId = Number(best.card.dataset.workId || 0);
+  if (workId) return { kind: "work", id: workId };
+  const authorId = Number(best.card.dataset.authorId || 0);
+  return authorId ? { kind: "author", id: authorId } : null;
+}
+
+/**
+ * 恢复锚点之前：分批渲染的列表要先把锚点那张卡**所在的批次**扩出来，
+ * 否则它压根不在 DOM 里、也就滚不过去。
+ */
+function expandShownForAnchor(bucket) {
+  const anchor = scrollAnchors[bucket];
+  if (!anchor || anchor.kind !== "work") return;
+  // 只有「所有作品」是分批的：作者作品库 / 收藏夹 / 散篇都是一次画完
+  if (state.activeAuthor || state.homeView !== "allWorks") return;
+  const index = state.allWorks.findIndex((work) => Number(work.id) === anchor.id);
+  if (index < 0) return;
+  const need = Math.ceil((index + 1) / ALL_WORKS_PAGE) * ALL_WORKS_PAGE;
+  if (state.allWorksShown < need) state.allWorksShown = need;
+}
+
+/** 把视口滚到锚点那张卡上；找不到（被删 / 被筛掉）就退回老的「按像素」恢复 */
+function restoreCardAnchor(bucket) {
+  const anchor = scrollAnchors[bucket];
+  const fallback = scrollTops[bucket] || 0;
+  if (!anchor) { restoreScrollTop(fallback); return; }
+  const selector = anchor.kind === "work"
+    ? `.work-card[data-work-id="${anchor.id}"]`
+    : `.author-card[data-author-id="${anchor.id}"]`;
+  const card = document.querySelector(selector);
+  if (!card) { restoreScrollTop(fallback); return; }
+  // 留 8px 余量，别让卡片紧贴窗口上沿
+  restoreScrollTop(Math.max(0, card.getBoundingClientRect().top + currentScrollTop() - 8));
+}
+
 function restoreScrollTop(top) {
   const value = Math.max(0, Number(top) || 0);
   const scroller = libraryScroller();
@@ -9147,6 +9213,7 @@ async function restoreViewState() {
     if (fields[key] !== undefined) state[key] = coerceViewStateValue(fields[key], fallback);
   });
   Object.assign(scrollTops, saved.scrollTops && typeof saved.scrollTops === "object" ? saved.scrollTops : {});
+  Object.assign(scrollAnchors, saved.scrollAnchors && typeof saved.scrollAnchors === "object" ? saved.scrollAnchors : {});
   state.authorReturnTo = saved.authorReturnTo === "allWorks" ? "allWorks" : null;
   // 瀑布流深度跟着回到离开时那样，否则滚动位置落在一片空白上
   if (!(state.allWorksShown >= ALL_WORKS_PAGE)) state.allWorksShown = ALL_WORKS_PAGE;
@@ -9204,8 +9271,10 @@ async function restoreViewState() {
   // 白白冲掉刚恢复好的位置
   const bucket = viewStateBucket();
   renderedBucket = bucket;
+  // 分批渲染的列表：锚点那张卡可能还没被画出来，先把它的批次扩出来（v1.2.45）
+  expandShownForAnchor(bucket);
   render();
-  restoreScrollTop(scrollTops[bucket] || 0);
+  restoreCardAnchor(bucket);
   // 正文搜索：把词放回框里，并重跑那次搜索（后端现扫本地文件，几百毫秒，不挡界面）。
   // 只放词不重跑的话框里有字、下面却写着「搜一下试试」，看着像坏了
   if (state.homeView === "textSearch" && state.textSearchQuery.trim()) {
