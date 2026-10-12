@@ -5755,29 +5755,65 @@ fn pixiv_sync_impl(
             if index > 0 {
                 std::thread::sleep(Duration::from_secs(current_delay));
             }
-            match fetch_pixiv_novel_detail(&client, novel_id) {
-                Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
-                    details.push((novel_id.clone(), detail));
-                    fail_streak = 0;
+            // 撞上限流 / 网络问题就**原地等一会儿、重试这一篇**（v1.2.50 用户要求：
+            // 「进度停在那里，过段时间自动再尝试，而不是直接报失败」）。
+            // 只有「作品被删 / 私密 / 其它非限流错」才记一笔失败往下走。
+            let mut retry_delay = current_delay;
+            loop {
+                if pixiv_sync_cancelled(author_id) {
+                    result.cancelled = true;
+                    break;
                 }
-                other => {
-                    // 记下原因：限流 / 作品被删 / 网络错，用户该采取的行动完全不同
-                    let reason = match other {
-                        Err(error) => error,
-                        Ok(_) => "Pixiv 拒绝返回这篇作品（可能已被作者删除或转为私密）".into(),
-                    };
-                    result.failed_count += 1;
-                    note_sync_failure(&mut result.failed_reasons, reason);
-                    fail_streak += 1;
-                    if fail_streak % SYNC_THROTTLE_STREAK == 0 {
-                        current_delay = throttled_delay_seconds(current_delay);
+                match fetch_pixiv_novel_detail(&client, novel_id) {
+                    Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
+                        details.push((novel_id.clone(), detail));
+                        fail_streak = 0;
+                        break;
                     }
-                    if fail_streak >= SYNC_ABORT_STREAK {
-                        // 连着失败＝大概率被限流，继续跑只是白白喂风控
-                        result.throttled = true;
+                    other => {
+                        // 记下原因：限流 / 作品被删 / 网络错，用户该采取的行动完全不同
+                        let reason = match other {
+                            Err(error) => error,
+                            Ok(_) => "Pixiv 拒绝返回这篇作品（可能已被作者删除或转为私密）".into(),
+                        };
+                        if is_throttling_error(&reason) {
+                            // 限流：**不记失败、不中止**，等够了重来 —— 间隔翻倍、封顶 60 秒
+                            retry_delay = throttled_delay_seconds(retry_delay).min(SYNC_MAX_DELAY_SECONDS);
+                            current_delay = retry_delay;
+                            let _ = app.emit(
+                                "pixiv-sync-progress",
+                                PixivSyncProgress {
+                                    author_id,
+                                    total: candidates.len(),
+                                    current: index + 1,
+                                    title: format!(
+                                        "被 Pixiv 限流，等 {} 秒后重试这一篇（{} / {}）",
+                                        retry_delay,
+                                        index + 1,
+                                        candidates.len()
+                                    ),
+                                },
+                            );
+                            if sleep_throttled_wait(author_id, retry_delay) {
+                                result.cancelled = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        result.failed_count += 1;
+                        note_sync_failure(&mut result.failed_reasons, reason);
+                        fail_streak += 1;
+                        if fail_streak >= SYNC_ABORT_STREAK {
+                            // 连着失败＝大概率被风控，继续跑只是白白喂风控
+                            result.throttled = true;
+                            break;
+                        }
                         break;
                     }
                 }
+            }
+            if result.cancelled {
+                break;
             }
             let _ = app.emit(
                 "pixiv-sync-progress",
@@ -5796,52 +5832,86 @@ fn pixiv_sync_impl(
                 result.cancelled = true;
                 break;
             }
-            let fetched = std::thread::scope(|scope| {
-                let handles = batch
-                    .iter()
-                    .map(|novel_id| {
-                        let client = client.clone();
-                        let novel_id = novel_id.clone();
-                        scope.spawn(move || {
-                            let detail = fetch_pixiv_novel_detail(&client, &novel_id);
-                            (novel_id, detail)
+            // 一批里只要还有「限流错」的，就等一会儿**重试这一批**（v1.2.50 用户要求）。
+            // 非限流错照旧记失败往下走；限流**不计数、不中止**，一直等到成功或用户点终止。
+            let mut pending: Vec<String> = batch.to_vec();
+            while !pending.is_empty() {
+                if pixiv_sync_cancelled(author_id) {
+                    result.cancelled = true;
+                    break;
+                }
+                let fetched = std::thread::scope(|scope| {
+                    let handles = pending
+                        .iter()
+                        .map(|novel_id| {
+                            let client = client.clone();
+                            let novel_id = novel_id.clone();
+                            scope.spawn(move || {
+                                let detail = fetch_pixiv_novel_detail(&client, &novel_id);
+                                (novel_id, detail)
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>();
-                handles
-                    .into_iter()
-                    .filter_map(|handle| handle.join().ok())
-                    .collect::<Vec<_>>()
-            });
-            for (novel_id, detail) in fetched {
-                match detail {
-                    Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
-                        details.push((novel_id, detail));
-                        fail_streak = 0;
-                    }
-                    other => {
-                        let reason = match other {
-                            Err(error) => error,
-                            Ok(_) => {
-                                "Pixiv 拒绝返回这篇作品（可能已被作者删除或转为私密）".into()
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .filter_map(|handle| handle.join().ok())
+                        .collect::<Vec<_>>()
+                });
+                let mut throttled_ids: Vec<String> = Vec::new();
+                for (novel_id, detail) in fetched {
+                    match detail {
+                        Ok(detail) if detail.get("error").and_then(Value::as_bool) != Some(true) => {
+                            details.push((novel_id, detail));
+                            fail_streak = 0;
+                        }
+                        other => {
+                            let reason = match other {
+                                Err(error) => error,
+                                Ok(_) => {
+                                    "Pixiv 拒绝返回这篇作品（可能已被作者删除或转为私密）".into()
+                                }
+                            };
+                            if is_throttling_error(&reason) {
+                                throttled_ids.push(novel_id);
+                            } else {
+                                result.failed_count += 1;
+                                note_sync_failure(&mut result.failed_reasons, reason);
+                                fail_streak += 1;
                             }
-                        };
-                        result.failed_count += 1;
-                        note_sync_failure(&mut result.failed_reasons, reason);
-                        fail_streak += 1;
+                        }
                     }
                 }
+                if throttled_ids.is_empty() {
+                    break;
+                }
+                current_delay = throttled_delay_seconds(current_delay).min(SYNC_MAX_DELAY_SECONDS);
+                let current = ((batch_index + 1) * DETAIL_CONCURRENCY).min(candidates.len());
+                let _ = app.emit(
+                    "pixiv-sync-progress",
+                    PixivSyncProgress {
+                        author_id,
+                        total: candidates.len(),
+                        current,
+                        title: format!(
+                            "被 Pixiv 限流，等 {} 秒后重试这 {} 篇（{} / {}）",
+                            current_delay,
+                            throttled_ids.len(),
+                            current,
+                            candidates.len()
+                        ),
+                    },
+                );
+                if sleep_throttled_wait(author_id, current_delay) {
+                    result.cancelled = true;
+                    break;
+                }
+                pending = throttled_ids;
             }
-            // 并发分支没有逐篇 sleep 的位置，所以这里的退避体现在「整批之间」：
-            // 连着失败够多就先睡一觉再继续，再不行就提前收工。
-            // 原来这里是完全裸奔的 —— 撞上风控会一路错到底。
-            if fail_streak > 0 && fail_streak % SYNC_THROTTLE_STREAK == 0 {
-                let wait = throttled_delay_seconds(current_delay);
-                current_delay = wait;
-                std::thread::sleep(Duration::from_secs(wait));
+            if result.cancelled {
+                break;
             }
             if fail_streak >= SYNC_ABORT_STREAK {
-                // 已经抓到的成功作品照常落库，只是不再继续往下撞墙
+                // 连着失败＝大概率被风控，继续跑只是白白喂风控（限流那类不会走到这儿）
                 result.throttled = true;
                 break;
             }
@@ -6285,8 +6355,41 @@ const SYNOPSIS_MAX_DELAY_SECONDS: u64 = 60;
 /// 是因为第一次有少数失败导致时间戳没落库（见 `pixiv_sync_impl` 末尾）。
 /// 现在按和「补抓简介」同一套阈值退避。
 const SYNC_THROTTLE_STREAK: usize = 4;
-/// 同步连着失败到这个数就提前停下，别继续喂风控
+/// 同步连着失败到这个数就提前停下，别继续喂风控。
+/// **只统计「非限流」的失败** —— 限流那类走"等一会儿重试"，永远不算在这个数里（v1.2.50）。
 const SYNC_ABORT_STREAK: usize = 10;
+
+/// 被限流时重试间隔的上限（秒）。用户 2026-10-12 拍板「一直等」—— 所以这里只封顶间隔，
+/// **没有"重试多少次就放弃"**：只有用户点「终止」才会停。
+const SYNC_MAX_DELAY_SECONDS: u64 = 60;
+
+/// 这个错误算不算「被 Pixiv 限流 / 风控」。
+///
+/// 判据写在错误文本里（`fetch_pixiv_novel_detail` 直接把 reqwest 的报错 to_string 了）：
+/// 429 是明说限流，403 是风控；**连接层的错（超时 / 连不上）也按限流处理** —— 那种时候
+/// 硬闯没有任何好处，等一会儿再来才是对的。
+fn is_throttling_error(error: &str) -> bool {
+    let lowered = error.to_lowercase();
+    lowered.contains("429")
+        || lowered.contains("too many requests")
+        || lowered.contains("403")
+        || lowered.contains("forbidden")
+        || lowered.contains("timeout")
+        || lowered.contains("timed out")
+        || lowered.contains("connection")
+}
+
+/// 睡一会儿，但**每秒看一眼有没有被终止** —— 限流等待可能长达一分钟，
+/// 不能让用户点了「终止」还得干等。返回 true 表示等的中途被取消了。
+fn sleep_throttled_wait(author_id: i64, seconds: u64) -> bool {
+    for _ in 0..seconds {
+        if pixiv_sync_cancelled(author_id) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    false
+}
 
 /// 连续失败之后的新间隔：翻倍，但封顶。
 /// 抽成函数是为了能单测 —— 这段决定了被限流时是「等一等再试」还是「干脆停下」。
@@ -14591,6 +14694,7 @@ mod tests {
         atom_entries, atom_field, decode_entities, html_to_text, probe_release_notes, tidy_release_notes,
         synopsis_indicates_preview,
         PREVIEW_SPONSOR_DOMAINS,
+        is_throttling_error,
         synopsis_indicates_preview_with,
         SynopsisRules,
         default_full_version_keywords,
@@ -17010,6 +17114,25 @@ mod tests {
         assert!(!synopsis_indicates_preview("群 https://t.me/somewhere"));
         assert!(!synopsis_indicates_preview(
             "<a href=\"https://www.pixiv.net/novel/show.php?id=29235839\">相关作品</a>"
+        ));
+    }
+
+    /// 限流判定：429 / 403 / 超时 / 连不上都算「等一会儿再来」，别的错照旧算失败。
+    #[test]
+    fn throttling_errors_are_recognised() {
+        assert!(is_throttling_error(
+            "HTTP status client error (429 Too Many Requests) for url (..)"
+        ));
+        assert!(is_throttling_error(
+            "HTTP status client error (403 Forbidden) for url (..)"
+        ));
+        assert!(is_throttling_error(
+            "error sending request for url (..): operation timed out"
+        ));
+        assert!(is_throttling_error("connection closed before message completed"));
+        // 作品被删 / 私密 —— 等多久都没用，该记失败往下走
+        assert!(!is_throttling_error(
+            "Pixiv 拒绝返回这篇作品（可能已被作者删除或转为私密）"
         ));
     }
 
