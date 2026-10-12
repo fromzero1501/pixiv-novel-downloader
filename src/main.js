@@ -6188,7 +6188,14 @@ async function autoGroupPurchasedFiles(authorId = null, authorName = "", mode = 
 // 指定作者自动分组：先选作者，再只在这位作者的作品里匹配文件名
 function autoGroupAuthorPicker() {
   if (!state.authors.length) { toast("还没有作者，请先新增作者", "info"); return; }
-  const options = state.authors.map((author) => {
+  // 「散篇」放最上面（v1.2.41 用户要求）：选中后只在散篇的作品里匹配。
+  // 值用 -1 这个哨兵（作者主键都是正数）—— 后端认它，把参与匹配的作者收窄到 stray=1 的那批。
+  const strayWorks = Number((state.straySummary || {}).workCount) || 0;
+  const strayAuthors = Number((state.straySummary || {}).authorCount) || 0;
+  const strayOption = strayWorks
+    ? `<option value="-1">散篇（${strayAuthors} 位作者 · ${strayWorks} 篇作品）</option>`
+    : "";
+  const options = strayOption + state.authors.map((author) => {
     const usable = Boolean(author.purchasedDir);
     return `<option value="${author.id}" ${usable ? "" : "disabled"}>${escapeHtml(author.name)}（${author.workCount} 个作品${usable ? "" : " · 未绑定完整版文件夹"}）</option>`;
   }).join("");
@@ -6206,10 +6213,11 @@ async function confirmAutoGroupAuthor() {
   const select = document.querySelector("#auto-group-author");
   if (!select) return;
   const authorId = Number(select.value);
-  const author = state.authors.find((item) => item.id === authorId);
-  if (!author) { toast("请选择要分组的作者", "info"); return; }
+  // -1 = 散篇：它不是一个真实作者，别去 state.authors 里找（v1.2.41）
+  const authorName = authorId === -1 ? "散篇" : state.authors.find((item) => item.id === authorId)?.name;
+  if (!authorName) { toast("请选择要分组的作者", "info"); return; }
   closeModal();
-  pickMatchMode({ action: "auto-group", authorId, authorName: author.name }, "指定作者自动分组", `先选择用哪种方式在「${escapeHtml(author.name)}」的作品里匹配，然后再开始分组。`);
+  pickMatchMode({ action: "auto-group", authorId, authorName }, "指定作者自动分组", `先选择用哪种方式在「${escapeHtml(authorName)}」的作品里匹配，然后再开始分组。`);
 }
 
 function toggleBulkMode() {
@@ -7127,7 +7135,14 @@ function characterTagsHtml(names) {
 }
 
 /** 文件名里写了作者、但作者不在作者库里的文件：按作者名分组，组下面是文件名，纯展示不给下拉框 */
-function unknownAuthorSection(groups) {
+/**
+ * 「作者不在作者库里」那一块。
+ *
+ * `withCandidates`（v1.2.41）：走**自动分组**那条路时，这些文件已经按全库列出了候选，
+ * 用户要能自己勾（作者名可能只是别名没录进去），所以说明写成"去下面勾"；
+ * 而扫单个作者目录那条路上它们确实只做展示，照旧。
+ */
+function unknownAuthorSection(groups, withCandidates = false) {
   if (!groups || !groups.length) return "";
   const rows = groups.map((group) => {
     const files = group.files.map((path) => {
@@ -7141,7 +7156,9 @@ function unknownAuthorSection(groups) {
   }).join("");
   return `<section class="unknown-section">
     <h3>作者不在作者库里</h3>
-    <p class="read-only-note">这些文件名里写明了作者（例如"作者：AAA"），但这位作者不在您的作者库里，所以没有可以匹配的作品，这里只做展示。把这几位作者加进作者库后再来匹配，或者手工处理这些文件。</p>
+    <p class="read-only-note">${withCandidates
+      ? `这些文件名里写明了作者（例如"作者：AAA"），但这位作者不在您的作者库里 —— 可能只是别名还没录进去。下面的列表里已经把它们按<strong>全库</strong>列了候选作品，请自己确认要归到哪一篇；这些文件一律<strong>不会自动搬</strong>。`
+      : `这些文件名里写明了作者（例如"作者：AAA"），但这位作者不在您的作者库里，所以没有可以匹配的作品，这里只做展示。把这几位作者加进作者库后再来匹配，或者手工处理这些文件。`}</p>
     <div class="unknown-list">${rows}</div>
   </section>`;
 }
@@ -7219,7 +7236,7 @@ function showManualGroupSelections(selections, unknownGroups = [], mode = "title
 
   showModal(modal("选择要分组到的作品", 
     `<p class="match-note">勾选 1 个作品＝移动文件；勾选多个作品＝复制多份，每个作品都会各自拿到一份，文件名按各自作品标题命名。${preselect ? "" : "这里默认不勾选任何作品，相似度达标也只做个标记，请自己确认。"}<br>${byCharacter ? "按角色匹配：只要角色名对得上就会列为候选（忽略标题相似度），所以请逐个确认。" : `<span class="group-tag">推荐</span> 表示该候选相似度已达到关联阈值；`}<span class="group-conflict">已有同名文件</span> 表示该作品的完整版目录里已存在同名文件；文件名前的灰色文字是它所在的子文件夹。</p>
-     ${empty}<div class="match-list">${rows}</div>${unknownAuthorSection(unknownGroups)}`,
+     ${empty}<div class="match-list">${rows}</div>${unknownAuthorSection(unknownGroups, true)}`,
     `<button class="quiet-button" data-action="close-modal">稍后处理</button>
      <button class="primary-button" data-action="confirm-manual-group" ${selections.length ? "" : "disabled"}>确认分组</button>`
   , "is-wide"));

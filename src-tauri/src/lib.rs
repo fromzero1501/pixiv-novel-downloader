@@ -9131,6 +9131,11 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), S
     Ok(())
 }
 
+/// 「指定作者自动分组」里选「散篇」时前端传的作者 id。
+/// 作者主键都是正数，撞不上（同 `collectionFilter` 用 -1 表示「任意收藏」的先例）。
+/// 它不是一个真实作者，只用来把参与匹配的作者收窄到 `stray=1` 的那批。
+const STRAY_SCOPE_AUTHOR_ID: i64 = -1;
+
 #[tauri::command]
 fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<AutoGroupResult, String> {
     let mode = resolve_match_mode(&mode)?;
@@ -9164,9 +9169,18 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
     }
 
     // 3. 获取参与匹配的作者及其完整版目录；指定作者时只取这一位
-    let belongs_to_scope = |id: i64| author_id.map_or(true, |only| only == id);
+    // 「散篇」范围（v1.2.41）：前端传 STRAY_SCOPE_AUTHOR_ID，只收 stray=1 的作者
+    let stray_scope = author_id == Some(STRAY_SCOPE_AUTHOR_ID);
+    let belongs_to_scope = |id: i64| {
+        // 散篇范围：SQL 那边已经按 stray=1 收过了，这里不用再判一遍
+        stray_scope || author_id.map_or(true, |only| only == id)
+    };
     let authors: Vec<(i64, String, String, String)> = conn
-        .prepare("SELECT id, name, purchased_dir, aliases FROM authors WHERE purchased_dir != ''")
+        .prepare(if stray_scope {
+            "SELECT id, name, purchased_dir, aliases FROM authors WHERE purchased_dir != '' AND stray = 1"
+        } else {
+            "SELECT id, name, purchased_dir, aliases FROM authors WHERE purchased_dir != ''"
+        })
         .map_err(|e| e.to_string())?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
         .map_err(|e| e.to_string())?
@@ -9177,7 +9191,8 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
         .collect();
 
     // 指定作者时先确认这位作者确实绑定了完整版目录，避免用户点了却"什么都没发生"
-    if let Some(only) = author_id {
+    // 散篇不是真实作者 id，不走这段「这位作者绑没绑目录」的检查 —— 范围由上面的 stray=1 收
+    if let Some(only) = author_id.filter(|id| *id != STRAY_SCOPE_AUTHOR_ID) {
         let name: Option<String> = conn
             .query_row("SELECT name FROM authors WHERE id=?1", params![only], |row| {
                 row.get(0)
@@ -9236,9 +9251,15 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
             .unwrap_or("");
         let stem = file_stem(&file_path);
         let detected = detect_author_in_name(&stem, &author_lookup);
-        // 文件名里写了作者、但库里没这个人 —— 不参与匹配，单独分组展示
+        // 文件名里写了作者、但库里没这个人：**照样参与匹配**（v1.2.41 用户要求）。
+        // 很可能是别名还没录进库里，用户要能自己把文件勾到正确的作品上，所以这里不再 `continue`。
+        // 作者未知 ⇒ 下面的 detected_author_id 自然是 None ⇒ 走「全库找候选」那条路；
+        // 但候选**一律不推荐、绝不自动搬**（靠 author_unknown 兜住，见 recommended 那处）。
+        // 作者名仍然记一笔进 unknown_author_groups，弹窗里提示"这几位不在库里"。
+        let mut author_unknown = false;
         if let Some(author) = &detected {
             if author.author_id.is_none() {
+                author_unknown = true;
                 match unknown_author_groups
                     .iter_mut()
                     .find(|group| group.author == author.name)
@@ -9249,7 +9270,6 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
                         files: vec![file_name_str.clone()],
                     }),
                 }
-                continue;
             }
         }
         let detected_author_id = detected.as_ref().and_then(|author| author.author_id);
@@ -9309,7 +9329,8 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
                     work_title: work_title.clone(),
                     similarity,
                     // 按角色匹配时不自动移动，所以一律不算「推荐自动处理」
-                    recommended: mode == MatchMode::Title && similarity >= threshold,
+                    // 作者没认出来的文件一律不算「推荐」⇒ 永远不会被自动搬，只能用户手动勾（v1.2.41）
+                    recommended: mode == MatchMode::Title && similarity >= threshold && !author_unknown,
                     conflict,
                     matched_characters: hit_characters,
                 });
