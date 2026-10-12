@@ -7305,15 +7305,22 @@ fn sync_pixiv_author_profile_impl(
         None => normalize_author_homepage(&homepage),
     };
     let user_id = pixiv_user_id(&homepage)?;
-    let existing: Option<String> = conn
+    // 这个主页是不是已经被库里的**另一条记录**占着；顺便把 `stray` 读出来 ——
+    // 散篇作者本来就在表里（只是标着散篇），直接报「主页已存在」等于没说该怎么办（v1.2.64）
+    let existing: Option<(String, i64)> = conn
         .query_row(
-            "SELECT name FROM authors WHERE homepage=?1 AND id <> COALESCE(?2, -1)",
+            "SELECT name, stray FROM authors WHERE homepage=?1 AND id <> COALESCE(?2, -1)",
             params![homepage, author_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if let Some(name) = existing {
+    if let Some((name, stray)) = existing {
+        if stray == 1 {
+            return Err(format!(
+                "「{name}」已经在「散篇」里了 —— 不用新建。去左侧栏的「散篇」页找到他的作品、点「散篇转正」，他就成正式作者了（作品也一起回作者库）。"
+            ));
+        }
         return Err(format!("作者主页已存在，名称为“{name}”"));
     }
     let response: Value = client
