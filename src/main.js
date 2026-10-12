@@ -8070,6 +8070,13 @@ function minimumSizeParts(bytes) {
 }
 
 async function settingsModal() {
+  // 只允许开一层（2026-10-12 用户截图报的：连点几次之后底部堆了一排「关闭」）。
+  // 它是 async 的 —— 连着点两下会**同时**过下面那个 await、各开一层；而 closeModal()
+  // 一次只关最上面那层，于是越关越多。两道闸：busy 挡「await 还没回来」那一下，
+  // DOM 检查挡「已经开着了」。（下面没有整体重排缩进，只加了 try —— 免得动到几百行。）
+  if (state.settingsModalBusy || document.getElementById("settings-form")) return;
+  state.settingsModalBusy = true;
+  try {
   const settings = await invoke("get_app_settings");
   const minimumSize = minimumSizeParts(settings.minimumFileSizeBytes);
   showModal(modal("设置（自动保存）", `<div class="settings-copy"><form id="settings-form" class="settings-form">
@@ -8164,6 +8171,8 @@ async function settingsModal() {
     <div class="settings-fields is-single">
       <div class="settings-slot" id="settings-slot-maintain"></div>
     </div>
+  </section>
+  <section class="settings-group is-bulk">
     <h3 class="settings-group-head"><span class="settings-group-no">7</span>批量维护</h3>
     <div class="settings-fields is-single">
     <div class="menu-list settings-actions">
@@ -8177,11 +8186,14 @@ async function settingsModal() {
     </div>
     </div>
   </section>  </section>
-</form>`, `<span id="settings-save-state" class="settings-save-state is-idle">改动会自动保存</span><span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>`, "is-wide"));
+</form>`, `<span id="settings-save-state" class="settings-save-state is-idle">改动会自动保存</span>`, "is-wide"));
   bindCharacterEditorInputs();
   await renderCharacterEditor();
   renderSearchSiteEditor(settings.searchSites || []);
   await renderBackups();
+  } finally {
+    state.settingsModalBusy = false;
+  }
 }
 
 /** 搜索网站编辑器：一项一个网站（输入行 + 清洗后出现的说明），就地增删（重开弹窗会丢掉其它未保存的设置） */

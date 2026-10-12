@@ -380,6 +380,8 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .settings-group.is-match { --accent: #7752cf; --tint: #f5f2fe; --line: #ddd6f6; }
 .settings-group.is-download { --accent: #b5793a; --tint: #fdf7ef; --line: #f0e1c9; }
 .settings-group.is-maintain { --accent: #5b7290; --tint: #f4f7fb; --line: #dde5ef; }
+/* 「7 批量维护」单独一块、用暖色和上面那组区分开（v1.2.49 用户要求"两块要分开、颜色也不同"） */
+.settings-group.is-bulk { --accent: #c2603d; --tint: #fdf5f1; --line: #f0ddd4; }
 
 /* 分组标题：序号 + 名称 + 右侧用途提示 */
 .settings-group-head { display: flex; align-items: center; gap: 8px; margin: 0 0 13px; padding-bottom: 10px; border-bottom: 1px solid var(--line); color: var(--accent); font-size: 14px; font-weight: 750; }
