@@ -1051,6 +1051,7 @@ async function invoke(command, args = {}) {
   }
   if (command === "bind_work_moving_to_purchased") return args.path;
   if (command === "relocate_author_works") return { moved: 0, missing: 0 };
+  if (command === "clear_skipped_novels") return 0;
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
@@ -5949,6 +5950,14 @@ async function bindEvents() {
       if (action === "backfill-novel-images") await backfillNovelImages();
       if (action === "relocate-lost-files") await relocateLostFiles();
       if (action === "relocate-lost-files-apply") await applyRelocateLostFiles();
+      if (action === "clear-skipped-novels") {
+        try {
+          const removed = await invoke("clear_skipped_novels");
+          toast(removed ? `已清空 ${removed} 条「太小跳过」记录，下次同步会重新看它们` : "没有需要清空的记录", "success");
+        } catch (error) {
+          toast(`清空失败：${error}`, "error");
+        }
+      }
       if (action === "scan-work-files") await scanWorkFiles();
       if (action === "clear-missing-bindings") await clearMissingBindings();
       if (action === "download-selected-reading") { await downloadSelectedReadings(element.dataset.format === "epub" ? "epub" : ""); return; }
@@ -8311,6 +8320,7 @@ async function settingsModal() {
       <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">把「正文里有插图、却还只绑着 txt」的作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定，图直接打进电子书里；EPUB 生成后旁边多余的配图目录会送进回收站。一篇一篇请求，随时可以终止</span></button>
       <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
       <button type="button" data-action="relocate-lost-files">${icon("sync", 18)}重新定位丢失的文件<span class="settings-action-hint">换盘 / 搬过目录之后用：到您设置过的所有目录里按文件名找同名文件，找到唯一一个就重新绑上（先给预览，再动手）</span></button>
+      <button type="button" data-action="clear-skipped-novels">${icon("archive", 18)}清空「太小跳过」记录<span class="settings-action-hint">同步时小于「最小文件大小」的作品会被记下来、下次直接跳过（省请求、也少招限流）。把最小文件大小调小之后点这里，让它们重新参与同步</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
       <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>

@@ -947,7 +947,18 @@ fn db() -> Result<Connection, String> {
     // 常见角色名表：用于「按角色匹配」的自动分组 / 关联完整版文件。
     // game 只用来分组展示，不参与匹配；name 与 aliases（`|` 分隔）都会拿去匹配。
     let _ = conn.execute(
-        "CREATE TABLE IF NOT EXISTS characters (
+        // 「因为太小被跳过」的作品（v1.2.61）：不存作品本身，只记 id，
+        // 免得每次同步都把同一批小作品重抓一遍。设置里把最小文件大小**调小**时会整体清空。
+        "CREATE TABLE IF NOT EXISTS skipped_novels (
+            novel_id TEXT PRIMARY KEY,
+            author_id INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT ''
+        );",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS characters (
           id INTEGER PRIMARY KEY,
           game TEXT NOT NULL DEFAULT '',
           name TEXT NOT NULL,
@@ -1661,6 +1672,22 @@ fn safe_dir_name(value: &str) -> String {
     safe_sync_stem(value).trim_end_matches('.').to_string()
 }
 
+/// 记一笔「这篇因为太小被跳过」（v1.2.61）。记的是**作品 ID**，不存作品本身 ——
+/// 目的只是下次同步别再抓它。`INSERT OR REPLACE` 是为了重复记不报错。
+fn mark_skipped_novel(
+    conn: &Connection,
+    novel_id: &str,
+    author_id: i64,
+    reason: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO skipped_novels (novel_id, author_id, reason, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![novel_id, author_id, reason, Utc::now().to_rfc3339()],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
 /// 作者目录名（v1.2.54 用户定的规则）：**作者名 + 括号里的别名**，例：`A(B)(C)`。
 ///
 /// 为什么要带别名：Pixiv 上重名的作者不少，光按名字建目录会撞车；带上别名就能分开。
@@ -2356,6 +2383,15 @@ fn relocate_lost_files(apply: bool) -> Result<LostRelocateReport, String> {
     })
 }
 
+/// 清空「太小被跳过」的记录（v1.2.61）：最小文件大小调过之后随时可以手动清一次，
+/// 让那些作品重新参与同步。返回清掉了多少条。
+#[tauri::command]
+fn clear_skipped_novels() -> Result<usize, String> {
+    let conn = db()?;
+    conn.execute("DELETE FROM skipped_novels", [])
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_app_settings() -> Result<AppSettings, String> {
     read_settings(&db()?)
@@ -2409,6 +2445,14 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
     }
     settings.update_mirrors = cleaned_mirrors;
     let conn = db()?;
+    // 最小文件大小**调小** ⇒ 之前按旧阈值跳过的那些现在可能够大了，名单整体清空重来；
+    // **调大**不用管（原来太小、现在只会更小）。用户 2026-10-13 定的规则。
+    let previous_min_size: u64 = setting(&conn, "minimum_file_size_bytes")?
+        .parse::<u64>()
+        .unwrap_or(0);
+    if settings.minimum_file_size_bytes < previous_min_size {
+        let _ = conn.execute("DELETE FROM skipped_novels", []);
+    }
     let values = [
         (
             "pixiv_cookie",
@@ -4159,6 +4203,9 @@ struct PixivNovelListMeta {
     description: String,
     /// Pixiv 的 createDate（**不是 uploadDate**），喂给 `is_within_date_range`
     published_at: String,
+    /// 正文字符数（列表接口的 `textCount`，2026-10-13 实测确认存在）。
+    /// 用来在抓详情**之前**粗筛「注定太小」的作品；拿不到就是 -1（不预筛）。
+    text_count: i64,
 }
 
 impl PixivNovelListMeta {
@@ -4166,6 +4213,7 @@ impl PixivNovelListMeta {
         Self {
             description: json_string(item, "description"),
             published_at: json_string(item, "createDate"),
+            text_count: item.get("textCount").and_then(Value::as_i64).unwrap_or(-1),
         }
     }
 }
@@ -5941,6 +5989,14 @@ fn pixiv_sync_impl(
         .map_err(|e| e.to_string())?
         .collect::<Result<HashSet<String>, _>>()
         .map_err(|e| e.to_string())?;
+    // 之前因为"太小"被跳过的（v1.2.61）：这些连列表核对都不用做，直接剔掉
+    let skipped_novel_ids: HashSet<String> = conn
+        .prepare("SELECT novel_id FROM skipped_novels")
+        .map_err(|e| e.to_string())?
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<HashSet<String>, _>>()
+        .map_err(|e| e.to_string())?;
     let mut result = PixivSyncResult {
         downloaded_count: 0,
         reused_preview_count: 0,
@@ -6006,6 +6062,22 @@ fn pixiv_sync_impl(
         for (novel_id, meta) in list_meta {
             if known_novel_ids.contains(&novel_id) {
                 result.skipped_existing_count += 1;
+                continue;
+            }
+            // 上次就因为太小跳过它了 ⇒ 这次直接略过（v1.2.61）。设置里把最小文件大小
+            // 调小的话，这张名单会被整体清空，所以改小之后它们会重新参与同步。
+            if skipped_novel_ids.contains(&novel_id) {
+                result.skipped_size_count += 1;
+                continue;
+            }
+            // 按列表接口给的正文字数**预判**太小：UTF-8 一个汉字最多 3 字节，
+            // 所以 `textCount × 3 < 阈值` 意味着"必然太小"，可以安全跳过、不用抓详情。
+            // 拿不到字数（-1）就不预筛，交给抓回来之后再判。
+            if meta.text_count > 0
+                && (meta.text_count as u64).saturating_mul(3) < minimum_file_size_bytes
+            {
+                let _ = mark_skipped_novel(&conn, &novel_id, author_id, "太小（按正文字数预估）");
+                result.skipped_size_count += 1;
                 continue;
             }
             // 日期范围筛选提前到这里：不及格的连详情都不用抓
@@ -6342,6 +6414,8 @@ fn pixiv_sync_impl(
         }
         // 点名下载不吃这条下限，见 `should_skip_small_content`
         if should_skip_small_content(is_single_sync, content.len(), minimum_file_size_bytes) {
+            // 中间地带那批（字数预判不出来）在这儿才落地：也记一笔，下次不再抓（v1.2.61）
+            let _ = mark_skipped_novel(&conn, &novel_id, author_id, "太小（抓回来才知道）");
             result.skipped_size_count += 1;
             continue;
         }
@@ -14878,6 +14952,7 @@ pub fn run() {
             update_author_path,
             relocate_author_works,
             relocate_lost_files,
+            clear_skipped_novels,
             get_app_settings,
             save_app_settings,
             read_pixiv_cookie_file,
