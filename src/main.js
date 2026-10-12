@@ -3462,6 +3462,72 @@ async function detailBindFile(workId) {
   toast("已绑定本地完整版内容", "success");
 }
 
+/**
+ * 拖放绑定（v1.2.42）：从资源管理器把文件拖进窗口，松手时指针若落在那块虚框上，
+ * 就把它绑成当前这篇作品的完整版。
+ *
+ * 用的是**窗口级**的拖放事件（网页那套 HTML5 拖放在桌面壳里拿不到真实文件路径），
+ * 所以落点得自己判 —— `elementFromPoint` 比矩形比较稳（被别的东西挡着也认得出来）。
+ * 事件给的是**物理像素**，要按 devicePixelRatio 换算成 CSS 像素才能和
+ * getBoundingClientRect / elementFromPoint 对上。
+ */
+function dropZoneAt(position) {
+  if (!position) return null;
+  const ratio = window.devicePixelRatio || 1;
+  const x = Number(position.x ?? 0) / ratio;
+  const y = Number(position.y ?? 0) / ratio;
+  const hit = document.elementFromPoint(x, y);
+  return hit && hit.closest ? hit.closest("#bind-drop-zone") : null;
+}
+
+function highlightDropZone(zone) {
+  document.querySelectorAll("#bind-drop-zone").forEach((el) => {
+    el.classList.toggle("is-drop-active", el === zone);
+  });
+}
+
+async function handleDropToBind(payload) {
+  const zone = dropZoneAt(payload?.position);
+  highlightDropZone(null);
+  // 拖到别处松手 = 什么都不做（照样清掉高亮）
+  if (!zone) return;
+  const workId = Number(state.workDetailId) || 0;
+  if (!workId) return;
+  const paths = Array.isArray(payload?.paths) ? payload.paths : [];
+  if (!paths.length) return;
+  if (paths.length > 1) toast("一次只能绑一个文件，这次只用了第一个", "info");
+  const path = paths[0];
+  // ⚠️ 目录要自己拦：后端的 bind_work 只拒绝「封面图 / 配图文件夹」，普通文件夹会被直接绑上。
+  // 没扩展名就当成文件夹（罕见情况下会误伤无扩展名的文件，那时提示也算合理）。
+  if (!/\.[A-Za-z0-9]{1,8}$/.test(path)) {
+    toast("请拖文件，不是文件夹", "error");
+    return;
+  }
+  captureDetailNote();
+  try {
+    await invoke("bind_work", { workId, path });
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  state.detailReadingPath = await invoke("work_reading_path", { workId }).catch(() => "");
+  await refreshAfterDetailChange();
+  toast("已绑定本地完整版内容", "success");
+}
+
+/**
+ * 装窗口级的拖放监听（只在桌面壳里有；浏览器预览里没有这套事件，直接不装 ——
+ * 那块区域还在，只是个静态提示）。
+ */
+function installDropToBind() {
+  if (!window.__TAURI_INTERNALS__) return;
+  const mark = (payload) => highlightDropZone(dropZoneAt(payload?.position));
+  listen("tauri://drag-enter", (event) => mark(event.payload)).catch(() => {});
+  listen("tauri://drag-over", (event) => mark(event.payload)).catch(() => {});
+  listen("tauri://drag-leave", () => highlightDropZone(null)).catch(() => {});
+  listen("tauri://drag-drop", (event) => { void handleDropToBind(event.payload); }).catch(() => {});
+}
+
 /** 详情里切带图版 */
 async function detailToggleImages(workId) {
   captureDetailNote();
@@ -3590,6 +3656,9 @@ function workDetailBody() {
       <div class="detail-actions">
         <button class="quiet-button" data-action="detail-set-version" data-work-id="${work.id}" data-as-full="${work.purchasedPath ? "0" : "1"}">${icon(work.purchasedPath ? "file" : "check", 16)}${work.purchasedPath ? "设为预览版" : "设为完整版"}</button>
         <button class="quiet-button" data-action="detail-bind-file" data-work-id="${work.id}">${icon("folder", 16)}绑定完整版文件</button>
+        <div class="bind-drop-zone" id="bind-drop-zone" title="从资源管理器把作品文件（txt / epub / html…）拖到这里，直接绑成这篇的完整版">
+          ${icon("upload", 15)}<span>拖动到此绑定完整版</span>
+        </div>
         <button class="quiet-button" data-action="detail-toggle-images" data-work-id="${work.id}">${icon("image", 16)}${work.hasImages ? "取消带图版" : "设为带图版"}</button>
       </div>
     </section>
@@ -9064,6 +9133,9 @@ async function bootstrap() {
 
     // 启动时检查Pixiv Cookie有效性
     checkPixivCookieOnStartup();
+
+    // 详情里的「拖动到此绑定完整版」（v1.2.42）：窗口级监听，装一次就够
+    installDropToBind();
 
     // 更新下载进度（下载中才有事件）
     try {
