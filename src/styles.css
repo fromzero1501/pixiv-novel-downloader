@@ -12,6 +12,12 @@ button { cursor: pointer; }
 .rail-footer { margin-top: auto; display: grid; justify-items: center; gap: 8px; }.rail-settings-button { width: 52px; height: 66px; grid-template-columns: 1fr; grid-template-rows: 46px 14px; gap: 3px; padding: 0; color: #5e718a; border: 0; background: transparent; box-shadow: none; font-size: 12px; font-weight: 650; line-height: 1; }.rail-settings-button:hover { color: #176bd3; background: transparent; box-shadow: none; }.rail-settings-button svg { width: 25px; height: 25px; color: currentColor; }.rail-settings-button span { align-self: start; }
 .workspace { padding: 40px 56px 56px; max-width: 1660px; width: 100%; margin: 0 auto; }
 .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 28px; padding-bottom: 34px; }
+/* 作品库顶栏吸顶（v1.2.44）：滚到下面也能直接点返回 / 批量 / 搜索筛选，不用先滑回顶部。
+   背景色**必须写死**（不然列表会从底下透上来）；批量条与工具行的 top 靠 --work-head-h /
+   --work-bulk-h 累加，值由 render 后的 syncStickyOffsets() 量出来。 */
+.has-work-topbar .topbar.work-topbar { position: sticky; top: 0; z-index: 12; background: #f5f8fc; padding-top: 18px; }
+.has-work-topbar .bulk-bar { position: sticky; top: var(--work-head-h, 96px); z-index: 11; background: #f5f8fc; }
+.has-work-topbar .library-tools { position: sticky; top: calc(var(--work-head-h, 96px) + var(--work-bulk-h, 0px)); z-index: 10; background: #f5f8fc; padding: 10px 0; }
 .section-kicker { margin: 0 0 8px; color: #5b7799; font-size: 13px; font-weight: 650; }.topbar h1 { margin: 0; font-size: 34px; line-height: 1.1; letter-spacing: 0; }.topbar-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; align-items: center; }
 .primary-button, .icon-text-button, .quiet-button { border: 1px solid transparent; min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border-radius: 7px; padding: 0 14px; font-weight: 650; }
 .primary-button { background: #176bd3; color: #fff; box-shadow: 0 6px 14px rgba(23,107,211,.18); }.primary-button:hover { background: #0e5fc2; }

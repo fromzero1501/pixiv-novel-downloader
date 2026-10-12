@@ -8022,6 +8022,46 @@ fn author_collections_of(author_id: i64) -> Result<Vec<i64>, String> {
 }
 
 /// 一次性替换这位作者在各作者收藏夹里的归属（弹窗勾完点确定走的就是这条路）。
+/// 同上，作者收藏夹那套（表是 `author_collections`）。
+#[tauri::command]
+fn ensure_default_author_collection() -> Result<i64, String> {
+    let conn = db()?;
+    if let Some(id) = setting(&conn, "default_author_collection_id")?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+    {
+        let alive: Option<i64> = conn
+            .query_row("SELECT id FROM author_collections WHERE id=?1", [id], |row| row.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if alive.is_some() {
+            return Ok(id);
+        }
+    }
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM author_collections WHERE name=?1",
+            [DEFAULT_COLLECTION_NAME],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            conn.execute(
+                "INSERT INTO author_collections (name, sort_order, created_at) VALUES (?1, 0, ?2)",
+                params![DEFAULT_COLLECTION_NAME, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.last_insert_rowid()
+        }
+    };
+    put_setting(&conn, "default_author_collection_id", &id.to_string())?;
+    Ok(id)
+}
+
 #[tauri::command]
 fn set_author_collections(author_id: i64, collection_ids: Vec<i64>) -> Result<(), String> {
     let mut conn = db()?;
@@ -11274,6 +11314,49 @@ fn work_collections(work_id: i64) -> Result<Vec<i64>, String> {
 }
 
 /// 一次性替换这篇作品在各收藏夹里的归属（弹窗里勾完点确定走的就是这条路）。
+/// 「我的收藏」默认夹（作品那套）的 id：收藏时一个夹子都没勾就放这儿，没有就建一个。
+///
+/// 内部**记 id 不记名字** —— 用户把「我的收藏」改个名，照样还是同一个夹；
+/// 只有它被删了，下一次调用才会重新建一个（并更新记录）。
+#[tauri::command]
+fn ensure_default_collection() -> Result<i64, String> {
+    let conn = db()?;
+    if let Some(id) = setting(&conn, "default_collection_id")?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+    {
+        let alive: Option<i64> = conn
+            .query_row("SELECT id FROM collections WHERE id=?1", [id], |row| row.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if alive.is_some() {
+            return Ok(id);
+        }
+    }
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM collections WHERE name=?1",
+            [DEFAULT_COLLECTION_NAME],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            conn.execute(
+                "INSERT INTO collections (name, sort_order, created_at) VALUES (?1, 0, ?2)",
+                params![DEFAULT_COLLECTION_NAME, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.last_insert_rowid()
+        }
+    };
+    put_setting(&conn, "default_collection_id", &id.to_string())?;
+    Ok(id)
+}
+
 #[tauri::command]
 fn set_work_collections(work_id: i64, collection_ids: Vec<i64>) -> Result<(), String> {
     let mut conn = db()?;
@@ -14275,6 +14358,7 @@ pub fn run() {
             list_collection_works,
             work_collections,
             set_work_collections,
+            ensure_default_collection,
             list_filter_views,
             search_full_text,
             save_filter_view,
@@ -14348,6 +14432,7 @@ pub fn run() {
             delete_author_collection,
             author_collections_of,
             set_author_collections,
+            ensure_default_author_collection,
             remove_authors_from_author_collections,
             list_author_collection_authors,
             promote_stray_authors,

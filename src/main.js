@@ -662,6 +662,23 @@ async function invoke(command, args = {}) {
     return { id: collection.id, name: collection.name, createdAt: collection.createdAt, workCount: members.length, coverPath: members[0]?.coverPath || "" };
   });
   // ---- 作者收藏夹（v1.2.33）：和作品收藏夹相互独立的一套 ----
+  // v1.2.44 的两个「默认收藏夹」命令：预览里就地找 / 建一个叫「我的收藏」的夹
+  if (command === "ensure_default_collection") {
+    let target = previewCollections.find((item) => item.name === "我的收藏");
+    if (!target) {
+      target = { id: Math.max(0, ...previewCollections.map((item) => item.id)) + 1, name: "我的收藏", createdAt: new Date().toISOString() };
+      previewCollections.push(target);
+    }
+    return target.id;
+  }
+  if (command === "ensure_default_author_collection") {
+    let target = previewAuthorCollections.find((item) => item.name === "我的收藏");
+    if (!target) {
+      target = { id: Math.max(0, ...previewAuthorCollections.map((item) => item.id)) + 1, name: "我的收藏", createdAt: new Date().toISOString() };
+      previewAuthorCollections.push(target);
+    }
+    return target.id;
+  }
   if (command === "list_author_collections") return previewAuthorCollections.map((collection) => {
     const members = previewAuthors.filter((author) => (author.authorCollectionIds || []).includes(collection.id));
     return { id: collection.id, name: collection.name, createdAt: collection.createdAt, authorCount: members.length, coverPath: members[0]?.avatarPath || "" };
@@ -1514,6 +1531,28 @@ function resetWorksListFilters() {
   state.filterPanelOpen = false;
 }
 
+/**
+ * 作品库顶栏吸顶的偏移（v1.2.44）。
+ *
+ * `.work-topbar` 固定在最上面，下面的批量条和工具行（搜索 / 筛选）要**紧贴着它排**，
+ * 所以得知道它此刻到底多高（作者名长短、按钮换行都会变）—— 每次 render 后量一次，
+ * 写进 CSS 变量给 sticky 用。没有顶栏的页面（作者库首页等）把变量和 body 类都清掉，
+ * 免得 `.library-tools` 在那些页面上白白吸顶。
+ */
+function syncStickyOffsets() {
+  const root = document.documentElement;
+  const head = document.querySelector(".work-topbar");
+  document.body.classList.toggle("has-work-topbar", Boolean(head));
+  if (!head) {
+    root.style.removeProperty("--work-head-h");
+    root.style.removeProperty("--work-bulk-h");
+    return;
+  }
+  root.style.setProperty("--work-head-h", `${Math.round(head.getBoundingClientRect().height)}px`);
+  const bulk = document.querySelector(".bulk-bar");
+  root.style.setProperty("--work-bulk-h", bulk ? `${Math.round(bulk.getBoundingClientRect().height)}px` : "0px");
+}
+
 function render() {
   app.innerHTML = state.activeAuthor
     ? (state.seriesView ? renderSeriesView() : renderWorks())
@@ -1527,6 +1566,8 @@ function render() {
       : state.homeView === "pixivBookmarks" ? renderPixivBookmarks()
       : state.homeView === "stray" ? renderStray()
       : state.homeView === "help" ? renderHelp() : renderAuthors());
+  // 顶栏吸顶的偏移得在 DOM 落地之后量（v1.2.44）
+  syncStickyOffsets();
   document.body.classList.toggle("is-bulk", Boolean(state.bulkMode));
   mountHelpDocument();
   bindEvents();
@@ -4422,7 +4463,11 @@ async function openCollectionPicker(workId) {
   // 先补齐免得弹窗里是空的（批量那条路一直有这行，单篇这条漏了）。
   if (!state.collections.length) await refreshCollections();
   state.pickerSelected = await invoke("work_collections", { workId });
-  showModal(modal("收藏到…", `<div id="collection-picker-body">${collectionPickerBody()}</div>`, `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="picker-save">确定</button>`));
+  // 已经收藏过的才给「取消收藏」—— 这是唯一的移除入口（卡片上那个按钮已经变成开关了）
+  const pickerClear = state.pickerSelected.length
+    ? '<button class="quiet-button" data-action="picker-clear">取消收藏</button>'
+    : "";
+  showModal(modal("收藏到…", `<div id="collection-picker-body">${collectionPickerBody()}</div>`, `<span class="footer-spacer"></span>${pickerClear}<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="picker-save">确定</button>`));
 }
 
 /* ---------------------- 作者收藏夹选择器（v1.2.33） ---------------------- */
@@ -4456,7 +4501,10 @@ async function openAuthorPicker(authorId) {
   // 夹子列表平时只有进「我的收藏」页才拉；作者卡的星标在任何页面都能点，先补齐
   await refreshAuthorCollections();
   state.authorPickerSelected = (await invoke("author_collections_of", { authorId })) || [];
-  showModal(modal("收藏到…", `<div id="author-collection-picker-body">${authorCollectionPickerBody()}</div>`, '<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="author-picker-save">确定</button>'));
+  const authorPickerClear = state.authorPickerSelected.length
+    ? '<button class="quiet-button" data-action="author-picker-clear">取消收藏</button>'
+    : "";
+  showModal(modal("收藏到…", `<div id="author-collection-picker-body">${authorCollectionPickerBody()}</div>`, `<span class="footer-spacer"></span>${authorPickerClear}<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="author-picker-save">确定</button>`));
 }
 
 /** 新建 / 重命名收藏夹共用的「输个名字」弹窗 */
@@ -5422,7 +5470,19 @@ async function bindEvents() {
       }
       if (action === "leave-series") await leaveWorkSeries(Number(workId));
       if (action === "remove-author-alias") removeAuthorAlias(Number(element.dataset.index));
-      if (action === "pick-collection") { closeModal(); await openCollectionPicker(Number(workId)); }
+      // 已收藏 ⇒ 再点一下＝**直接取消**（用户 2026-10-12 的规则）；没收藏才弹选择器。
+      // 想改归属就进详情里那个「调整」入口（那边的语义才是不动收藏状态、只换夹子）。
+      if (action === "pick-collection") {
+        const pickedWork = findWork(Number(workId));
+        if (pickedWork && pickedWork.favorite) {
+          await invoke("set_work_collections", { workId: Number(workId), collectionIds: [] });
+          await refreshAfterWorkFlagChange();
+          toast("已取消收藏", "success");
+        } else {
+          closeModal();
+          await openCollectionPicker(Number(workId));
+        }
+      }
       // 作品详情弹窗（v1.2.0）
       if (action === "cycle-read-state") await cycleReadState(Number(workId));
       if (action === "detail-read-state") await setDetailMeta({ readState: Number(element.dataset.readState) });
@@ -5638,7 +5698,21 @@ async function bindEvents() {
         if (!authorCollection) { toast("这个作者收藏夹已经不在了，刷新一下", "error"); return; }
         closeModal(); state.activeCollection = null; state.activeAuthorCollection = authorCollection; await refreshAuthorCollectionAuthors(); render();
       }
-      if (action === "pick-author-collections") await openAuthorPicker(Number(element.dataset.authorId));
+      // 同上（作者那套）：已收藏 ⇒ 再点＝从所有作者收藏夹里移除
+      if (action === "pick-author-collections") {
+        const pickedAuthorId = Number(element.dataset.authorId);
+        const pickedAuthor = state.authors.find((item) => item.id === pickedAuthorId);
+        if (pickedAuthor && pickedAuthor.starred) {
+          await invoke("set_author_collections", { authorId: pickedAuthorId, collectionIds: [] });
+          await refreshAuthors();
+          await refreshAuthorCollections();
+          if (state.activeAuthorCollection) await refreshAuthorCollectionAuthors();
+          render();
+          toast("已取消收藏", "success");
+        } else {
+          await openAuthorPicker(pickedAuthorId);
+        }
+      }
       if (action === "author-picker-toggle") {
         const pickId = Number(element.dataset.collectionId);
         state.authorPickerSelected = state.authorPickerSelected.includes(pickId) ? state.authorPickerSelected.filter((item) => item !== pickId) : [...state.authorPickerSelected, pickId];
@@ -5655,14 +5729,37 @@ async function bindEvents() {
           refreshAuthorPickerDom();
         } catch (error) { toast(String(error), "error"); }
       }
-      if (action === "author-picker-save") {
-        await invoke("set_author_collections", { authorId: Number(state.authorPickerId), collectionIds: state.authorPickerSelected });
+      if (action === "author-picker-clear") {
+        await invoke("set_author_collections", { authorId: Number(state.authorPickerId), collectionIds: [] });
         closeModal();
         await refreshAuthors();
         await refreshAuthorCollections();
         if (state.activeAuthorCollection) await refreshAuthorCollectionAuthors();
         render();
-        toast(state.authorPickerSelected.length ? "已更新作者收藏夹" : "已从所有作者收藏夹移除", "success");
+        toast("已取消收藏", "success");
+        state.authorPickerId = null;
+        state.authorPickerSelected = [];
+        return;
+      }
+      if (action === "author-picker-save") {
+        const authorPickerId = Number(state.authorPickerId);
+        const wasStarred = Boolean(state.authors.find((item) => item.id === authorPickerId)?.starred);
+        // 一个夹子都没勾 ⇒ 放进默认的「我的收藏」（作者那套）
+        const pickedAuthorCollectionIds = state.authorPickerSelected.length
+          ? state.authorPickerSelected
+          : [await invoke("ensure_default_author_collection")];
+        await invoke("set_author_collections", { authorId: authorPickerId, collectionIds: pickedAuthorCollectionIds });
+        // 新收藏的作者放到作者库**首位**（用户 2026-10-12 要求）；本来就在夹子里的不挪它
+        if (!wasStarred) {
+          const order = [authorPickerId, ...state.authors.map((item) => item.id).filter((id) => id !== authorPickerId)];
+          await invoke("set_author_order", { authorIds: order });
+        }
+        closeModal();
+        await refreshAuthors();
+        await refreshAuthorCollections();
+        if (state.activeAuthorCollection) await refreshAuthorCollectionAuthors();
+        render();
+        toast(state.authorPickerSelected.length ? "已更新作者收藏夹" : "已加入「我的收藏」", "success");
         state.authorPickerId = null;
         state.authorPickerSelected = [];
         return;
@@ -5719,11 +5816,26 @@ async function bindEvents() {
         state.pickerSelected = [...state.pickerSelected, created.id];
         refreshPickerDom();
       }
-      if (action === "picker-save") {
-        await invoke("set_work_collections", { workId: Number(state.pickerWorkId), collectionIds: state.pickerSelected });
+      // 已收藏时的「取消收藏」出口（卡片按钮已是开关，这里是详情「调整」那条路的）
+      if (action === "picker-clear") {
+        await invoke("set_work_collections", { workId: Number(state.pickerWorkId), collectionIds: [] });
         closeModal();
         await refreshAfterWorkFlagChange();
-        toast(state.pickerSelected.length ? "已更新收藏夹" : "已从所有收藏夹移除", "success");
+        toast("已取消收藏", "success");
+        state.pickerWorkId = null;
+        state.pickerSelected = [];
+        return;
+      }
+      if (action === "picker-save") {
+        // 一个夹子都没勾 ⇒ 放进默认的「我的收藏」（用户 2026-10-12 的规则）：
+        // 先让后端把那个夹找出来（没有就建），再传它的 id。
+        const pickedCollectionIds = state.pickerSelected.length
+          ? state.pickerSelected
+          : [await invoke("ensure_default_collection")];
+        await invoke("set_work_collections", { workId: Number(state.pickerWorkId), collectionIds: pickedCollectionIds });
+        closeModal();
+        await refreshAfterWorkFlagChange();
+        toast(state.pickerSelected.length ? "已更新收藏夹" : "已加入「我的收藏」", "success");
         state.pickerWorkId = null;
         state.pickerSelected = [];
         return;
