@@ -5039,6 +5039,11 @@ async function runConfirmedAction() {
   if (action) await action();
 }
 
+/** 这个作者对象是不是"还没存过的新作者"（author.id 在提交时被规范化成 null 或数字） */
+function isNewAuthorValue(author) {
+  return !author || !author.id;
+}
+
 function authorModal(author = {}) {
   showModal(modal(author.id ? "编辑作者" : "新增作者", `
     <form id="author-form" class="form-stack">
@@ -5054,9 +5059,7 @@ function authorModal(author = {}) {
       </div>
       <label class="is-homepage-field">Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>这栏填作者主页或任意一篇作品链接都行 —— 贴的是作品链接时，保存会自动识别出真正的作者。点"同步作者信息"能顺便取回作者名称和头像；保存时只保留到作者 ID。</small></label>
       <label>头像文件 <div class="path-input"><input name="avatarPath" value="${escapeHtml(author.avatarPath || "")}" readonly placeholder="尚未选择"><button type="button" class="quiet-button" data-action="pick-avatar">选择图片</button></div></label>
-      <p class="read-only-note">预览版 / 完整版文件夹不用在这里选：保存时按「设置 → 文件与目录」里的默认目录自动创建，目录名是「作者名(别名)」，跟别名一起保证不重名。</p>
       <label>备注 <textarea name="notes" rows="3" placeholder="可记录来源、说明等">${escapeHtml(author.notes || "")}</textarea></label>
-      <div class="form-note"><small>关联相似度阈值已在全局设置中配置，无需为每个作者单独设置。</small></div>
     </form>`, `${author.id ? `<button class="danger-button" data-action="delete-author" data-author-id="${author.id}">删除作者</button>` : ""}<span class="footer-spacer"></span><button class="quiet-button" data-action="sync-author-profile">同步作者信息</button><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" form="author-form" type="submit">保存作者</button>`));
 }
 
@@ -6188,6 +6191,22 @@ async function bindEvents() {
         author.id = author.id ? Number(author.id) : null;
         author.avatarManaged = author.avatarManaged === "true";
         author.aliases = authorAliases().join("|");
+        // 新建作者时**默认同步一次**（v1.2.55 用户要求）：以 Pixiv 上的为准 ——
+        // 你填的名字只是拿来找人的线索，同步到了就用同步的覆盖它。
+        // 同步失败不拦着保存，但要让你知道（按你填的先存下来）。
+        if (isNewAuthorValue(author) && String(author.homepage || "").trim()) {
+          try {
+            const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage: author.homepage });
+            author.homepage = profile.homepage || author.homepage;
+            if (String(profile.name || "").trim()) author.name = profile.name;
+            if (!author.avatarPath) {
+              author.avatarPath = profile.avatarPath || "";
+              author.avatarManaged = Boolean(profile.avatarManaged);
+            }
+          } catch (error) {
+            toast(`作者信息同步失败：${error}（先按你填的保存）`, "error");
+          }
+        }
         // 主页那栏贴成作品链接是很常见的误操作。作品详情接口是公开的、能读出 userId，
         // 所以先反查成作者主页再保存 —— 不然存下去的会是作品 ID 冒充的作者 UID。
         if (isPixivNovelUrl(author.homepage)) {
@@ -8207,7 +8226,21 @@ async function settingsModal() {
     </div>
   </section>
   <section class="settings-group is-match">
-    <h3 class="settings-group-head"><span class="settings-group-no">3</span>匹配与关联</h3>
+  <section class="settings-group is-keyword">
+    <h3 class="settings-group-head"><span class="settings-group-no">3</span>完整版 / 预览版判定</h3>
+    <div class="settings-fields is-single">
+<div class="form-field">
+  <div class="char-setting-head"><span class="field-title">完整版 / 预览版判定</span><span class="settings-group-hint">抓取同步时用</span></div>
+  <small>同步时看作品简介里有没有这些词：命中<b>完整版关键词</b>就当完整版，命中<b>预览版关键词</b>就当预览版。一行一个，按需要增删。</small>
+  <small>两组词都能命中时，<b>写得更长的那个说了算</b>。比如完整版填「全文放出」、预览版填「全文」：简介里有「全文放出」的判完整版，只有「全文」的判预览版 —— 「全文放出」相当于「全文」的特例。</small>
+  <label>完整版关键词 <textarea name="fullVersionKeywords" rows="3" placeholder="全文放出">${escapeHtml((settings.fullVersionKeywords || []).join("\n"))}</textarea></label>
+  <label>预览版关键词 <textarea name="previewVersionKeywords" rows="10" placeholder="购买">${escapeHtml((settings.previewVersionKeywords || []).join("\n"))}</textarea><small>赞助 / 售卖网站的域名也在这份清单里（fanbox、booth、爱发电那一批）—— 删掉某个就不再算预览信号。</small></label>
+  <small>没命中任何关键词的，按<b>完整版</b>处理（和以前一样）。</small>
+</div>
+    </div>
+  </section>
+  <section class="settings-group is-match">
+    <h3 class="settings-group-head"><span class="settings-group-no">4</span>匹配与关联</h3>
     <p class="settings-note">决定文件名怎么和作品对上号。「匹配标题」用相似度，「匹配角色」用下面的角色名列表。</p>
     <div class="settings-fields">
       <label>关联相似度阈值 <div class="threshold-input"><input name="similarityThreshold" type="number" min="0" max="100" value="${settings.similarityThreshold || 70}"><span>%</span></div><small>文件名与作品标题的相似度达到此值时自动关联。建议值：70-85。</small></label>
@@ -8223,14 +8256,14 @@ async function settingsModal() {
     </div>
   </section>
   <section class="settings-group is-download">
-    <h3 class="settings-group-head"><span class="settings-group-no">4</span>下载与图文</h3>
+    <h3 class="settings-group-head"><span class="settings-group-no">5</span>下载与图文</h3>
     <div class="settings-fields is-single">
       <label>配图画质 <select name="imageQuality"><option value="1200" ${(settings.imageQuality || "1200") === "1200" ? "selected" : ""}>1200 宽（推荐，每张约 1 MB）</option><option value="original" ${settings.imageQuality === "original" ? "selected" : ""}>原始画质（作者上传的原图，可能每张几 MB）</option></select><small>图文小说同步时下载正文配图用这一档。原图更清晰，但一篇的配图可能要几十到上百 MB。</small></label>
       <label>同步作品时图文小说自动保存为 <select name="syncImageFormat"><option value="html" ${(settings.syncImageFormat || "html") === "html" ? "selected" : ""}>HTML（浏览器直接打开）</option><option value="epub" ${settings.syncImageFormat === "epub" ? "selected" : ""}>EPUB（电子书阅读器）</option></select><small>同步图文小说时只保留这一种阅读版：HTML 双击就能用浏览器看，EPUB 适合推到手机 / 阅读器。不会两种都存。</small></label>
     </div>
   </section>
   <section class="settings-group is-search">
-    <h3 class="settings-group-head"><span class="settings-group-no">5</span>搜索网站</h3>
+    <h3 class="settings-group-head"><span class="settings-group-no">6</span>搜索网站</h3>
     <p class="settings-note">在作品卡上选中标题文字后右键，菜单里会多出这些网站的搜索入口，点一下就用系统浏览器打开它的搜索页。不填就没有这些入口。</p>
     <div class="settings-fields is-single">
       <div class="form-field search-site-setting">
@@ -8242,7 +8275,7 @@ async function settingsModal() {
     </div>
   </section>
   <section class="settings-group is-maintain">
-    <h3 class="settings-group-head"><span class="settings-group-no">6</span>维护与数据</h3>
+    <h3 class="settings-group-head"><span class="settings-group-no">7</span>维护与数据</h3>
     <div class="settings-fields is-single">
       <div class="form-field update-setting">
         <div class="char-setting-head"><span class="field-title">软件更新</span><span class="settings-group-hint">当前 v${APP_VERSION}</span></div>
@@ -8251,14 +8284,7 @@ async function settingsModal() {
         <label class="check-row"><input name="autoCheckUpdate" type="checkbox" ${settings.autoCheckUpdate === false ? "" : "checked"}><span>启动时自动检查新版本</span><small>关掉之后程序不会主动联网查版本，想更新时点上面的「检查更新」。</small></label>
         <label>更新加速镜像 <textarea name="updateMirrors" rows="4" placeholder="https://ghproxy.net/">${escapeHtml((settings.updateMirrors || []).join("\n"))}</textarea><button type="button" class="quiet-button" data-action="reset-update-mirrors">恢复默认</button><small>一行一个。检查更新会同时问直连和这里所有镜像、取报出的最高版本，下载时按这个顺序挨个重试（地址直接接在 <code>https://github.com/...</code> 前面）。镜像失效时自己换一个即可，不用等新版。</small></label>
       </div>
-      <div class="form-field">
-        <div class="char-setting-head"><span class="field-title">完整版 / 预览版判定</span><span class="settings-group-hint">抓取同步时用</span></div>
-        <small>同步时看作品简介里有没有这些词：命中<b>完整版关键词</b>就当完整版，命中<b>预览版关键词</b>就当预览版。一行一个，按需要增删。</small>
-        <small>两组词都能命中时，<b>写得更长的那个说了算</b>。比如完整版填「全文放出」、预览版填「全文」：简介里有「全文放出」的判完整版，只有「全文」的判预览版 —— 「全文放出」相当于「全文」的特例。</small>
-        <label>完整版关键词 <textarea name="fullVersionKeywords" rows="3" placeholder="全文放出">${escapeHtml((settings.fullVersionKeywords || []).join("\n"))}</textarea></label>
-        <label>预览版关键词 <textarea name="previewVersionKeywords" rows="10" placeholder="购买">${escapeHtml((settings.previewVersionKeywords || []).join("\n"))}</textarea><small>赞助 / 售卖网站的域名也在这份清单里（fanbox、booth、爱发电那一批）—— 删掉某个就不再算预览信号。</small></label>
-        <small>没命中任何关键词的，按<b>完整版</b>处理（和以前一样）。</small>
-      </div>
+
       <div class="form-field update-setting">
         <div class="char-setting-head"><span class="field-title">浏览历史</span><span class="settings-group-hint">最多 500 条</span></div>
         <small>打开作品或阅读版时自动记一笔，按时间倒序排在左侧栏的「浏览历史」里。</small>
@@ -8279,7 +8305,7 @@ async function settingsModal() {
     </div>
   </section>
   <section class="settings-group is-bulk">
-    <h3 class="settings-group-head"><span class="settings-group-no">7</span>批量维护</h3>
+    <h3 class="settings-group-head"><span class="settings-group-no">8</span>批量维护</h3>
     <div class="settings-fields is-single">
     <div class="menu-list settings-actions">
       <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>

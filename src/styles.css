@@ -378,6 +378,8 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .settings-group.is-account { --accent: #1595e8; --tint: #eff7ff; --line: #cfe5f9; }
 .settings-group.is-storage { --accent: #2f8f8f; --tint: #eff9f8; --line: #cde7e5; }
 .settings-group.is-match { --accent: #7752cf; --tint: #f5f2fe; --line: #ddd6f6; }
+/* 「3 完整版 / 预览版判定」独立成组（v1.2.55 用户要求挪到第三个、单独一块） */
+.settings-group.is-keyword { --accent: #2f8f8f; --tint: #eff9f8; --line: #cde7e5; }
 .settings-group.is-download { --accent: #b5793a; --tint: #fdf7ef; --line: #f0e1c9; }
 .settings-group.is-maintain { --accent: #5b7290; --tint: #f4f7fb; --line: #dde5ef; }
 /* 「7 批量维护」单独一块、用暖色和上面那组区分开（v1.2.49 用户要求"两块要分开、颜色也不同"） */
