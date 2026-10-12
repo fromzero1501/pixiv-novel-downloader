@@ -5054,8 +5054,7 @@ function authorModal(author = {}) {
       </div>
       <label class="is-homepage-field">Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>这栏填作者主页或任意一篇作品链接都行 —— 贴的是作品链接时，保存会自动识别出真正的作者。点"同步作者信息"能顺便取回作者名称和头像；保存时只保留到作者 ID。</small></label>
       <label>头像文件 <div class="path-input"><input name="avatarPath" value="${escapeHtml(author.avatarPath || "")}" readonly placeholder="尚未选择"><button type="button" class="quiet-button" data-action="pick-avatar">选择图片</button></div></label>
-      ${author.id ? `<label>预览版文件夹 <div class="path-input"><input name="previewDir" value="\${escapeHtml(author.previewDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-preview-dir">选择文件夹</button></div><small>留空时按「设置 → 文件与目录」里的默认目录自动创建。</small></label>
-      <label>完整版文件夹 <div class="path-input"><input name="purchasedDir" value="\${escapeHtml(author.purchasedDir || "")}" readonly placeholder="可在稍后绑定"><button type="button" class="quiet-button" data-action="pick-purchased-dir">选择文件夹</button></div><small>留空时按「设置 → 文件与目录」里的默认目录自动创建。</small></label>` : `<p class="read-only-note">预览版 / 完整版文件夹会在保存时按「设置 → 文件与目录」里的默认目录自动创建，不用在这里选。</p>`}
+      <p class="read-only-note">预览版 / 完整版文件夹不用在这里选：保存时按「设置 → 文件与目录」里的默认目录自动创建，目录名是「作者名(别名)」，跟别名一起保证不重名。</p>
       <label>备注 <textarea name="notes" rows="3" placeholder="可记录来源、说明等">${escapeHtml(author.notes || "")}</textarea></label>
       <div class="form-note"><small>关联相似度阈值已在全局设置中配置，无需为每个作者单独设置。</small></div>
     </form>`, `${author.id ? `<button class="danger-button" data-action="delete-author" data-author-id="${author.id}">删除作者</button>` : ""}<span class="footer-spacer"></span><button class="quiet-button" data-action="sync-author-profile">同步作者信息</button><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" form="author-form" type="submit">保存作者</button>`));
@@ -5952,8 +5951,8 @@ async function bindEvents() {
       if (action === "download-selected-reading") { await downloadSelectedReadings(element.dataset.format === "epub" ? "epub" : ""); return; }
       if (action === "backfill-images") { await downloadSelectedReadings(""); return; }
       if (action === "pick-avatar") await pickPath("avatarPath", false, ["jpg", "jpeg", "png", "webp"]);
-      if (action === "pick-preview-dir") await pickPath("previewDir", true);
-      if (action === "pick-purchased-dir") await pickPath("purchasedDir", true);
+      // 「选择文件夹」那两个按钮随作者弹窗里的目录输入一起去掉了（v1.2.54）：
+      // 目录现在一律按「设置 → 文件与目录」的默认目录 + 「作者名(别名)」自动创建
       if (action === "pick-import-file") await pickPath("filePath", false, ["csv", "xlsx", "xls"]);
       if (action === "pick-import-folder") await pickPath("folderPath", true);
       if (action === "submit-import") await submitImport();
@@ -8294,7 +8293,7 @@ async function settingsModal() {
     </div>
     </div>
   </section>  </section>
-</form>`, `<span id="settings-save-state" class="settings-save-state is-idle">改动会自动保存</span>`, "is-wide"));
+</form>`, "", "is-wide"));
   bindCharacterEditorInputs();
   await renderCharacterEditor();
   renderSearchSiteEditor(settings.searchSites || []);

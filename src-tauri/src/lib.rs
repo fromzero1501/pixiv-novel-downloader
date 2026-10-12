@@ -1661,34 +1661,58 @@ fn safe_dir_name(value: &str) -> String {
     safe_sync_stem(value).trim_end_matches('.').to_string()
 }
 
+/// 作者目录名（v1.2.54 用户定的规则）：**作者名 + 括号里的别名**，例：`A(B)(C)`。
+///
+/// 为什么要带别名：Pixiv 上重名的作者不少，光按名字建目录会撞车；带上别名就能分开。
+fn author_folder_name(name: &str, aliases: &str) -> String {
+    let base = safe_dir_name(name);
+    let mut folder = base.clone();
+    for alias in aliases.split('|') {
+        let alias = safe_dir_name(alias.trim());
+        if alias.is_empty() || alias == base || folder.contains(&format!("({alias})")) {
+            continue;
+        }
+        folder.push('(');
+        folder.push_str(&alias);
+        folder.push(')');
+    }
+    folder
+}
+
 fn apply_default_dirs(conn: &Connection, author_id: i64) -> Result<(), String> {
-    // v1.2.54：「自动创建作者目录」的开关撤了，行为**恒为自动创建**
-    // （用户要求：新建作者不再让你手选目录，就按默认目录建）
+    // v1.2.54：「自动创建作者目录」的开关撤了，行为**恒为自动创建**；
+    // 作者弹窗里那两个目录输入也撤了，目录名一律按「作者名(别名…)」生成。
     let settings = read_settings(conn)?;
-    let (name, preview, purchased): (String, String, String) = conn
+    let (name, aliases, preview, purchased): (String, String, String, String) = conn
         .query_row(
-            "SELECT name, preview_dir, purchased_dir FROM authors WHERE id=?1",
+            "SELECT name, aliases, preview_dir, purchased_dir FROM authors WHERE id=?1",
             [author_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|e| e.to_string())?;
-    let folder = safe_dir_name(&name);
-    let preview_dir =
-        if preview.trim().is_empty() && !settings.default_preview_dir.trim().is_empty() {
-            let path = PathBuf::from(&settings.default_preview_dir).join(&folder);
-            fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-            path.to_string_lossy().to_string()
-        } else {
-            preview
-        };
-    let purchased_dir =
-        if purchased.trim().is_empty() && !settings.default_purchased_dir.trim().is_empty() {
-            let path = PathBuf::from(&settings.default_purchased_dir).join(&folder);
-            fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-            path.to_string_lossy().to_string()
-        } else {
-            purchased
-        };
+    let folder = author_folder_name(&name, &aliases);
+    let clash = format!(
+        "「{folder}」这个目录已经存在（多半是别的作者占着）。给这位作者再加个别名、或者改个名字，让目录名不撞车，然后再保存一次。"
+    );
+
+    let mut preview_dir = preview;
+    if preview_dir.trim().is_empty() && !settings.default_preview_dir.trim().is_empty() {
+        let path = PathBuf::from(&settings.default_preview_dir).join(&folder);
+        if path.exists() {
+            return Err(clash);
+        }
+        fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        preview_dir = path.to_string_lossy().to_string();
+    }
+    let mut purchased_dir = purchased;
+    if purchased_dir.trim().is_empty() && !settings.default_purchased_dir.trim().is_empty() {
+        let path = PathBuf::from(&settings.default_purchased_dir).join(&folder);
+        if path.exists() {
+            return Err(clash);
+        }
+        fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        purchased_dir = path.to_string_lossy().to_string();
+    }
     conn.execute(
         "UPDATE authors SET preview_dir=?1, purchased_dir=?2 WHERE id=?3",
         params![preview_dir, purchased_dir, author_id],
