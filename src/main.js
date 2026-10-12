@@ -1820,7 +1820,12 @@ function syncRowStatusText(item) {
   if (item.status === "cancelled") return item.note || "已终止";
   if (item.status === "missing") return item.note || "主页打不开（可能已销号或封号），已跳过同步";
   if (item.status === "failed") return item.note || "同步失败";
-  if (!item.total) return "已是最新，无新作品";
+  if (!item.total) {
+    // 作者已被标成「已销号或封号」时别再说"已是最新" —— 那听着像"他没更新"（v1.2.62）
+    const rowAuthorId = Number(item.authorId || item.id || 0);
+    if (rowAuthorId && state.missingAuthorIds.has(rowAuthorId)) return "作者已销号或封号（Pixiv 上已经没有作品了）";
+    return "已是最新，无新作品";
+  }
   return item.note || "已完成";
 }
 
@@ -7912,6 +7917,12 @@ async function syncPixivWorks() {
   // 刚同步进来的作品字数还是 -1（路径一变触发器就标回未算），重新踢一次后台补算，
   // 否则要等下次开软件卡片上才有字数。算完它会自己刷新列表。
   fillWordCountsInBackground(true);
+  // 这次同步如果发现作者在 Pixiv 上已经没有作品了（后端会把他标成「已销号或封号」），
+  // 就别再报「已下载 0 篇」了 —— 直接说清是怎么回事（v1.2.62 用户反馈）
+  if (state.missingAuthorIds.has(authorId) && !result.downloadedCount) {
+    toast("这位作者在 Pixiv 上已经没有作品了（多半已销号或封号）；本地已收的作品和文件都还在，不受影响。", "error");
+    return;
+  }
   const summaryParts = [
     `已下载 ${result.downloadedCount} 篇`,
     `已关联 ${result.reusedPreviewCount || 0} 篇已有预览版`,

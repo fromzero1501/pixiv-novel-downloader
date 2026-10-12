@@ -5962,19 +5962,14 @@ fn pixiv_sync_impl(
     // 账号多半销号 / 被封，作品全没了。用户 2026-10-13 定：**直接标成「已销号或封号」**，
     // 不提示、不询问。**只标灰、一个字节的本地数据都不动**；下次同步能拉到作品就自动摘掉。
     if novels.is_empty() {
-        let local_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM works WHERE author_id=?1",
-                [author_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        if local_count > 0 {
-            let _ = conn.execute(
-                "UPDATE authors SET missing_since=?1 WHERE id=?2",
-                params![Utc::now().to_rfc3339(), author_id],
-            );
-        }
+        // 拉到的是**空列表** ⇒ 账号多半销号 / 被封、作品全没了，直接标上（v1.2.62）。
+        // 原来还要求"本地得有作品"才标，于是"库里还没收过他的东西"的作者永远标不上 ——
+        // 用户反馈那个作者（/users/109693812）显示成「已是最新，无新作品」就是这么来的。
+        // 只标记、不碰数据；下次同步能拉到作品会自动摘掉（下面的 else 分支）。
+        let _ = conn.execute(
+            "UPDATE authors SET missing_since=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), author_id],
+        );
     } else {
         // 能拉到作品 ⇒ 之前若被标过，摘掉（自愈）
         let _ = conn.execute("UPDATE authors SET missing_since='' WHERE id=?1", [author_id]);
