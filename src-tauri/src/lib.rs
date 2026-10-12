@@ -7305,23 +7305,26 @@ fn sync_pixiv_author_profile_impl(
         None => normalize_author_homepage(&homepage),
     };
     let user_id = pixiv_user_id(&homepage)?;
-    // 这个主页是不是已经被库里的**另一条记录**占着；顺便把 `stray` 读出来 ——
-    // 散篇作者本来就在表里（只是标着散篇），直接报「主页已存在」等于没说该怎么办（v1.2.64）
-    let existing: Option<(String, i64)> = conn
+    // 这个主页是不是已经被库里的**另一条记录**占着；顺便把 `id` / `stray` 读出来。
+    // 散篇作者本来就在表里（只是标着散篇）：**直接转正、复用那一行**（用户 2026-10-13 拍板），
+    // 跟「从 Pixiv 收藏新增作者」那条路保持一致 —— 绝不新建第二条，否则同一个人两条记录、
+    // 作品被劈成两半。命中的是正式作者才照旧报「主页已存在」。
+    let mut resolved_author_id = author_id;
+    let existing: Option<(i64, String, i64)> = conn
         .query_row(
-            "SELECT name, stray FROM authors WHERE homepage=?1 AND id <> COALESCE(?2, -1)",
+            "SELECT id, name, stray FROM authors WHERE homepage=?1 AND id <> COALESCE(?2, -1)",
             params![homepage, author_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    if let Some((name, stray)) = existing {
-        if stray == 1 {
-            return Err(format!(
-                "「{name}」已经在「散篇」里了 —— 不用新建。去左侧栏的「散篇」页找到他的作品、点「散篇转正」，他就成正式作者了（作品也一起回作者库）。"
-            ));
+    if let Some((existing_id, name, stray)) = existing {
+        if stray != 1 {
+            return Err(format!("作者主页已存在，名称为“{name}”"));
         }
-        return Err(format!("作者主页已存在，名称为“{name}”"));
+        conn.execute("UPDATE authors SET stray = 0 WHERE id = ?1", [existing_id])
+            .map_err(|e| e.to_string())?;
+        resolved_author_id = Some(existing_id);
     }
     let response: Value = client
         .get(format!("https://www.pixiv.net/ajax/user/{user_id}"))
@@ -7336,7 +7339,7 @@ fn sync_pixiv_author_profile_impl(
     if name.is_empty() {
         return Err("无法获取 Pixiv 作者名称。".into());
     }
-    if let Some(id) = author_id {
+    if let Some(id) = resolved_author_id {
         // 改名处理（v1.2.56）：Pixiv 上的名字和库里不一样 ⇒ 旧名进别名、目录跟着改名、
         // 作品路径跟着改。以前这里是**直接覆盖**名字的，旧名和旧目录就都丢了。
         let (old_name, old_aliases, old_preview, old_purchased): (String, String, String, String) =
@@ -7396,7 +7399,7 @@ fn sync_pixiv_author_profile_impl(
             }
         }
     }
-    if let Some(id) = author_id {
+    if let Some(id) = resolved_author_id {
         let author = read_author(&conn, id)?;
         return Ok(PixivAuthorProfile {
             id: Some(author.id),

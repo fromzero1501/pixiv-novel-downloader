@@ -6211,6 +6211,10 @@ async function bindEvents() {
         if (isNewAuthorValue(author) && String(author.homepage || "").trim()) {
           try {
             const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage: author.homepage });
+            // 同步回来的 profile 带 id ⇒ 说明库里**已经有这位**（典型的：他还在「散篇」里，
+            // 后端已经顺手转正并把那一行的 id 给了我们）。填上它，保存时就会走「更新」，
+            // 而不是插一条新记录（v1.2.65 用户拍板：新增作者撞上散篇直接转正）
+            if (profile.id) author.id = profile.id;
             author.homepage = profile.homepage || author.homepage;
             if (String(profile.name || "").trim()) author.name = profile.name;
             if (!author.avatarPath) {
