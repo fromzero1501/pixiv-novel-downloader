@@ -834,7 +834,7 @@ async function invoke(command, args = {}) {
     return;
   }
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
-  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumFileSizeBytes: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
+  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumFileSizeBytes: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
   if (command === "save_app_settings") return args.settings;
   // 浏览器预览默认当作「已是最新版」；要看更新界面就把 window.__mockUpdateCheck 塞进来
   // 预览环境没有 Tauri 后端：给个默认「没填过 Cookie」，验证脚本可以塞 window.__mockCookieProbe 覆盖
@@ -4247,11 +4247,29 @@ function renderStray() {
  * 散篇转正（v1.2.33）：把散篇作者**去掉 stray 标记**、变成正式作者 —— 不是下载。
  * 转正是**作者级**的：他名下的散篇作品会一起回到作者库。
  */
+/**
+ * 把几位作者挪到作者库**最后**（v1.2.49）。
+ *
+ * 用在「新增作者」和「散篇转正」上：这两种都是"库里多了一个人"，不该往前挤；
+ * 而「**收藏**作者」那条路是用户主动关注，仍然置顶（见 author-picker-save）。
+ * 走的是和手动拖拽同一套 `set_author_order`，所以之后手动拖一次就按用户的顺序来。
+ */
+async function moveAuthorsToEnd(authorIds) {
+  const ids = [...new Set((authorIds || []).map(Number).filter((id) => id > 0))];
+  if (!ids.length) return;
+  // 注意 `state.authors` 是**刷新前**的列表：新建 / 刚转正的作者还不在里面，
+  // 所以直接"其余的照旧 + 他们在末尾"就对了
+  const rest = state.authors.map((item) => item.id).filter((id) => !ids.includes(id));
+  await invoke("set_author_order", { authorIds: [...rest, ...ids] });
+}
+
 async function promoteStrayAuthors(authorIds, label) {
   const ids = [...new Set((authorIds || []).map(Number).filter((id) => id > 0))];
   if (!ids.length) { toast("没有可转正的作者", "info"); return; }
   try {
     const count = await invoke("promote_stray_authors", { authorIds: ids });
+    // 转正进来的作者排到作者库最后（v1.2.49 用户要求）
+    await moveAuthorsToEnd(ids);
     await refreshStray();
     await refreshAuthors();
     if (state.homeView === "stray") await refreshStrayWorks();
@@ -6163,6 +6181,9 @@ async function bindEvents() {
         }
         const isNewAuthor = !author.id;
         const saved = await invoke("save_author", { author });
+        // 新作者排到作者库最后（v1.2.49 用户要求）—— 注意是"最后"不是"最前"：
+        // 往里加人和"我收藏了这位"是两回事，后者才置顶
+        if (isNewAuthor) await moveAuthorsToEnd([saved.id]);
         await refreshAuthors();
         if (state.activeAuthor?.id === saved.id) state.activeAuthor = saved;
         closeModal();
@@ -8108,22 +8129,7 @@ async function settingsModal() {
     </div>
   </section>
   <section class="settings-group is-maintain">
-    <h3 class="settings-group-head"><span class="settings-group-no">6</span>批量维护</h3>
-    <div class="settings-fields is-single">
-    <p class="settings-note">下面这些操作点下去立刻执行，跟自动保存无关。</p>
-    <div class="settings-fields is-single">
-      <div class="settings-slot" id="settings-slot-maintain"></div>
-    </div>
-    <div class="menu-list settings-actions">
-      <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>
-      <button type="button" data-action="backfill-covers">${icon("image", 18)}补齐失效封面<span class="settings-action-hint">作品搬过家、目录被整理过之后，封面可能指向已经找不到的文件（卡片显示「暂无封面」）。这里按 Pixiv 作品 ID 重新取一次，下载到正文旁边</span></button>
-      <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">把「正文里有插图、却还只绑着 txt」的作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定，图直接打进电子书里；EPUB 生成后旁边多余的配图目录会送进回收站。一篇一篇请求，随时可以终止</span></button>
-      <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
-      <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
-      <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
-      <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>
-    </div>
-    <h3 class="settings-group-head"><span class="settings-group-no">7</span>维护与数据</h3>
+    <h3 class="settings-group-head"><span class="settings-group-no">6</span>维护与数据</h3>
     <div class="settings-fields is-single">
       <div class="form-field update-setting">
         <div class="char-setting-head"><span class="field-title">软件更新</span><span class="settings-group-hint">当前 v${APP_VERSION}</span></div>
@@ -8137,7 +8143,7 @@ async function settingsModal() {
         <small>同步时看作品简介里有没有这些词：命中<b>完整版关键词</b>就当完整版，命中<b>预览版关键词</b>就当预览版。一行一个，按需要增删。</small>
         <small>两组词都能命中时，<b>写得更长的那个说了算</b>。比如完整版填「全文放出」、预览版填「全文」：简介里有「全文放出」的判完整版，只有「全文」的判预览版 —— 「全文放出」相当于「全文」的特例。</small>
         <label>完整版关键词 <textarea name="fullVersionKeywords" rows="3" placeholder="全文放出">${escapeHtml((settings.fullVersionKeywords || []).join("\n"))}</textarea></label>
-        <label>预览版关键词 <textarea name="previewVersionKeywords" rows="4" placeholder="购买">${escapeHtml((settings.previewVersionKeywords || []).join("\n"))}</textarea></label>
+        <label>预览版关键词 <textarea name="previewVersionKeywords" rows="10" placeholder="购买">${escapeHtml((settings.previewVersionKeywords || []).join("\n"))}</textarea><small>赞助 / 售卖网站的域名也在这份清单里（fanbox、booth、爱发电那一批）—— 删掉某个就不再算预览信号。</small></label>
         <small>没命中任何关键词的，按<b>完整版</b>处理（和以前一样）。</small>
       </div>
       <div class="form-field update-setting">
@@ -8155,8 +8161,22 @@ async function settingsModal() {
         <div class="settings-button-row"><button type="button" class="quiet-button" data-action="backup-now">${icon("database", 16)}立即备份一份</button></div>
       </div>
     </div>
+    <div class="settings-fields is-single">
+      <div class="settings-slot" id="settings-slot-maintain"></div>
     </div>
-  </section>
+    <h3 class="settings-group-head"><span class="settings-group-no">7</span>批量维护</h3>
+    <div class="settings-fields is-single">
+    <div class="menu-list settings-actions">
+      <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>
+      <button type="button" data-action="backfill-covers">${icon("image", 18)}补齐失效封面<span class="settings-action-hint">作品搬过家、目录被整理过之后，封面可能指向已经找不到的文件（卡片显示「暂无封面」）。这里按 Pixiv 作品 ID 重新取一次，下载到正文旁边</span></button>
+      <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">把「正文里有插图、却还只绑着 txt」的作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定，图直接打进电子书里；EPUB 生成后旁边多余的配图目录会送进回收站。一篇一篇请求，随时可以终止</span></button>
+      <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
+      <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
+      <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
+      <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>
+    </div>
+    </div>
+  </section>  </section>
 </form>`, `<span id="settings-save-state" class="settings-save-state is-idle">改动会自动保存</span><span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>`, "is-wide"));
   bindCharacterEditorInputs();
   await renderCharacterEditor();

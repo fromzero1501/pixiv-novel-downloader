@@ -3345,12 +3345,15 @@ fn synopsis_rules_from(conn: &Connection) -> SynopsisRules {
 /// 「不管两者是不是包含关系，谁更具体谁赢」，所以**不做矛盾检测**。
 /// 等长时完整版优先，结果才稳定（不然两个等长的词谁先谁后看排序实现，等于随机）。
 ///
-/// 赞助域名是内置的、不进设置（那次只要求关键词可配）。
+/// 赞助 / 售卖平台的域名现在是**默认关键词的一部分**（见 `default_preview_version_keywords`），
+/// 所以这里不再有单独的兜底 —— 用户在设置里删掉某个域名，它就真不生效了。
 fn synopsis_indicates_preview_with(rules: &SynopsisRules, description: &str) -> bool {
     let compact: String = description
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
+    // 域名可能大小写混写（WWW.FANSKY.CO），两边都转小写再比；中文不受影响
+    let lowered = compact.to_lowercase();
     let mut candidates: Vec<(&str, bool)> = rules
         .full
         .iter()
@@ -3362,15 +3365,12 @@ fn synopsis_indicates_preview_with(rules: &SynopsisRules, description: &str) -> 
         (std::cmp::Reverse(keyword.chars().count()), *is_preview)
     });
     for (keyword, is_preview) in candidates {
-        if compact.contains(keyword) {
+        if lowered.contains(&keyword.to_lowercase()) {
             return is_preview;
         }
     }
-    // 都没命中：只有内置的赞助域名才算预览，其余照旧按完整版
-    let lowered = compact.to_lowercase();
-    PREVIEW_SPONSOR_DOMAINS
-        .iter()
-        .any(|domain| lowered.contains(domain))
+    // 一条都没命中 ⇒ 照旧按完整版
+    false
 }
 
 /// 用**内置规则**判定（单测与其它老调用点用；生产路径走 `synopsis_indicates_preview_with`）。
@@ -12921,8 +12921,14 @@ fn default_full_version_keywords() -> Vec<String> {
 }
 
 /// 简介判定的内置默认：预览版关键词。
+///
+/// v1.2.48 起把赞助 / 售卖平台的**域名也并进来**（用户要求「那些网站也内置」）——
+/// 它们以前是代码里的兜底（`PREVIEW_SPONSOR_DOMAINS`），现在写进这份默认清单，
+/// 用户能在设置里看见、也能自己删掉。删了就是真不生效（兜底已经撤掉）。
 fn default_preview_version_keywords() -> Vec<String> {
-    vec!["购买".to_string(), "全文".to_string()]
+    let mut keywords = vec!["购买".to_string(), "全文".to_string()];
+    keywords.extend(PREVIEW_SPONSOR_DOMAINS.iter().map(|domain| domain.to_string()));
+    keywords
 }
 
 fn default_update_mirrors() -> Vec<String> {
@@ -14587,6 +14593,8 @@ mod tests {
         PREVIEW_SPONSOR_DOMAINS,
         synopsis_indicates_preview_with,
         SynopsisRules,
+        default_full_version_keywords,
+        default_preview_version_keywords,
         clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
         HISTORY_LIMIT, migrate_favorites_into_collections,
         add_watch_later_impl, remove_watch_later_impl, list_watch_later_impl,
@@ -17026,13 +17034,26 @@ mod tests {
         assert!(!synopsis_indicates_preview_with(&custom, "这是完整版，请放心阅读"));
         assert!(synopsis_indicates_preview_with(&custom, "完整试读部分，正文在别处"));
 
-        // 两组都清空 ⇒ 没有任何关键词命中，照旧按完整版（只有内置的赞助域名才算预览）
+        // 两组都清空 ⇒ 真的一条规则都没有了（v1.2.48 起域名也在关键词里，删了就删了），
+        // 所以任何简介都按完整版
         let empty = SynopsisRules {
             full: vec![],
             preview: vec![],
         };
         assert!(!synopsis_indicates_preview_with(&empty, "全文"));
-        assert!(synopsis_indicates_preview_with(&empty, "https://kedaya.booth.pm/items/1"));
+        assert!(!synopsis_indicates_preview_with(&empty, "https://kedaya.booth.pm/items/1"));
+
+        // 默认清单里确实带着那批赞助 / 售卖网站的域名（用户要求「那些网站也内置」）
+        let defaults = default_preview_version_keywords();
+        assert!(defaults.contains(&"booth.pm".to_string()));
+        assert!(defaults.contains(&"fansky.co".to_string()));
+        assert!(defaults.contains(&"aifans.fans".to_string()));
+        let builtin_full = SynopsisRules {
+            full: default_full_version_keywords(),
+            preview: defaults,
+        };
+        // 域名进了关键词之后，大小写混写也照样认
+        assert!(synopsis_indicates_preview_with(&builtin_full, "https://WWW.FANSKY.CO/yunibobo"));
     }
 
     fn sample_novel_slots() -> Vec<NovelImageSlot> {
