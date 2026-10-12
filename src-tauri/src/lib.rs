@@ -5880,16 +5880,44 @@ fn pixiv_sync_impl(
         if listing.get("error").and_then(Value::as_bool) == Some(true) {
             return Err("Pixiv 拒绝了作者作品列表请求；请检查作者链接或 Cookie。".into());
         }
+        // ⚠️ 这里**不能**再用 `unwrap_or_default()` 兜底（v1.2.59）：那会把「字段缺失 /
+        // 接口结构变了」也悄悄变成"空列表"，跟「作者真把作品删光了」混成一回事。
+        // 现在字段缺失直接报错，于是下面那个"空列表"才是一个可信信号。
         listing
             .pointer("/body/novels")
             .and_then(Value::as_object)
-            .map(|items| items.keys().cloned().collect())
-            .unwrap_or_default()
+            .ok_or_else(|| {
+                "Pixiv 作者作品列表的结构和预期不一致（没有 body.novels）—— 可能接口变了，先别同步，反馈一下".to_string()
+            })?
+            .keys()
+            .cloned()
+            .collect()
     };
     // 这里**不能**顺手把「主页打不开」标记摘掉。「能读到作品列表」不等于「作者还在」——
     // 实测退会作者的 /profile/all 照样返回 200。这段原来会在这里清掉标记，
     // 于是检测刚标上的灰立刻被同步擦掉，用户看到的就是「同步一切正常」。
     // 现在缺失标记的唯一管理者是 check_pixiv_author。
+    // 作品列表是**真·空的**（不是解析失败 —— 那种情况上面已经报错了）：
+    // 账号多半销号 / 被封，作品全没了。用户 2026-10-13 定：**直接标成「已销号或封号」**，
+    // 不提示、不询问。**只标灰、一个字节的本地数据都不动**；下次同步能拉到作品就自动摘掉。
+    if novels.is_empty() {
+        let local_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM works WHERE author_id=?1",
+                [author_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if local_count > 0 {
+            let _ = conn.execute(
+                "UPDATE authors SET missing_since=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), author_id],
+            );
+        }
+    } else {
+        // 能拉到作品 ⇒ 之前若被标过，摘掉（自愈）
+        let _ = conn.execute("UPDATE authors SET missing_since='' WHERE id=?1", [author_id]);
+    }
     // profile/all intentionally only contains IDs for novels. Process newer IDs
     // first; the submission-time filter is applied after loading each detail.
     novels.sort_by(|left, right| right.cmp(left));
