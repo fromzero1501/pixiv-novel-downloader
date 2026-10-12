@@ -834,7 +834,7 @@ async function invoke(command, args = {}) {
     return;
   }
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
-  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumFileSizeBytes: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
+  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumFileSizeBytes: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
   if (command === "save_app_settings") return args.settings;
   // 浏览器预览默认当作「已是最新版」；要看更新界面就把 window.__mockUpdateCheck 塞进来
   // 预览环境没有 Tauri 后端：给个默认「没填过 Cookie」，验证脚本可以塞 window.__mockCookieProbe 覆盖
@@ -7981,6 +7981,13 @@ function collectSettings(form) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+  // 简介判定的两组关键词（v1.2.46）：同样是"一行一个"
+  const keywordLines = (raw) => String(raw || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  values.fullVersionKeywords = keywordLines(values.fullVersionKeywords);
+  values.previewVersionKeywords = keywordLines(values.previewVersionKeywords);
   // 浏览历史：只是勾选框，FormData 拿不到未勾选的状态
   values.recordHistory = Boolean(form.querySelector('[name="recordHistory"]')?.checked);
   // 自动备份：勾选框 + 保留份数（范围与后端一致：1 到 50）
@@ -8106,6 +8113,14 @@ async function settingsModal() {
         <div class="settings-button-row"><button type="button" class="quiet-button" data-action="check-update">检查更新</button><button type="button" class="quiet-button" data-action="open-release-page">打开发布页</button></div>
         <label class="check-row"><input name="autoCheckUpdate" type="checkbox" ${settings.autoCheckUpdate === false ? "" : "checked"}><span>启动时自动检查新版本</span><small>关掉之后程序不会主动联网查版本，想更新时点上面的「检查更新」。</small></label>
         <label>更新加速镜像 <textarea name="updateMirrors" rows="4" placeholder="https://ghproxy.net/">${escapeHtml((settings.updateMirrors || []).join("\n"))}</textarea><button type="button" class="quiet-button" data-action="reset-update-mirrors">恢复默认</button><small>一行一个。检查更新会同时问直连和这里所有镜像、取报出的最高版本，下载时按这个顺序挨个重试（地址直接接在 <code>https://github.com/...</code> 前面）。镜像失效时自己换一个即可，不用等新版。</small></label>
+      </div>
+      <div class="form-field">
+        <div class="char-setting-head"><span class="field-title">完整版 / 预览版判定</span><span class="settings-group-hint">抓取同步时用</span></div>
+        <small>同步时看作品简介里有没有这些词：命中<b>完整版关键词</b>就当完整版，命中<b>预览版关键词</b>就当预览版。一行一个，按需要增删。</small>
+        <small>两组词都能命中时，<b>写得更长的那个说了算</b>。比如完整版填「全文放出」、预览版填「全文」：简介里有「全文放出」的判完整版，只有「全文」的判预览版 —— 「全文放出」相当于「全文」的特例。</small>
+        <label>完整版关键词 <textarea name="fullVersionKeywords" rows="3" placeholder="全文放出">${escapeHtml((settings.fullVersionKeywords || []).join("\n"))}</textarea></label>
+        <label>预览版关键词 <textarea name="previewVersionKeywords" rows="4" placeholder="购买">${escapeHtml((settings.previewVersionKeywords || []).join("\n"))}</textarea></label>
+        <small>没命中任何关键词的，按<b>完整版</b>处理（和以前一样）。</small>
       </div>
       <div class="form-field update-setting">
         <div class="char-setting-head"><span class="field-title">浏览历史</span><span class="settings-group-hint">最多 500 条</span></div>

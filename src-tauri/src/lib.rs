@@ -386,6 +386,12 @@ struct AppSettings {
     /// GitHub 加速镜像（直连失败后按顺序试）。用户可以自己增删，镜像挂了不用等发新版。
     #[serde(default = "default_update_mirrors")]
     update_mirrors: Vec<String>,
+    /// 「完整版关键词」：简介里命中它 ⇒ 这份是完整版。默认内置「全文放出」。
+    #[serde(default = "default_full_version_keywords")]
+    full_version_keywords: Vec<String>,
+    /// 「预览版关键词」：简介里命中它 ⇒ 这份只是预览。默认内置「购买」「全文」。
+    #[serde(default = "default_preview_version_keywords")]
+    preview_version_keywords: Vec<String>,
     /// 打开作品 / 阅读版时是否记一笔浏览历史。
     #[serde(default = "default_true")]
     record_history: bool,
@@ -1574,6 +1580,15 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
         // 存的是 JSON 文本；解析不出来（手改坏了或旧库空值）就当没配过
         search_sites: serde_json::from_str::<Vec<SearchSite>>(&setting(conn, "search_sites")?)
             .unwrap_or_default(),
+        // 简介判定的两组关键词（v1.2.46）：没配过（空串）用内置默认，配过就用配的
+        full_version_keywords: parse_keyword_list(
+            &setting(conn, "full_version_keywords")?,
+            default_full_version_keywords,
+        ),
+        preview_version_keywords: parse_keyword_list(
+            &setting(conn, "preview_version_keywords")?,
+            default_preview_version_keywords,
+        ),
         auto_check_update: match setting(conn, "auto_check_update")?.as_str() {
             "" => true,
             value => value == "1",
@@ -2195,6 +2210,14 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
         (
             "search_sites",
             serde_json::to_string(&settings.search_sites).map_err(|e| e.to_string())?,
+        ),
+        (
+            "full_version_keywords",
+            serde_json::to_string(&settings.full_version_keywords).map_err(|e| e.to_string())?,
+        ),
+        (
+            "preview_version_keywords",
+            serde_json::to_string(&settings.preview_version_keywords).map_err(|e| e.to_string())?,
         ),
         (
             "auto_check_update",
@@ -3287,25 +3310,77 @@ const PREVIEW_SPONSOR_DOMAINS: &[&str] = &[
     "lit.link",
 ];
 
-fn synopsis_indicates_preview(description: &str) -> bool {
+/// 简介判定用的一组关键词（v1.2.46 起可在设置里改）。同步开始前读一次，别每条作品都查库。
+struct SynopsisRules {
+    full: Vec<String>,
+    preview: Vec<String>,
+}
+
+/// 解析设置里存的关键词列表；**没配过**（空串）时用内置默认，配过就用配的（哪怕清空成 0 个）。
+fn parse_keyword_list(raw: &str, fallback: fn() -> Vec<String>) -> Vec<String> {
+    if raw.trim().is_empty() {
+        return fallback();
+    }
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| fallback())
+}
+
+/// 从库里读两组关键词（同步前调一次）。
+fn synopsis_rules_from(conn: &Connection) -> SynopsisRules {
+    SynopsisRules {
+        full: parse_keyword_list(
+            &setting(conn, "full_version_keywords").unwrap_or_default(),
+            default_full_version_keywords,
+        ),
+        preview: parse_keyword_list(
+            &setting(conn, "preview_version_keywords").unwrap_or_default(),
+            default_preview_version_keywords,
+        ),
+    }
+}
+
+/// 判定「Pixiv 上这份是不是预览版」。
+///
+/// **所有关键词按「长度从长到短」排，第一个命中的说了算** —— 长的那个算**特例**：
+/// 完整版「全文放出」压住预览版「全文」，靠的就是这个顺序。用户 2026-10-12 拍的规则是
+/// 「不管两者是不是包含关系，谁更具体谁赢」，所以**不做矛盾检测**。
+/// 等长时完整版优先，结果才稳定（不然两个等长的词谁先谁后看排序实现，等于随机）。
+///
+/// 赞助域名是内置的、不进设置（那次只要求关键词可配）。
+fn synopsis_indicates_preview_with(rules: &SynopsisRules, description: &str) -> bool {
     let compact: String = description
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect();
-    // 「购买」是作者给完整版留的出处暗号：简介里带它，Pixiv 上这份就只是预览
-    // （v0.3.63 加的是「购买途径」，v0.3.66 按用户要求放宽成一个「购买」）
-    if compact.contains("购买") {
-        return true;
+    let mut candidates: Vec<(&str, bool)> = rules
+        .full
+        .iter()
+        .map(|keyword| (keyword.as_str(), false))
+        .chain(rules.preview.iter().map(|keyword| (keyword.as_str(), true)))
+        .filter(|(keyword, _)| !keyword.trim().is_empty())
+        .collect();
+    candidates.sort_by_key(|(keyword, is_preview)| {
+        (std::cmp::Reverse(keyword.chars().count()), *is_preview)
+    });
+    for (keyword, is_preview) in candidates {
+        if compact.contains(keyword) {
+            return is_preview;
+        }
     }
-    if compact.contains("全文") && !compact.contains("全文放出") {
-        return true;
-    }
-    // 赞助链接（2026-10-11）：很多作者根本不写「购买」，直接甩一个赞助 / 售卖页的链接。
-    // 域名可能大小写混写，先整体转小写再比（中文不受影响）。
+    // 都没命中：只有内置的赞助域名才算预览，其余照旧按完整版
     let lowered = compact.to_lowercase();
     PREVIEW_SPONSOR_DOMAINS
         .iter()
         .any(|domain| lowered.contains(domain))
+}
+
+/// 用**内置规则**判定（单测与其它老调用点用；生产路径走 `synopsis_indicates_preview_with`）。
+#[cfg(test)]
+fn synopsis_indicates_preview(description: &str) -> bool {
+    let builtin = SynopsisRules {
+        full: default_full_version_keywords(),
+        preview: default_preview_version_keywords(),
+    };
+    synopsis_indicates_preview_with(&builtin, description)
 }
 
 /// Pixiv 小说标题前 15 个字里出现「插画」或「图文」时，判定为带图版。
@@ -5483,6 +5558,8 @@ fn pixiv_sync_impl(
         .filter(|tag| !tag.is_empty())
         .map(|tag| tag.to_lowercase())
         .collect();
+    // 简介判定的两组关键词（v1.2.46）：这里读一次，后面每条作品都用它
+    let synopsis_rules = synopsis_rules_from(&conn);
     let sync_settings = read_settings(&conn)?;
     let image_quality = sync_settings.image_quality.clone();
     // 同步时就按设置生成阅读版：html 单网页，或者直接产出 epub
@@ -5849,7 +5926,7 @@ fn pixiv_sync_impl(
                     .join("| ")
             })
             .unwrap_or_default();
-        let is_preview = synopsis_indicates_preview(&description);
+        let is_preview = synopsis_indicates_preview_with(&synopsis_rules, &description);
         if let Some((preview_path, cover_path)) = matched_sync_preview(&preview_entries, &title) {
             // 单份模型：预览版作品留在预览版目录，完整版作品整份搬去完整版目录，不再复制第二份。
             let cover_name = cover_path
@@ -12838,6 +12915,16 @@ const MIN_UPDATE_BYTES: u64 = 1_000_000;
 ///
 /// 2026-10 实测：老那组基本全废（gh-proxy.com 403、ghfast.top 超时、gh.xxooo.cf 连不上），
 /// 换成下面这组当时实测能用的。
+/// 简介判定的内置默认：完整版关键词（用户 2026-10-12 起可改可删，这里只是默认值）。
+fn default_full_version_keywords() -> Vec<String> {
+    vec!["全文放出".to_string()]
+}
+
+/// 简介判定的内置默认：预览版关键词。
+fn default_preview_version_keywords() -> Vec<String> {
+    vec!["购买".to_string(), "全文".to_string()]
+}
+
 fn default_update_mirrors() -> Vec<String> {
     vec![
         "https://ghproxy.net/".to_string(),
@@ -14498,6 +14585,8 @@ mod tests {
         atom_entries, atom_field, decode_entities, html_to_text, probe_release_notes, tidy_release_notes,
         synopsis_indicates_preview,
         PREVIEW_SPONSOR_DOMAINS,
+        synopsis_indicates_preview_with,
+        SynopsisRules,
         clean_collection_name, record_history, sync_work_favorite, DEFAULT_COLLECTION_NAME,
         HISTORY_LIMIT, migrate_favorites_into_collections,
         add_watch_later_impl, remove_watch_later_impl, list_watch_later_impl,
@@ -16914,6 +17003,36 @@ mod tests {
         assert!(!synopsis_indicates_preview(
             "<a href=\"https://www.pixiv.net/novel/show.php?id=29235839\">相关作品</a>"
         ));
+    }
+
+    /// 简介判定改成可配置之后的核心规则：**谁更具体（更长）谁说了算**（2026-10-12 用户拍板，
+    /// 包含关系不报矛盾 —— 长的那个当特例）。
+    #[test]
+    fn synopsis_keywords_longer_one_wins() {
+        let builtin = SynopsisRules {
+            full: vec!["全文放出".to_string()],
+            preview: vec!["全文".to_string(), "购买".to_string()],
+        };
+        // 「全文放出」更长 ⇒ 它是「全文」的特例，简介里出现了就判完整版
+        assert!(!synopsis_indicates_preview_with(&builtin, "全文放出，感谢支持"));
+        assert!(synopsis_indicates_preview_with(&builtin, "这里是全文的前半部分"));
+        assert!(synopsis_indicates_preview_with(&builtin, "购买途径：某站"));
+
+        // 自定义：完整版「完整版」压住预览版「完整」
+        let custom = SynopsisRules {
+            full: vec!["完整版".to_string()],
+            preview: vec!["试读".to_string(), "完整".to_string()],
+        };
+        assert!(!synopsis_indicates_preview_with(&custom, "这是完整版，请放心阅读"));
+        assert!(synopsis_indicates_preview_with(&custom, "完整试读部分，正文在别处"));
+
+        // 两组都清空 ⇒ 没有任何关键词命中，照旧按完整版（只有内置的赞助域名才算预览）
+        let empty = SynopsisRules {
+            full: vec![],
+            preview: vec![],
+        };
+        assert!(!synopsis_indicates_preview_with(&empty, "全文"));
+        assert!(synopsis_indicates_preview_with(&empty, "https://kedaya.booth.pm/items/1"));
     }
 
     fn sample_novel_slots() -> Vec<NovelImageSlot> {
