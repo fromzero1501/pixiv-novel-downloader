@@ -3369,6 +3369,11 @@ async function refreshVisibleList() {
   } else if (state.homeView === "history") await refreshHistory();
   else if (state.homeView === "watchLater") await refreshWatchLater();
   else if (state.homeView === "missingFull") await refreshMissingFull();
+  // 散篇页和 Pixiv 收藏页的卡片上也有收藏角标（心形）—— 漏掉这两条，用户在那边点完收藏，
+  // 角标要等换页才变（2026-10-12 用户报的就是散篇）。散篇走 list_stray_works；
+  // 收藏页只是重读本地镜像，不联网。
+  else if (state.homeView === "stray") await refreshStrayWorks();
+  else if (state.homeView === "pixivBookmarks") await refreshPixivBookmarks();
 }
 
 /**
