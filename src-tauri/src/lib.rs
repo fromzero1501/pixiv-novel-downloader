@@ -1303,6 +1303,40 @@ fn is_name_separator(c: char) -> bool {
         )
 }
 
+/// 「作者：」后面跟的这些**不是人名**，是占位（用户 2026-10-13：「未知」不算作者名）。
+/// 命中就当"文件名没写作者"—— 交给倒查作者库那一层，以及全库匹配。
+fn is_placeholder_author(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.is_empty()
+        || matches!(
+            trimmed.to_lowercase().as_str(),
+            "未知"
+                | "不详"
+                | "佚名"
+                | "匿名"
+                | "无"
+                | "暂无"
+                | "未知作者"
+                | "unknown"
+                | "n/a"
+                | "na"
+                | "none"
+                | "null"
+                | "-"
+                | "?"
+                | "？"
+        )
+}
+
+/// 作者名里带 `&`（「YOYO&大芋泥啵啵」这种）算**多位作者**：拆开分别到库里找，
+/// **有一个在库内就算匹配上**（用户 2026-10-13 定的规则）。
+fn split_multi_author(name: &str) -> Vec<String> {
+    name.split(['&', '＆'])
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 /// 第一层：文件名里的显式「作者」标记，如 `作者：AAA`、`作者 - AAA`。取最后一个标记。
 /// 故意不收裸的 `by ` —— 英文标题里 "Stand by Me" 这种会把 "Me" 误当成作者名。
 fn author_after_marker(stem: &str) -> Option<String> {
@@ -1323,7 +1357,8 @@ fn author_after_marker(stem: &str) -> Option<String> {
         // 跳过紧跟标记的分隔符，再取到下一个分隔符为止
         let trimmed = after.trim_start_matches(is_name_separator);
         let name: String = trimmed.chars().take_while(|c| !is_name_separator(*c)).collect();
-        if !name.is_empty() && name.chars().count() <= 30 {
+        // 占位词不当人名（v1.2.63）：「作者：未知」这种等于没写作者
+        if !name.is_empty() && name.chars().count() <= 30 && !is_placeholder_author(&name) {
             best = Some(name);
         }
         search_from = abs;
@@ -1361,6 +1396,26 @@ fn detect_author_in_name(stem: &str, authors: &[(i64, String, String)]) -> Optio
         return None;
     }
     if let Some(name) = author_after_marker(stem) {
+        // 多作者（带 `&`）：拆开逐个到库里找，**有一个在库内就用他**（v1.2.63）。
+        // 拆开之后一个都不在库里 ⇒ 不硬认，落到下面按原名报出去（照旧进「作者不在库」名单）。
+        let parts = split_multi_author(&name);
+        if parts.len() > 1 {
+            let hit = parts.iter().find_map(|part| {
+                authors
+                    .iter()
+                    .find(|(_, known, aliases)| {
+                        known.trim() == part.as_str()
+                            || aliases.split('|').any(|alias| alias.trim() == part.as_str())
+                    })
+                    .map(|(id, _, _)| (*id, part.clone()))
+            });
+            if let Some((id, matched_name)) = hit {
+                return Some(DetectedAuthor {
+                    author_id: Some(id),
+                    name: matched_name,
+                });
+            }
+        }
         let matched = authors.iter().find(|(_, known, aliases)| {
             known.trim() == name || aliases.split('|').any(|alias| alias.trim() == name)
         });
@@ -15340,6 +15395,14 @@ mod tests {
         let unknown = detect_author_in_name("甘雨同人 作者：查无此人", &authors).unwrap();
         assert_eq!(unknown.author_id, None);
         assert_eq!(unknown.name, "查无此人");
+        // 占位词不算作者名（v1.2.63）：`作者：未知` 等于没写作者，不能因此归进「作者不在库」
+        assert!(detect_author_in_name("陈老头 作者：未知", &authors).is_none());
+        assert!(detect_author_in_name("陈老头 作者：不详", &authors).is_none());
+        assert!(detect_author_in_name("陈老头 作者：unknown", &authors).is_none());
+        // 多作者（带 &）：有一个在库内就算匹配上（v1.2.63）
+        let multi = detect_author_in_name("某作品 作者：查无此人&蓝蓝天", &authors).unwrap();
+        assert_eq!(multi.author_id, Some(7));
+        assert_eq!(multi.name, "蓝蓝天");
         // 第二层：没有「作者」二字，靠倒查作者库（别名也算）
         assert_eq!(
             detect_author_in_name("甘雨的午后 - blue", &authors)
