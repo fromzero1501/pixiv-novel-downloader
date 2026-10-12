@@ -5880,18 +5880,31 @@ fn pixiv_sync_impl(
         if listing.get("error").and_then(Value::as_bool) == Some(true) {
             return Err("Pixiv 拒绝了作者作品列表请求；请检查作者链接或 Cookie。".into());
         }
-        // ⚠️ 这里**不能**再用 `unwrap_or_default()` 兜底（v1.2.59）：那会把「字段缺失 /
-        // 接口结构变了」也悄悄变成"空列表"，跟「作者真把作品删光了」混成一回事。
-        // 现在字段缺失直接报错，于是下面那个"空列表"才是一个可信信号。
-        listing
-            .pointer("/body/novels")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                "Pixiv 作者作品列表的结构和预期不一致（没有 body.novels）—— 可能接口变了，先别同步，反馈一下".to_string()
-            })?
-            .keys()
-            .cloned()
-            .collect()
+        // 实测（2026-10-13，用的实例 /users/109693812，这个接口**不需要 Cookie**）：
+        //   作品为空 → `"novels": []`（**数组**）
+        //   有作品   → `"novels": {"id": {...}}`（**对象**）
+        // 两种形状都得认 —— v1.2.59 只认对象，结果"作品被清空的作者"反倒报错。
+        // 只有 `body` / `novels` **真的不在**时才算结构异常（那才可能是接口改了）。
+        let body = listing.get("body").ok_or_else(|| {
+            "Pixiv 返回里没有 body —— 可能接口变了，先别同步，反馈一下".to_string()
+        })?;
+        match body.get("novels") {
+            Some(Value::Object(map)) => map.keys().cloned().collect(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str().map(str::to_string).or_else(|| {
+                        item.get("id").and_then(Value::as_str).map(str::to_string)
+                    })
+                })
+                .collect(),
+            _ => {
+                return Err(
+                    "Pixiv 作者作品列表的结构和预期不一致（body 里没有 novels）—— 可能接口变了，先别同步，反馈一下"
+                        .to_string(),
+                )
+            }
+        }
     };
     // 这里**不能**顺手把「主页打不开」标记摘掉。「能读到作品列表」不等于「作者还在」——
     // 实测退会作者的 /profile/all 照样返回 200。这段原来会在这里清掉标记，
