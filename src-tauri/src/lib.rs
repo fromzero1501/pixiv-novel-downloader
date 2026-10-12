@@ -11710,8 +11710,10 @@ fn set_work_meta(
             return Err("阅读状态只能是 0 / 1 / 2".into());
         }
         conn.execute(
-            "UPDATE works SET read_state=?1 WHERE id=?2",
-            params![state, work_id],
+            // 标成已读 ⇒ 顺手把「新」标记也清掉（v1.2.40）：NEW 的意思是「新入库、还没处理」，
+            // 标过已读就算处理过了。标成未读 / 在读时**不动**它，免得来回改状态还能把 NEW 弄回来。
+            "UPDATE works SET read_state=?1, is_new=CASE WHEN ?1=?3 THEN 0 ELSE is_new END WHERE id=?2",
+            params![state, work_id, READ_DONE],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -11752,8 +11754,9 @@ fn set_works_read_state(work_ids: Vec<i64>, read_state: i64) -> Result<usize, St
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     for work_id in &work_ids {
         tx.execute(
-            "UPDATE works SET read_state=?1 WHERE id=?2",
-            params![read_state, work_id],
+            // 同上（v1.2.40）：批量设为「已读」时顺手清掉 NEW，其他状态不动它
+            "UPDATE works SET read_state=?1, is_new=CASE WHEN ?1=?3 THEN 0 ELSE is_new END WHERE id=?2",
+            params![read_state, work_id, READ_DONE],
         )
         .map_err(|e| e.to_string())?;
     }

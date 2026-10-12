@@ -172,6 +172,12 @@ body.is-bulk button { cursor: pointer; }
    现在接近不透明 + 一圈半透明白描边 + 更重的投影 + 极淡的文字阴影，任何封面上都读得清。 */
 .work-characters > span { max-width: 100%; padding: 2px 9px; color: #fff; background: rgba(15,31,51,.94); border: 1px solid rgba(255,255,255,.5); border-radius: 999px; font-size: 11px; font-weight: 700; line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-shadow: 0 1px 2px rgba(6,18,34,.65); box-shadow: 0 2px 7px rgba(6,18,34,.5); }
 .work-characters .work-characters-more { background: rgba(15,31,51,.8); border-color: rgba(255,255,255,.36); }
+/* v1.2.40：角色名条默认只显示前 6 个，多出来的挂 .is-extra 藏起来；点「+N」给整条加 .is-expanded 展开 */
+.work-characters .is-extra { display: none; }
+.work-characters.is-expanded .is-extra { display: block; }
+/* 「+N」展开后**保持可见**：再点它一下就是收起（藏掉它就再也点不着了） */
+/* 整条是 pointer-events: none（不能挡住「点封面打开作品」），只有「+N」这一个单独开回来 */
+.work-characters .work-characters-more { pointer-events: auto; cursor: pointer; }
 /* 默认和「标为已读」同一组：悬停封面才淡入；工具栏开关打开后（body 类）常显 */
 .work-cover:hover .work-characters, .work-card:focus-within .work-characters, body.show-character-names .work-characters { opacity: 1; }
 .status-badge, .favorite-badge { width: 32px; height: 32px; border-color: rgba(255,255,255,.9); box-shadow: 0 2px 8px rgba(27,54,82,.22); }

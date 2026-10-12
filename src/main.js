@@ -182,7 +182,11 @@ const state = {
    * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
    * v1.2.8 起显示在「高级筛选」面板里（工具栏那排按钮撤了）。
    */
-  readFilter: "all",
+  /**
+   * 阅读状态多选（v1.2.40）：**空数组 = 不限**。可以同时选「未读」+「在读」，结果是并集。
+   * 以前存的是单个字符串（`"unread"` / `"all"`），老筛选模板在 filterTemplatePayload() 里翻译。
+   */
+  readFilter: [],
   /** 作品详情弹窗正在展示的作品 id（null = 没开） */
   workDetailId: null,
   /** 详情弹窗里那篇作品当前所在的收藏夹 id（打开时查一次，改完刷新） */
@@ -202,8 +206,13 @@ const state = {
    * 收藏夹过滤要走后端 —— 一篇作品在哪些夹子里是关系数据，前端手里没有。
    * 三个状态「作者作品库」和「所有作品」共用一份。
    */
-  ratingFilter: "all",
-  wordsFilter: "all",
+  /**
+   * 评分多选（v1.2.40）：空数组 = 不限。
+   * 注意档位本身是**重叠**的（5 星也满足「3 星及以上」），多选＝命中任意一档。
+   */
+  ratingFilter: [],
+  /** 字数多选（v1.2.40）：空数组 = 不限。档位是互斥区间，多选就是并集 */
+  wordsFilter: [],
   collectionFilter: 0,
   filterPanelOpen: false,
   /** 「待补完整版」工作台：全量缺口（含作者名，前端按作者归并） / 当前按处理状态筛的档 */
@@ -431,7 +440,10 @@ previewWorks.forEach((work, index) => { work.seriesId = index < 2 ? "demo-series
 // 「打开模板 → 条件写回 → 所有作品跟着筛」这条链在预览里开箱就能验到。
 let previewFilterViewNextId = 1;
 let previewFilterViews = [
-  { id: 1, name: "未读长篇", payload: JSON.stringify({ readFilter: "unread", ratingFilter: "all", wordsFilter: "gte8w", collectionFilter: 0, allWorksQuery: "", searchField: "title", status: "all", allWorksFavoritesOnly: false, imagesFilter: "all", sort: "date_desc" }), createdAt: "2026-09-15T10:00:00+00:00" },
+  { id: 1, name: "未读长篇", payload: JSON.stringify({ readFilter: ["unread"], ratingFilter: [], wordsFilter: ["gte8w"], collectionFilter: 0, allWorksQuery: "", searchField: "title", status: "all", allWorksFavoritesOnly: false, imagesFilter: "all", sort: "date_desc" }), createdAt: "2026-09-15T10:00:00+00:00" },
+  // 这条**故意留着 v1.2.40 之前的老格式**（单值字符串，不是数组）—— 喂无头验证的兼容场景：
+  // 老模板读进来必须照样能用，不能因为筛选改成了多选就静默失效。
+  { id: 2, name: "（老格式）未读", payload: JSON.stringify({ readFilter: "unread", ratingFilter: "all", wordsFilter: "all", collectionFilter: 0, allWorksQuery: "", searchField: "title", status: "all", allWorksFavoritesOnly: false, imagesFilter: "all", sort: "date_desc" }), createdAt: "2026-09-15T10:00:00+00:00" },
 ];
 // 作者卡上的「上次同步」也要有值（真数据由 SQL 聚合，mock 里按相对日期造，标签才稳定）
 previewAuthors[0].pixivLastSyncAt = previewDayAt(0, 8, 40);
@@ -1495,9 +1507,9 @@ function resetWorksListFilters() {
   state.imagesFilter = "all";
   state.serialLatestOnly = false;
   state.status = "all";
-  state.readFilter = "all";
-  state.ratingFilter = "all";
-  state.wordsFilter = "all";
+  state.readFilter = [];
+  state.ratingFilter = [];
+  state.wordsFilter = [];
   state.collectionFilter = 0;
   state.filterPanelOpen = false;
 }
@@ -2232,10 +2244,20 @@ const WORK_CHARACTER_LIMIT = 6;
 function workCharacterNames(work) {
   const names = matchedCharacterNames(work);
   if (!names.length) return "";
-  const shown = names.slice(0, WORK_CHARACTER_LIMIT);
-  const rest = names.length - shown.length;
-  const chips = shown.map((name) => `<span>${escapeHtml(name)}</span>`).join("");
-  return `<div class="work-characters" title="${escapeHtml(names.join("、"))}">${chips}${rest > 0 ? `<span class="work-characters-more">+${rest}</span>` : ""}</div>`;
+  const rest = names.length - WORK_CHARACTER_LIMIT;
+  // 超出上限的名字**照样画出来**、只是挂 `is-extra`（CSS 默认藏着）—— 这样点「+N」
+  // 只要给这一条切个类就能展开全部，不用整页重绘、也不会丢滚动位置（v1.2.40）。
+  const chips = names
+    .map((name, index) =>
+      index >= WORK_CHARACTER_LIMIT
+        ? `<span class="is-extra">${escapeHtml(name)}</span>`
+        : `<span>${escapeHtml(name)}</span>`
+    )
+    .join("");
+  const more = rest > 0
+    ? `<span class="work-characters-more" data-action="expand-characters" title="还有 ${rest} 个角色名没显示，点一下展开">+${rest}</span>`
+    : "";
+  return `<div class="work-characters" title="${escapeHtml(names.join("、"))}">${chips}${more}</div>`;
 }
 
 /**
@@ -2332,11 +2354,10 @@ function bookmarkTags(tags) {
  * 所以只留评分行那一个 —— 用户要的「未评分可筛」照样在面板里。
  */
 function matchesReadFilter(work) {
+  // 多选（v1.2.40）：命中任意一档就算过；一个都没选 = 不限
+  if (!state.readFilter.length) return true;
   const readState = Number(work.readState) || 0;
-  if (state.readFilter === "unread") return readState === 0;
-  if (state.readFilter === "reading") return readState === 1;
-  if (state.readFilter === "read") return readState === 2;
-  return true;
+  return state.readFilter.some((value) => READ_STATE_BY_FILTER[value] === readState);
 }
 
 /**
@@ -2348,6 +2369,53 @@ function matchesReadFilter(work) {
  * 已读的作品，这一档就成了半截功能（原来只给 未读 / 在读，是漏的）。
  */
 const READ_FILTERS = [["all", "不限"], ["unread", "未读"], ["reading", "在读"], ["read", "已读"]];
+
+/** 阅读状态档位 → works.read_state 的值（多选匹配与模板计数共用这一份，别各写一遍） */
+const READ_STATE_BY_FILTER = { unread: 0, reading: 1, read: 2 };
+
+/**
+ * 档位值列表的**兼容层**（v1.2.40）：阅读状态 / 评分 / 字数从「单个字符串」改成了「多选数组」，
+ * 而库里已经存下来的筛选模板里是老的单个字符串（`"all"` = 不限）。
+ * 三处读模板的地方（套用 / 摘要 / 计数）都走 `filterTemplatePayload()`，在那儿翻译一次就够。
+ */
+function normalizeFilterList(value) {
+  if (Array.isArray(value)) return value.filter((item) => item && item !== "all");
+  if (typeof value === "string" && value && value !== "all") return [value];
+  return [];
+}
+
+/**
+ * 多选档位的点击语义：点「不限」＝清空；点具体档位＝加入 / 移出（不清掉别人）。
+ * 总是返回**新数组** —— 默认值里那几份 `[]` 是共享常量，原地改会污染它们。
+ */
+function toggleFilterValue(list, value) {
+  if (!value || value === "all") return [];
+  return list.includes(value) ? list.filter((item) => item !== value) : [...list, value];
+}
+
+/** 字数档位匹配（v1.2.40 从 matchesAdvancedFilters 里抽出来，模板计数那段也用它） */
+function wordsMatchRange(value, words) {
+  if (value === "lt5k") return words < 5000;
+  if (value === "5k-2w") return words >= 5000 && words < 20000;
+  if (value === "2w-8w") return words >= 20000 && words < 80000;
+  if (value === "gte8w") return words >= 80000;
+  return true;
+}
+
+/**
+ * 可多选的档位行（v1.2.40）。和单选的 `filterPanelRow` 只差两件事：
+ * 「不限」那一档改成「一个都没选」时点亮；点任意档位＝加入 / 移出，不清别人。
+ */
+function filterPanelRowMulti(label, items, activeList, action, attribute) {
+  const active = new Set(normalizeFilterList(activeList));
+  const buttons = items
+    .map(([value, text]) => {
+      const on = value === "all" ? active.size === 0 : active.has(value);
+      return `<button class="filter-button ${on ? "is-active" : ""}" data-action="${action}" ${attribute}="${value}">${text}</button>`;
+    })
+    .join("");
+  return `<div class="filter-panel-row"><span class="filter-panel-label">${label}</span><div class="filter-group">${buttons}</div></div>`;
+}
 
 /** 排序下拉（三处共用）：作者库 / 所有作品 / 收藏夹各用各的排序状态字段 */
 /**
@@ -2388,11 +2456,11 @@ const IMAGES_FILTERS = [["all", "不限"], ["has", "有图"], ["none", "无图"]
  */
 function activeFilterCount() {
   return [
-    state.readFilter !== "all",
+    state.readFilter.length > 0,
     state.status !== "all",
     state.imagesFilter !== "all",
-    state.ratingFilter !== "all",
-    state.wordsFilter !== "all",
+    state.ratingFilter.length > 0,
+    state.wordsFilter.length > 0,
     state.collectionFilter !== 0,
   ].filter(Boolean).length;
 }
@@ -2423,11 +2491,11 @@ function filterPanel() {
     ? `<p class="filter-panel-note">正在后台统计字数，还有 <strong>${state.wordCountPending}</strong> 篇没算完 —— 没算完的暂时进不了字数档。</p>`
     : "";
   return `<div class="filter-panel">
-    ${filterPanelRow("阅读状态", READ_FILTERS, state.readFilter, "read-filter", "data-read-filter")}
+    ${filterPanelRowMulti("阅读状态", READ_FILTERS, state.readFilter, "read-filter", "data-read-filter")}
     ${filterPanelRow("版本", STATUS_FILTERS, state.status, "status", "data-status")}
     ${filterPanelRow("配图", IMAGES_FILTERS, state.imagesFilter, "images-filter", "data-images-filter")}
-    ${filterPanelRow("评分", RATING_FILTERS, state.ratingFilter, "rating-filter", "data-rating-filter")}
-    ${filterPanelRow("字数", WORDS_FILTERS, state.wordsFilter, "words-filter", "data-words-filter")}
+    ${filterPanelRowMulti("评分", RATING_FILTERS, state.ratingFilter, "rating-filter", "data-rating-filter")}
+    ${filterPanelRowMulti("字数", WORDS_FILTERS, state.wordsFilter, "words-filter", "data-words-filter")}
     ${filterPanelRow("收藏夹", collections, state.collectionFilter, "collection-filter", "data-collection-filter")}
     ${wordsPending}
     <div class="filter-panel-foot"><button class="quiet-button" data-action="clear-filters">清空筛选</button><button class="quiet-button" data-action="save-filter-view">${icon("star", 15)}存为筛选模板</button>${filterTemplateChips()}<span>这些条件都在本机筛，不会重新读文件。</span></div>
@@ -2458,9 +2526,9 @@ function filterTemplateChips() {
  * 漏掉的字段会退回默认值，表现是「打开模板后条件少了一个」。
  */
 const FILTER_VIEW_FIELDS = [
-  ["readFilter", "all"],
-  ["ratingFilter", "all"],
-  ["wordsFilter", "all"],
+  ["readFilter", []],
+  ["ratingFilter", []],
+  ["wordsFilter", []],
   ["collectionFilter", 0],
   ["allWorksQuery", ""],
   ["searchField", "title"],
@@ -2539,6 +2607,12 @@ function parseFilterPayload(raw) {
 function filterTemplatePayload(view) {
   const payload = parseFilterPayload(view.payload);
   if (payload.imagesFilter === undefined && payload.allWorksImagesOnly) payload.imagesFilter = "has";
+  // v1.2.40：阅读状态 / 评分 / 字数 从「单个字符串」改成了「多选数组」。老模板里存的是单值
+  // （`"all"` = 不限），在这儿统一翻成数组 —— 三处读模板的地方（套用 / 摘要 / 计数）都走
+  // 这个函数，所以只要在这里翻译一次，别处不用各自写兼容。
+  payload.readFilter = normalizeFilterList(payload.readFilter);
+  payload.ratingFilter = normalizeFilterList(payload.ratingFilter);
+  payload.wordsFilter = normalizeFilterList(payload.wordsFilter);
   return payload;
 }
 
@@ -2587,15 +2661,16 @@ function filterViewSummary(view) {
   const payload = filterTemplatePayload(view);
   const parts = [];
   const readLabels = { unread: "未读", reading: "在读", read: "已读" };
-  if (payload.readFilter && payload.readFilter !== "all") parts.push(readLabels[payload.readFilter] || payload.readFilter);
-  if (payload.ratingFilter && payload.ratingFilter !== "all") {
-    const found = RATING_FILTERS.find(([value]) => value === payload.ratingFilter);
+  // 多选（v1.2.40）：一份条件里可能有好几档，全都要列出来
+  payload.readFilter.forEach((value) => parts.push(readLabels[value] || value));
+  payload.ratingFilter.forEach((value) => {
+    const found = RATING_FILTERS.find(([item]) => item === value);
     if (found) parts.push(found[1]);
-  }
-  if (payload.wordsFilter && payload.wordsFilter !== "all") {
-    const found = WORDS_FILTERS.find(([value]) => value === payload.wordsFilter);
+  });
+  payload.wordsFilter.forEach((value) => {
+    const found = WORDS_FILTERS.find(([item]) => item === value);
     if (found) parts.push(found[1]);
-  }
+  });
   if (Number(payload.collectionFilter) === -1) {
     parts.push("任意收藏");
   } else if (Number(payload.collectionFilter) > 0) {
@@ -2627,24 +2702,19 @@ function filterViewCount(view) {
     if (payload.allWorksFavoritesOnly && !work.favorite) return false;
     if (payload.imagesFilter === "has" && !work.hasImages) return false;
     if (payload.imagesFilter === "none" && work.hasImages) return false;
-    if (payload.readFilter && payload.readFilter !== "all") {
+    if (payload.readFilter.length) {
       const readState = Number(work.readState) || 0;
-      const want = { unread: 0, reading: 1, read: 2 }[payload.readFilter];
-      if (want !== undefined && readState !== want) return false;
+      if (!payload.readFilter.some((value) => READ_STATE_BY_FILTER[value] === readState)) return false;
     }
-    if (payload.ratingFilter && payload.ratingFilter !== "all") {
+    if (payload.ratingFilter.length) {
       const rating = Number(work.rating || 0);
-      if (payload.ratingFilter === "none") {
-        if (rating !== 0) return false;
-      } else if (rating < Number(payload.ratingFilter)) return false;
+      const hit = payload.ratingFilter.some((value) => (value === "none" ? rating === 0 : rating >= Number(value)));
+      if (!hit) return false;
     }
-    if (payload.wordsFilter && payload.wordsFilter !== "all") {
+    if (payload.wordsFilter.length) {
       const words = Number(work.wordCount || 0);
       if (words <= 0) return false;
-      if (payload.wordsFilter === "lt5k" && words >= 5000) return false;
-      if (payload.wordsFilter === "5k-2w" && (words < 5000 || words >= 20000)) return false;
-      if (payload.wordsFilter === "2w-8w" && (words < 20000 || words >= 80000)) return false;
-      if (payload.wordsFilter === "gte8w" && words < 80000) return false;
+      if (!payload.wordsFilter.some((value) => wordsMatchRange(value, words))) return false;
     }
     // 收藏夹那档要查库，前端算不了（「任意收藏」也一样：判不出它在哪个夹子里）——
     // 先不扣这一条，所以带收藏夹条件的模板这个数只是**上限**，摘要里会写明是哪个夹子
@@ -2939,23 +3009,18 @@ async function runTextSearch(query) {
  * 收藏夹那条不在这里：它是关系数据，在 SQL 里用 EXISTS 子查询处理。
  */
 function matchesAdvancedFilters(work) {
-  if (state.ratingFilter !== "all") {
+  // 多选（v1.2.40）：命中任意一档即通过；一个都没选 = 不限
+  if (state.ratingFilter.length) {
     const rating = Number(work.rating || 0);
-    if (state.ratingFilter === "none") {
-      if (rating !== 0) return false;
-    } else if (rating < Number(state.ratingFilter)) {
-      return false;
-    }
+    const hit = state.ratingFilter.some((value) => (value === "none" ? rating === 0 : rating >= Number(value)));
+    if (!hit) return false;
   }
-  if (state.wordsFilter !== "all") {
+  if (state.wordsFilter.length) {
     const words = Number(work.wordCount || 0);
     // 字数为 0 表示「读不出字数」（绑的是 EPUB / HTML 阅读版就是这样）。
     // 那是「不知道」，不是「0 个字」，所以任何字数档位都不收它。
     if (words <= 0) return false;
-    if (state.wordsFilter === "lt5k" && words >= 5000) return false;
-    if (state.wordsFilter === "5k-2w" && (words < 5000 || words >= 20000)) return false;
-    if (state.wordsFilter === "2w-8w" && (words < 20000 || words >= 80000)) return false;
-    if (state.wordsFilter === "gte8w" && words < 80000) return false;
+    if (!state.wordsFilter.some((value) => wordsMatchRange(value, words))) return false;
   }
   return true;
 }
@@ -3197,6 +3262,8 @@ async function cycleReadState(workId) {
   try {
     await invoke("set_work_meta", { workId, readState: next, rating: null, note: null });
     work.readState = next;
+    // 标成已读 ⇒ 顺手把封面上的 NEW 去掉（与后端一致：标过已读就不算「新」了，v1.2.40）
+    if (next === 2) work.isNew = false;
     render();
   } catch (error) {
     toast(String(error), "error");
@@ -3217,6 +3284,7 @@ async function toggleWorkRead(workId) {
   try {
     await invoke("set_work_meta", { workId, readState: next, rating: null, note: null });
     work.readState = next;
+    if (next === 2) work.isNew = false;
     // 就地改完重画，不重查列表 —— 重查会把「所有作品」的瀑布流退回第一屏
     render();
     toast(read ? "已标为未读" : "已标为已读", "success");
@@ -5245,7 +5313,12 @@ async function bindEvents() {
         return;
       }
       // 已读 / 评分筛选是纯前端过滤（数据都在列表里了），不用回后端重查
-      if (action === "read-filter") { state.readFilter = element.dataset.readFilter; render(); }
+      // 封面角色名条的「+N」：就地展开 / 收起全部角色名。不整页重绘（重绘会把展开状态冲掉），
+      // 也不会顺带把作品打开 —— 委托入口第一行就是 stopPropagation（v1.2.40）
+      if (action === "expand-characters") {
+        element.closest(".work-characters")?.classList.toggle("is-expanded");
+      }
+      if (action === "read-filter") { state.readFilter = toggleFilterValue(state.readFilter, element.dataset.readFilter); render(); }
       if (action === "authors-starred-only") { state.authorsStarredOnly = !state.authorsStarredOnly; render(); }
       if (action === "scroll-top") { scrollLibraryTo("top"); return; }
       if (action === "scroll-bottom") { scrollLibraryTo("bottom"); return; }
@@ -5345,8 +5418,8 @@ async function bindEvents() {
         state.filterPanelOpen = !state.filterPanelOpen;
         render();
       }
-      if (action === "rating-filter") { state.ratingFilter = element.dataset.ratingFilter || "all"; render(); }
-      if (action === "words-filter") { state.wordsFilter = element.dataset.wordsFilter || "all"; render(); }
+      if (action === "rating-filter") { state.ratingFilter = toggleFilterValue(state.ratingFilter, element.dataset.ratingFilter); render(); }
+      if (action === "words-filter") { state.wordsFilter = toggleFilterValue(state.wordsFilter, element.dataset.wordsFilter); render(); }
       if (action === "collection-filter") {
         // 收藏夹是关系数据，前端筛不了 —— 改完要重新查库。-1 = 任意收藏夹
         const picked = Number(element.dataset.collectionFilter);
@@ -5354,7 +5427,7 @@ async function bindEvents() {
         await refreshActiveList();
         render();
       }
-      if (action === "clear-filters") { state.readFilter = "all"; state.ratingFilter = "all"; state.wordsFilter = "all"; state.collectionFilter = 0; state.imagesFilter = "all"; state.status = "all"; await refreshActiveList(); render(); }
+      if (action === "clear-filters") { state.readFilter = []; state.ratingFilter = []; state.wordsFilter = []; state.collectionFilter = 0; state.imagesFilter = "all"; state.status = "all"; await refreshActiveList(); render(); }
       if (action === "load-more-all-works") await loadMoreAllWorks();
       // 待补完整版工作台
       if (action === "open-missing-author") { state.missingFullAuthorId = Number(element.dataset.authorId) || null; state.missingFullFilter = "todo"; render(); }
