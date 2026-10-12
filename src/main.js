@@ -1557,7 +1557,10 @@ function render() {
   const bucket = viewStateBucket();
   if (bucket !== renderedBucket) {
     renderedBucket = bucket;
-    restoreScrollTop(0);
+    // v1.2.47：以前这里是**一律回顶**（防「换页后停在半空」）。但用户要的是
+    // 「退出作品库再进去，还是上次那张卡」—— 所以改成：这个桶记过锚点就回到那张卡，
+    // 没记过才回顶。不会停在半空：锚点是按**卡片**找的，卡片不在（被删/被筛掉）就自然退回顶部。
+    restoreCardAnchor(bucket);
   }
 }
 
@@ -8105,7 +8108,22 @@ async function settingsModal() {
     </div>
   </section>
   <section class="settings-group is-maintain">
-    <h3 class="settings-group-head"><span class="settings-group-no">6</span>维护与数据</h3>
+    <h3 class="settings-group-head"><span class="settings-group-no">6</span>批量维护</h3>
+    <div class="settings-fields is-single">
+    <p class="settings-note">下面这些操作点下去立刻执行，跟自动保存无关。</p>
+    <div class="settings-fields is-single">
+      <div class="settings-slot" id="settings-slot-maintain"></div>
+    </div>
+    <div class="menu-list settings-actions">
+      <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>
+      <button type="button" data-action="backfill-covers">${icon("image", 18)}补齐失效封面<span class="settings-action-hint">作品搬过家、目录被整理过之后，封面可能指向已经找不到的文件（卡片显示「暂无封面」）。这里按 Pixiv 作品 ID 重新取一次，下载到正文旁边</span></button>
+      <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">把「正文里有插图、却还只绑着 txt」的作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定，图直接打进电子书里；EPUB 生成后旁边多余的配图目录会送进回收站。一篇一篇请求，随时可以终止</span></button>
+      <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
+      <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
+      <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
+      <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>
+    </div>
+    <h3 class="settings-group-head"><span class="settings-group-no">7</span>维护与数据</h3>
     <div class="settings-fields is-single">
       <div class="form-field update-setting">
         <div class="char-setting-head"><span class="field-title">软件更新</span><span class="settings-group-hint">当前 v${APP_VERSION}</span></div>
@@ -8137,18 +8155,6 @@ async function settingsModal() {
         <div class="settings-button-row"><button type="button" class="quiet-button" data-action="backup-now">${icon("database", 16)}立即备份一份</button></div>
       </div>
     </div>
-    <p class="settings-note">下面这些操作点下去立刻执行，跟自动保存无关。</p>
-    <div class="settings-fields is-single">
-      <div class="settings-slot" id="settings-slot-maintain"></div>
-    </div>
-    <div class="menu-list settings-actions">
-      <button type="button" data-action="backfill-synopses">${icon("info", 18)}补抓作品简介<span class="settings-action-hint">给同步过、但还没抓到简介的作品补一次（已经有简介的、上次确认过「作者没写简介」的都会跳过）</span></button>
-      <button type="button" data-action="backfill-covers">${icon("image", 18)}补齐失效封面<span class="settings-action-hint">作品搬过家、目录被整理过之后，封面可能指向已经找不到的文件（卡片显示「暂无封面」）。这里按 Pixiv 作品 ID 重新取一次，下载到正文旁边</span></button>
-      <button type="button" data-action="backfill-novel-images">${icon("image", 18)}补齐正文插图<span class="settings-action-hint">把「正文里有插图、却还只绑着 txt」的作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定，图直接打进电子书里；EPUB 生成后旁边多余的配图目录会送进回收站。一篇一篇请求，随时可以终止</span></button>
-      <button type="button" data-action="scan-work-files">${icon("search", 18)}检查文件是否还在<span class="settings-action-hint">逐个核对绑定的文件，列出「数据库里有记录、硬盘上已经没了」的作品，并统计磁盘占用</span></button>
-      <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
-      <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
-      <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>
     </div>
   </section>
 </form>`, `<span id="settings-save-state" class="settings-save-state is-idle">改动会自动保存</span><span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>`, "is-wide"));
@@ -9129,7 +9135,17 @@ function scheduleViewStateSave() {
  * 那时再读 scrollTop 读到的是新页的 0，上一页的位置就永远存不进去。
  */
 function trackScrollPosition() {
-  scrollTops[viewStateBucket()] = currentScrollTop();
+  const bucket = viewStateBucket();
+  scrollTops[bucket] = currentScrollTop();
+  // 锚点也要**边滚边记**（用 rAF 节流，一帧最多算一次）：只在防抖落盘那一步取的话，
+  // 「滚到底、马上关软件」那一下还没到防抖时间，存下来的就还是上一次的位置（v1.2.47）
+  if (!anchorFrame) {
+    anchorFrame = window.requestAnimationFrame(() => {
+      anchorFrame = 0;
+      const anchor = topVisibleCardAnchor();
+      if (anchor) scrollAnchors[bucket] = anchor;
+    });
+  }
   scheduleViewStateSave();
 }
 
@@ -9152,6 +9168,9 @@ let scrollRestoreFrame = 0;
  * 恢复时先把那张卡所在的批次扩出来，再滚到它身上。
  */
 const scrollAnchors = {};
+
+/** 边滚边记锚点的 rAF 句柄（见 trackScrollPosition） */
+let anchorFrame = 0;
 
 /** 当前视口里**最靠上且还没滚过去**的那张卡（作品卡或作者卡）；没有就返回 null */
 function topVisibleCardAnchor() {
