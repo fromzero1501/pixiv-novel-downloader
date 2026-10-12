@@ -8225,12 +8225,10 @@ async function settingsModal() {
       <label class="check-row"><input name="syncWorksOnStrayPromote" type="checkbox" ${settings.syncWorksOnStrayPromote ? "checked" : ""}><span>散篇转正时同步其所有作品</span><small>把散篇作者转成正式作者时，只要他有 Pixiv 主页，就自动把他的全部作品同步一遍。</small></label>
     </div>
   </section>
-  <section class="settings-group is-match">
   <section class="settings-group is-keyword">
-    <h3 class="settings-group-head"><span class="settings-group-no">3</span>完整版 / 预览版判定</h3>
+    <h3 class="settings-group-head"><span class="settings-group-no">3</span>完整版 / 预览版判定<span class="settings-group-hint">抓取同步时用</span></h3>
     <div class="settings-fields is-single">
 <div class="form-field">
-  <div class="char-setting-head"><span class="field-title">完整版 / 预览版判定</span><span class="settings-group-hint">抓取同步时用</span></div>
   <small>同步时看作品简介里有没有这些词：命中<b>完整版关键词</b>就当完整版，命中<b>预览版关键词</b>就当预览版。一行一个，按需要增删。</small>
   <small>两组词都能命中时，<b>写得更长的那个说了算</b>。比如完整版填「全文放出」、预览版填「全文」：简介里有「全文放出」的判完整版，只有「全文」的判预览版 —— 「全文放出」相当于「全文」的特例。</small>
   <label>完整版关键词 <textarea name="fullVersionKeywords" rows="3" placeholder="全文放出">${escapeHtml((settings.fullVersionKeywords || []).join("\n"))}</textarea></label>
