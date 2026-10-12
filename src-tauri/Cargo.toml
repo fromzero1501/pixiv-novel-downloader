@@ -1,6 +1,6 @@
 [package]
 name = "collection-library"
-version = "1.2.51"
+version = "1.2.52"
 description = "Local collection library"
 authors = ["you"]
 edition = "2021"

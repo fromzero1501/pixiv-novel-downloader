@@ -3505,13 +3505,17 @@ async function detailBindFile(workId) {
     filters: [{ name: "作品文件", extensions: ["txt", "md", "html", "htm", "xhtml", "epub", "mobi", "azw", "azw3", "fb2", "lit", "pdf"] }],
   });
   if (!path) return;
+  let movedPath = "";
   try {
     // v1.2.51：搬进完整版目录 + 按标题命名（以前只写路径、文件原地不动）
-    await invoke("bind_work_moving_to_purchased", { workId, path });
+    movedPath = await invoke("bind_work_moving_to_purchased", { workId, path });
   } catch (error) {
     toast(String(error), "error");
     return;
   }
+  // 同上：就地改这一篇，别只指望列表刷新（v1.2.52）
+  const boundWork = findWork(workId);
+  if (boundWork && movedPath) boundWork.purchasedPath = movedPath;
   state.detailReadingPath = await invoke("work_reading_path", { workId }).catch(() => "");
   await refreshAfterDetailChange();
   toast("已绑定本地完整版内容", "success");
@@ -3559,13 +3563,18 @@ async function handleDropToBind(payload) {
     return;
   }
   captureDetailNote();
+  let movedPath = "";
   try {
     // v1.2.51：和详情按钮同一条路 —— 搬进完整版目录 + 按标题命名
-    await invoke("bind_work_moving_to_purchased", { workId, path });
+    movedPath = await invoke("bind_work_moving_to_purchased", { workId, path });
   } catch (error) {
     toast(String(error), "error");
     return;
   }
+  // 拿到最终落地的路径就**就地改这一篇**（v1.2.52）：详情可能开在任何页面上，
+  // 「刷新当前列表」那条链未必覆盖得到，光靠它会留着老路径
+  const boundWork = findWork(workId);
+  if (boundWork && movedPath) boundWork.purchasedPath = movedPath;
   state.detailReadingPath = await invoke("work_reading_path", { workId }).catch(() => "");
   await refreshAfterDetailChange();
   toast("已绑定本地完整版内容", "success");
@@ -6419,11 +6428,27 @@ function autoGroupAuthorPicker() {
   const usableCount = state.authors.filter((author) => author.purchasedDir).length;
   showModal(modal("指定作者自动分组",
     `<p class="match-note">只在选中的这位作者的作品里做文件名匹配，其他作者的作品一律不参与。适合"某位作者的书正好混在一起、想单独归档"的情况。</p>
+     <label class="match-row"><span>搜索作者</span><input id="auto-group-author-search" type="search" placeholder="打几个字过滤，名字里含这几个字才留下" autocomplete="off"></label>
      <label class="match-row"><span>选择作者</span><select id="auto-group-author">${options}</select></label>
      <p class="read-only-note">共 ${usableCount} 位作者已绑定完整版文件夹、可参与分组；未绑定的作者在列表里是灰的。分组范围仍是设置里的「完整版自动分组文件夹」。</p>`,
     `<button class="quiet-button" data-action="close-modal">取消</button>
      <button class="primary-button" data-action="confirm-auto-group-author" ${usableCount ? "" : "disabled"}>开始分组</button>`
   ));
+  // 输入即过滤（v1.2.52 用户要求：作者太多，列表得能搜）。
+  // 「散篇」那一项永远留着 —— 它不是作者名，搜不着才怪。
+  const search = document.querySelector("#auto-group-author-search");
+  const select = document.querySelector("#auto-group-author");
+  search?.addEventListener("input", () => {
+    const keyword = search.value.trim().toLowerCase();
+    let firstVisible = null;
+    [...select.options].forEach((option) => {
+      const hit = option.value === "-1" || !keyword || option.textContent.toLowerCase().includes(keyword);
+      option.hidden = !hit;
+      if (hit && !firstVisible && !option.disabled) firstVisible = option;
+    });
+    // 当前选中的被过滤掉了就跳到第一个可见的，免得"列表变了、选的还是看不见的那个"
+    if (select.selectedOptions[0]?.hidden && firstVisible) select.value = firstVisible.value;
+  });
 }
 
 async function confirmAutoGroupAuthor() {
