@@ -1049,7 +1049,7 @@ async function invoke(command, args = {}) {
     if (window.__previewBookmarkDownloadError) return Promise.reject(new Error(String(window.__previewBookmarkDownloadError)));
     return { total: 1, downloaded: 1, skipped: 0, failed: 0, failedNames: [], authorId: 901, cancelled: false };
   }
-  if (command === "bind_work_with_rename") return args.path;
+  if (command === "bind_work_moving_to_purchased") return args.path;
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
     return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, lastSyncAt: new Date().toISOString() };
@@ -3506,7 +3506,8 @@ async function detailBindFile(workId) {
   });
   if (!path) return;
   try {
-    await invoke("bind_work", { workId, path });
+    // v1.2.51：搬进完整版目录 + 按标题命名（以前只写路径、文件原地不动）
+    await invoke("bind_work_moving_to_purchased", { workId, path });
   } catch (error) {
     toast(String(error), "error");
     return;
@@ -3559,7 +3560,8 @@ async function handleDropToBind(payload) {
   }
   captureDetailNote();
   try {
-    await invoke("bind_work", { workId, path });
+    // v1.2.51：和详情按钮同一条路 —— 搬进完整版目录 + 按标题命名
+    await invoke("bind_work_moving_to_purchased", { workId, path });
   } catch (error) {
     toast(String(error), "error");
     return;
@@ -7462,7 +7464,7 @@ async function confirmMatches() {
   let renamedCount = 0;
   for (const item of selections) {
     try {
-      const newPath = await invoke("bind_work_with_rename", item);
+      const newPath = await invoke("bind_work_moving_to_purchased", item);
       if (newPath !== item.path) renamedCount++;
     } catch (error) {
       console.error("绑定失败:", error);

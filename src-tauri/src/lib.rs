@@ -9078,107 +9078,57 @@ fn scan_purchased(author_id: i64, mode: String) -> Result<ScanPurchasedResult, S
     })
 }
 
-#[tauri::command]
-fn bind_work(work_id: i64, path: String) -> Result<(), String> {
-    let conn = db()?;
-    // 能绑的只有文本 / 电子书 / HTML（以及用户自己整理的文件夹），封面图、配图文件夹不算
-    if is_image_like_asset(Path::new(&path)) {
-        return Err("封面图 / 配图文件夹不能当作作品文件绑定，请选择文本、电子书或 HTML 文件".into());
-    }
-    conn.execute(
-        "UPDATE works SET purchased_path=?1 WHERE id=?2",
-        params![path, work_id],
-    )
-    .map_err(|e| e.to_string())?;
-    refresh_reading_image_count(&conn, work_id);
-    Ok(())
-}
 
+/// 绑定完整版（v1.2.51）：把文件**搬进该作者的完整版目录**、按作品标题命名，再绑定。
+///
+/// 三个入口（详情里的「绑定完整版文件」、详情里的「拖动到此绑定完整版」、还有扫描后的
+/// 「确认绑定」）统一走这里 —— 以前它们调 `bind_work`（只写路径、文件原地不动）或
+/// `bind_work_with_rename`（只改名不搬家），用户 2026-10-12 拍板要"搬进去 + 改名"。
+///
+/// 两个边界：作者没绑完整版目录 ⇒ 报错说清楚（不猜目录）；目标已有同名文件 ⇒
+/// **不覆盖**，另存成「标题 (2).ext」，避免丢数据。返回最终落地的路径。
 #[tauri::command]
-fn bind_work_with_rename(work_id: i64, path: String) -> Result<String, String> {
+fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, String> {
     let conn = db()?;
-    // 封面图 / 配图文件夹不当作品文件，与「关联完整版文件」保持一致
     if is_image_like_asset(Path::new(&path)) {
         return Err("封面图 / 配图文件夹不能当作作品文件绑定，请选择文本、电子书或 HTML 文件".into());
     }
-    // 1. 获取作品标题
-    let title: String = conn
+    let source = PathBuf::from(&path);
+    if !source.is_file() {
+        return Err("要绑定的文件不在了（可能被移走或改了名）".into());
+    }
+    let (title, author_id): (String, i64) = conn
+        .query_row("SELECT title, author_id FROM works WHERE id=?1", [work_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|e| format!("找不到作品：{e}"))?;
+    let purchased_dir: String = conn
         .query_row(
-            "SELECT title FROM works WHERE id=?1",
-            [work_id],
+            "SELECT purchased_dir FROM authors WHERE id=?1",
+            [author_id],
             |row| row.get(0),
         )
-        .map_err(|e| format!("找不到作品：{e}"))?;
+        .unwrap_or_default();
+    if purchased_dir.trim().is_empty() {
+        return Err("这位作者还没绑定完整版文件夹 —— 先去作者设置里填上，再回来绑定".into());
+    }
+    let target_dir = PathBuf::from(&purchased_dir);
+    fs::create_dir_all(&target_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
 
-    // 2. 获取原文件扩展名
-    let old_path = Path::new(&path);
-    let extension = old_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("");
-
-    // 3. 生成新文件名（使用作品标题，保留原扩展名）
-    let new_file_name = if extension.is_empty() {
-        title.clone()
-    } else {
-        format!("{title}.{extension}")
-    };
-
-    // 4. 获取目标目录
-    let parent_dir = old_path
-        .parent()
-        .ok_or_else(|| "无法获取文件目录".to_string())?;
-    let new_path = parent_dir.join(&new_file_name);
-
-    // 5. 处理文件名冲突（如果目标文件名已存在）
-    let final_path = if new_path.exists() {
-        // 如果目标文件已存在，检查是否是同一文件（相同路径）
-        if new_path == old_path {
-            // 文件已经是目标名称，无需重命名
-            conn.execute(
-                "UPDATE works SET purchased_path=?1 WHERE id=?2",
-                params![path, work_id],
-            )
-            .map_err(|e| e.to_string())?;
-            refresh_reading_image_count(&conn, work_id);
-            return Ok(path);
-        }
-        // 生成带数字后缀的文件名
-        let stem = Path::new(&new_file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&new_file_name);
-        let mut counter = 1;
-        loop {
-            let candidate_name = if extension.is_empty() {
-                format!("{stem} ({counter})")
-            } else {
-                format!("{stem} ({counter}).{extension}")
-            };
-            let candidate_path = parent_dir.join(&candidate_name);
-            if !candidate_path.exists() {
-                break candidate_path;
-            }
-            counter += 1;
-        }
-    } else {
-        new_path
-    };
-
-    // 6. 重命名文件
-    fs::rename(old_path, &final_path).map_err(|e| format!("重命名文件失败：{e}"))?;
-
-    // 7. 更新数据库中的purchased_path
-    let final_path_str = final_path.to_string_lossy().to_string();
+    let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let target = unique_target_path(&target_dir, &title, extension);
+    if source != target {
+        move_path(&source, &target)?;
+    }
     conn.execute(
         "UPDATE works SET purchased_path=?1 WHERE id=?2",
-        params![final_path_str, work_id],
+        params![target.to_string_lossy().to_string(), work_id],
     )
     .map_err(|e| e.to_string())?;
     refresh_reading_image_count(&conn, work_id);
-
-    Ok(final_path_str)
+    Ok(target.to_string_lossy().to_string())
 }
+
 
 /// 去掉文件名中的非法字符，避免生成路径时失败
 fn sanitize_file_name(name: &str) -> String {
@@ -14537,8 +14487,7 @@ pub fn run() {
             leave_work_series,
             scan_preview,
             scan_purchased,
-            bind_work,
-            bind_work_with_rename,
+            bind_work_moving_to_purchased,
             auto_group_purchased_files,
             confirm_manual_group,
             copy_previews_to_purchased,
@@ -16443,31 +16392,6 @@ mod tests {
             },
         ];
         assert!(matched_sync_preview(&duplicated, "同名").is_none());
-    }
-
-    #[test]
-    fn bind_work_with_rename_generates_correct_filename() {
-        // 测试文件名生成逻辑
-        let title = "测试作品标题";
-        let extension = "txt";
-        let expected = "测试作品标题.txt";
-        let result = if extension.is_empty() {
-            title.to_string()
-        } else {
-            format!("{title}.{extension}")
-        };
-        assert_eq!(result, expected);
-
-        // 测试无扩展名的情况
-        let title = "无扩展名文件";
-        let extension = "";
-        let expected = "无扩展名文件";
-        let result = if extension.is_empty() {
-            title.to_string()
-        } else {
-            format!("{title}.{extension}")
-        };
-        assert_eq!(result, expected);
     }
 
     #[test]
