@@ -5099,7 +5099,7 @@ async function matchSeriesBundle() {
   }
   let files = [];
   try {
-    files = await invoke("match_series_files", { seriesTitle: view.title });
+    files = await invoke("match_series_files", { title: String(view.title || "") });
   } catch (error) {
     toast(String(error), "error");
     return;
@@ -9667,6 +9667,9 @@ function expandShownForAnchor(bucket) {
 function restoreCardAnchor(bucket) {
   const anchor = scrollAnchors[bucket];
   const fallback = scrollTops[bucket] || 0;
+  // 上次本来就在最顶部（或几乎贴着顶）⇒ 直接回 0，**别拿第一张卡当锚**
+  // 否则等于凭空往下滚一屏，顶栏又被顶出视野（v1.2.73 用户要求）
+  if (fallback <= 40) { restoreScrollTop(0); return; }
   if (!anchor) { restoreScrollTop(fallback); return; }
   const selector = anchor.kind === "work"
     ? `.work-card[data-work-id="${anchor.id}"]`

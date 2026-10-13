@@ -9727,10 +9727,13 @@ fn collect_series_candidates(dir: &Path, needle: &str, out: &mut Vec<String>, de
 /// 比如系列名 `A`，能匹配到 `A(1-5).txt`、`[作者] A 1-5.txt` 这类。
 /// 找不到不算错，返回空数组让前端提示；目录没配 / 不在了才报错（那是真没法找）。
 #[tauri::command]
-fn match_series_files(series_title: String) -> Result<Vec<String>, String> {
+fn match_series_files(title: String) -> Result<Vec<String>, String> {
     let conn = db()?;
     let settings = read_settings(&conn)?;
-    let needle = series_title.trim().to_lowercase();
+    // 参数名故意用**单个词** `title`（v1.2.73）：多词参数在 snake_case / camelCase 之间
+    // 会撞上转换歧义 —— 前端传 seriesTitle、后端要 series_title 时直接报
+    // "missing required key"。单词名没有这个问题，两边怎么写都对得上。
+    let needle = title.trim().to_lowercase();
     if needle.is_empty() {
         return Err("这个系列还没有名字 —— 先给系列起个名字再来匹配".into());
     }
