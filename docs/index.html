@@ -507,7 +507,7 @@
     <li>封面上的徽标在这里也能点，和作者作品库共用同一份数据 —— 在这里收藏完，用作者作品库的「仅看收藏」就能筛出来。</li>
     <li><strong>「仅看收藏」</strong>在作者作品库和「所有作品」里分别保存，互不影响。</li>
     <li><strong>搜索范围</strong>可以选五档：<strong>标题</strong>（默认）、<strong>标题 + 简介</strong>、<strong>标题 + 简介 + 标签</strong>、<strong>标签</strong>、<strong>正文内容</strong>。库里存的是 Pixiv 上的整篇简介，想按设定、情节找作品时，后两档比只搜标题有用得多。选「正文内容」时要按回车（扫描本地文件，见 <a class="inline" href="#textsearch">第 13 节</a>）。</li>
-    <li><strong>排序</strong>可选：日期从新到旧 / 从旧到新、名称 A-Z、<strong>字数从多到少</strong>、<strong>评分从高到低</strong>。字数这条把 <strong>EPUB、HTML 这类阅读版按配图张数</strong>排，并且<strong>整体排在 TXT 前面</strong>（图文作品通常就是最想先看的），TXT 之间再按字数排。</li>
+    <li><strong>排序</strong>可选：日期从新到旧 / 从旧到新、名称 A-Z、<strong>字数从多到少</strong>、<strong>评分从高到低</strong>。字数这条<strong>一律按字数排</strong>：TXT 与 EPUB 都算得出字数，一视同仁；算不出字数的（只绑了 MOBI / PDF / HTML 这类）字数为 0，排在末尾。</li>
     <li><strong>连载只看最新</strong>：同一前缀的连载作品只保留章节号最大的那一篇。按钮上会写清折叠掉了几篇。</li>
     <li><strong>列表分页加载</strong>：「所有作品」库里上千篇时不会一次全铺出来，先显示一批，滚到底自动接着加载（页脚也有「再加载」按钮兜底）。页脚会写「已显示 N / 共 M」。改筛选条件后会退回第一批。</li>
     <li><strong>视图会记住</strong>：上次停在哪个页面、那页的搜索词 / 筛选 / 排序、滚到哪儿，下次打开接着看。超过一个月没动过的位置不再还原。</li>
@@ -544,7 +544,7 @@
     <li><strong>版本</strong>：不限 / 完整版 / 预览版。它和工具栏上那排「全部 / 完整版 / 预览版」是<strong>同一个字段</strong>，两处显示永远一致。</li>
     <li><strong>配图</strong>：不限 / 有图 / 无图。工具栏的「仅看带图版」按钮就是这个字段的快捷开关。</li>
     <li><strong>评分</strong>：不限 / 未评分 / 3 星及以上 / 4 星及以上 / 5 星。</li>
-    <li><strong>字数</strong>：不限 / 5 千字以下 / 5 千 ~ 2 万 / 2 万 ~ 8 万 / 8 万字以上。<strong>字数读不出来的作品（比如只绑了 EPUB 阅读版）任何一档都不收</strong>，不会硬塞进「5 千字以下」。</li>
+    <li><strong>字数</strong>：不限 / 5 千字以下 / 5 千 ~ 2 万 / 2 万 ~ 8 万 / 8 万字以上。TXT 与 EPUB 都算得出字数；<strong>算不出字数的作品（比如只绑了 MOBI / PDF 阅读版）任何一档都不收</strong>，不会硬塞进「5 千字以下」。</li>
     <li><strong>收藏夹</strong>：不限 / 任意收藏 / 具体的某个夹子。选「任意收藏」就是「在任何一个夹子里都算」。</li>
   </ul>
   <p>生效中的条件数会显示在「高级筛选」按钮上，一眼就能看出列表是不是正被筛着。面板底部有「清空筛选」，一键把六行全复位。</p>
@@ -781,12 +781,12 @@
     <p>它只在<strong>标题比文件名长</strong>时生效。文件名更长时，分母恒等于文件名长度，截短标题只会让分子变小、分数不变。</p>
   </details>
   <details class="faq">
-    <summary>字数排序里，电子书怎么跑到 TXT 前面了？</summary>
-    <p>「字数从多到少」对 EPUB / HTML 这类阅读版是按<strong>配图张数</strong>排的（它们没法简单数正文汉字），并且整体排在 TXT 前面 —— 图文作品通常最想先看。TXT 之间才按字数排。</p>
+    <summary>字数排序里，电子书怎么排的？</summary>
+    <p>「字数从多到少」<strong>一律按字数排</strong>：TXT 和 EPUB 都算得出字数，谁字多谁在前。算不出字数的（只绑了 MOBI / PDF / HTML 这类）字数为 0，排在末尾。</p>
   </details>
   <details class="faq">
     <summary>按字数筛选会漏掉一些作品？</summary>
-    <p>绑的是 EPUB / HTML 阅读版、目录里没有 txt 的作品，字数读不出来 —— 这类作品<strong>任何字数档都不收</strong>，不会硬塞进「5 千字以下」。另外新装的作品字数是后台慢慢算的，没算完的暂时也进不了字数档，面板上会写明还剩几篇。</p>
+    <p>绑的是 MOBI / PDF / HTML 阅读版、目录里又没有 txt 的作品，字数读不出来 —— 这类作品<strong>任何字数档都不收</strong>，不会硬塞进「5 千字以下」。（绑 EPUB 的算得出字数，正常参与筛选。）另外新装的作品字数是后台慢慢算的，没算完的暂时也进不了字数档，面板上会写明还剩几篇。</p>
   </details>
   <details class="faq">
     <summary>「筛选模板」和「收藏夹」有什么区别？</summary>

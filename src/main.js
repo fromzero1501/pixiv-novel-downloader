@@ -3317,7 +3317,7 @@ function workAuthorName(work) {
     || "";
 }
 
-/** 详情副标题里的格式信息：EPUB 这类报不出字数的，把配图数报出来 */
+/** 详情副标题里的格式信息：有字数报字数，算不出字数的（MOBI / 坏 EPUB…）报格式名 */
 function workFormatLabels(work) {
   const parts = [];
   if (work.wordCount) parts.push(wordCountLabel(work.wordCount));

@@ -652,10 +652,14 @@ fn migrate_favorites_into_collections(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// v1.2.18：老库里非 txt 的完整版（EPUB / HTML）被当文本读过，把压缩包解出来的乱码
-/// 字符数当成了正文字数 —— 用户库里 56 本 EPUB 因此挂着 98 万～5288 万的假字数，
-/// 作品卡和详情页显示的是那个数，而不是「EPUB」。这里把它们标回 -1（未算），
-/// 交给启动时的 `refresh_word_counts` 按新判据重算，会得 0 ＝「读不出来」。
+/// v1.2.18：老库里非正文本的完整版（曾是 EPUB / HTML）被当文本读过，把压缩包解出来的乱码
+/// 字符数当成了正文字数 —— 用户库里 56 本 EPUB 因此挂着 98 万～5288 万的假字数。
+/// 这里把它们标回 -1（未算），交给启动时的 `refresh_word_counts` 按新判据重算。
+///
+/// ⚠️ v1.2.94 起 EPUB 进了 `TEXT_BODY_EXTENSIONS`（能解包算字数了），所以这条迁移
+/// **不再碰 epub** —— 它现在只管 MOBI / PDF / HTML 这些仍算不出的格式。
+/// 老库里 epub 的假字数在 v1.2.94 之前已经被这条清过了（那时它还不是正文）；
+/// 升级到 v1.2.94 之后想让 epub 有字数，靠的是 `migrate_epub_word_counts()`。
 ///
 /// 判据直接调 `is_text_body_path()`，**不写成 SQL 里的 `LIKE '%.txt'`** ——
 /// 那样等于把扩展名规则抄第二遍（`a.txt.bak` 这种还会被判错），
@@ -689,6 +693,53 @@ fn migrate_word_counts_for_non_text_files(conn: &Connection) -> Result<(), Strin
     }
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES ('word_counts_non_text_reset', '1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// v1.2.94：EPUB 从这一版起能算出字数了，得把老库里那些「已经算过、但结果是 0」的
+/// EPUB 标回未算（-1），让启动时那轮 `refresh_word_counts` 重新算一遍。
+///
+/// 为什么非标不可：`refresh_word_counts_impl` 只捞 `word_count < 0` 的行，
+/// 而它们此前被算成 0（＝「读不出来」），于是**永远不会再被算**。
+/// 不重置的话，老用户升级后 EPUB 还是没字数。
+///
+/// 判据用 `extension_of()`（全项目同一处扩展名规则），只动「路径是 epub」的行；
+/// txt 的和已经 -1 的一律不碰。只跑一次（`app_settings` 里一个 flag 守），
+/// 否则每次启动都白扫全库。
+fn migrate_epub_word_counts(conn: &Connection) -> Result<(), String> {
+    if setting(conn, "epub_word_counts_reset")? == "1" {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String, String)> = {
+        let mut statement = conn
+            .prepare("SELECT id, purchased_path, preview_path FROM works")
+            .map_err(|e| e.to_string())?;
+        let mapped = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for (id, purchased_path, preview_path) in rows {
+        // 和 `refresh_word_counts_impl` 同一套取路径规矩：完整版优先
+        let path = if purchased_path.trim().is_empty() {
+            preview_path
+        } else {
+            purchased_path
+        };
+        if extension_of(Path::new(&path)).as_deref() != Some("epub") {
+            continue;
+        }
+        conn.execute("UPDATE works SET word_count = -1 WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('epub_word_counts_reset', '1')
          ON CONFLICT(key) DO UPDATE SET value='1'",
         [],
     )
@@ -982,6 +1033,10 @@ fn db() -> Result<Connection, String> {
     // 标回未算让后台按新判据重算。要排在触发器 DDL 之后 —— 那个触发器盯着路径列，
     // 这里只写 word_count，不会互相踩。
     let _ = migrate_word_counts_for_non_text_files(&conn);
+    // EPUB 从 v1.2.94 起能算字数：把老库里「算过、结果是 0」的 EPUB 标回未算，
+    // 让启动那轮后台补算重新算一遍（否则它们永远停在 0，用户看不到新功能）。
+    // 必须排在上面那条 v1.2.18 的迁移之后，两条各管各的、都只跑一次。
+    let _ = migrate_epub_word_counts(&conn);
     // 常见角色名表：用于「按角色匹配」的自动匹配 / 关联完整版文件。
     // game 只用来分组展示，不参与匹配；name 与 aliases（`|` 分隔）都会拿去匹配。
     let _ = conn.execute(
@@ -1930,41 +1985,72 @@ fn decode_text_bytes(bytes: &[u8]) -> String {
 
 fn text_file_word_count(path: &Path) -> Option<usize> {
     let content = read_text_file(path)?;
-    Some(
-        content
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .count(),
-    )
+    Some(count_non_whitespace(&content))
 }
 
-/// 能当「正文」数出字数的扩展名白名单：**只有 txt**。
+/// 非空白字符数 —— **全项目只有这一处口径**。TXT 和 EPUB 都走它，
+/// 同一部作品的两种格式字数才对得上（各写一套迟早会漂）。
+fn count_non_whitespace(content: &str) -> usize {
+    content
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count()
+}
+
+/// EPUB 的字数（v1.2.94）：走 `epub_text()` 把全书 XHTML 抽成纯文本，
+/// 再用和 TXT 同一套口径数非空白字符。
 ///
-/// 口径和 `populate_work_display_info()` 里的 `extension != "TXT"` 是同一条：
-/// 非 txt 的完整版算「阅读版」，界面上显示格式名（EPUB / HTML…）而不是字数。
-/// 两处判据必须一起改，别在一处偷偷放宽。
-const TEXT_BODY_EXTENSIONS: &[&str] = &["txt"];
+/// 为什么复用 `epub_text()` 而不是另写一个解析器：正文检索那道功能已经在用它，
+/// 两处各写一套必然会读出两种结果（`TEXT_BODY_EXTENSIONS` 那条注释踩过同样的坑）。
+/// 它会把版权页 / 目录页的文字也算进来 —— 这是「整本书有多少字」，符合直觉。
+///
+/// 失败（坏包 / 加密 / 没见过的 zip 写法）返回 None，调用方记 0，
+/// 界面照旧显示格式名「EPUB」而不是一个假的字数。
+fn epub_file_word_count(path: &Path) -> Option<usize> {
+    Some(count_non_whitespace(&epub_text(path)?))
+}
+
+/// 能当「正文」数出字数的扩展名白名单：txt 与 epub（v1.2.94 起收了 epub）。
+///
+/// txt 是直接读文本；epub 要先解包（见 `epub_file_word_count`）。
+/// 其余（MOBI / AZW3 / PDF / HTML）**故意不在里面** —— 解析复杂度和收益不成正比，
+/// 它们照旧算不出字数、界面显示格式名。
+const TEXT_BODY_EXTENSIONS: &[&str] = &["txt", "epub"];
 
 fn is_text_body_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
+    extension_of(path)
         .map(|extension| {
             TEXT_BODY_EXTENSIONS
                 .iter()
-                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+                .any(|allowed| extension == *allowed)
         })
         .unwrap_or(false)
 }
 
+/// 路径的小写扩展名（没有就 None）。比每个调用点各写一遍 `extension().and_then(…)` 稳。
+fn extension_of(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.trim().to_ascii_lowercase())
+        .filter(|extension| !extension.is_empty())
+}
+
+/// 单个文件的字数：txt 直接读、epub 先解包；其余格式返回 None（＝算不出）。
+fn file_word_count(path: &Path) -> Option<usize> {
+    match extension_of(path)?.as_str() {
+        "txt" => text_file_word_count(path),
+        "epub" => epub_file_word_count(path),
+        _ => None,
+    }
+}
+
 fn text_word_count_at(path: &Path) -> Option<usize> {
     if path.is_file() {
-        // EPUB / MOBI / PDF 这些是压缩包或二进制：硬当文本读会解出一大堆乱码，
-        // 数出来的就成了「乱码字符数」——用户库里 56 本 EPUB 因此挂着 98 万～5288 万的
-        // 假字数，作品卡和详情页一直显示那个数、而不是「EPUB」（v1.2.18 修）。
+        // EPUB 从 v1.2.94 起能算出字数（解包取正文）；MOBI / AZW3 / PDF 这些仍是
+        // 「算不出」——硬当文本读会解出一大堆乱码，数出来的就成了「乱码字符数」，
+        // 用户库里 56 本 EPUB 因此挂着 98 万～5288 万的假字数（v1.2.18 修）。
         // 目录那条分支也是同一个判据，两处不能各写一套。
-        return is_text_body_path(path)
-            .then(|| text_file_word_count(path))
-            .flatten();
+        return file_word_count(path);
     }
     if !path.is_dir() {
         return None;
@@ -2020,7 +2106,7 @@ fn resolve_cover_path(cover_path: &str, preview_path: &str, purchased_path: &str
  * 之前 `word_count` 是在这里现读文件算的 —— 全库 1350 个 txt、98 MB，一次 1.4 秒，
  * 而列表每次改筛选 / 敲搜索都会重跑一遍，界面就卡住了（v1.2.8 用户报的「加载得有点慢」）。
  * 现在字数走 `works.word_count` 那一列（由 `refresh_word_counts` 在后台一次算好），
- * 这里只做两件便宜事：封面兜底、认出 EPUB/HTML 这类非 txt 的阅读版格式。
+ * 这里只做两件便宜事：封面兜底、在算不出字数时认出阅读版的格式名。
  * 想再加「要读文件」的字段，请走后台补算那条路，别加回这个函数。
  */
 fn populate_work_display_info(work: &mut Work) {
@@ -2030,33 +2116,40 @@ fn populate_work_display_info(work: &mut Work) {
         return;
     }
     let purchased_path = Path::new(&work.purchased_path);
-    if purchased_path.is_file() {
-        let extension = purchased_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::trim)
-            .filter(|extension| !extension.is_empty())
-            .map(str::to_ascii_uppercase)
-            .unwrap_or_else(|| "文件".into());
-        if extension != "TXT" {
-            work.file_format = Some(extension);
-        }
+    if !purchased_path.is_file() {
+        return;
+    }
+    // 有字数就显示字数，格式名只在**算不出字数**时才上场（v1.2.94 起 EPUB 也算得出，
+    // 于是它不再显示「EPUB」而显示字数；MOBI / PDF / HTML 仍是格式名）。
+    if work.word_count.unwrap_or(0) > 0 {
+        return;
+    }
+    let extension = purchased_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::trim)
+        .filter(|extension| !extension.is_empty())
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| "文件".into());
+    // TXT 算不出字数（空文件）也不显示「TXT」—— 那是它自己坏/空，不该拿格式名顶替
+    if extension != "TXT" {
+        work.file_format = Some(extension);
     }
 }
 
-/// 「字数从多到少」排序用的比较键：EPUB / HTML 这类阅读版**没有字数**，改成按配图张数比。
-/// 返回 `(分组, 数量)` —— 分组 1 ＝ 电子书 / HTML（整体排在前面），0 ＝ TXT 与预览版正文。
-fn content_size_key(work: &Work) -> (u8, usize) {
-    if work.file_format.is_some() {
-        (1, usize::try_from(work.image_count).unwrap_or(0))
-    } else {
-        (0, work.word_count.unwrap_or(0))
-    }
+/// 「字数从多到少」排序用的比较键：**一律按字数**（v1.2.94 起）。
+///
+/// 原来 EPUB / HTML 没有字数，只好按配图张数比、并把电子书整体排在 TXT 前面。
+/// 现在 EPUB 能算出字数和 TXT 一视同仁了，这条特例就没必要了 ——
+/// 剩下算不出字数的（MOBI / PDF / HTML）字数为 0，自然沉到末尾。
+fn content_size_key(work: &Work) -> usize {
+    work.word_count.unwrap_or(0)
 }
 
-/// 「字数从多到少」（v0.3.67 用户要求）：TXT 按字数排，EPUB / HTML 按配图张数排，电子书整体排在 TXT 前面。
-/// 字数是 `populate_work_display_info()` 读文件算出来的，SQL 里排不了，所以必须在这之后重排；
-/// `sort_by` 是稳定排序，键一样的还保持 SQL 给的日期序。
+/// 「字数从多到少」：全按字数排（v0.3.67 起就有这个排序，v1.2.94 起口径统一）。
+/// 字数是后台 `refresh_word_counts()` 算好写进 `works.word_count` 的，
+/// SQL 里排不了，所以必须在这之后重排；`sort_by` 是稳定排序，
+/// 键一样的还保持 SQL 给的日期序。
 fn sort_works_by_content_size(works: &mut [Work]) {
     works.sort_by(|left, right| content_size_key(right).cmp(&content_size_key(left)));
 }
@@ -16041,6 +16134,8 @@ mod tests {
         EXPORT_COL_READ, EXPORT_COL_NOTE, EXPORT_COL_PIXIV_URL, EXPORT_COL_TEXT_PATH,
         EXPORT_COL_COVER_PATH, EXPORT_COL_NOVEL_ID, EXPORT_COL_IMAGES, EXPORT_COL_SYNOPSIS,
         text_word_count, is_text_body_path, TEXT_BODY_EXTENSIONS,
+        file_word_count, epub_file_word_count, count_non_whitespace, extension_of,
+        migrate_epub_word_counts,
         apply_author_status, check_pixiv_author_impl, classify_author_status,
         title_indicates_images, unique_target_path, write_reading_output,
         text_has_raw_novel_image_tokens, detail_has_embedded_images,
@@ -18225,20 +18320,27 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// 「字数从多到少」（v0.3.67）：EPUB / HTML 按配图张数排、整体排在 TXT 前面；TXT 之间按字数排。
+    /// 「字数从多到少」（v1.2.94）：**一律按字数**排，EPUB 不再特排前面。
+    /// 算不出字数的（MOBI / PDF / HTML，word_count 为 None→0）自然沉到末尾。
     #[test]
-    fn content_size_sort_puts_ebooks_first_and_uses_words_for_txt() {
+    fn content_size_sort_uses_words_for_every_format() {
         let mut works = vec![
             content_size_work(1, Some(3000), None, 0),
-            content_size_work(2, None, Some("EPUB"), 2),
+            // EPUB 有字数了 ⇒ 按字数排，不再看配图张数
+            content_size_work(2, Some(50000), Some("EPUB"), 2),
             content_size_work(3, Some(9000), None, 0),
+            // HTML 算不出字数（word_count = 0）⇒ 沉到末尾，配图再多也不顶用
             content_size_work(4, None, Some("HTML"), 7),
+            // 未算过的（-1 会被 map 成 None）也当 0
+            content_size_work(5, None, None, 0),
         ];
 
         sort_works_by_content_size(&mut works);
 
         let order = works.iter().map(|work| work.id).collect::<Vec<_>>();
-        assert_eq!(order, vec![4, 2, 3, 1]);
+        // 5 万字 EPUB > 9000 > 3000 > HTML(0) ＝ 未算(0)
+        // 稳定排序：0 的那两个保持原顺序 4 在前、5 在后
+        assert_eq!(order, vec![2, 3, 1, 4, 5]);
     }
 
     fn content_size_work(
@@ -18277,13 +18379,15 @@ mod tests {
         }
     }
 
+    /// 算不出字数时显示格式名（v1.2.94 起这条只对「读不出正文的文件」成立 ——
+    /// EPUB 现在能算出字数，有字数就该显示字数而不是「EPUB」）。
     #[test]
     fn purchased_non_text_file_shows_its_format_instead_of_a_word_count() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("collection-library-test-{suffix}.epub"));
+        let path = std::env::temp_dir().join(format!("collection-library-test-{suffix}.mobi"));
         fs::write(&path, [1_u8, 2, 3]).unwrap();
         let mut work = Work {
             author_id: 1,
@@ -18317,7 +18421,25 @@ mod tests {
         populate_work_display_info(&mut work);
 
         assert_eq!(work.word_count, None);
-        assert_eq!(work.file_format.as_deref(), Some("EPUB"));
+        assert_eq!(work.file_format.as_deref(), Some("MOBI"));
+        fs::remove_file(path).unwrap();
+    }
+
+    /// 有字数就不显示格式名（v1.2.94）：EPUB 算出字数后该显示「12 字」而不是「EPUB」。
+    #[test]
+    fn epub_with_a_word_count_hides_its_format_label() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("collection-library-test-{suffix}.epub"));
+        fs::write(&path, [1_u8, 2, 3]).unwrap();
+        let mut work = content_size_work(1, Some(12345), Some("EPUB"), 0);
+        work.purchased_path = path.to_string_lossy().to_string();
+
+        populate_work_display_info(&mut work);
+
+        assert_eq!(work.file_format, None, "有字数就不该再显示格式名");
         fs::remove_file(path).unwrap();
     }
 
@@ -19941,17 +20063,17 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// v1.2.18：EPUB 不是文本，**不能**当正文数字数。
+    /// v1.2.18 / v1.2.94：EPUB 从 v1.2.94 起能算出字数，但**坏包**仍然算不出（记 None→0）。
     ///
-    /// 起因：EPUB 是 zip 包，`read_text_file` 硬解码出来一大堆乱码，数出来就成了
-    /// 「乱码字符数」——用户库里 56 本 EPUB 挂着 98 万～5288 万的假字数，
-    /// 作品卡和详情页因此显示那个数、而不是「EPUB」。
+    /// v1.2.18 的起因：EPUB 是 zip 包，`read_text_file` 硬解码出来一大堆乱码，数出来就成了
+    /// 「乱码字符数」——用户库里 56 本 EPUB 挂着 98 万～5288 万的假字数。
+    /// 现在走 `epub_file_word_count()` 正经解包，坏包解不开就返回 None，绝不会退回乱码计数。
     #[test]
     fn non_text_file_is_never_counted_as_words() {
         let root = std::env::temp_dir().join(format!("text-body-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        // 真 EPUB 就是 PK 开头的 zip；这里只要是「非文本字节」就够了
+        // 只是个 PK 头的残包，解不开 ⇒ 该算不出，绝不能把 zip 字节当乱码数进去
         let epub = root.join("假书.epub");
         fs::write(&epub, [0x50_u8, 0x4b, 0x03, 0x04, 0xff, 0x00, 0x80, 0xfe]).unwrap();
         let txt = root.join("真书.txt");
@@ -19960,16 +20082,65 @@ mod tests {
         let txt_text = txt.to_string_lossy().to_string();
         let root_text = root.to_string_lossy().to_string();
 
-        assert_eq!(text_word_count(&epub_text), None, "EPUB 读不出正文字数");
+        assert_eq!(text_word_count(&epub_text), None, "坏 EPUB 解不开 ⇒ 算不出");
         assert_eq!(text_word_count(&txt_text), Some(5));
-        // 目录那条分支必须和文件分支同判据：只数 txt，跳过 epub
+        // 目录那条分支：坏 epub 跳过，只数 txt
         assert_eq!(text_word_count(&root_text), Some(5));
 
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// v1.2.18：升级时要把老库里 EPUB 的假字数清掉，txt 的一字不动；而且只跑一次 ——
-    /// 重算出来的 0（＝「读不出来」）不能被下一次启动又标回未算。
+    /// v1.2.94：EPUB 能算出字数了，而且口径和 TXT 是同一条（非空白字符）。
+    #[test]
+    fn epub_word_count_matches_the_txt_rule() {
+        let root = std::env::temp_dir().join(format!("epub-words-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let epub = root.join("真电子书.epub");
+        {
+            let mut writer = zip::ZipWriter::new(fs::File::create(&epub).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            // 两页正文，中间有换行与缩进（空白不该算进去）
+            writer.start_file("OEBPS/ch1.xhtml", options).unwrap();
+            writer
+                .write_all("<p>一二三四五</p>\n  <p>六七八</p>".as_bytes())
+                .unwrap();
+            writer.start_file("OEBPS/ch2.xhtml", options).unwrap();
+            writer.write_all("<p>九十</p>".as_bytes()).unwrap();
+            // 图片与脚本都不算
+            writer.start_file("OEBPS/images/001.jpg", options).unwrap();
+            writer.write_all(b"not-a-real-image").unwrap();
+            writer.start_file("OEBPS/ch3.xhtml", options).unwrap();
+            writer
+                .write_all("<script>var 不该算=1</script><p>十一</p>".as_bytes())
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        // 正文一共「一二三四五六七八九十十一」＝12 个字；空白、标签、脚本都不算
+        let count = text_word_count(&epub.to_string_lossy()).unwrap();
+        assert_eq!(count, 12, "EPUB 字数按非空白字符算");
+
+        // 同样内容的 TXT 必须得出同一个数 —— 口径漂了这条会红
+        let txt = root.join("同样内容.txt");
+        fs::write(&txt, "一二三四五六七八九十十一").unwrap();
+        assert_eq!(text_word_count(&txt.to_string_lossy()), Some(count));
+
+        // 目录分支也要认 epub（v1.2.94 之前只认 txt，会漏掉）
+        assert_eq!(file_word_count(&epub).map(|n| n as i64), Some(12));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.2.18 / v1.2.94：EPUB 假字数的两口子迁移。
+    ///
+    /// · v1.2.18 那条（`migrate_word_counts_for_non_text_files`）把「不是正文」的假字数标回未算。
+    ///   EPUB 从 v1.2.94 起算正文了，所以它现在**跳过** epub（只碰 MOBI / PDF 那些）。
+    /// · v1.2.94 那条（`migrate_epub_word_counts`）才是管 epub 的：把「算过、结果是 0」的
+    ///   epub 标回未算，让后台按新能力重算。
+    /// 两条都只跑一次。
     #[test]
     fn migration_resets_fake_word_counts_on_non_text_files() {
         let root = std::env::temp_dir().join(format!("word-count-migrate-{}", std::process::id()));
@@ -19977,9 +20148,12 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let epub = root.join("假书.epub");
         fs::write(&epub, [0x50_u8, 0x4b, 0x03, 0x04]).unwrap();
+        let mobi = root.join("甲的书.mobi");
+        fs::write(&mobi, [0x00_u8, 0x11, 0x22]).unwrap();
         let txt = root.join("真书.txt");
         fs::write(&txt, "一二三四五").unwrap();
         let epub_path = epub.to_string_lossy().to_string();
+        let mobi_path = mobi.to_string_lossy().to_string();
         let txt_path = txt.to_string_lossy().to_string();
 
         let conn = Connection::open_in_memory().unwrap();
@@ -19999,8 +20173,11 @@ mod tests {
             [txt_path.as_str()],
         )
         .unwrap();
-
-        migrate_word_counts_for_non_text_files(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO works (id, title, purchased_path, word_count) VALUES (3, '丙的 mobi', ?1, 777)",
+            [mobi_path.as_str()],
+        )
+        .unwrap();
 
         let stored = |id: i64| -> i64 {
             conn.query_row("SELECT word_count FROM works WHERE id=?1", [id], |row| {
@@ -20008,16 +20185,32 @@ mod tests {
             })
             .unwrap()
         };
-        assert_eq!(stored(1), -1, "EPUB 的假字数要标回未算");
+
+        // v1.2.18 那条：MOBI 是假字数 ⇒ 标回未算；EPUB 现在算正文 ⇒ 不动它；txt 更不动
+        migrate_word_counts_for_non_text_files(&conn).unwrap();
+        assert_eq!(stored(3), -1, "MOBI 的假字数要标回未算");
+        assert_eq!(stored(1), 45296941, "EPUB 已是正文，这条迁移不再碰它");
         assert_eq!(stored(2), 5, "txt 的字数不能动");
 
-        // 后台按新判据重算：EPUB 读不出正文 → 0
+        // 后台重算：坏 MOBI 读不出 → 0
         assert_eq!(refresh_word_counts_impl(&conn, 10, None).unwrap().updated, 1);
-        assert_eq!(stored(1), 0);
+        assert_eq!(stored(3), 0);
 
-        // 标记位必须挡住第二次：否则重算好的 0 每次启动都被标回未算，白跑一遍全库
+        // v1.2.94 那条：把「算过、结果是 0」的 EPUB 标回未算（老库里它们永远停在 0）
+        conn.execute("UPDATE works SET word_count = 0 WHERE id = 1", [])
+            .unwrap();
+        migrate_epub_word_counts(&conn).unwrap();
+        assert_eq!(stored(1), -1, "EPUB 要重新排队等重算");
+        assert_eq!(stored(2), 5, "txt 不能动");
+        assert_eq!(stored(3), 0, "MOBI 不是 epub，不能动");
+
+        // 两条迁移都只跑一次：再调不该有任何改动
+        conn.execute("UPDATE works SET word_count = 0 WHERE id = 1", [])
+            .unwrap();
+        migrate_epub_word_counts(&conn).unwrap();
         migrate_word_counts_for_non_text_files(&conn).unwrap();
-        assert_eq!(stored(1), 0, "迁移只跑一次");
+        assert_eq!(stored(1), 0, "epub 迁移只跑一次");
+        assert_eq!(stored(3), 0, "非文本迁移只跑一次");
 
         fs::remove_dir_all(&root).unwrap();
     }
