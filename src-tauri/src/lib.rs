@@ -9878,7 +9878,18 @@ fn bind_series_bundle(work_ids: Vec<i64>, path: String) -> Result<String, String
         refresh_reading_image_count(&tx, *work_id);
     }
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(target.to_string_lossy().to_string())
+    // 这批的字数当场补上（v1.2.82）：换了路径 ⇒ 触发器把 word_count 标回 -1，
+    // 等后台分批可能在用户点回列表时还没轮到，看着像"同一个合集有的有字数、有的没有"。
+    // 同一个文件只读一次，结果写给所有指着它的篇。
+    let final_path = target.to_string_lossy().to_string();
+    let count = text_word_count(&final_path).unwrap_or(0) as i64;
+    for (work_id, _, _, _, _) in &rows {
+        let _ = conn.execute(
+            "UPDATE works SET word_count=?1 WHERE id=?2",
+            params![count, work_id],
+        );
+    }
+    Ok(final_path)
 }
 
 /// 把系列序号压成范围串（v1.2.67 用户给的写法）：`[1,2,3,6,7,8,9]` → `1-3,6-9`，
@@ -14809,32 +14820,43 @@ fn default_update_mirror_list() -> Vec<String> {
 
 fn parse_line(line: &str) -> Option<(String, String)> {
     let line = line.trim();
-    if line.len() < 11 {
+    if line.is_empty() {
         return None;
     }
-    let bytes = line.as_bytes();
-    if bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
-        return None;
-    }
-    let date = &line[0..10];
-    if !date.chars().enumerate().all(|(i, c)| {
-        if i == 4 || i == 7 {
-            c == '-'
-        } else {
-            c.is_ascii_digit()
+    // 行首**是**完整日期（`YYYY-MM-DD`）就摘出来当发布日期（v1.2.82 起这是可选的，
+    // 之前一旦不是这个格式整行就被判为无效，用户贴纯标题文本时全被跳过）。
+    if line.len() >= 11 {
+        let bytes = line.as_bytes();
+        let looks_like_date = bytes.get(4) == Some(&b'-')
+            && bytes.get(7) == Some(&b'-')
+            && line[0..10].chars().enumerate().all(|(i, c)| {
+                if i == 4 || i == 7 {
+                    c == '-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            });
+        if looks_like_date {
+            let date = &line[0..10];
+            let title = line[10..]
+                .trim()
+                .trim_start_matches(['-', '_', ' ', '　'])
+                .trim()
+                .to_string();
+            if !title.is_empty() {
+                return Some((date.to_string(), title));
+            }
         }
-    }) {
-        return None;
     }
-    let title = line[10..]
-        .trim()
+    // 没有日期前缀也没关系：**整行就是标题**，日期留空（"是文本即可"）
+    let title = line
         .trim_start_matches(['-', '_', ' ', '　'])
         .trim()
         .to_string();
     if title.is_empty() {
         None
     } else {
-        Some((date.to_string(), title))
+        Some((String::new(), title))
     }
 }
 
@@ -15061,6 +15083,10 @@ fn refresh_word_counts_impl(
             .map_err(|e| e.to_string())?
     };
     let mut updated = 0;
+    // 同一个文件只读一次（v1.2.82）：合集里好几篇共用一个文件，逐条算等于把同一个
+    // 大文件读 N 遍 —— 又慢，又会因为"每批 120 篇"的推进节奏不同，让同一个合集里
+    // 有的篇显示了字数、有的还没轮到。
+    let mut word_count_cache: HashMap<String, i64> = HashMap::new();
     for (id, preview_path, purchased_path) in rows {
         // 和 `populate_work_display_info` 同一套取路径的规矩：完整版优先，没有就看预览版
         let path = if purchased_path.trim().is_empty() {
@@ -15068,7 +15094,14 @@ fn refresh_word_counts_impl(
         } else {
             purchased_path
         };
-        let count = text_word_count(&path).unwrap_or(0) as i64;
+        let count = match word_count_cache.get(&path) {
+            Some(value) => *value,
+            None => {
+                let value = text_word_count(&path).unwrap_or(0) as i64;
+                word_count_cache.insert(path.clone(), value);
+                value
+            }
+        };
         conn.execute(
             "UPDATE works SET word_count=?1 WHERE id=?2",
             params![count, id],
