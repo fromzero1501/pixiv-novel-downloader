@@ -9874,6 +9874,79 @@ fn compress_series_orders(orders: &[i64]) -> String {
     parts.join(",")
 }
 
+/// 某篇作品**从合集里被领走**时的收尾（v1.2.78 用户要求）。
+///
+/// 调用时机：**任何**把 `purchased_path` 改走的地方，改之前调一次（那时旧路径还在库里）。
+/// 剩余作品 ≥ 2 篇 ⇒ 那是个合集，篇范围变了，**文件跟着改名**、剩余作品的路径一并更新；
+/// 剩不到 2 篇 ⇒ 不算合集，原样不动（单人文件改名只会越改越乱）。
+fn relink_bundle_after_removal(conn: &Connection, leaving_work_id: i64) -> Result<(), String> {
+    let old: String = conn
+        .query_row(
+            "SELECT purchased_path FROM works WHERE id=?1",
+            [leaving_work_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    let old = old.trim().to_string();
+    if old.is_empty() {
+        return Ok(());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT id, series_order, series_title FROM works
+             WHERE purchased_path=?1 AND id<>?2 ORDER BY series_order, id",
+        )
+        .map_err(|e| e.to_string())?;
+    let keep: Vec<(i64, i64, String)> = statement
+        .query_map(params![old, leaving_work_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect();
+    drop(statement);
+    if keep.len() < 2 {
+        return Ok(());
+    }
+    let series_title = keep[0].2.trim().to_string();
+    if series_title.is_empty() {
+        return Ok(());
+    }
+    let mut orders: Vec<i64> = keep.iter().map(|(_, order, _)| *order).filter(|order| *order > 0).collect();
+    orders.sort_unstable();
+    orders.dedup();
+    if orders.is_empty() {
+        return Ok(());
+    }
+    let source = Path::new(&old);
+    if !source.exists() {
+        // 文件本身不在了就别折腾记录了，交给"检查文件是否还在"去报
+        return Ok(());
+    }
+    let Some(parent) = source.parent() else {
+        return Ok(());
+    };
+    let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let folder = format!("{series_title}({})", compress_series_orders(&orders));
+    let target = unique_target_path(parent, &folder, extension);
+    if target == source {
+        return Ok(());
+    }
+    if target.exists() {
+        // 新名字那个文件已经存在 —— 不覆盖、不合并，保持原样（宁可名字不准，也不能动错文件）
+        return Ok(());
+    }
+    move_path(source, &target)?;
+    for (work_id, _, _) in &keep {
+        conn.execute(
+            "UPDATE works SET purchased_path=?1 WHERE id=?2",
+            params![target.to_string_lossy().to_string(), work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, String> {
     let conn = db()?;
@@ -9907,6 +9980,8 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, S
     if source != target {
         move_path(&source, &target)?;
     }
+    // 这篇原来要是在某个合集里，走之前先把合集收尾（改名 + 剩余作品的路径跟着改）
+    relink_bundle_after_removal(&conn, work_id)?;
     conn.execute(
         "UPDATE works SET purchased_path=?1 WHERE id=?2",
         params![target.to_string_lossy().to_string(), work_id],
@@ -10023,6 +10098,8 @@ fn distribute_file(
             fs::copy(file_path, path).map_err(|e| e.to_string())?;
             let _ = fs::remove_file(file_path);
         }
+        // 从合集里领走的话先收尾（v1.2.78）
+        relink_bundle_after_removal(conn, *work_id)?;
         conn.execute(
             "UPDATE works SET purchased_path=?1 WHERE id=?2",
             params![path.to_string_lossy().to_string(), work_id],
@@ -10051,6 +10128,8 @@ fn distribute_file(
     let _ = fs::remove_file(file_path);
 
     for (work_id, path, _) in &resolved {
+        // 从合集里领走的话先收尾（v1.2.78）
+        relink_bundle_after_removal(conn, *work_id)?;
         conn.execute(
             "UPDATE works SET purchased_path=?1 WHERE id=?2",
             params![path.to_string_lossy().to_string(), work_id],
