@@ -4439,8 +4439,10 @@ async function runAddStray(url) {
     else if (result.skipped) toast("本地已经有这一篇了", "info");
     else toast(result.failedNames?.[0] || "这一篇没能下下来", "error");
     await refreshAfterBookmarkDownload();
-    // 设置里开了「新建作者时同步其所有作品」→ 给刚建档的那位作者补一次整库同步
-    if ((state.settings || {}).syncWorksOnNewAuthor && result.authorId) await syncAuthorsAfterCreate([result.authorId]);
+    // ⚠️ 这里**不再**按「新建作者时同步其所有作品」补同步（v1.2.88 修）。
+    // 散篇建出来的是**散篇作者**，一补同步就是"整库作品全下进散篇" —— 用户 2026-10-13 报的就是这个：
+    // 他只想下贴进来的那一篇，转正与否他自己决定。
+    // 那个开关只管「从 Pixiv 收藏新增作者」和「手动新增作者」两条路。
   } catch (error) {
     toast(String(error), "error");
   } finally {
@@ -8623,7 +8625,7 @@ async function settingsModal() {
       <label>预览版文件夹默认目录 <div class="path-input"><input name="defaultPreviewDir" value="${escapeHtml(settings.defaultPreviewDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-preview">选择目录</button></div></label>
       <label>完整版文件夹默认目录 <div class="path-input"><input name="defaultPurchasedDir" value="${escapeHtml(settings.defaultPurchasedDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-purchased">选择目录</button></div></label>
       <label>完整版自动匹配文件夹 <div class="path-input"><input name="autoGroupDir" value="${escapeHtml(settings.autoGroupDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-auto-group-dir">选择目录</button></div><small>将此文件夹（含其子文件夹）中的文件自动移动到对应作者的完整版文件夹中。同一本书匹配到多个作品时会列入手动选择，勾选几个作品就复制几份。</small></label>
-      <label class="check-row"><input name="syncWorksOnNewAuthor" type="checkbox" ${settings.syncWorksOnNewAuthor ? "checked" : ""}><span>新建作者时同步其所有作品</span><small>手动新增作者、从 Pixiv 收藏新增作者、添加散篇时，只要这位作者有 Pixiv 主页，就自动把他的全部作品同步一遍（右下角有进度条，可随时终止）。</small></label>
+      <label class="check-row"><input name="syncWorksOnNewAuthor" type="checkbox" ${settings.syncWorksOnNewAuthor ? "checked" : ""}><span>新建作者时同步其所有作品</span><small>手动新增作者、从 Pixiv 收藏新增作者时，只要这位作者有 Pixiv 主页，就自动把他的全部作品同步一遍（右下角有进度条，可随时终止）。<br>「添加散篇」不受这一项影响 —— 散篇只下你贴的那一篇，要不要转正由你决定。</small></label>
       <label class="check-row"><input name="syncWorksOnStrayPromote" type="checkbox" ${settings.syncWorksOnStrayPromote ? "checked" : ""}><span>散篇转正时同步其所有作品</span><small>把散篇作者转成正式作者时，只要他有 Pixiv 主页，就自动把他的全部作品同步一遍。</small></label>
     </div>
   </section>
