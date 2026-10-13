@@ -255,7 +255,7 @@ struct AutoGroupResult {
 struct ManualGroupSelection {
     file_path: String,
     file_name: String,
-    /// 文件相对自动分组目录的子文件夹路径（顶层文件为空），用于区分不同子目录里的同名文件
+    /// 文件相对自动匹配目录的子文件夹路径（顶层文件为空），用于区分不同子目录里的同名文件
     sub_dir: String,
     candidates: Vec<GroupCandidate>,
     /// 文件名里认出来的作者名（没有就是空串）
@@ -944,7 +944,7 @@ fn db() -> Result<Connection, String> {
     // 标回未算让后台按新判据重算。要排在触发器 DDL 之后 —— 那个触发器盯着路径列，
     // 这里只写 word_count，不会互相踩。
     let _ = migrate_word_counts_for_non_text_files(&conn);
-    // 常见角色名表：用于「按角色匹配」的自动分组 / 关联完整版文件。
+    // 常见角色名表：用于「按角色匹配」的自动匹配 / 关联完整版文件。
     // game 只用来分组展示，不参与匹配；name 与 aliases（`|` 分隔）都会拿去匹配。
     let _ = conn.execute(
         // 「因为太小被跳过」的作品（v1.2.61）：不存作品本身，只记 id，
@@ -3897,7 +3897,7 @@ fn is_images_asset_dir(path: &Path) -> bool {
 /// **只在扫「预览版文件夹」时用**（`sync_preview_entries` 那几处）—— 那里出现的
 /// html/epub 一定是同步刚落下来的阅读版。
 ///
-/// **待归档文件夹（自动分组）不能用它**：用户放在那里的 epub / HTML 是手头正经的
+/// **待归档文件夹（自动匹配）不能用它**：用户放在那里的 epub / HTML 是手头正经的
 /// 完整版（能当作品文件的只有文本、电子书和 HTML，见 `is_image_like_asset`），
 /// 用这个判据会把它们整批滤掉。那边改用 `is_images_asset_dir`，见 `collect_files_recursively`。
 fn is_generated_asset(path: &Path) -> bool {
@@ -9561,7 +9561,7 @@ fn scan_purchased(author_id: i64, mode: String) -> Result<ScanPurchasedResult, S
         }
         // 认出了作者就只在这位作者的作品里找。注意 works 已经按当前作者筛过：
         // 书名里写的正是这位作者 → 照常匹配；写的是库里另一位作者 → 这个文件不属于
-        // 这里（要归到别人名下请用「完整版自动分组」），跳过并计数，不要拿作者 ID
+        // 这里（要归到别人名下请用「完整版自动匹配」），跳过并计数，不要拿作者 ID
         // 去和作品 ID 比大小，两者不是一套编号。
         if !scope_allows_path(detected.as_ref().and_then(|author| author.author_id), author_id) {
             other_author_count += 1;
@@ -9698,6 +9698,56 @@ fn scan_purchased(author_id: i64, mode: String) -> Result<ScanPurchasedResult, S
 /// · 这批作品的 `purchased_path` 全指向它：**路径相同就说明它们同属一个合集**
 ///   （不额外加字段，避免"标记说是一伙的、路径却是散的"这种烂账）；
 /// · 磁盘占用等统计按路径去重（见 `scan_work_files_impl`），**整本只算一次**。
+/// 递归找「文件名含某个词」的文件（v1.2.71）。跳过封面图 / 配图这类派生物。
+fn collect_series_candidates(dir: &Path, needle: &str, out: &mut Vec<String>, depth: usize) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_series_candidates(&path, needle, out, depth + 1);
+            continue;
+        }
+        if is_image_like_asset(&path) {
+            continue;
+        }
+        if file_stem(&path).to_lowercase().contains(needle) {
+            out.push(path.to_string_lossy().to_string());
+        }
+    }
+}
+
+/// 按**系列名**去「完整版自动匹配文件夹」里找候选文件（v1.2.71 用户要求）。
+///
+/// 匹配口径：文件名（不含扩展名）**包含**系列名 —— 两边都去空白、忽略大小写。
+/// 比如系列名 `A`，能匹配到 `A(1-5).txt`、`[作者] A 1-5.txt` 这类。
+/// 找不到不算错，返回空数组让前端提示；目录没配 / 不在了才报错（那是真没法找）。
+#[tauri::command]
+fn match_series_files(series_title: String) -> Result<Vec<String>, String> {
+    let conn = db()?;
+    let settings = read_settings(&conn)?;
+    let needle = series_title.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err("这个系列还没有名字 —— 先给系列起个名字再来匹配".into());
+    }
+    let root = settings.auto_group_dir.trim().to_string();
+    if root.is_empty() {
+        return Err("还没设置「完整版自动匹配文件夹」—— 先去设置的文件与目录里指定一个".into());
+    }
+    let root = PathBuf::from(root);
+    if !root.is_dir() {
+        return Err("「完整版自动匹配文件夹」不在了，去设置里重新选一个".into());
+    }
+    let mut found: Vec<String> = Vec::new();
+    collect_series_candidates(&root, &needle, &mut found, 0);
+    found.sort();
+    Ok(found)
+}
+
 #[tauri::command]
 fn bind_series_bundle(work_ids: Vec<i64>, path: String) -> Result<String, String> {
     let mut conn = db()?;
@@ -10021,7 +10071,7 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), S
     Ok(())
 }
 
-/// 「指定作者自动分组」里选「散篇」时前端传的作者 id。
+/// 「指定作者自动匹配」里选「散篇」时前端传的作者 id。
 /// 作者主键都是正数，撞不上（同 `collectionFilter` 用 -1 表示「任意收藏」的先例）。
 /// 它不是一个真实作者，只用来把参与匹配的作者收窄到 `stray=1` 的那批。
 const STRAY_SCOPE_AUTHOR_ID: i64 = -1;
@@ -10032,17 +10082,17 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
     let conn = db()?;
     let settings = read_settings(&conn)?;
 
-    // 1. 检查自动分组文件夹是否已设置
+    // 1. 检查自动匹配文件夹是否已设置
     if settings.auto_group_dir.is_empty() {
-        return Err("请先在设置中选择完整版自动分组文件夹".into());
+        return Err("请先在设置中选择完整版自动匹配文件夹".into());
     }
 
     let auto_group_dir = Path::new(&settings.auto_group_dir);
     if !auto_group_dir.exists() {
-        return Err("自动分组文件夹不存在".into());
+        return Err("自动匹配文件夹不存在".into());
     }
 
-    // 2. 递归读取自动分组文件夹下的所有文件（含子文件夹里的文件）
+    // 2. 递归读取自动匹配文件夹下的所有文件（含子文件夹里的文件）
     let mut files: Vec<PathBuf> = vec![];
     collect_files_recursively(auto_group_dir, &mut files)?;
     // 封面图、配图文件夹不是作品文件，别拿去匹配（否则会被当成作品搬进完整版目录）
@@ -15230,6 +15280,7 @@ pub fn run() {
             scan_purchased,
             bind_work_moving_to_purchased,
             bind_series_bundle,
+            match_series_files,
             auto_group_purchased_files,
             confirm_manual_group,
             copy_previews_to_purchased,
@@ -15853,7 +15904,7 @@ mod tests {
     fn distributing_one_file_to_many_works_keeps_a_copy_for_each() {
         let root = std::env::temp_dir().join(format!("distribute-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let source = root.join("自动分组");
+        let source = root.join("自动匹配");
         let dir_a = root.join("作者A");
         let dir_b = root.join("作者B");
         fs::create_dir_all(&source).unwrap();
@@ -15905,7 +15956,7 @@ mod tests {
     fn existing_target_file_follows_the_chosen_conflict_action() {
         let root = std::env::temp_dir().join(format!("conflict-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let source = root.join("自动分组");
+        let source = root.join("自动匹配");
         let dir = root.join("作者A");
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&dir).unwrap();
@@ -16836,7 +16887,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// v1.2.19 修的就是这条：自动分组原先复用「扫预览目录」的判据，
+    /// v1.2.19 修的就是这条：自动匹配原先复用「扫预览目录」的判据，
     /// 把 HTML / EPUB 也当同步附属产物一起滤掉 —— 用户丢进待归档文件夹的电子书
     /// 永远不会被分组，而且一声不吭（目录里还有 txt 时连提示都没有）。
     /// 现在只整棵跳过 `{标题}_images` 配图文件夹，其余一律收。
@@ -16858,9 +16909,9 @@ mod tests {
         collect_files_recursively(&root, &mut files).unwrap();
         let names: Vec<String> = files.iter().map(|path| file_name(path)).collect();
 
-        // 电子书与 HTML 必须参与自动分组（本次修复的重点）
-        assert!(names.contains(&"希儿.epub".to_string()), "epub 要参与自动分组");
-        assert!(names.contains(&"希儿.html".to_string()), "html 要参与自动分组");
+        // 电子书与 HTML 必须参与自动匹配（本次修复的重点）
+        assert!(names.contains(&"希儿.epub".to_string()), "epub 要参与自动匹配");
+        assert!(names.contains(&"希儿.html".to_string()), "html 要参与自动匹配");
         assert!(
             names.contains(&"另一本.epub".to_string()),
             "子文件夹里的 epub 也要收"
@@ -16876,7 +16927,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 判据分工：`is_images_asset_dir` 只认配图文件夹（自动分组用），
+    /// 判据分工：`is_images_asset_dir` 只认配图文件夹（自动匹配用），
     /// `is_generated_asset` 才顺带认阅读版文件（只该用在预览目录那三处）。
     #[test]
     fn only_the_preview_scan_treats_reading_formats_as_generated_assets() {

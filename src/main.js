@@ -1061,6 +1061,7 @@ async function invoke(command, args = {}) {
   if (command === "clear_skipped_novels") return 0;
   if (command === "bind_series_bundle") return args.path;
   if (command === "list_bundles") return [];
+  if (command === "match_series_files") return [];
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
@@ -2184,8 +2185,8 @@ function renderAuthors() {
     <section class="topbar">
       <div><p class="section-kicker">私人作品档案</p><h1>作者库</h1></div>
       <div class="topbar-actions">
-        <button class="icon-text-button" data-action="auto-group">${icon("upload", 18)}<span>完整版自动分组</span></button>
-        <button class="icon-text-button" data-action="auto-group-by-author">${icon("folder", 18)}<span>指定作者自动分组</span></button>
+        <button class="icon-text-button" data-action="auto-group">${icon("upload", 18)}<span>完整版自动匹配</span></button>
+        <button class="icon-text-button" data-action="auto-group-by-author">${icon("folder", 18)}<span>指定作者自动匹配</span></button>
         <button class="icon-text-button" data-action="sync-all-authors">${icon("sync", 18)}<span>同步所有作者</span></button>
         <button class="icon-text-button" data-action="import-bookmark-authors">${icon("heart", 18)}<span>从pixiv收藏新增作者</span></button>
         <button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button>
@@ -2301,8 +2302,8 @@ function serialFilterButton(works) {
 /**
  * 封面上的角色名。
  *
- * 匹配口径和「扫描完整版 / 自动分组」那套按角色**不一样**：那边只扫标题，这里还要多扫标签，
- * 两套各自独立 —— 自动分组那套一个字都没动。
+ * 匹配口径和「扫描完整版 / 自动匹配」那套按角色**不一样**：那边只扫标题，这里还要多扫标签，
+ * 两套各自独立 —— 自动匹配那套一个字都没动。
  * 角色表来自 `state.characterIndex`（启动时建一次、角色增删改后重建），所以匹配是同步的。
  *
  * **长名优先**：索引本来就按长名排前（见 `buildCharacterIndex`），所以某条命中名一旦
@@ -4976,6 +4977,7 @@ function renderSeriesView() {
           <span class="series-progress" title="系列里读过的篇数（已读 + 在读都算）">读过 ${readCount} / ${total}</span>
           ${gaps.length ? `<span class="series-gap" title="按序号算出来缺的篇目：第 ${gaps.join("、")} 篇">${icon("info", 15)}<span>${seriesGapLabel(gaps)}</span></span>` : ""}
           <button class="icon-text-button" data-action="export-series-epub" data-series-id="${escapeHtml(state.seriesView.id)}" data-series-title="${escapeHtml(state.seriesView.title)}" title="把这个系列里的作品打成一整本 EPUB">${icon("download", 18)}<span>合成一本 EPUB</span></button>
+          <button class="icon-text-button" data-action="match-series-bundle" title="按系列名去「完整版自动匹配文件夹」里找文件，找到后弹窗勾选这个文件里含哪几篇">${icon("sync", 18)}<span>合集自动匹配</span></button>
           <button class="icon-text-button bind-drop-zone" id="bundle-drop-zone" data-action="bind-series-bundle" title="有些文件是整个系列合成一本的：从资源管理器把文件拖到这里（或者点一下选文件），再把本系列的作品勾进这个合集 —— 文件会搬进完整版目录、按「系列名(篇范围)」命名">${icon("archive", 18)}<span>拖动绑定合集文件</span></button>
           <button class="primary-button" data-action="series-continue" title="${nextUnread ? `接着打开：${escapeHtml(nextUnread.title)}` : "这个系列都读过了"}" ${nextUnread ? "" : "disabled"}>${icon("arrow", 18)}<span>${readCount ? "继续读" : "从头读"}</span></button>
         </div>
@@ -5084,6 +5086,49 @@ async function setCardRating(workId, value) {
  * 字数这块：搬家后会被标成待补算，后台补算时这几篇读的是**同一个文件**，所以每篇
  * 显示的都是**整本的字数**（用户 2026-10-13 明确要的口径）；磁盘占用则按路径去重。
  */
+/**
+ * 「合集自动匹配」（v1.2.71 用户要求）：按**系列名**去「完整版自动匹配文件夹」里找文件。
+ *
+ * 找一个就直接进「勾选篇数」那一步；找到多个先让你挑一个；一个都没找到就提示一句。
+ */
+async function matchSeriesBundle() {
+  const view = state.seriesView;
+  if (!view) {
+    toast("先进入某个系列的详情页", "info");
+    return;
+  }
+  let files = [];
+  try {
+    files = await invoke("match_series_files", { seriesTitle: view.title });
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  if (!files.length) {
+    toast(`「完整版自动匹配文件夹」里没找到文件名含「${view.title}」的文件`, "info");
+    return;
+  }
+  if (files.length === 1) {
+    await startSeriesBundle(files[0]);
+    return;
+  }
+  const rows = files.map((path) => {
+    const name = String(path).split(/[\\/]/).pop();
+    return `<label class="bundle-row"><input type="radio" name="series-file" value="${escapeHtml(path)}"${files.indexOf(path) === 0 ? " checked" : ""}><span class="bundle-title" title="${escapeHtml(path)}">${escapeHtml(name)}</span></label>`;
+  }).join("");
+  showModal(modal("选一个文件",
+    `<div class="bundle-list">${rows}</div>`,
+    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="pick-series-file" data-path="${escapeHtml(files[0])}">下一步</button>`,
+    "is-wide"));
+  // 「下一步」要带上真正选中的那个文件，radio 变了就更新按钮上的 path
+  document.querySelectorAll('input[name="series-file"]').forEach((box) => {
+    box.addEventListener("change", () => {
+      const button = document.querySelector('[data-action="pick-series-file"]');
+      if (button) button.dataset.path = box.value;
+    });
+  });
+}
+
 async function bindSeriesBundle() {
   const view = state.seriesView;
   const works = state.seriesItems || [];
@@ -5928,6 +5973,8 @@ async function bindEvents() {
       if (action === "toggle-read") await toggleWorkRead(Number(element.dataset.workId));
       // 合集 EPUB
       if (action === "card-rate") await setCardRating(Number(element.dataset.workId), Number(element.dataset.rating));
+      if (action === "match-series-bundle") await matchSeriesBundle();
+      if (action === "pick-series-file") await startSeriesBundle(element.dataset.path);
       if (action === "bind-series-bundle") await bindSeriesBundle();
       if (action === "confirm-series-bundle") await confirmSeriesBundle();
       if (action === "bundle-select-all") toggleBundleSelection(true);
@@ -6253,7 +6300,7 @@ async function bindEvents() {
       if (action === "pick-default-preview") await pickPath("defaultPreviewDir", true);
       if (action === "pick-default-purchased") await pickPath("defaultPurchasedDir", true);
       if (action === "pick-auto-group-dir") await pickPath("autoGroupDir", true);
-      if (action === "auto-group") pickMatchMode({ action: "auto-group", authorId: null, authorName: "" }, "完整版自动分组", "先选择用哪种方式把文件匹配到作品上，然后再开始分组。");
+      if (action === "auto-group") pickMatchMode({ action: "auto-group", authorId: null, authorName: "" }, "完整版自动匹配", "先选择用哪种方式把文件匹配到作品上，然后再开始匹配。");
       if (action === "auto-group-by-author") autoGroupAuthorPicker();
       if (action === "add-search-site") addSearchSiteRow();
       if (action === "remove-search-site") {
@@ -6718,7 +6765,7 @@ async function scanPurchased(mode = "title") {
   fillWordCountsInBackground(true); // 刚绑上的文件是新的，字数要当场补上
 }
 
-// 自动分组：authorId 为空＝全库匹配；传入作者 id 时只在这位作者的作品里匹配
+// 自动匹配：authorId 为空＝全库匹配；传入作者 id 时只在这位作者的作品里匹配
 async function autoGroupPurchasedFiles(authorId = null, authorName = "", mode = "title") {
   const scope = authorId ? `「${authorName}」的作品` : "全部作者的作品";
   const byCharacter = mode === "character";
@@ -6745,11 +6792,11 @@ async function autoGroupPurchasedFiles(authorId = null, authorName = "", mode = 
     render();
     fillWordCountsInBackground(true); // 自动移动/绑定后文件路径变了，字数要当场补上
   } catch (error) {
-    toast(`自动分组失败: ${error}`, "error");
+    toast(`自动匹配失败: ${error}`, "error");
   }
 }
 
-// 指定作者自动分组：先选作者，再只在这位作者的作品里匹配文件名
+// 指定作者自动匹配：先选作者，再只在这位作者的作品里匹配文件名
 function autoGroupAuthorPicker() {
   if (!state.authors.length) { toast("还没有作者，请先新增作者", "info"); return; }
   // 「散篇」放最上面（v1.2.41 用户要求）：选中后只在散篇的作品里匹配。
@@ -6764,11 +6811,11 @@ function autoGroupAuthorPicker() {
     return `<option value="${author.id}" ${usable ? "" : "disabled"}>${escapeHtml(author.name)}（${author.workCount} 个作品${usable ? "" : " · 未绑定完整版文件夹"}）</option>`;
   }).join("");
   const usableCount = state.authors.filter((author) => author.purchasedDir).length;
-  showModal(modal("指定作者自动分组",
+  showModal(modal("指定作者自动匹配",
     `<p class="match-note">只在选中的这位作者的作品里做文件名匹配，其他作者的作品一律不参与。适合"某位作者的书正好混在一起、想单独归档"的情况。</p>
      <label class="match-row"><span>搜索作者</span><input id="auto-group-author-search" type="search" placeholder="打几个字过滤，名字里含这几个字才留下" autocomplete="off"></label>
      <label class="match-row"><span>选择作者</span><select id="auto-group-author">${options}</select></label>
-     <p class="read-only-note">共 ${usableCount} 位作者已绑定完整版文件夹、可参与分组；未绑定的作者在列表里是灰的。分组范围仍是设置里的「完整版自动分组文件夹」。</p>`,
+     <p class="read-only-note">共 ${usableCount} 位作者已绑定完整版文件夹、可参与匹配；未绑定的作者在列表里是灰的。匹配范围仍是设置里的「完整版自动匹配文件夹」。</p>`,
     `<button class="quiet-button" data-action="close-modal">取消</button>
      <button class="primary-button" data-action="confirm-auto-group-author" ${usableCount ? "" : "disabled"}>开始分组</button>`
   ));
@@ -6797,7 +6844,7 @@ async function confirmAutoGroupAuthor() {
   const authorName = authorId === -1 ? "散篇" : state.authors.find((item) => item.id === authorId)?.name;
   if (!authorName) { toast("请选择要分组的作者", "info"); return; }
   closeModal();
-  pickMatchMode({ action: "auto-group", authorId, authorName }, "指定作者自动分组", `先选择用哪种方式在「${escapeHtml(authorName)}」的作品里匹配，然后再开始分组。`);
+  pickMatchMode({ action: "auto-group", authorId, authorName }, "指定作者自动匹配", `先选择用哪种方式在「${escapeHtml(authorName)}」的作品里匹配，然后再开始匹配。`);
 }
 
 function toggleBulkMode() {
@@ -7718,7 +7765,7 @@ function characterTagsHtml(names) {
 /**
  * 「作者不在作者库里」那一块。
  *
- * `withCandidates`（v1.2.41）：走**自动分组**那条路时，这些文件已经按全库列出了候选，
+ * `withCandidates`（v1.2.41）：走**自动匹配**那条路时，这些文件已经按全库列出了候选，
  * 用户要能自己勾（作者名可能只是别名没录进去），所以说明写成"去下面勾"；
  * 而扫单个作者目录那条路上它们确实只做展示，照旧。
  */
@@ -7744,7 +7791,7 @@ function unknownAuthorSection(groups, withCandidates = false) {
 }
 
 function showPurchasedSelections(selections, unknownGroups = [], mode = "title") {
-  // 结构与「自动分组」的选择弹窗对齐：宽弹窗 + 文件名超长时省略号（不再把弹窗撑宽）
+  // 结构与「自动匹配」的选择弹窗对齐：宽弹窗 + 文件名超长时省略号（不再把弹窗撑宽）
   const byCharacter = mode === "character";
   const rows = selections.map((selection) => {
     const fileName = selection.path.split(/[\\/]/).pop();
@@ -7779,8 +7826,8 @@ function showManualGroupSelections(selections, unknownGroups = [], mode = "title
     const recommendedCount = selection.candidates.filter((candidate) => candidate.recommended).length;
     const conflictCount = selection.candidates.filter((candidate) => candidate.conflict).length;
     const options = selection.candidates.map((candidate) => {
-      // 只有「指定作者自动分组」那条路（preselect=true）、且只有一个达标候选时才默认勾选；
-      // 全库自动分组一律不预勾 —— 相似度只是个参考，勾错一下文件就挪到别的作品里了
+      // 只有「指定作者自动匹配」那条路（preselect=true）、且只有一个达标候选时才默认勾选；
+      // 全库自动匹配一律不预勾 —— 相似度只是个参考，勾错一下文件就挪到别的作品里了
       const checked = preselect && recommendedCount === 1 && candidate.recommended ? "checked" : "";
       const conflictTag = candidate.conflict ? '<span class="group-conflict">已有同名文件</span>' : "";
       const charTags = characterTagsHtml(candidate.matchedCharacters);
@@ -8467,7 +8514,7 @@ async function settingsModal() {
       <label>最小文件大小 <div class="size-input"><input name="minimumFileSize" type="number" min="0" step="0.1" value="${minimumSize.value}"><select name="minimumFileSizeUnit" aria-label="最小文件大小单位">${["KB", "MB", "GB"].map((unit) => `<option value="${unit}" ${minimumSize.unit === unit ? "selected" : ""}>${unit}</option>`).join("")}</select></div><small>导入文件夹和 Pixiv 同步时，会跳过小于此大小的文本内容；文件夹不受此限制。</small></label>
       <label>预览版文件夹默认目录 <div class="path-input"><input name="defaultPreviewDir" value="${escapeHtml(settings.defaultPreviewDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-preview">选择目录</button></div></label>
       <label>完整版文件夹默认目录 <div class="path-input"><input name="defaultPurchasedDir" value="${escapeHtml(settings.defaultPurchasedDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-purchased">选择目录</button></div></label>
-      <label>完整版自动分组文件夹 <div class="path-input"><input name="autoGroupDir" value="${escapeHtml(settings.autoGroupDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-auto-group-dir">选择目录</button></div><small>将此文件夹（含其子文件夹）中的文件自动移动到对应作者的完整版文件夹中。同一本书匹配到多个作品时会列入手动选择，勾选几个作品就复制几份。</small></label>
+      <label>完整版自动匹配文件夹 <div class="path-input"><input name="autoGroupDir" value="${escapeHtml(settings.autoGroupDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-auto-group-dir">选择目录</button></div><small>将此文件夹（含其子文件夹）中的文件自动移动到对应作者的完整版文件夹中。同一本书匹配到多个作品时会列入手动选择，勾选几个作品就复制几份。</small></label>
       <label class="check-row"><input name="syncWorksOnNewAuthor" type="checkbox" ${settings.syncWorksOnNewAuthor ? "checked" : ""}><span>新建作者时同步其所有作品</span><small>手动新增作者、从 Pixiv 收藏新增作者、添加散篇时，只要这位作者有 Pixiv 主页，就自动把他的全部作品同步一遍（右下角有进度条，可随时终止）。</small></label>
       <label class="check-row"><input name="syncWorksOnStrayPromote" type="checkbox" ${settings.syncWorksOnStrayPromote ? "checked" : ""}><span>散篇转正时同步其所有作品</span><small>把散篇作者转成正式作者时，只要他有 Pixiv 主页，就自动把他的全部作品同步一遍。</small></label>
     </div>

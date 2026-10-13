@@ -204,8 +204,8 @@ body.is-bulk button { cursor: pointer; }
 .bind-drop-zone svg { flex: 0 0 auto; }
 .bind-drop-zone.is-drop-active { color: #1259ae; background: #e2f0ff; border-style: solid; border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; }
 /* 系列作品页的搜索栏（v1.2.70）：只搜系列名，靠在 topbar 右侧 */
-.series-search-box { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; padding: 5px 10px; color: #6d8bab; background: #f7fbff; border: 1px solid #dbe8f4; border-radius: 7px; }
-.series-search-box input { width: 170px; padding: 0; background: none; border: 0; outline: none; color: #344f6b; font-size: 13px; }
+.series-search-box { display: inline-flex; align-items: center; gap: 8px; margin: 0 auto; padding: 8px 14px; color: #6d8bab; background: #f7fbff; border: 1px solid #dbe8f4; border-radius: 8px; }
+.series-search-box input { width: 280px; padding: 0; background: none; border: 0; outline: none; color: #344f6b; font-size: 15px; }
 .series-search-box svg { flex: 0 0 auto; }
 /* 合集勾选窗（v1.2.69）：工具栏 + **每行一个作品** */
 .bundle-toolbar { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
