@@ -376,6 +376,7 @@ const mockSearchText = (work, field) => {
   const synopsis = work.synopsis || "";
   const tags = work.tags || "";
   if (field === "tags") return tags;
+  if (field === "series") return work.seriesTitle || "";
   if (field === "title_synopsis") return `${title} ${synopsis}`;
   if (field === "title_synopsis_tags") return `${title} ${synopsis} ${tags}`;
   return title;
@@ -2489,13 +2490,14 @@ function filterPanelRowMulti(label, items, activeList, action, attribute) {
  * 想按设定/情节找作品的时候比只搜标题有用得多。
  */
 function searchFieldSelect(current) {
-  const options = [["title", "标题"], ["title_synopsis", "标题 + 简介"], ["title_synopsis_tags", "标题 + 简介 + 标签"], ["tags", "标签"], ["body", "正文内容"]];
+  const options = [["title", "标题"], ["title_synopsis", "标题 + 简介"], ["title_synopsis_tags", "标题 + 简介 + 标签"], ["series", "系列"], ["tags", "标签"], ["body", "正文内容"]];
   return `<select class="sort-select search-mode-select" id="search-field" aria-label="搜索范围">${options.map(([value, label]) => `<option value="${value}" ${current === value ? "selected" : ""}>${label}</option>`).join("")}</select>`;
 }
 
 /** 搜索框的提示语跟着搜索范围走 */
 function searchPlaceholder() {
   if (state.searchField === "tags") return "搜索标签";
+  if (state.searchField === "series") return "搜索系列名";
   if (state.searchField === "title_synopsis") return "搜索标题或简介";
   if (state.searchField === "title_synopsis_tags") return "搜索标题、简介或标签";
   // 正文这一档要扫盘，不能边打边搜 —— 提示里说清楚要按回车
@@ -3104,7 +3106,7 @@ function renderWorks() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy">${workCardStars(work)}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}${workBundleBadge(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workBundleBadge(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
 
   return renderShell(`
@@ -3143,7 +3145,7 @@ function renderAllWorks() {
         ${workCharacterNames(work)}
         ${workReadToggle(work)}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}${workCardStars(work)}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}${workBundleBadge(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workBundleBadge(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`).join("");
   const remaining = filtered.length - shown.length;
   const footer = filtered.length
@@ -4243,7 +4245,7 @@ function renderStray() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="stray-promote-button" data-action="promote-stray-work" data-work-id="${work.id}" data-author-id="${work.authorId}" title="把「${escapeHtml(work.authorName || "这位作者")}」转成正式作者">${icon("star", 14)}<span>散篇转正</span></button>${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}${workCardStars(work)}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}${workBundleBadge(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workBundleBadge(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`).join("");
   const empty = state.straySummary.workCount
     ? '<div class="empty-state works-empty"><h2>没有匹配的作品</h2></div>'
@@ -5017,7 +5019,8 @@ function workCardStars(work) {
   const stars = [1, 2, 3, 4, 5]
     .map((value) => `<button class="card-star ${value <= rating ? "is-on" : ""}" title="给 ${value} 星" data-action="card-rate" data-work-id="${work.id}" data-rating="${value}">${icon(value <= rating ? "starFilled" : "star", 14)}</button>`)
     .join("");
-  return `<div class="work-card-stars" title="${rating ? `当前 ${rating} 星` : "还没评分，点星星打分（打分会自动标已读）"}">${stars}</div>`;
+  // 「已读」按钮跟着评分走（v1.2.69 用户要求：放在评分右边）
+  return `<div class="work-card-stars" title="${rating ? `当前 ${rating} 星` : "还没评分，点星星打分（打分会自动标已读）"}">${stars}${workReadDot(work)}</div>`;
 }
 
 /** 点卡片上的星星改评分（v1.2.68）。点当前星级 = 清除（跟详情里的规矩一致）。 */
@@ -5078,10 +5081,28 @@ async function startSeriesBundle(path) {
     return `<label class="bundle-row"><input type="checkbox" name="bundle-work" value="${work.id}" checked><span class="bundle-order">${order}</span><span class="bundle-title">${escapeHtml(work.title)}</span></label>`;
   }).join("");
   showModal(modal("绑定为合集",
-    `<p class="match-note">选中的作品会<strong>都指向这一个文件</strong>：文件搬进这位作者的完整版目录，按「<strong>系列名(篇范围)</strong>」命名 —— 例如 <code>${escapeHtml(view.title)}(1-5)</code>；序号断开会写成 <code>${escapeHtml(view.title)}(1-3,6-9)</code>。<br>序号是 0（还没排进系列）的篇不能参与，先把它们的序号排好。</p>
+    `<div class="bundle-toolbar"><button class="quiet-button" data-action="bundle-select-all">全选</button><button class="quiet-button" data-action="bundle-select-none">全不选</button><span class="bundle-count" id="bundle-count">已选 ${works.length} 篇</span></div>
      <div class="bundle-list">${rows}</div>`,
     `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="confirm-series-bundle">确认绑定</button>`,
     "is-wide"));
+  // 勾选变化时更新「已选 N 篇」（v1.2.69）
+  document.querySelectorAll('input[name="bundle-work"]').forEach((box) => box.addEventListener("change", refreshBundleCount));
+  refreshBundleCount();
+}
+
+/** 合集弹窗里的全选 / 全不选（v1.2.69），顺带更新计数 */
+function toggleBundleSelection(checked) {
+  const boxes = [...document.querySelectorAll('input[name="bundle-work"]')];
+  boxes.forEach((box) => { box.checked = checked; });
+  const count = document.getElementById("bundle-count");
+  if (count) count.textContent = `已选 ${checked ? boxes.length : 0} 篇`;
+}
+
+/** 勾选变化时更新计数（弹窗里挂在 change 上） */
+function refreshBundleCount() {
+  const boxes = [...document.querySelectorAll('input[name="bundle-work"]')];
+  const count = document.getElementById("bundle-count");
+  if (count) count.textContent = `已选 ${boxes.filter((box) => box.checked).length} 篇`;
 }
 
 async function confirmSeriesBundle() {
@@ -5101,6 +5122,8 @@ async function confirmSeriesBundle() {
     const target = await invoke("bind_series_bundle", { workIds: ids, path });
     state.pendingBundlePath = "";
     closeModal();
+    // 重拉合集索引（v1.2.69 修）：不然刚绑完的这几篇身上看不到「合集」徽标
+    await loadBundleIndex();
     await refreshVisibleList();
     await openSeriesDetail(state.seriesView.id, state.seriesView.title, state.seriesView.returnTo);
     render();
@@ -5875,6 +5898,8 @@ async function bindEvents() {
       if (action === "card-rate") await setCardRating(Number(element.dataset.workId), Number(element.dataset.rating));
       if (action === "bind-series-bundle") await bindSeriesBundle();
       if (action === "confirm-series-bundle") await confirmSeriesBundle();
+      if (action === "bundle-select-all") toggleBundleSelection(true);
+      if (action === "bundle-select-none") toggleBundleSelection(false);
       if (action === "export-series-epub") {
         await exportAnthology(`series:${element.dataset.seriesId}`, element.dataset.seriesTitle || "系列合集");
       }

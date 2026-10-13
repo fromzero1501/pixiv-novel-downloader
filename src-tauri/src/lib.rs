@@ -2714,6 +2714,8 @@ fn search_match_clause(
     let title = format!("{prefix}title");
     let body = match search_field {
         "tags" => format!("{prefix}tags LIKE {like_param}"),
+        // 系列（v1.2.69 用户要求）：只比系列名，方便"这个系列我还有哪几篇"这种找法
+        "series" => "(w.series_title IS NOT NULL AND w.series_title <> '' AND w.series_title LIKE ?2)".to_string(),
         "title_synopsis" => format!(
             "(COALESCE({title},'') || ' ' || COALESCE({prefix}synopsis,'')) LIKE {like_param}"
         ),
