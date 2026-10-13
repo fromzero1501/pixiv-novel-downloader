@@ -179,6 +179,8 @@ const state = {
   missingAuthorIds: new Set(),
   /** 「绑定为合集」时暂存的待绑定文件路径（v1.2.67） */
   pendingBundlePath: "",
+  /** 合集索引（v1.2.68）：`workId -> 同属一个文件的其它作品`，用来挂「合集」徽标 */
+  bundleIndex: new Map(),
   /**
    * 阅读状态筛选（v1.2.0）：`all` / `unread`（未读） / `reading`（在读，＝「继续读」清单）。
    * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
@@ -1055,6 +1057,7 @@ async function invoke(command, args = {}) {
   if (command === "relocate_author_works") return { moved: 0, missing: 0 };
   if (command === "clear_skipped_novels") return 0;
   if (command === "bind_series_bundle") return args.path;
+  if (command === "list_bundles") return [];
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
@@ -1283,6 +1286,8 @@ async function refreshAuthors() {
   state.authors = await invoke("list_authors");
   // 「主页打不开」的作者 id：单独一条轻量命令，免得塞进 AuthorSummary 连累那两处查询的取列顺序
   state.missingAuthorIds = new Set(await invoke("list_missing_author_ids"));
+  // 合集索引（v1.2.68）：跟作者一起刷新，同步/绑定之后自然会跟上
+  await loadBundleIndex();
 }
 
 /**
@@ -3099,7 +3104,7 @@ function renderWorks() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${workCardStars(work)}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}${workBundleBadge(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
 
   return renderShell(`
@@ -3138,7 +3143,7 @@ function renderAllWorks() {
         ${workCharacterNames(work)}
         ${workReadToggle(work)}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}${workCardStars(work)}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}${workBundleBadge(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`).join("");
   const remaining = filtered.length - shown.length;
   const footer = filtered.length
@@ -3547,11 +3552,12 @@ function dropZoneAt(position) {
   const x = Number(position.x ?? 0) / ratio;
   const y = Number(position.y ?? 0) / ratio;
   const hit = document.elementFromPoint(x, y);
-  return hit && hit.closest ? hit.closest("#bind-drop-zone") : null;
+  // 详情里的「拖动到此绑定完整版」和系列页的「拖动绑定合集文件」都是拖放区（v1.2.68）
+  return hit && hit.closest ? hit.closest("#bind-drop-zone, #bundle-drop-zone") : null;
 }
 
 function highlightDropZone(zone) {
-  document.querySelectorAll("#bind-drop-zone").forEach((el) => {
+  document.querySelectorAll("#bind-drop-zone, #bundle-drop-zone").forEach((el) => {
     el.classList.toggle("is-drop-active", el === zone);
   });
 }
@@ -3561,8 +3567,6 @@ async function handleDropToBind(payload) {
   highlightDropZone(null);
   // 拖到别处松手 = 什么都不做（照样清掉高亮）
   if (!zone) return;
-  const workId = Number(state.workDetailId) || 0;
-  if (!workId) return;
   const paths = Array.isArray(payload?.paths) ? payload.paths : [];
   if (!paths.length) return;
   if (paths.length > 1) toast("一次只能绑一个文件，这次只用了第一个", "info");
@@ -3573,6 +3577,13 @@ async function handleDropToBind(payload) {
     toast("请拖文件，不是文件夹", "error");
     return;
   }
+  // 拖到系列页那块 ⇒ 走合集流程（v1.2.68）
+  if (zone.id === "bundle-drop-zone") {
+    await startSeriesBundle(path);
+    return;
+  }
+  const workId = Number(state.workDetailId) || 0;
+  if (!workId) return;
   captureDetailNote();
   let movedPath = "";
   try {
@@ -4232,7 +4243,7 @@ function renderStray() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="stray-promote-button" data-action="promote-stray-work" data-work-id="${work.id}" data-author-id="${work.authorId}" title="把「${escapeHtml(work.authorName || "这位作者")}」转成正式作者">${icon("star", 14)}<span>散篇转正</span></button>${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}${workCardStars(work)}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}${workBundleBadge(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`).join("");
   const empty = state.straySummary.workCount
     ? '<div class="empty-state works-empty"><h2>没有匹配的作品</h2></div>'
@@ -4938,7 +4949,7 @@ function renderSeriesView() {
           <span class="series-progress" title="系列里读过的篇数（已读 + 在读都算）">读过 ${readCount} / ${total}</span>
           ${gaps.length ? `<span class="series-gap" title="按序号算出来缺的篇目：第 ${gaps.join("、")} 篇">${icon("info", 15)}<span>${seriesGapLabel(gaps)}</span></span>` : ""}
           <button class="icon-text-button" data-action="export-series-epub" data-series-id="${escapeHtml(state.seriesView.id)}" data-series-title="${escapeHtml(state.seriesView.title)}" title="把这个系列里的作品打成一整本 EPUB">${icon("download", 18)}<span>合成一本 EPUB</span></button>
-          <button class="icon-text-button" data-action="bind-series-bundle" title="有些文件是整个系列合成一本的：把选中的作品都指向同一个文件（文件会搬进完整版目录、按「系列名(篇范围)」命名）">${icon("archive", 18)}<span>绑定为合集</span></button>
+          <button class="icon-text-button bind-drop-zone" id="bundle-drop-zone" data-action="bind-series-bundle" title="有些文件是整个系列合成一本的：从资源管理器把文件拖到这里（或者点一下选文件），再把本系列的作品勾进这个合集 —— 文件会搬进完整版目录、按「系列名(篇范围)」命名">${icon("archive", 18)}<span>拖动绑定合集文件</span></button>
           <button class="primary-button" data-action="series-continue" title="${nextUnread ? `接着打开：${escapeHtml(nextUnread.title)}` : "这个系列都读过了"}" ${nextUnread ? "" : "disabled"}>${icon("arrow", 18)}<span>${readCount ? "继续读" : "从头读"}</span></button>
         </div>
       </section>
@@ -4948,6 +4959,86 @@ function renderSeriesView() {
   return renderShell(`
     <section class="topbar work-topbar"><div class="crumb-heading"><button class="back-button" title="返回作品库" data-action="close-series-view">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库</p><h1>系列作品</h1></div></div></section>
     <section class="library-content"><div class="series-grid">${cards || '<div class="empty-state works-empty"><div class="empty-icon">' + icon("series", 26) + '</div><h2>还没有系列作品</h2><p>同步到的系列作品会显示在这里。</p></div>'}</div></section>`);
+}
+
+/**
+ * 拉一份「合集」索引（v1.2.68）：**两篇以上共用同一个完整版文件**的分组。
+ * 判据就是路径相同（绑定时写下的），前端据此挂徽标、算篇范围。
+ */
+async function loadBundleIndex() {
+  const index = new Map();
+  try {
+    const groups = await invoke("list_bundles");
+    for (const group of groups || []) {
+      const members = group.members || [];
+      const orders = members.map((item) => Number(item.seriesOrder) || 0).filter((value) => value > 0);
+      const label = orders.length ? `含${members[0].seriesTitle || "本系列"}第 ${compressOrdersForLabel(orders)} 篇` : `含 ${members.length} 篇`;
+      for (const member of members) {
+        index.set(Number(member.workId), { count: members.length, label });
+      }
+    }
+  } catch (error) {
+    // 拉不到就不挂徽标，不影响别的
+  }
+  state.bundleIndex = index;
+}
+
+/** 把系列序号压成范围写法（跟后端 compress_series_orders 一个规矩）：连续 a-b、断开用逗号 */
+function compressOrdersForLabel(orders) {
+  const list = [...new Set(orders)].sort((left, right) => left - right);
+  const parts = [];
+  let index = 0;
+  while (index < list.length) {
+    const start = list[index];
+    let end = start;
+    while (index + 1 < list.length && list[index + 1] === end + 1) {
+      index += 1;
+      end = list[index];
+    }
+    parts.push(start === end ? `${start}` : `${start}-${end}`);
+    index += 1;
+  }
+  return parts.join(",");
+}
+
+/** 卡片上的「合集」徽标（v1.2.68）：鼠标悬停说清这个文件含哪几篇 */
+function workBundleBadge(work) {
+  const info = state.bundleIndex.get(Number(work.id));
+  if (!info) return "";
+  return `<span class="work-bundle-badge" title="${escapeHtml(info.label)}（这个文件里装着 ${info.count} 篇作品）">${icon("archive", 12)}<span>合集</span></span>`;
+}
+
+/**
+ * 卡片标题上方的评分行（v1.2.68 用户要求）：**只显示星星**，未评分就是空心星。
+ * 点星星直接改评分 —— 后端会顺手把这篇标成已读（能打分说明看过了）。
+ */
+function workCardStars(work) {
+  const rating = Number(work.rating) || 0;
+  const stars = [1, 2, 3, 4, 5]
+    .map((value) => `<button class="card-star ${value <= rating ? "is-on" : ""}" title="给 ${value} 星" data-action="card-rate" data-work-id="${work.id}" data-rating="${value}">${icon(value <= rating ? "starFilled" : "star", 14)}</button>`)
+    .join("");
+  return `<div class="work-card-stars" title="${rating ? `当前 ${rating} 星` : "还没评分，点星星打分（打分会自动标已读）"}">${stars}</div>`;
+}
+
+/** 点卡片上的星星改评分（v1.2.68）。点当前星级 = 清除（跟详情里的规矩一致）。 */
+async function setCardRating(workId, value) {
+  const work = findWork(workId);
+  const current = Number(work?.rating) || 0;
+  const next = current === value ? 0 : value;
+  try {
+    await invoke("set_work_meta", { workId, readState: null, rating: next, note: null });
+    // 后端在评分 > 0 时会顺手标已读，本地这份也得跟上，不然卡片上的状态点还是旧的
+    if (work) {
+      work.rating = next;
+      if (next > 0) {
+        work.readState = 2;
+        work.isNew = 0;
+      }
+    }
+    render();
+  } catch (error) {
+    toast(String(error), "error");
+  }
 }
 
 /**
@@ -4970,6 +5061,17 @@ async function bindSeriesBundle() {
     filters: [{ name: "文本 / 电子书", extensions: ["txt", "md", "html", "htm", "epub", "mobi", "azw3", "pdf"] }],
   });
   if (!path) return;
+  await startSeriesBundle(path);
+}
+
+/** 合集绑定的第二步（v1.2.68 抽出来）：拿着文件路径弹勾选窗。点击选文件和拖放都走这里。 */
+async function startSeriesBundle(path) {
+  const view = state.seriesView;
+  const works = state.seriesItems || [];
+  if (!view || !works.length) {
+    toast("先进入某个系列的详情页，再拖合集文件进来", "info");
+    return;
+  }
   state.pendingBundlePath = path;
   const rows = works.map((work) => {
     const order = Number(work.seriesOrder) > 0 ? `第 ${work.seriesOrder} 篇` : "未排号";
@@ -5770,6 +5872,7 @@ async function bindEvents() {
       // 一键标已读 / 未读（卡片左下角）
       if (action === "toggle-read") await toggleWorkRead(Number(element.dataset.workId));
       // 合集 EPUB
+      if (action === "card-rate") await setCardRating(Number(element.dataset.workId), Number(element.dataset.rating));
       if (action === "bind-series-bundle") await bindSeriesBundle();
       if (action === "confirm-series-bundle") await confirmSeriesBundle();
       if (action === "export-series-epub") {

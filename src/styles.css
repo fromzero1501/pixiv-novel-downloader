@@ -203,6 +203,14 @@ body.is-bulk button { cursor: pointer; }
 .bind-drop-zone { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; color: #6d8bab; background: #f7fbff; border: 1px dashed #a9c8e8; border-radius: 7px; font-size: 12px; font-weight: 650; }
 .bind-drop-zone svg { flex: 0 0 auto; }
 .bind-drop-zone.is-drop-active { color: #1259ae; background: #e2f0ff; border-style: solid; border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; }
+/* 卡片标题上方的评分行（v1.2.68）：只显示星星，未评分是空心星；点一下即改评分 */
+.work-card-stars { display: flex; align-items: center; gap: 1px; margin: 0 0 3px; }
+.card-star { width: auto; min-height: 0; display: inline-flex; align-items: center; padding: 0; color: #c6d4e3; background: none; border: 0; cursor: pointer; }
+.card-star.is-on { color: #eba400; }
+.card-star:hover { color: #f3b62a; }
+/* 「合集」徽标（v1.2.68）：鼠标悬停说明这个文件里含着哪几篇 */
+.work-bundle-badge { display: inline-flex; align-items: center; gap: 3px; margin-left: auto; padding: 1px 6px; color: #6b5bb5; background: #f2efff; border: 1px solid #ddd6f6; border-radius: 4px; font-size: 11px; line-height: 1.45; }
+.work-bundle-badge svg { flex: 0 0 auto; }
 /* 版本号从 v1.2.38 起是**按钮**（点它＝检查更新）：清掉 UA 的按钮样式，保持原来那行灰字的样子 */
 button.app-version { width: auto; min-height: 0; padding: 0; background: none; border: 0; font-family: inherit; cursor: pointer; }
 button.app-version:hover { color: #1764c5; text-decoration: underline; }

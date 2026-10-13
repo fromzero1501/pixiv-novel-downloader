@@ -2440,6 +2440,72 @@ fn relocate_lost_files(apply: bool) -> Result<LostRelocateReport, String> {
 
 /// 清空「太小被跳过」的记录（v1.2.61）：最小文件大小调过之后随时可以手动清一次，
 /// 让那些作品重新参与同步。返回清掉了多少条。
+/// 合集分组里的一位成员。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleMember {
+    work_id: i64,
+    series_order: i64,
+    title: String,
+    series_title: String,
+}
+
+/// 一个合集：一群作品共用一个完整版文件。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BundleGroup {
+    path: String,
+    members: Vec<BundleMember>,
+}
+
+/// 列出所有「合集」（v1.2.68）：**两篇以上共用同一个完整版文件**的分组。
+/// 判据就是路径相同 —— 绑定时就是这么写的，这里不引入第二套标记。
+/// 只有一篇一个文件的（绝大多数）不进结果，前端据此决定要不要挂「合集」徽标。
+#[tauri::command]
+fn list_bundles() -> Result<Vec<BundleGroup>, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare(
+            "SELECT purchased_path, id, series_order, title, series_title FROM works
+             WHERE purchased_path <> '' ORDER BY purchased_path, series_order, id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+
+    let mut groups: Vec<BundleGroup> = Vec::new();
+    for (path, work_id, series_order, title, series_title) in rows {
+        let member = BundleMember {
+            work_id,
+            series_order,
+            title,
+            series_title,
+        };
+        match groups.last_mut() {
+            Some(group) if group.path == path => group.members.push(member),
+            _ => groups.push(BundleGroup {
+                path,
+                members: vec![member],
+            }),
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .filter(|group| group.members.len() > 1)
+        .collect())
+}
+
 #[tauri::command]
 fn clear_skipped_novels() -> Result<usize, String> {
     let conn = db()?;
@@ -12605,9 +12671,15 @@ fn set_work_meta(
         if !(0..=5).contains(&value) {
             return Err("评分只能是 0-5".into());
         }
+        // 评分 ⇒ 顺手标成已读（v1.2.68 用户要求）：能打分说明看过了。
+        // 只往前不往回 —— 清空评分（0）**不动**阅读状态，也不会把已读退回去；
+        // NEW 标记跟"手动标已读"一个待遇，一起清掉。
         conn.execute(
-            "UPDATE works SET rating=?1 WHERE id=?2",
-            params![value, work_id],
+            "UPDATE works SET rating=?1,
+                 read_state=CASE WHEN ?1 > 0 THEN ?3 ELSE read_state END,
+                 is_new=CASE WHEN ?1 > 0 THEN 0 ELSE is_new END
+             WHERE id=?2",
+            params![value, work_id, READ_DONE],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -14950,10 +15022,15 @@ fn set_works_rating_impl(
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let mut changed = 0;
     for work_id in work_ids {
+        // 批量设评分同样自动标已读（v1.2.68 用户确认）：跟单篇一个口径，
+        // 清空评分（0）不动阅读状态
         changed += tx
             .execute(
-                "UPDATE works SET rating=?1 WHERE id=?2",
-                params![rating, work_id],
+                "UPDATE works SET rating=?1,
+                     read_state=CASE WHEN ?1 > 0 THEN ?3 ELSE read_state END,
+                     is_new=CASE WHEN ?1 > 0 THEN 0 ELSE is_new END
+                 WHERE id=?2",
+                params![rating, work_id, READ_DONE],
             )
             .map_err(|e| e.to_string())?;
     }
@@ -15135,6 +15212,7 @@ pub fn run() {
             relocate_author_works,
             relocate_lost_files,
             clear_skipped_novels,
+            list_bundles,
             get_app_settings,
             save_app_settings,
             read_pixiv_cookie_file,
@@ -18401,6 +18479,7 @@ mod tests {
                title TEXT NOT NULL DEFAULT '',
                favorite INTEGER NOT NULL DEFAULT 0,
                read_state INTEGER NOT NULL DEFAULT 0,
+               is_new INTEGER NOT NULL DEFAULT 0,
                rating INTEGER NOT NULL DEFAULT 0,
                note TEXT NOT NULL DEFAULT '',
                tags TEXT NOT NULL DEFAULT '',
