@@ -177,6 +177,8 @@ const state = {
    * 后端同步时发现主页 404 就落库，成功同步再清掉；这里只负责显示。
    */
   missingAuthorIds: new Set(),
+  /** 「绑定为合集」时暂存的待绑定文件路径（v1.2.67） */
+  pendingBundlePath: "",
   /**
    * 阅读状态筛选（v1.2.0）：`all` / `unread`（未读） / `reading`（在读，＝「继续读」清单）。
    * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
@@ -1052,6 +1054,7 @@ async function invoke(command, args = {}) {
   if (command === "bind_work_moving_to_purchased") return args.path;
   if (command === "relocate_author_works") return { moved: 0, missing: 0 };
   if (command === "clear_skipped_novels") return 0;
+  if (command === "bind_series_bundle") return args.path;
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
@@ -4935,6 +4938,7 @@ function renderSeriesView() {
           <span class="series-progress" title="系列里读过的篇数（已读 + 在读都算）">读过 ${readCount} / ${total}</span>
           ${gaps.length ? `<span class="series-gap" title="按序号算出来缺的篇目：第 ${gaps.join("、")} 篇">${icon("info", 15)}<span>${seriesGapLabel(gaps)}</span></span>` : ""}
           <button class="icon-text-button" data-action="export-series-epub" data-series-id="${escapeHtml(state.seriesView.id)}" data-series-title="${escapeHtml(state.seriesView.title)}" title="把这个系列里的作品打成一整本 EPUB">${icon("download", 18)}<span>合成一本 EPUB</span></button>
+          <button class="icon-text-button" data-action="bind-series-bundle" title="有些文件是整个系列合成一本的：把选中的作品都指向同一个文件（文件会搬进完整版目录、按「系列名(篇范围)」命名）">${icon("archive", 18)}<span>绑定为合集</span></button>
           <button class="primary-button" data-action="series-continue" title="${nextUnread ? `接着打开：${escapeHtml(nextUnread.title)}` : "这个系列都读过了"}" ${nextUnread ? "" : "disabled"}>${icon("arrow", 18)}<span>${readCount ? "继续读" : "从头读"}</span></button>
         </div>
       </section>
@@ -4944,6 +4948,64 @@ function renderSeriesView() {
   return renderShell(`
     <section class="topbar work-topbar"><div class="crumb-heading"><button class="back-button" title="返回作品库" data-action="close-series-view">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库</p><h1>系列作品</h1></div></div></section>
     <section class="library-content"><div class="series-grid">${cards || '<div class="empty-state works-empty"><div class="empty-icon">' + icon("series", 26) + '</div><h2>还没有系列作品</h2><p>同步到的系列作品会显示在这里。</p></div>'}</div></section>`);
+}
+
+/**
+ * 「绑定为合集」（v1.2.67 用户规格）：有些文件是整个系列合成一本的。
+ *
+ * 先选文件，再列本系列的作品让你勾（默认全勾）；确认后交给后端 —— 文件搬进完整版目录、
+ * 按「**系列名(篇范围)**」命名（连续 `A(1-5)`、断开 `A(1-3,6-9)`），选中的作品都指向它。
+ * 字数这块：搬家后会被标成待补算，后台补算时这几篇读的是**同一个文件**，所以每篇
+ * 显示的都是**整本的字数**（用户 2026-10-13 明确要的口径）；磁盘占用则按路径去重。
+ */
+async function bindSeriesBundle() {
+  const view = state.seriesView;
+  const works = state.seriesItems || [];
+  if (!view || !works.length) {
+    toast("这个系列还没有作品", "info");
+    return;
+  }
+  const path = await open({
+    multiple: false,
+    filters: [{ name: "文本 / 电子书", extensions: ["txt", "md", "html", "htm", "epub", "mobi", "azw3", "pdf"] }],
+  });
+  if (!path) return;
+  state.pendingBundlePath = path;
+  const rows = works.map((work) => {
+    const order = Number(work.seriesOrder) > 0 ? `第 ${work.seriesOrder} 篇` : "未排号";
+    return `<label class="bundle-row"><input type="checkbox" name="bundle-work" value="${work.id}" checked><span class="bundle-order">${order}</span><span class="bundle-title">${escapeHtml(work.title)}</span></label>`;
+  }).join("");
+  showModal(modal("绑定为合集",
+    `<p class="match-note">选中的作品会<strong>都指向这一个文件</strong>：文件搬进这位作者的完整版目录，按「<strong>系列名(篇范围)</strong>」命名 —— 例如 <code>${escapeHtml(view.title)}(1-5)</code>；序号断开会写成 <code>${escapeHtml(view.title)}(1-3,6-9)</code>。<br>序号是 0（还没排进系列）的篇不能参与，先把它们的序号排好。</p>
+     <div class="bundle-list">${rows}</div>`,
+    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="confirm-series-bundle">确认绑定</button>`,
+    "is-wide"));
+}
+
+async function confirmSeriesBundle() {
+  const path = state.pendingBundlePath;
+  const ids = [...document.querySelectorAll('input[name="bundle-work"]:checked')]
+    .map((box) => Number(box.value))
+    .filter(Boolean);
+  if (!ids.length) {
+    toast("至少勾一篇", "info");
+    return;
+  }
+  if (!path) {
+    toast("没有拿到文件路径，请重新选一次", "error");
+    return;
+  }
+  try {
+    const target = await invoke("bind_series_bundle", { workIds: ids, path });
+    state.pendingBundlePath = "";
+    closeModal();
+    await refreshVisibleList();
+    await openSeriesDetail(state.seriesView.id, state.seriesView.title, state.seriesView.returnTo);
+    render();
+    toast(`已把这 ${ids.length} 篇绑到合集：${String(target).split(/[\\/]/).pop()}`, "success");
+  } catch (error) {
+    toast(`绑定失败：${error}`, "error");
+  }
 }
 
 /**
@@ -5708,6 +5770,8 @@ async function bindEvents() {
       // 一键标已读 / 未读（卡片左下角）
       if (action === "toggle-read") await toggleWorkRead(Number(element.dataset.workId));
       // 合集 EPUB
+      if (action === "bind-series-bundle") await bindSeriesBundle();
+      if (action === "confirm-series-bundle") await confirmSeriesBundle();
       if (action === "export-series-epub") {
         await exportAnthology(`series:${element.dataset.seriesId}`, element.dataset.seriesTitle || "系列合集");
       }

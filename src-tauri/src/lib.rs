@@ -9621,6 +9621,122 @@ fn scan_purchased(author_id: i64, mode: String) -> Result<ScanPurchasedResult, S
 ///
 /// 两个边界：作者没绑完整版目录 ⇒ 报错说清楚（不猜目录）；目标已有同名文件 ⇒
 /// **不覆盖**，另存成「标题 (2).ext」，避免丢数据。返回最终落地的路径。
+/// 把一批**同系列**作品绑到同一个「合集」文件上（v1.2.67 用户规格）。
+///
+/// · 文件**照旧搬进完整版目录**（不是原地绑）；文件名是「**系列名(篇范围)**」——
+///   连续写 `A(1-5)`，断开写 `A(1-3,6-9)`；
+/// · 这批作品的 `purchased_path` 全指向它：**路径相同就说明它们同属一个合集**
+///   （不额外加字段，避免"标记说是一伙的、路径却是散的"这种烂账）；
+/// · 磁盘占用等统计按路径去重（见 `scan_work_files_impl`），**整本只算一次**。
+#[tauri::command]
+fn bind_series_bundle(work_ids: Vec<i64>, path: String) -> Result<String, String> {
+    let mut conn = db()?;
+    if work_ids.is_empty() {
+        return Err("先选要绑的作品".into());
+    }
+    if is_image_like_asset(Path::new(&path)) {
+        return Err("封面图 / 配图文件夹不能当作作品文件绑定，请选择文本、电子书或 HTML 文件".into());
+    }
+    let source = PathBuf::from(&path);
+    if !source.is_file() {
+        return Err("要绑定的文件不在了（可能被移走或改了名）".into());
+    }
+
+    let mut rows: Vec<(i64, String, String, i64, i64)> = vec![];
+    for work_id in &work_ids {
+        let row = conn
+            .query_row(
+                "SELECT id, series_id, series_title, series_order, author_id FROM works WHERE id=?1",
+                [work_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("找不到作品 {work_id}：{e}"))?;
+        rows.push(row);
+    }
+    let series_id = rows[0].1.trim().to_string();
+    let series_title = rows[0].2.trim().to_string();
+    if series_id.is_empty() {
+        return Err("这几篇还没归进同一个系列 —— 先在作品详情里把它们加进系列，再回来绑合集".into());
+    }
+    if rows.iter().any(|(_, sid, _, _, _)| sid.trim() != series_id) {
+        return Err("一次只能绑同一个系列的作品".into());
+    }
+    if rows.iter().any(|(_, _, _, order, _)| *order <= 0) {
+        return Err("有作品还没排系列序号（是 0）—— 先把它们的序号排好再绑合集".into());
+    }
+    if series_title.is_empty() {
+        return Err("这个系列还没有名字，先给系列起个名字".into());
+    }
+
+    let mut orders: Vec<i64> = rows.iter().map(|(_, _, _, order, _)| *order).collect();
+    orders.sort_unstable();
+    orders.dedup();
+    let range = compress_series_orders(&orders);
+
+    let author_id = rows[0].4;
+    let purchased_dir: String = conn
+        .query_row(
+            "SELECT purchased_dir FROM authors WHERE id=?1",
+            [author_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    if purchased_dir.trim().is_empty() {
+        return Err("这位作者还没绑定完整版文件夹 —— 先去作者设置里填上，再回来绑".into());
+    }
+    let target_dir = PathBuf::from(purchased_dir.trim());
+    fs::create_dir_all(&target_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
+
+    let folder_title = format!("{series_title}({range})");
+    let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let target = unique_target_path(&target_dir, &folder_title, extension);
+    if source != target {
+        move_path(&source, &target)?;
+    }
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (work_id, _, _, _, _) in &rows {
+        tx.execute(
+            "UPDATE works SET purchased_path=?1 WHERE id=?2",
+            params![target.to_string_lossy().to_string(), work_id],
+        )
+        .map_err(|e| e.to_string())?;
+        refresh_reading_image_count(&tx, *work_id);
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// 把系列序号压成范围串（v1.2.67 用户给的写法）：`[1,2,3,6,7,8,9]` → `1-3,6-9`，
+/// 单个不连的照旧写自己（`[1,3,5]` → `1,3,5`）。纯函数，方便单测。
+fn compress_series_orders(orders: &[i64]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    while index < orders.len() {
+        let start = orders[index];
+        let mut end = start;
+        while index + 1 < orders.len() && orders[index + 1] == end + 1 {
+            index += 1;
+            end = orders[index];
+        }
+        parts.push(if start == end {
+            format!("{start}")
+        } else {
+            format!("{start}-{end}")
+        });
+        index += 1;
+    }
+    parts.join(",")
+}
+
 #[tauri::command]
 fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, String> {
     let conn = db()?;
@@ -12678,6 +12794,8 @@ fn scan_work_files_impl(conn: &Connection) -> Result<WorkFileReport, String> {
     let mut total_bytes = 0u64;
     let mut total_files = 0usize;
     let mut per_author: HashMap<i64, (String, u64, usize)> = HashMap::new();
+    // 已经算过的文件（v1.2.67：合集里多篇共用一个文件，只该算一次）
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
     let mut checked = 0usize;
     for work in &works {
         let bound = [
@@ -12701,6 +12819,10 @@ fn scan_work_files_impl(conn: &Connection) -> Result<WorkFileReport, String> {
             }
         }
         for path in work_file_paths(work) {
+            // 合集（v1.2.67）：同一个文件被多篇引用 ⇒ 只算一次，不然磁盘占用会翻好几倍
+            if !seen_files.insert(path.clone()) {
+                continue;
+            }
             let Ok(meta) = fs::metadata(&path) else {
                 continue;
             };
@@ -15025,6 +15147,7 @@ pub fn run() {
             scan_preview,
             scan_purchased,
             bind_work_moving_to_purchased,
+            bind_series_bundle,
             auto_group_purchased_files,
             confirm_manual_group,
             copy_previews_to_purchased,
@@ -15151,6 +15274,7 @@ mod tests {
         collect_files_recursively,
         collect_pending_purchased_files,
         compress_cover,
+        compress_series_orders,
         direct_target_path, distribute_file, epub_target_path, existing_sync_target, file_name,
         follow_cover_path, preview_is_redundant, recycle_to_bin,
         has_invalid_date_range, insert_local_work, is_generated_asset,
@@ -16937,6 +17061,16 @@ mod tests {
             },
         ];
         assert!(matched_sync_preview(&duplicated, "同名").is_none());
+    }
+
+    #[test]
+    fn series_orders_compress_into_ranges() {
+        // 用户 2026-10-13 给的写法：连续写 a-b，断开用逗号
+        assert_eq!(compress_series_orders(&[1, 2, 3, 4, 5]), "1-5");
+        assert_eq!(compress_series_orders(&[1, 2, 3, 6, 7, 8, 9]), "1-3,6-9");
+        assert_eq!(compress_series_orders(&[1, 3, 5]), "1,3,5");
+        assert_eq!(compress_series_orders(&[7]), "7");
+        assert_eq!(compress_series_orders(&[2, 3, 4, 10]), "2-4,10");
     }
 
     #[test]
