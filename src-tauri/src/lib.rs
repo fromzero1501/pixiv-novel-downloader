@@ -9030,7 +9030,12 @@ fn list_stray_works(
         // 「字数从多到少」要读文件才知道，SQL 排不了：先按日期打底，取回后在 Rust 里重排
         "words_desc" => " ORDER BY w.release_date DESC, w.id DESC",
         "rating_desc" => " ORDER BY w.rating DESC, w.release_date DESC, w.id DESC",
-        _ => " ORDER BY w.release_date DESC, w.id DESC",
+        // 散篇页的默认排序（v1.2.91，用户要求）：**按添加时间倒序**，后添加的排前面。
+        // 表里没有单独的"入库时间"列，但 `works.id` 是 INTEGER PRIMARY KEY（自增），
+        // 插入顺序 = id 顺序，所以 id 递减就是"最近添加在前"。
+        // 散篇页是"我贴一篇、它下一篇"的流水账，按投稿时间排会把它和添加顺序搅在一起。
+        "added_desc" => " ORDER BY w.id DESC",
+        _ => " ORDER BY w.id DESC",
     });
     let raw_query = query.trim();
     let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -13867,23 +13872,56 @@ fn open_work_directory(work_id: i64) -> Result<String, String> {
 /// （可能是 txt、epub、封面图片，也可能直接是个目录），所以这里收 `path` 而不是 `work_id`。
 /// 这个命令原先只在文档里被前端调用过、后端从没实现 —— 详情页那排按钮点了只会报
 /// 「命令不存在」。别再删。
+/// 给路径补上 `\\?\` 扩展前缀（已经带 `\\?\` / `\\.\` 就原样返回）。
+///
+/// 抽成**平台无关的纯函数**，就是为了能单测这段"加不加、加几层"的判断 ——
+/// 它错了不会有编译错，只会让 `GetShortPathNameW` 静默返回 0（v1.2.91 之前就是这样，
+/// 短名恒拿不到、超长路径的"打开并选中"一直退回"只打开目录"）。
+fn extended_path_for_api(path: &str) -> String {
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        path.to_string()
+    } else {
+        format!(r"\\?\{}", path)
+    }
+}
+
+/// 剥掉 `\\?\` / `\\.\` 前缀（没有就原样返回）。交给 `explorer /select,` 之前用它，
+/// 让它拿一条最普通的盘符路径。
+fn strip_extended_prefix(path: &str) -> &str {
+    path.strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\\.\"))
+        .unwrap_or(path)
+}
+
 /// 把超长路径换成 8.3 短名（`D:\400个~1\…\重度熟~1.EPU`）—— 资源管理器有 260 字符上限，
 /// 但短名一定够短（实测 273 字符能压到 32），于是"打开并选中"又可行了。
 /// 拿不到短名（卷禁用了 8.3 生成）就返回 None，调用方退回"只打开目录"。
+///
+/// ⚠️ **`\\?\` 扩展前缀不能省**（v1.2.91 实测定位）：本进程没有声明「长路径感知」，
+/// 于是 `GetShortPathNameW` 自己也受 260 限制 —— 直接拿 273 字符的原路径去问，
+/// 它只会回 `ERROR_PATH_NOT_FOUND(3)`（路径**明明存在**，这就是之前"短名恒拿不到"的真凶）。
+/// 先加 `\\?\` 前缀绕开限制，实测同一路径立刻返回 32 字符的短名。
 #[cfg(windows)]
 fn short_path_name(path: &Path) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::GetShortPathNameW;
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let extended = extended_path_for_api(&path.as_os_str().to_string_lossy());
+    let wide: Vec<u16> = std::ffi::OsStr::new(&extended)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut buffer = vec![0u16; 512];
     let length = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buffer)) };
     if length == 0 || length as usize >= buffer.len() {
         return None;
     }
     buffer.truncate(length as usize);
-    Some(PathBuf::from(String::from_utf16_lossy(&buffer)))
+    // 结果可能仍带 `\\?\`（取决于传进去的样子）；交给 `explorer /select,` 之前剥掉，
+    // 留原样的盘符路径最省事 —— explorer 对带 `\\?\` 的短名也能认，但剥掉少一层意外。
+    let short = String::from_utf16_lossy(&buffer);
+    Some(PathBuf::from(strip_extended_prefix(&short).to_string()))
 }
 
 #[cfg(not(windows))]
@@ -15770,6 +15808,7 @@ mod tests {
         render_novel_xhtml, resolve_cover_path, rewrite_novel_txt,
         sanitize_file_name,
         select_argument,
+        extended_path_for_api, strip_extended_prefix,
         should_import_folder_entry, should_skip_small_content, similarity_percent, similarity_with_title_limit,
         sort_works_by_content_size,
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
@@ -15962,6 +16001,43 @@ mod tests {
             "/select,\"D:\\400 个人\\小说\\已购版\\鉄iron5\\作品名 a.txt\""
         );
         assert!(argument.to_string_lossy().starts_with("/select,\""));
+    }
+
+    /// `\\?\` 前缀是"超长路径能拿到 8.3 短名"的唯一开关（v1.2.91 实测）：
+    /// 没加就用原路径去问，`GetShortPathNameW` 对 > 260 的路径直接回 0，
+    /// 症状是"打开并选中"静默退回"只打开目录"。这里把加/不加、会不会加两层钉死。
+    #[test]
+    fn extended_prefix_added_once() {
+        // 普通盘符路径 ⇒ 前面补一层
+        assert_eq!(
+            extended_path_for_api(r"D:\400 个人\小说\a.epub"),
+            r"\\?\D:\400 个人\小说\a.epub"
+        );
+        // 已经带 `\\?\` ⇒ 不再加第二层（两层同样报"找不到路径"）
+        assert_eq!(
+            extended_path_for_api(r"\\?\D:\a\b\c.txt"),
+            r"\\?\D:\a\b\c.txt"
+        );
+        // 设备命名空间 `\\.\` 也认，同样不叠加
+        assert_eq!(
+            extended_path_for_api(r"\\.\C:\a.txt"),
+            r"\\.\C:\a.txt"
+        );
+    }
+
+    /// 交给 `explorer /select,` 之前剥掉扩展前缀，还原成最普通的盘符路径。
+    #[test]
+    fn extended_prefix_stripped_before_explorer() {
+        assert_eq!(strip_extended_prefix(r"\\?\D:\400个~1\a.EPU"), r"D:\400个~1\a.EPU");
+        assert_eq!(strip_extended_prefix(r"\\.\C:\a.txt"), r"C:\a.txt");
+        // 没前缀的（已经剥过了）原样返回
+        assert_eq!(strip_extended_prefix(r"D:\400个~1\a.EPU"), r"D:\400个~1\a.EPU");
+        // 往返一致：加了再剥 == 原样
+        let original = r"D:\400 个人\小说\已购版\大芋泥啵啵（NEW！）\很长很长.txt";
+        assert_eq!(
+            strip_extended_prefix(&extended_path_for_api(original)),
+            original
+        );
     }
 
     #[test]

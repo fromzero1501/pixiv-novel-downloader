@@ -3125,8 +3125,14 @@ function matchesAdvancedFilters(work) {
   return true;
 }
 
-function sortSelect(current) {
-  return `<select class="sort-select" id="sort-select" aria-label="排序"><option value="date_desc" ${current === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${current === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${current === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${current === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="rating_desc" ${current === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>`;
+/**
+ * 排序下拉。`withAdded` 只有散篇页传 true —— 那里多一个「最近添加」档
+ * （散篇是"我贴一篇、它下一篇"的流水账，用户 2026-10-14 要求默认按添加时间倒序，
+ * 所以散篇页把「最近添加」放在第一项并当作默认值）。作品库 / 所有作品不传，选项不变。
+ */
+function sortSelect(current, withAdded = false) {
+  const added = withAdded ? `<option value="added_desc" ${current === "added_desc" ? "selected" : ""}>最近添加</option>` : "";
+  return `<select class="sort-select" id="sort-select" aria-label="排序">${added}<option value="date_desc" ${current === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${current === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${current === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${current === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="rating_desc" ${current === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>`;
 }
 
 function renderWorks() {
@@ -4352,7 +4358,7 @@ function renderStray() {
         <button class="icon-text-button favorite-filter images-filter ${state.imagesFilter === "has" ? "is-active" : ""}" data-action="images-only" title="只看有配图的作品（等同高级筛选里的「配图 · 有图」）">${icon("image", 17)}<span>仅看带图版</span></button>
         ${serialFilterButton(state.strayWorks)}
         ${filterButton()}
-        ${sortSelect(state.sort)}
+        ${sortSelect(state.sort, true)}
       </div>
       ${filterPanel()}
       <div class="read-only-note">这里的作品是「下下来的时候，作者还没在库里」自动建档收进来的 —— 作者不占作者库的卡，作品本身和别处一样能用。想让哪位作者正式留下，点封面上的「散篇转正」（或右上角「批量转正」），作品会跟着他一起回到作者库里。</div>
@@ -4431,10 +4437,33 @@ function addStrayFromUrl() {
 }
 
 async function runAddStray(url) {
+  // 另开一个任务的话会顶着已有的同步 —— 直接挡住，避免两套进度浮层打架
+  if (state.syncTask) {
+    toast("有任务正在进行，等它结束再添加散篇", "info");
+    return;
+  }
   state.bookmarkDownloading = true;
+  // 挂上和「单作者同步」同一套的进度浮层（v1.2.91 用户要求）：
+  // 后端 `add_stray_from_url` 内部就走 `pixiv_sync_impl`，那句 `pixiv-sync-progress`
+  // 本来就在发，只是前端以前没接 —— 接上就有进度条了，不用改后端。
+  // 脚底按钮走「隐藏进度」而不是「终止同步」：这条路没有取消键（一次 spawn_blocking 跑到底），
+  // 给个终止按钮只会点了没反应。隐藏之后任务照常在后台跑完，收尾 toast 照发。
+  state.syncTask = { authorId: null, label: "正在下载这一篇散篇", phase: "downloading", title: "正在准备…", total: 0, current: 0, cancelling: false, cancelAction: "hide-images-progress", cancelText: "隐藏进度" };
   render();
+  const unlisten = await listen("pixiv-sync-progress", (event) => {
+    const { total = 0, current = 0, title = "" } = event.payload || {};
+    if (!state.syncTask) return;
+    state.syncTask.phase = "downloading";
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    if (title) state.syncTask.title = title;
+    updateSyncFloater();
+  });
   try {
     const result = await invoke("add_stray_from_url", { url });
+    unlisten();
+    state.syncTask = null;
+    render();
     if (result.downloaded) toast("已下载到本地（作者归入散篇）", "success");
     else if (result.skipped) toast("本地已经有这一篇了", "info");
     else toast(result.failedNames?.[0] || "这一篇没能下下来", "error");
@@ -4444,10 +4473,14 @@ async function runAddStray(url) {
     // 他只想下贴进来的那一篇，转正与否他自己决定。
     // 那个开关只管「从 Pixiv 收藏新增作者」和「手动新增作者」两条路。
   } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
     toast(String(error), "error");
   } finally {
     state.bookmarkDownloading = false;
-    render();
+    // 收尾时若还有残留（异常路径下 state.syncTask 已经清过，这里只是兜底）就一并清掉
+    if (state.syncTask) { state.syncTask = null; render(); }
   }
 }
 
@@ -5928,7 +5961,9 @@ async function bindEvents() {
       if (action === "go-pixiv-bookmarks") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "pixivBookmarks"; state.seriesView = null; state.seriesItems = []; await refreshPixivBookmarks(); render(); }
       // 散篇：进页面时重拉一次列表（刚下完的作品要能立刻看到）
       // 散篇页和作品库共用同一份筛选 state，进来先复位（v1.2.33）—— 否则会带着上一个列表的条件进来
-      if (action === "open-stray") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "stray"; state.seriesView = null; state.seriesItems = []; resetWorksListFilters(); state.bulkMode = false; state.selectedWorkIds.clear(); await refreshStray(); await refreshStrayWorks(); render(); }
+      // 散篇页默认按「最近添加」倒序（v1.2.91）：进页面时复位筛选顺带把排序也复位，
+      // 否则会带着上次在作品库选的「日期从新到旧」进来 —— 用户 2026-10-14 明确要添加时间序。
+      if (action === "open-stray") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "stray"; state.seriesView = null; state.seriesItems = []; resetWorksListFilters(); state.sort = "added_desc"; state.bulkMode = false; state.selectedWorkIds.clear(); await refreshStray(); await refreshStrayWorks(); render(); }
       if (action === "add-stray") await addStrayFromUrl();
       if (action === "refresh-pixiv-bookmarks") await updatePixivBookmarks();
       // 「添加散篇」的提交：拿表单里的链接去下，下完自动关弹窗
