@@ -13830,7 +13830,7 @@ fn update_work_tags(work_id: i64, tags: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_work_directory(work_id: i64) -> Result<(), String> {
+fn open_work_directory(work_id: i64) -> Result<String, String> {
     let conn = db()?;
     let (purchased, preview): (String, String) = conn
         .query_row(
@@ -13851,7 +13851,20 @@ fn open_work_directory(work_id: i64) -> Result<(), String> {
     // 绑定的本身就是目录（有些作品直接绑文件夹），那就只有打开目录这一种做法
     if target.is_dir() {
         open::that(&target).map_err(|e| format!("无法打开目录：{e}"))?;
-        return Ok(());
+        return Ok(String::new());
+    }
+    // ⚠️ Windows 的资源管理器**打不开超过 260 字符的路径**，而且是静默失败（v1.2.85）。
+    // 用户 2026-10-13 遇到的就是这个：新建的作品标题很长 ⇒ 路径 273 字符 ⇒
+    // 点"打开所在目录"毫无反应，可文件其实在、程序也读得到。
+    // 这种时候只打开**所在目录**（父目录通常短得多），并把原因返回给前端说清楚。
+    if path.chars().count() > 260 {
+        let dir = target
+            .parent()
+            .map(Path::to_path_buf)
+            .filter(|dir| dir.exists())
+            .ok_or_else(|| "绑定的本地目录已不存在".to_string())?;
+        open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
+        return Ok("路径太长（超过 260 个字符），资源管理器没法定位到文件，已帮你打开它所在的目录".to_string());
     }
     let dir = target
         .parent()
@@ -13869,7 +13882,7 @@ fn open_work_directory(work_id: i64) -> Result<(), String> {
     } else {
         open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
     }
-    Ok(())
+    Ok(String::new())
 }
 
 /// 打开任意一个本地路径：`parent=false` 直接打开它，`parent=true` 打开它所在的目录。

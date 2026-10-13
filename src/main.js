@@ -5897,7 +5897,11 @@ async function bindEvents() {
       if (action === "detail-series") { closeModal(); await chooseSeriesForWork(Number(workId)); }
       // 原来「三个点」菜单里的功能，现在都在详情页里（v1.2.1）
       if (action === "detail-toggle-synopsis") toggleDetailSynopsis();
-      if (action === "detail-open-directory") await invoke("open_work_directory", { workId: Number(workId) });
+      if (action === "detail-open-directory") {
+        // 后端会带回一句"为什么没定位到文件"（比如路径超长），有就提示出来（v1.2.85）
+        const note = await invoke("open_work_directory", { workId: Number(workId) });
+        if (note) toast(String(note), "info");
+      }
       if (action === "detail-set-version") await detailSetVersion(Number(workId), element.dataset.asFull === "1");
       if (action === "detail-bind-file") await detailBindFile(Number(workId));
       if (action === "detail-bind-preview") await detailBindPreview(Number(workId));
