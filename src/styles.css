@@ -234,6 +234,10 @@ button.app-version { width: auto; min-height: 0; padding: 0; background: none; b
 button.app-version:hover { color: #1764c5; text-decoration: underline; }
 .app-version.is-checking { color: #8fa6bd; cursor: progress; text-decoration: none; }
 .sync-status { display: block; margin-top: 4px; color: #5e84ac; font-size: 12px; font-style: normal; }
+/* 批量同步浮层可折叠（v1.2.86）：收起来只留头部那一行总进度 */
+.sync-floater.is-collapsed .sync-floater-rows { display: none; }
+.sync-floater-fold { width: auto; min-height: 0; padding: 2px 8px; color: #4c7bab; background: #eef6ff; border: 1px solid #d3e6f8; border-radius: 5px; font-size: 12px; cursor: pointer; }
+.sync-floater-fold:hover { color: #1764c5; background: #e2f0ff; border-color: #b9d9f5; }
 .work-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; min-height: 21px; }
 .work-tags span { display: inline-flex; align-items: center; gap: 3px; color: #5a7695; background: #eef5fc; border: 1px solid #d9e8f6; border-radius: 4px; padding: 2px 5px; font-size: 12px; line-height: 1.2; overflow-wrap: anywhere; }
 .work-tags svg { flex: 0 0 auto; color: #4c82bc; }

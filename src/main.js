@@ -185,6 +185,8 @@ const state = {
   seriesMatchPairs: [],
   /** 合集索引（v1.2.68）：`workId -> 同属一个文件的其它作品`，用来挂「合集」徽标 */
   bundleIndex: new Map(),
+  /** 批量同步浮层是不是收起来了（v1.2.86）：作者一多那串进度条能占半屏 */
+  syncFloaterCollapsed: false,
   /**
    * 阅读状态筛选（v1.2.0）：`all` / `unread`（未读） / `reading`（在读，＝「继续读」清单）。
    * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
@@ -1885,10 +1887,12 @@ function batchSyncFloater(task) {
     </div>`;
   }).join("");
   const finished = task.authors.filter(syncRowSettled).length;
-  return `<div class="sync-floater is-batch" id="sync-floater">
+  const collapsed = Boolean(state.syncFloaterCollapsed);
+  return `<div class="sync-floater is-batch${collapsed ? " is-collapsed" : ""}" id="sync-floater">
     <div class="sync-floater-head">
       <strong>${icon("sync", 16)}<span id="sync-progress-label">${escapeHtml(task.label)}</span></strong>
       <span class="sync-floater-count" id="sync-progress-count">${finished} / ${task.authors.length}</span>
+      <button class="sync-floater-fold" data-action="toggle-sync-floater">${collapsed ? "展开" : "收起"}</button>
     </div>
     <div class="sync-floater-rows">${rows}</div>
     <div class="sync-floater-foot">
@@ -6414,6 +6418,15 @@ async function bindEvents() {
       if (action === "confirm-auto-group-author") await confirmAutoGroupAuthor();
       if (action === "confirm-pixiv-sync") await syncPixivWorks();
       if (action === "cancel-pixiv-sync") await cancelPixivSync();
+      if (action === "toggle-sync-floater") {
+        state.syncFloaterCollapsed = !state.syncFloaterCollapsed;
+        const box = document.getElementById("sync-floater");
+        if (box) {
+          box.classList.toggle("is-collapsed", state.syncFloaterCollapsed);
+          const button = box.querySelector(".sync-floater-fold");
+          if (button) button.textContent = state.syncFloaterCollapsed ? "展开" : "收起";
+        }
+      }
       // 批量下载阅读版没法中断，只能把进度浮层收起来；任务照跑，结束时照常弹提示
       if (action === "hide-images-progress") { state.syncTask = null; render(); return; }
       if (action === "delete-author") await deleteAuthor(Number(authorId));
