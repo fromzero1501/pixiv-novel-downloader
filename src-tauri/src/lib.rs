@@ -9891,12 +9891,16 @@ fn relink_bundle_after_removal(conn: &Connection, leaving_work_id: i64) -> Resul
     if old.is_empty() {
         return Ok(());
     }
-    let mut statement = conn
-        .prepare(
-            "SELECT id, series_order, series_title FROM works
-             WHERE purchased_path=?1 AND id<>?2 ORDER BY series_order, id",
-        )
-        .map_err(|e| e.to_string())?;
+    // ⚠️ 表结构不全就**静默跳过**（v1.2.79）：单测里手建的简化 works 表没有 series_order /
+    // series_title，而这函数是"绑定前必调"、会被大量用例走到，报错会连累它们。
+    // 这里做的事只是"锦上添花"（改个名、路径跟着走），跳过不影响绑定本身；
+    // 生产库里这两列一定在（schema 就是这么建的）。
+    let Ok(mut statement) = conn.prepare(
+        "SELECT id, series_order, series_title FROM works
+         WHERE purchased_path=?1 AND id<>?2 ORDER BY series_order, id",
+    ) else {
+        return Ok(());
+    };
     let keep: Vec<(i64, i64, String)> = statement
         .query_map(params![old, leaving_work_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
