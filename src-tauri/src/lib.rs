@@ -17,6 +17,45 @@ use tauri::{AppHandle, Emitter};
 
 static PIXIV_SYNC_CANCELLATIONS: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
 
+/// 「批量同步」的跨作者抓取进度（v1.2.95）。
+///
+/// **为什么需要它**：`pixiv_sync_impl` 里那个「要不要一篇一篇来 + 中间 sleep」的
+/// 判断原来是**按单个作者**算的 —— `candidates.len() > delay_threshold`。
+/// 于是「同步所有作者」时，每一位只有几篇新作的作者都会走**串行 + 每篇睡
+/// `delay_seconds`** 那条路，几十位作者加起来就是几十倍的空转；而两位各抓 80 篇
+/// 的作者谁都不触发节流（80 < 150），本该踩刹车的量级被拆散了。
+///
+/// 现在把「本轮累计已抓篇数」放这儿，按 `batch_key`（整库 = 0，单作者 = author_id）
+/// 共享：只有**累计量**真的越过阈值才进入串行睡眠模式，而且**跨作者连续计数**。
+/// 请求总量不变（该抓的一篇不少），只是不再对「少量新作的作者」平白踩刹车。
+static PIXIV_SYNC_BATCH_CURSOR: OnceLock<Mutex<HashMap<i64, usize>>> = OnceLock::new();
+
+fn pixiv_sync_batch_cursor() -> &'static Mutex<HashMap<i64, usize>> {
+    PIXIV_SYNC_BATCH_CURSOR.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 开一轮同步（整库键 = 0）时把累计计数清零。见 `PIXIV_SYNC_BATCH_CURSOR`。
+fn reset_pixiv_sync_batch(batch_key: i64) {
+    let _ = pixiv_sync_batch_cursor()
+        .lock()
+        .map(|mut cursors| cursors.remove(&batch_key));
+}
+
+/// 读-加-写：把本轮已抓篇数加上 `delta`，返回**加之前**的累计值。
+///
+/// 调用方拿返回值去比阈值 —— 也就是「这一篇开抓之前，本轮已经抓了多少」。
+fn take_pixiv_sync_batch_slot(batch_key: i64, delta: usize) -> usize {
+    let mut cursors = match pixiv_sync_batch_cursor().lock() {
+        Ok(cursors) => cursors,
+        // 锁中毒（别处 panic 过）：这条判据只是节流优化，拿不到就当 0，别把同步拖死
+        Err(_) => return 0,
+    };
+    let entry = cursors.entry(batch_key).or_insert(0);
+    let before = *entry;
+    *entry = entry.saturating_add(delta);
+    before
+}
+
 fn pixiv_sync_cancelled(author_id: i64) -> bool {
     PIXIV_SYNC_CANCELLATIONS
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -6102,11 +6141,16 @@ fn should_skip_small_content(
     !is_single_sync && (content_bytes as u64) < minimum_file_size_bytes
 }
 
+/// 「本轮同步的累计抓取游标」键：整库 / 批量同步用 0，单作者同步用 author_id。
+///
+/// 见 `PIXIV_SYNC_BATCH_CURSOR` —— 传它的意义是让「是否进入串行节流模式」按
+/// **整轮累计量**判断，而不是按单个作者。
 fn pixiv_sync_impl(
     author_id: i64,
     start_date: String,
     end_date: String,
     novel_url: String,
+    batch_key: i64,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     let conn = db()?;
@@ -6366,9 +6410,21 @@ fn pixiv_sync_impl(
             ),
         },
     );
-    // 是否改用「一篇一篇来 + 中间 sleep」：按**预筛之后真正要抓的数量**判断。
-    // 预筛前按原始总数判会让「156 篇里只有 3 篇要抓」也走串行，白等。
-    let use_request_delay = candidates.len() > delay_threshold && delay_seconds > 0;
+    // 是否改用「一篇一篇来 + 中间 sleep」：按**整轮累计已抓篇数**判断，
+    // 不是按这一位作者要抓多少（v1.2.95）。
+    //
+    // 原来是 `candidates.len() > delay_threshold` —— 单作者同步时没问题，但
+    // 「同步所有作者」会把几十位各抓几篇的作者统统判成「不用节流」，同时每位
+    // 作者**又都在串行路径里每篇睡 `delay_seconds`**（那条路的成立条件是
+    // `candidates.len() <= threshold`）⇒ 既没起到节流作用，又白等了几十轮。
+    //
+    // 现在：先看这一位自己的量会不会把整轮累计顶过阈值 —— 会，就整轮切到串行；
+    // 不会，就走并发（并发路径每次调用只用一次网络往返，比串行+睡眠快得多）。
+    let took_sequential = {
+        let before = take_pixiv_sync_batch_slot(batch_key, candidates.len());
+        before.saturating_add(candidates.len()) > delay_threshold
+    };
+    let use_request_delay = took_sequential && delay_seconds > 0;
     let mut details = Vec::with_capacity(candidates.len());
     // 连续失败退避：和「补抓简介」同一套思路（那边早就有了，同步这条一直缺）。
     // 没有它的时候，撞上风控会一路错到底 —— 用户看到的就是整片失败。
@@ -6661,7 +6717,20 @@ fn pixiv_sync_impl(
                     }
                 }
             };
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, (title_indicates_images(&title) || detail_has_embedded_images(body)) as i64, description]).is_err() {
+            // 复用本地已有文件：字数据接口的 `textCount`，没有就当场读一遍这个文件
+            // （v1.2.95）—— 复用路径不经过下面的下载循环，原来只能写 -1 等后台补算。
+            let api_text_count = body.get("textCount").and_then(Value::as_i64).unwrap_or(-1);
+            let reused_word_count = if api_text_count > 0 {
+                api_text_count
+            } else {
+                let counted = text_word_count(&preview_value)
+                    .or_else(|| text_word_count(&purchased_value));
+                match counted {
+                    Some(count) if count > 0 => count as i64,
+                    _ => -1,
+                }
+            };
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new, synopsis, word_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, (title_indicates_images(&title) || detail_has_embedded_images(body)) as i64, description, reused_word_count]).is_err() {
                 result.failed_count += 1;
                 continue;
             }
@@ -6804,8 +6873,15 @@ fn pixiv_sync_impl(
                 || detail_has_embedded_images(&work.embedded_images);
             // 字数只有一份（v1.2.87）：**接口给了就用接口的**（跟 Pixiv 页面对得上，
             // 而且是 epub / html 那些本地数不出字数的作品的唯一来源）；
-            // 接口没给就写 -1，让后台按 txt 本地算 —— 还是同一列 `word_count`。
-            let stored_word_count: i64 = if work.text_count > 0 { work.text_count } else { -1 };
+            // 接口没给就**当场按刚写下去的正文算**（v1.2.95）——
+            // 正文就在手上（`text_body`），数一遍是纯内存操作，比让后台再读一遍文件便宜得多，
+            // 也让字数在作品卡上**同步完就出现**，不必等那轮全库补算。仍然数不出来才写 -1。
+            let stored_word_count: i64 = if work.text_count > 0 {
+                work.text_count
+            } else {
+                let counted = count_non_whitespace(&text_body) as i64;
+                if counted > 0 { counted } else { -1 }
+            };
             if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis, word_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, has_images as i64, image_saved as i64, work.synopsis, stored_word_count]).is_err() {
             result.failed_count += 1;
             continue;
@@ -6918,16 +6994,27 @@ async fn sync_pixiv_novels(
     start_date: String,
     end_date: String,
     novel_url: String,
+    batch_key: Option<i64>,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     clear_pixiv_sync_cancel(author_id);
+    // 累计游标的键：批量同步（「同步所有作者」）由前端传 0，让整轮几十位作者
+    // 共用一个计数器 —— 节流判断按**整轮累计量**走，不再被拆散（见 PIXIV_SYNC_BATCH_CURSOR）。
+    // 单作者同步 / 点名下载不传，退回按 author_id 记，各自独立。
+    let cursor_key = batch_key.unwrap_or(author_id);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        pixiv_sync_impl(author_id, start_date, end_date, novel_url, app)
+        pixiv_sync_impl(author_id, start_date, end_date, novel_url, cursor_key, app)
     })
     .await
     .map_err(|e| e.to_string())?;
     clear_pixiv_sync_cancel(author_id);
     result
+}
+
+/// 开一轮批量同步前清零累计游标。整库 / 批量同步用键 0（见 `PIXIV_SYNC_BATCH_CURSOR`）。
+#[tauri::command]
+fn reset_pixiv_sync_batch_cursor(batch_key: i64) {
+    reset_pixiv_sync_batch(batch_key);
 }
 
 #[tauri::command]
@@ -8586,7 +8673,8 @@ fn download_bookmark_novel_impl(
     // 连接交出去再走同步：`pixiv_sync_impl` 自己另开一个连接，两边同时开着容易在写库上打架
     drop(conn);
     let url = format!("https://www.pixiv.net/novel/show.php?id={novel_id}");
-    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, app.clone())?;
+    // 「点名下载」只有一篇，不需要调流；游标键沿用作者 id 就行（不会被读）
+    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, author_id, app.clone())?;
     if result.downloaded_count == 0 {
         if result.throttled {
             return Err("被 Pixiv 限流了，停一会儿再试".into());
@@ -16009,6 +16097,8 @@ pub fn run() {
             sync_pixiv_novels,
             check_pixiv_author,
             cancel_pixiv_sync,
+            // v1.2.95：批量同步的跨作者抓取累计游标（节流判断按整轮算）
+            reset_pixiv_sync_batch_cursor,
             sync_pixiv_author_profile,
             // v1.2.27：Pixiv 收藏页
             refresh_pixiv_bookmarks,
@@ -16126,6 +16216,8 @@ mod tests {
         SYNOPSIS_THROTTLE_STREAK, SYNOPSIS_META_MAX_CHARS,
         PixivNovelListMeta, note_sync_failure, SYNC_MAX_FAILED_REASONS,
         SYNC_THROTTLE_STREAK, SYNC_ABORT_STREAK,
+        // v1.2.95：批量同步的跨作者抓取累计游标
+        take_pixiv_sync_batch_slot, reset_pixiv_sync_batch,
         synopsis_plain_text, build_anthology_epub, AnthologyChapter,
         images_filter_clause, collection_filter_clause,
         write_export_markdown, EXPORT_HEADERS, EXPORT_COL_TITLE, EXPORT_COL_AUTHOR,
@@ -18494,6 +18586,38 @@ mod tests {
             pixiv_published_at(&json!({ "uploadDate": "2025-04-10T11:00:00+00:00" })),
             "2025-04-10T11:00:00+00:00"
         );
+    }
+
+    #[test]
+    fn batch_cursor_accumulates_across_authors_in_one_round() {
+        // v1.2.95：节流判断要按「整轮累计抓了多少篇」走，不再按单个作者。
+        // 用一个大到不会和真实测试撞车的键（真实键只有 0 和各作者 id）。
+        let key = -987_654;
+        reset_pixiv_sync_batch(key);
+        // 第一位抓 100 篇：加之前是 0 ⇒ 累计 100
+        assert_eq!(take_pixiv_sync_batch_slot(key, 100), 0);
+        // 第二位抓 60 篇：加之前是 100，累计 160 ⇒ 越过阈值（这里用 150 比）
+        let before = take_pixiv_sync_batch_slot(key, 60);
+        assert_eq!(before, 100);
+        assert!(before + 60 > 150);
+        // 清零之后从头算 —— 下一轮批量同步不该继承上一轮的计数
+        reset_pixiv_sync_batch(key);
+        assert_eq!(take_pixiv_sync_batch_slot(key, 1), 0);
+        reset_pixiv_sync_batch(key);
+    }
+
+    #[test]
+    fn batch_cursor_keys_do_not_leak_into_each_other() {
+        // 批量同步（键 0）和单作者同步（键 = author_id）各记各的：
+        // 不然「同步所有作者」跑到一半，某位作者的单作者同步会被凭空判成要节流。
+        let batch_key = -111_111;
+        let author_key = -222_222;
+        reset_pixiv_sync_batch(batch_key);
+        reset_pixiv_sync_batch(author_key);
+        assert_eq!(take_pixiv_sync_batch_slot(batch_key, 500), 0);
+        assert_eq!(take_pixiv_sync_batch_slot(author_key, 3), 0);
+        reset_pixiv_sync_batch(batch_key);
+        reset_pixiv_sync_batch(author_key);
     }
 
     #[test]

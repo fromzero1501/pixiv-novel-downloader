@@ -1106,6 +1106,8 @@ async function invoke(command, args = {}) {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
     return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, lastSyncAt: new Date().toISOString() };
   }
+  // v1.2.95：批量同步前清零跨作者抓取累计游标
+  if (command === "reset_pixiv_sync_batch_cursor") return undefined;
   if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.isNew = false; if (work.readState === 0) work.readState = 1; } return; }
   if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
   if (command === "open_search_site") {
@@ -8537,6 +8539,10 @@ async function syncAllAuthors(targetsOverride) {
     authors: targets.map((author) => ({ authorId: author.id, name: author.name, status: "pending", current: 0, total: 0, title: "", note: "" })),
   };
   render();
+  // v1.2.95：整轮批量同步共用一个抓取累计游标（键 0）。后端按「整轮累计抓了多少篇」
+  // 决定要不要进入串行节流 —— 否则每位只抓几篇的作者都被判成「不用节流」，
+  // 却仍各自走串行 + 每篇 sleep，几十位加起来就是几十倍空转。
+  try { await invoke("reset_pixiv_sync_batch_cursor", { batchKey: 0 }); } catch { /* 清不掉也不影响正确性，只是首轮起点偏大 */ }
   const unlisten = await listen("pixiv-sync-progress", (event) => {
     const { authorId = null, total = 0, current = 0, title = "" } = event.payload || {};
     const authors = state.syncTask?.authors;
@@ -8577,9 +8583,12 @@ async function syncAllAuthors(targetsOverride) {
       updateSyncFloater();
       continue;
     }
+    // 这一位本次新落库的作品数（新下载 + 复用本地），用来决定跑完要不要补算字数
+    let thisAuthorAdded = 0;
     try {
-      const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "" });
+      const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "", batchKey: 0 });
       downloaded += result.downloadedCount || 0;
+      thisAuthorAdded = (result.downloadedCount || 0) + (result.reusedPreviewCount || 0);
       if (row) {
         row.current = result.downloadedCount || 0;
         if (result.cancelled) {
@@ -8612,8 +8621,13 @@ async function syncAllAuthors(targetsOverride) {
       doneAuthors += 1;
       if (row) { row.status = "failed"; row.note = String(error); }
       failures.push(`${author.name}（${error}）`);
+      thisAuthorAdded = 0;
     }
     updateSyncFloater();
+    // 这位作者确实下进来新作品才补算（v1.2.95）：后端落库时正文在手，绝大多数字数
+    // 已经直接写好了，这里只兜「复用本地文件 + 拿不到接口字数」剩下的那几篇。
+    // 没下东西就不去空转那轮扫描 —— 库里若有大量历史未算作品，每作者跑一遍代价不小。
+    if (thisAuthorAdded > 0) fillWordCountsInBackground();
   }
 
   unlisten();
@@ -8624,7 +8638,8 @@ async function syncAllAuthors(targetsOverride) {
     await refreshWorks();
   }
   render();
-  // 这一轮同步进来的作品字数还是 -1，重新踢一次后台补算（算完它会自己刷新列表）
+  // 收尾兜底：后端落库时已经算好绝大部分字数（v1.2.95），这里只处理极少数
+  // 「当时没算出来」的残留，顺带把列表里的字数补到卡片上。
   fillWordCountsInBackground(true);
 
   const head = stopped ? `批量同步已终止（完成 ${doneAuthors} / ${targets.length} 位作者）` : `已同步 ${doneAuthors} / ${targets.length} 位作者，共下载 ${downloaded} 篇`;
