@@ -179,6 +179,8 @@ const state = {
   missingAuthorIds: new Set(),
   /** 「绑定为合集」时暂存的待绑定文件路径（v1.2.67） */
   pendingBundlePath: "",
+  /** 系列作品页的搜索词（v1.2.70）：只搜系列名 */
+  seriesQuery: "",
   /** 合集索引（v1.2.68）：`workId -> 同属一个文件的其它作品`，用来挂「合集」徽标 */
   bundleIndex: new Map(),
   /**
@@ -1558,6 +1560,18 @@ function render() {
       : state.homeView === "help" ? renderHelp() : renderAuthors());
   document.body.classList.toggle("is-bulk", Boolean(state.bulkMode));
   mountHelpDocument();
+  // 系列作品页的搜索框（v1.2.70）：跟别的搜索框一个套路 —— 输入即筛、重画后把焦点还回去
+  const seriesSearchBox = document.getElementById("series-search");
+  if (seriesSearchBox) {
+    seriesSearchBox.oncompositionstart = () => { seriesSearchBox.dataset.composing = "true"; };
+    seriesSearchBox.oncompositionend = () => { seriesSearchBox.dataset.composing = "false"; };
+    seriesSearchBox.oninput = (event) => {
+      if (seriesSearchBox.dataset.composing === "true") return;
+      state.seriesQuery = event.target.value;
+      render();
+      restoreSearchFocus("series-search");
+    };
+  }
   bindEvents();
   // 界面记忆的**唯一落盘点**：筛选、排序、搜索、切页最后都会走到这里，
   // 挂一处就够，加新筛选项不必再去追那十几处 data-action（详见「视图状态记忆」一节）
@@ -1697,15 +1711,23 @@ function renderShell(content) {
 function floatingBackTarget() {
   // 批量态下「返回」是退出批量（和顶栏那个按钮同一个语义，别让人在下面找不到）
   if (state.activeAuthor) {
-    return state.bulkMode
-      ? { action: "bulk-mode", title: "退出批量操作" }
-      : { action: state.authorReturnTo === "allWorks" ? "back-to-all-works" : "go-home", title: "返回作者库" };
+    if (state.bulkMode) return { action: "bulk-mode", title: "退出批量操作" };
+    // 系列详情（v1.2.71）：上一层是「系列作品」列表，不是作者库。
+    // 原来这里一律回作者库，用户点浮动返回就被甩出去一整层。
+    if (state.seriesView) return { action: "close-series-view", title: "返回系列作品" };
+    return { action: state.authorReturnTo === "allWorks" ? "back-to-all-works" : "go-home", title: "返回作者库" };
   }
   if (state.activeCollection) return { action: "back-to-collections", title: "返回收藏夹" };
   if (state.homeView === "stray") {
     return state.bulkMode
       ? { action: "bulk-mode", title: "退出批量操作" }
       : { action: "go-home", title: "返回作者库" };
+  }
+  // 待补完整版的第二层（某位作者的缺口列表）：上一层是作者卡列表（v1.2.71 顺手补）
+  if (state.homeView === "missingFull" && state.missingFullAuthorId) {
+    return state.bulkMode
+      ? { action: "bulk-mode", title: "退出批量操作" }
+      : { action: "back-to-missing-authors", title: "返回作者列表" };
   }
   // 作者库首页 / 所有作品 / 历史这些是侧栏的一级页，没有"上一级"，不显示
   return null;
@@ -2508,7 +2530,9 @@ function searchPlaceholder() {
 /* ==================== 高级筛选面板（v1.2.7） ==================== */
 
 /** 评分档位与字数档位：面板上「一行单选按钮」，选中的值直接存在 state 里 */
-const RATING_FILTERS = [["all", "不限"], ["none", "未评分"], ["3", "3 星及以上"], ["4", "4 星及以上"], ["5", "5 星"]];
+// v1.2.70 用户要求：改成 1~5 星**精确匹配**（原来那几档是"及以上"，互相重叠）。
+// 多选＝命中任意一档，跟别的行一个规矩；「未评分」保留。
+const RATING_FILTERS = [["all", "不限"], ["none", "未评分"], ["1", "1 星"], ["2", "2 星"], ["3", "3 星"], ["4", "4 星"], ["5", "5 星"]];
 const WORDS_FILTERS = [["all", "不限"], ["lt5k", "5 千字以下"], ["5k-2w", "5 千 ~ 2 万字"], ["2w-8w", "2 万 ~ 8 万字"], ["gte8w", "8 万字以上"]];
 /**
  * 版本状态与配图档位（v1.2.13 进面板）。
@@ -3079,7 +3103,8 @@ function matchesAdvancedFilters(work) {
   // 多选（v1.2.40）：命中任意一档即通过；一个都没选 = 不限
   if (state.ratingFilter.length) {
     const rating = Number(work.rating || 0);
-    const hit = state.ratingFilter.some((value) => (value === "none" ? rating === 0 : rating >= Number(value)));
+    // 精确匹配（v1.2.70）：选「3 星」就只留 3 星的，不再把 4、5 星也算进来
+    const hit = state.ratingFilter.some((value) => (value === "none" ? rating === 0 : rating === Number(value)));
     if (!hit) return false;
   }
   if (state.wordsFilter.length) {
@@ -3106,7 +3131,7 @@ function renderWorks() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workBundleBadge(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
 
   return renderShell(`
@@ -3145,7 +3170,7 @@ function renderAllWorks() {
         ${workCharacterNames(work)}
         ${workReadToggle(work)}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workBundleBadge(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`).join("");
   const remaining = filtered.length - shown.length;
   const footer = filtered.length
@@ -4245,7 +4270,7 @@ function renderStray() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="stray-promote-button" data-action="promote-stray-work" data-work-id="${work.id}" data-author-id="${work.authorId}" title="把「${escapeHtml(work.authorName || "这位作者")}」转成正式作者">${icon("star", 14)}<span>散篇转正</span></button>${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workBundleBadge(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
     </article>`).join("");
   const empty = state.straySummary.workCount
     ? '<div class="empty-state works-empty"><h2>没有匹配的作品</h2></div>'
@@ -4891,7 +4916,7 @@ function renderSeriesWorkCards(works) {
         ${workCharacterNames(work)}
         ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
     </article>`).join("");
 }
 
@@ -4957,9 +4982,15 @@ function renderSeriesView() {
       </section>
       <section class="library-content"><div class="works-grid">${renderSeriesWorkCards(state.seriesItems) || '<div class="empty-state works-empty"><h2>该系列没有作品</h2></div>'}</div></section>`);
   }
-  const cards = state.seriesItems.map((series) => `<article class="series-card" data-action="open-series-card" data-series-id="${escapeHtml(series.id)}" data-series-title="${escapeHtml(series.title)}" tabindex="0">${series.coverPath ? `<img src="${asset(series.coverPath)}" alt="${escapeHtml(series.title)} 的封面">` : `<div class="series-card-placeholder">${icon("series", 30)}</div>`}<div class="series-card-copy"><h2>${escapeHtml(series.title)}</h2><p><strong>${series.workCount}</strong> 部作品 · 完整版 ${series.purchasedCount} · 预览版 ${series.previewCount}</p>${series.readCount ? `<p class="series-read">读过 ${series.readCount} / ${series.workCount}</p>` : ""}${(series.gapOrders || []).length ? `<p class="series-gap-line">${icon("info", 13)}<span>${seriesGapLabel(series.gapOrders)}</span></p>` : ""}</div></article>`).join("");
+  // 只搜系列名（v1.2.70 用户要求）
+  const needle = state.seriesQuery.trim().toLowerCase();
+  const visibleSeries = needle
+    ? state.seriesItems.filter((series) => String(series.title || "").toLowerCase().includes(needle))
+    : state.seriesItems;
+  const cards = visibleSeries.map((series) => `<article class="series-card" data-action="open-series-card" data-series-id="${escapeHtml(series.id)}" data-series-title="${escapeHtml(series.title)}" tabindex="0">${series.coverPath ? `<img src="${asset(series.coverPath)}" alt="${escapeHtml(series.title)} 的封面">` : `<div class="series-card-placeholder">${icon("series", 30)}</div>`}<div class="series-card-copy"><h2>${escapeHtml(series.title)}</h2><p><strong>${series.workCount}</strong> 部作品 · 完整版 ${series.purchasedCount} · 预览版 ${series.previewCount}</p>${series.readCount ? `<p class="series-read">读过 ${series.readCount} / ${series.workCount}</p>` : ""}${(series.gapOrders || []).length ? `<p class="series-gap-line">${icon("info", 13)}<span>${seriesGapLabel(series.gapOrders)}</span></p>` : ""}</div></article>`).join("");
   return renderShell(`
-    <section class="topbar work-topbar"><div class="crumb-heading"><button class="back-button" title="返回作品库" data-action="close-series-view">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库</p><h1>系列作品</h1></div></div></section>
+    <section class="topbar work-topbar"><div class="crumb-heading"><button class="back-button" title="返回作品库" data-action="close-series-view">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库</p><h1>系列作品</h1></div></div>
+      <div class="series-search-box">${icon("search", 16)}<input id="series-search" type="search" placeholder="搜索系列名" value="${escapeHtml(state.seriesQuery)}" autocomplete="off"></div></section>
     <section class="library-content"><div class="series-grid">${cards || '<div class="empty-state works-empty"><div class="empty-icon">' + icon("series", 26) + '</div><h2>还没有系列作品</h2><p>同步到的系列作品会显示在这里。</p></div>'}</div></section>`);
 }
 
@@ -5019,8 +5050,9 @@ function workCardStars(work) {
   const stars = [1, 2, 3, 4, 5]
     .map((value) => `<button class="card-star ${value <= rating ? "is-on" : ""}" title="给 ${value} 星" data-action="card-rate" data-work-id="${work.id}" data-rating="${value}">${icon(value <= rating ? "starFilled" : "star", 14)}</button>`)
     .join("");
-  // 「已读」按钮跟着评分走（v1.2.69 用户要求：放在评分右边）
-  return `<div class="work-card-stars" title="${rating ? `当前 ${rating} 星` : "还没评分，点星星打分（打分会自动标已读）"}">${stars}${workReadDot(work)}</div>`;
+  // 「已读」按钮跟着评分走（v1.2.69 用户要求：放在评分右边）；
+  // 「合集」徽标再往右（v1.2.70 用户要求）
+  return `<div class="work-card-stars" title="${rating ? `当前 ${rating} 星` : "还没评分，点星星打分（打分会自动标已读）"}">${stars}${workReadDot(work)}${workBundleBadge(work)}</div>`;
 }
 
 /** 点卡片上的星星改评分（v1.2.68）。点当前星级 = 清除（跟详情里的规矩一致）。 */

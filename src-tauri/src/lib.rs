@@ -2714,8 +2714,10 @@ fn search_match_clause(
     let title = format!("{prefix}title");
     let body = match search_field {
         "tags" => format!("{prefix}tags LIKE {like_param}"),
-        // 系列（v1.2.69 用户要求）：只比系列名，方便"这个系列我还有哪几篇"这种找法
-        "series" => "(w.series_title IS NOT NULL AND w.series_title <> '' AND w.series_title LIKE ?2)".to_string(),
+        // 系列（v1.2.69 用户要求）：只比系列名，方便"这个系列我还有哪几篇"这种找法。
+        // ⚠️ 前缀和参数号必须用调用方给的（v1.2.70 修）—— 硬写 `w.` / `?2` 会让别的调用点
+        // 参数错位、SQL 直接不生效，用户看到的就是"系列搜索无效"。
+        "series" => format!("COALESCE({prefix}series_title,'') LIKE {like_param}"),
         "title_synopsis" => format!(
             "(COALESCE({title},'') || ' ' || COALESCE({prefix}synopsis,'')) LIKE {like_param}"
         ),
