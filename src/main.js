@@ -54,6 +54,10 @@ const state = {
   bulkMode: false,
   selectedWorkIds: new Set(),
   pendingConfirmation: null,
+  // 「新建作品」预览里勾中的候选（v1.2.92）：预览 → 确认框 → 落库，中间要把它带着走
+  pendingImport: null,
+  // 「新建作品」预览正在拉数据（拉文件 / 跑相似度都要一会儿，防连点叠两层弹窗）
+  importBusy: false,
   /** 等待用户选择"匹配角色 / 匹配标题"的操作意图 */
   pendingMatch: null,
   /** 常见角色名列表（按游戏分组） */
@@ -1061,6 +1065,27 @@ async function invoke(command, args = {}) {
     return { total: 1, downloaded: 1, skipped: 0, failed: 0, failedNames: [], authorId: 901, cancelled: false };
   }
   if (command === "bind_work_moving_to_purchased") return args.path;
+  // 「新建作品」预览（v1.2.92）：脚本要验勾选清单就预置 window.__previewImportResult；
+  // 没预置时按"一行一条、都没匹配到"回一份最小结果。
+  if (command === "read_import_folder") {
+    if (Array.isArray(window.__previewImportFolder)) return window.__previewImportFolder;
+    return [];
+  }
+  if (command === "read_import_file") return Array.isArray(window.__previewImportLines) ? window.__previewImportLines : [];
+  if (command === "preview_import_bytes") {
+    if (window.__previewImportResult) return window.__previewImportResult;
+    return {
+      candidates: (args.lines || []).map((line, index) => ({
+        line, title: String(line).trim(), releaseDate: "", sourcePath: "", matchedWorkId: 0, matchedTitle: "", matchedScore: 0,
+      })).filter((item) => item.title).map((item, index) => ({ ...item, title: item.title || `第 ${index + 1} 行` })),
+      invalidLines: [],
+    };
+  }
+  if (command === "commit_import") {
+    if (typeof window.__commitImportResult === "function") return window.__commitImportResult(args);
+    const count = (args.selections || []).length;
+    return { created: count, matched: 0, failed: 0 };
+  }
   if (command === "relocate_author_works") return { moved: 0, missing: 0 };
   if (command === "clear_skipped_novels") return 0;
   if (command === "bind_series_bundle") return args.path;
@@ -4494,6 +4519,11 @@ async function refreshAfterBookmarkDownload() {
   await refreshStray();
   if (state.homeView === "stray") await refreshStrayWorks();
   if (state.allWorks.length) await refreshAllWorks();
+  // ⚠️ 收口处必须自己重画一次（v1.2.92 修）：`refreshStrayWorks()` 只是把新数据写进
+  // `state.strayWorks`，**从不 render**（这是全项目的约定）；调用方 `runAddStray` 里那句
+  // render 发生在 invoke 之前，画的是旧数据。少了这一次，用户看到的就是
+  // 「添加散篇后散篇库不刷新，要退出重进才看到」。
+  render();
 }
 
 /** 作者库那张「散篇」卡上的计数（几篇 · 几位作者）。 */
@@ -5453,7 +5483,7 @@ function authorModal(author = {}) {
 }
 
 function importModal() {
-  showModal(modal("导入作品", `
+  showModal(modal("新建作品", `
     <div class="import-tabs"><button class="filter-button is-active" data-tab="paste">粘贴文本</button><button class="filter-button" data-tab="file">Excel / CSV</button><button class="filter-button" data-tab="folder">文件夹</button></div>
     <form id="paste-import-form" class="form-stack import-panel" data-panel="paste">
       <label>固定开头 <input name="prefix" placeholder="例如：2025-"><small>只导入以该字符串开头的整行；行首日期会被提取。</small></label>
@@ -5464,8 +5494,8 @@ function importModal() {
       <label>选择 Excel 或 CSV 文件 <div class="path-input"><input name="filePath" readonly placeholder="尚未选择文件"><button type="button" class="quiet-button" data-action="pick-import-file">选择文件</button></div></label>
     </form>
     <form id="folder-import-form" class="form-stack import-panel is-hidden" data-panel="folder">
-      <label>选择作品文件夹 <div class="path-input"><input name="folderPath" readonly placeholder="尚未选择文件夹"><button type="button" class="quiet-button" data-action="pick-import-folder">选择文件夹</button></div><small>仅导入第一层中的 TXT 文件名和文件夹名；名称中的发布日期会自动提取。最小文件大小可在设置中调整。</small></label>
-    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="submit-import">预览导入结果</button>`));
+      <label>选择作品文件夹 <div class="path-input"><input name="folderPath" readonly placeholder="尚未选择文件夹"><button type="button" class="quiet-button" data-action="pick-import-folder">选择文件夹</button></div><small>会递归找出文件夹里所有的 <strong>TXT、EPUB、HTML</strong> 文件（以及自定义分组用的文件夹），文件名里的发布日期会自动提取。勾中新建的会顺手<strong>绑成完整版并搬进这位作者的完整版目录</strong>。最小作品字数可在设置中调整。</small></label>
+    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="submit-import">预览新建结果</button>`));
 }
 
 /**
@@ -5581,6 +5611,7 @@ async function bindEvents() {
   updateScrollJump();
   // 「所有作品」瀑布流的哨兵：每次重画都是一个新节点，这里重新挂一遍
   ensureLoadMoreObserver();
+  // 界面上的措辞统一成「新建作品」（弹窗标题在 importModal() 那边已经改过，这句只兜图标按钮上的旧文案）
   app.querySelectorAll('[data-action="import-works"] span').forEach((label) => { label.textContent = "新建作品"; });
   app.querySelectorAll('[data-action="sync-pixiv"] span').forEach((label) => { label.textContent = "同步作品"; });
   const libraryActions = app.querySelector(".work-topbar .topbar-actions");
@@ -6376,6 +6407,17 @@ async function bindEvents() {
       if (action === "pick-import-file") await pickPath("filePath", false, ["csv", "xlsx", "xls"]);
       if (action === "pick-import-folder") await pickPath("folderPath", true);
       if (action === "submit-import") await submitImport();
+      if (action === "import-toggle-all") {
+        document.querySelectorAll("[data-import-pick]").forEach((box) => { box.checked = element.dataset.checked === "true"; });
+        // 勾选状态变了，按钮上的条数也要跟着变
+        const confirmButton = document.querySelector('[data-action="import-confirm"]');
+        const picked = document.querySelectorAll("[data-import-pick]:checked").length;
+        if (confirmButton) {
+          confirmButton.textContent = picked ? `确认新建（${picked} 条）` : "确认新建";
+          confirmButton.disabled = !picked;
+        }
+      }
+      if (action === "import-confirm") confirmImportPreview();
       if (action === "settings") await settingsModal();
       if (action === "open-update") openUpdateModal();
       // 左下角版本号 = 检查更新（v1.2.38）。**只是检查**：查到新版后由 openUpdateModal()
@@ -8202,11 +8244,31 @@ async function cleanupPreviewVersions() {
   }
 }
 
+/**
+ * 「新建作品」第一步（v1.2.92）：三种方式（粘贴文本 / Excel / 文件夹）都先出**预览新建结果**。
+ *
+ * 预览不是"统计一下有几条重复"，而是**一条一行、带勾选框**：没匹配到本地作品的默认勾上，
+ * 匹配到的默认不勾、并在右边写明撞上了哪一篇（连相似度）。勾中的才会真的新建。
+ */
 async function submitImport() {
+  // 防重入（两道闸）：拉文件夹 + 跑相似度都要一会儿，连点两下会叠出两层「预览新建结果」，
+  // 而 closeModal 一次只关最上层 ⇒ 越关越多。这里第二道闸兜住"上一次还没回来"。
+  if (state.importBusy || document.querySelector(".import-rows")) return;
+  state.importBusy = true;
+  try {
+    await runImportPreview();
+  } finally {
+    state.importBusy = false;
+  }
+}
+
+/** 「新建作品」第一步的实际干活部分（拆出来只为让上面那道防重入闸能 try/finally 收干净）。 */
+async function runImportPreview() {
   const pastePanel = document.querySelector('[data-panel="paste"]');
   const folderPanel = document.querySelector('[data-panel="folder"]');
   const usingPaste = !pastePanel.classList.contains("is-hidden");
   const usingFolder = !folderPanel.classList.contains("is-hidden");
+  // 文件夹方式给的是**完整路径**（后端要拿它把文件绑成完整版）
   let lines = [];
   if (usingPaste) {
     const form = new FormData(document.querySelector("#paste-import-form"));
@@ -8225,19 +8287,81 @@ async function submitImport() {
     if (!path) throw new Error("请先选择 Excel 或 CSV 文件");
     lines = await invoke("read_import_file", { path, column: Number(form.get("column") || 1) });
   }
-  const preview = await invoke("preview_import", { authorId: state.activeAuthor.id, lines });
+  const preview = await invoke("preview_import_bytes", { authorId: state.activeAuthor.id, lines });
+  const candidates = preview.candidates || [];
+  if (!candidates.length && !(preview.invalidLines || []).length) {
+    toast("这个来源里没找到任何作品名", "info");
+    return;
+  }
   // 被跳过的行也列出来（v1.2.81）：光说"跳过 1 条"用户只能猜是哪条、为什么
   const invalidBlock = (preview.invalidLines || []).length
-    ? `<p class="import-note">下面这些行<strong>没被认出来</strong>，所以跳过了 —— 每行要写成「<strong>日期 + 标题</strong>」，日期必须是完整的 <code>YYYY-MM-DD</code>（月和日都补两位），日期后面才是标题：</p><div class="duplicate-list">${preview.invalidLines.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>`
+    ? `<p class="import-note">下面这些行<strong>没被认出来</strong>，所以跳过了 —— 每行要写成「<strong>日期 + 标题</strong>」，日期可以省略；只写日期或只写符号的行不算一条：</p><div class="duplicate-list">${preview.invalidLines.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>`
     : "";
-  const body = `<p class="import-summary">可新增 <strong>${preview.newCount}</strong> 条；重复 <strong>${preview.duplicateCount}</strong> 条；跳过 <strong>${preview.invalidCount}</strong> 条。</p>${preview.duplicates.length ? `<div class="duplicate-list">${preview.duplicates.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>` : ""}${invalidBlock}`;
+  const matchedCount = candidates.filter((item) => item.matchedWorkId).length;
+  const rows = candidates.map((item, index) => {
+    // 没匹配到 ⇒ 默认勾选；匹配到了 ⇒ 默认不勾，右边写明撞上了哪一篇
+    const checked = item.matchedWorkId ? "" : " checked";
+    const badge = item.matchedWorkId
+      ? `<span class="import-match" title="本地已有这篇作品">撞上：${escapeHtml(item.matchedTitle)}（${item.matchedScore}%）</span>`
+      : (item.matchedScore ? `<span class="import-faint">本地没有相近的作品（最像的只有 ${item.matchedScore}%）</span>` : `<span class="import-faint">本地没有相近的作品</span>`);
+    const where = item.sourcePath ? `<span class="import-path">${escapeHtml(item.sourcePath)}</span>` : "";
+    return `<label class="import-row" data-index="${index}"><input type="checkbox" data-import-pick${checked}><span class="import-row-main"><strong>${escapeHtml(item.releaseDate ? `${item.releaseDate} ${item.title}` : item.title)}</strong>${where}</span>${badge}</label>`;
+  }).join("");
+  const body = `<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品够像，已经自动取消勾选。勾上的才会新建${usingFolder ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）" : ""}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
   closeModal();
-  showModal(modal("确认导入", body, `<button class="quiet-button" data-action="close-modal">取消</button><button class="quiet-button" data-action="commit-import" data-overwrite="false">跳过重复项</button><button class="primary-button" data-action="commit-import" data-overwrite="true">覆盖已有记录</button>`));
-  document.querySelectorAll('[data-action="commit-import"]').forEach((button) => button.addEventListener("click", async () => {
-    const result = await invoke("commit_import", { authorId: state.activeAuthor.id, lines, overwrite: button.dataset.overwrite === "true" });
-    closeModal(); await refreshWorks(); await refreshAuthors(); render();
-    toast(`导入完成：新增 ${result.created} 条，更新 ${result.updated} 条，跳过 ${result.skipped} 条`, "success");
-  }));
+  showModal(modal("预览新建结果", body, `<button class="quiet-button" data-action="close-modal">取消</button><span class="footer-spacer"></span><button class="quiet-button" data-action="import-toggle-all" data-checked="true">全选</button><button class="quiet-button" data-action="import-toggle-all" data-checked="false">全不选</button><button class="primary-button" data-action="import-confirm">确认新建</button>`));
+  // 「确认新建」的说明里要报数，选一个就更新一次
+  const confirmButton = document.querySelector('[data-action="import-confirm"]');
+  const syncCount = () => {
+    const picked = document.querySelectorAll("[data-import-pick]:checked").length;
+    if (confirmButton) {
+      confirmButton.textContent = picked ? `确认新建（${picked} 条）` : "确认新建";
+      confirmButton.disabled = !picked;
+    }
+  };
+  document.querySelectorAll(".import-rows").forEach((list) => list.addEventListener("change", syncCount));
+  syncCount();
+  // 这一步只把"用户勾了什么"记下来，真正落库在 confirmImportPreview()（要再确认一次）
+  state.pendingImport = { candidates, usingFolder };
+}
+
+/** 预览里点「确认新建」：再来一道确认框 —— 确认框只有取消和确认，没有"跳过/覆盖"那些开关。 */
+function confirmImportPreview() {
+  const pending = state.pendingImport;
+  if (!pending) return;
+  const picked = [];
+  document.querySelectorAll(".import-row").forEach((row) => {
+    const box = row.querySelector("[data-import-pick]");
+    if (!box || !box.checked) return;
+    const item = pending.candidates[Number(row.dataset.index)];
+    if (item) picked.push(item);
+  });
+  if (!picked.length) {
+    toast("一条都没勾 —— 至少勾一条再确认新建", "info");
+    return;
+  }
+  const folderPicked = picked.filter((item) => item.sourcePath).length;
+  const lines = [
+    `将在「${state.activeAuthor.name}」名下新建 ${picked.length} 篇作品。`,
+    folderPicked ? `其中 ${folderPicked} 篇会把对应文件绑成完整版，并把文件搬进这位作者的完整版目录。` : "",
+    "新建之后不能一键撤销，请确认勾选的是你要的那些。",
+  ].filter(Boolean).join("");
+  confirmAction("确认新建", lines, "确认新建", async () => {
+    const selections = picked.map((item) => ({
+      title: item.title,
+      releaseDate: item.releaseDate || "",
+      sourcePath: item.sourcePath || "",
+    }));
+    const result = await invoke("commit_import", { authorId: state.activeAuthor.id, selections });
+    state.pendingImport = null;
+    await refreshWorks();
+    await refreshAuthors();
+    render();
+    const bits = [`新建 ${result.created} 篇`];
+    if (result.matched) bits.push(`${result.matched} 篇撞上已有作品、没建`);
+    if (result.failed) bits.push(`${result.failed} 篇的文件没能绑成完整版`);
+    toast(bits.join("，"), result.failed ? "info" : "success");
+  });
 }
 
 function isPixivNovelUrl(value) {

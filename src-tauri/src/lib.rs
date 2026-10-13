@@ -331,22 +331,54 @@ struct DistributeTarget {
     extension: String,
 }
 
+/// 「新建作品」预览里的一条候选（v1.2.92）。
+///
+/// 精确判重（同作者 + 同标题 + 同日期）已经**撤掉**：新建作品只看**相似度**，
+/// 撞上哪篇已有作品就把它摆出来让用户自己判断，勾了才建。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportCandidate {
+    /// 原文（粘贴是那一行、Excel 是那个单元格、文件夹是文件名）—— 列给用户核对
+    line: String,
+    title: String,
+    release_date: String,
+    /// 文件夹方式才有的完整路径；粘贴 / Excel 留空
+    source_path: String,
+    /// 匹配到的已有作品 id（0 = 没匹配到）
+    matched_work_id: i64,
+    /// 匹配到的已有作品标题（空 = 没匹配到）—— 用户要能看见"撞上的是哪一篇"
+    matched_title: String,
+    /// 相似度（0~100）；以文件名去比时返回的是文件名那边的分数
+    matched_score: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportPreview {
-    new_count: usize,
-    duplicate_count: usize,
-    invalid_count: usize,
-    /// 被跳过的行**原文**（v1.2.81）：列给用户看，省得他猜"为什么这一条没进来"。
+    candidates: Vec<ImportCandidate>,
+    /// 没认出标题的行（空行 / 只有分隔符）—— 列出来省得用户猜"为什么这条没进来"
     invalid_lines: Vec<String>,
-    duplicates: Vec<String>,
+}
+
+/// 用户在预览里**勾中**的一条（勾上 = 新建，不勾 = 不建）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportSelection {
+    title: String,
+    #[serde(default)]
+    release_date: String,
+    /// 文件夹方式带完整路径 ⇒ 建完还要把文件绑成完整版并搬进完整版目录
+    #[serde(default)]
+    source_path: String,
 }
 
 #[derive(Serialize)]
 struct ImportResult {
     created: usize,
-    updated: usize,
-    skipped: usize,
+    /// 因为相似度撞上已有作品而没建的条数（前端拿来跟用户交代）
+    matched: usize,
+    /// 建了作品、但文件没能绑成完整版的条数
+    failed: usize,
 }
 
 /// 一个「完整版搜索网站」：名字用来在右键菜单里显示，网址是它的搜索页
@@ -15070,84 +15102,192 @@ fn parse_line(line: &str) -> Option<(String, String)> {
     }
 }
 
+/// 相似度匹配：拿一个候选标题去和**这位作者的全部作品**比。
+///
+/// 两个分数取大的那个：
+/// · 标题对标题 —— 用户在粘贴 / Excel 里写的名字，可能比磁盘上的文件名更完整；
+/// · 标题对文件名 —— 文件夹方式下，真正该看的是磁盘上那个文件名。
+///
+/// 只有达到最小相似度（`min_similarity_threshold`）的才算"选了"，其中唯一最高的那个
+/// 当作"匹配到的作品"列给用户看。**不看精确相等** —— 完全同名当然相似度就是 100。
+fn best_import_match(
+    works: &[(i64, String)],
+    title: &str,
+    source_name: &str,
+    title_limit: i64,
+    min_similarity: i64,
+) -> Option<(i64, String, i64)> {
+    let mut best: Option<(i64, String, i64)> = None;
+    for (work_id, work_title) in works {
+        let score = similarity_with_title_limit(work_title, title, title_limit).max(
+            if source_name.is_empty() {
+                0
+            } else {
+                similarity_with_title_limit(work_title, source_name, title_limit)
+            },
+        );
+        if score < min_similarity {
+            continue;
+        }
+        if best.as_ref().map_or(true, |(_, _, top)| score > *top) {
+            best = Some((*work_id, work_title.clone(), score));
+        }
+    }
+    best
+}
+
+/// 「新建作品」的预览（v1.2.92）：三种方式（粘贴文本 / Excel / 文件夹）共用。
+///
+/// 返回**每一条都带匹配结果**的候选，前端一行一个复选框：
+/// **没匹配到的默认勾选、匹配到的默认不勾**，勾了才建。
 #[tauri::command]
-fn preview_import(author_id: i64, lines: Vec<String>) -> Result<ImportPreview, String> {
+fn preview_import_bytes(author_id: i64, lines: Vec<String>) -> Result<ImportPreview, String> {
     let conn = db()?;
-    let mut new_count = 0;
-    let mut invalid_count = 0;
-    let mut duplicates = vec![];
+    Ok(build_import_preview(&conn, author_id, lines)?)
+}
+
+fn build_import_preview(
+    conn: &Connection,
+    author_id: i64,
+    lines: Vec<String>,
+) -> Result<ImportPreview, String> {
+    let settings = read_settings(conn)?;
+    let title_limit = settings.match_title_length;
+    let min_similarity = settings.min_similarity_threshold;
+    let threshold = settings.similarity_threshold;
+    let works = author_works_for_match(conn, author_id)?;
+    let mut candidates = vec![];
     let mut invalid_lines = vec![];
     for line in lines {
-        if let Some((date, title)) = parse_line(&line) {
-            let exists: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM works WHERE author_id=?1 AND title=?2 AND release_date=?3",
-                    params![author_id, title, date],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
-            if exists.is_some() {
-                duplicates.push(format!("{date} {title}"));
-            } else {
-                new_count += 1;
-            }
+        // 文件夹方式给的是完整路径（先按路径原样取一次，取不到再当普通文本解析）
+        let path = Path::new(&line);
+        let as_file = path.is_file();
+        let source_name = if as_file { file_name(path) } else { String::new() };
+        let raw = if as_file {
+            file_stem(path)
         } else {
-            invalid_count += 1;
+            line.clone()
+        };
+        let Some((date, title)) = parse_line(&raw) else {
             // 只留前 60 个字符，免得一行超长把弹窗撑破
             let preview: String = line.trim().chars().take(60).collect();
             invalid_lines.push(preview);
-        }
+            continue;
+        };
+        let (matched_work_id, matched_title, matched_score) =
+            match best_import_match(&works, &title, &source_name, title_limit, min_similarity) {
+                Some((id, matched, score)) => {
+                    // 只有"够像"（达到关联相似度）才把它说成"匹配到的作品"，
+                    // 否则那点分数不足为凭，列出来反而误导
+                    if score >= threshold {
+                        (id, matched, score)
+                    } else {
+                        (0, String::new(), score)
+                    }
+                }
+                None => (0, String::new(), 0),
+            };
+        candidates.push(ImportCandidate {
+            line: line.clone(),
+            title,
+            release_date: date,
+            source_path: if as_file {
+                line.clone()
+            } else {
+                String::new()
+            },
+            matched_work_id,
+            matched_title,
+            matched_score,
+        });
     }
     Ok(ImportPreview {
-        new_count,
-        duplicate_count: duplicates.len(),
-        invalid_count,
+        candidates,
         invalid_lines,
-        duplicates,
     })
 }
 
+/// 参与"新建作品"匹配的作品：**这位作者名下的全部作品**。
+fn author_works_for_match(conn: &Connection, author_id: i64) -> Result<Vec<(i64, String)>, String> {
+    let mut statement = conn
+        .prepare("SELECT id, title FROM works WHERE author_id=?1")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([author_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 「新建作品」的落库（v1.2.92）：**只建用户勾中的那些**。
+///
+/// · 勾中且**没匹配到**已有作品 ⇒ 直接建；
+/// · 勾中但**匹配到了**已有作品 ⇒ 跳过去（用户真要建，得先取消那个匹配，
+///   v1.2.92 的判据就是"相似度够像 ⇒ 认作同一篇"，不再有第二个开关）；
+/// · 文件夹方式勾中的还带 `source_path` ⇒ 建完把那个文件**绑成完整版并搬进完整版目录**
+///   （复用 `bind_work_moving_to_purchased`，跟详情里那个按钮是同一条路）。
+///
+/// 绑文件刻意**放到事务外**：磁盘搬家可能慢，不该把数据库事务开着；
+/// 而且某一条搬失败也只影响它自己，前面建好的作品照旧落地。
 #[tauri::command]
 fn commit_import(
     author_id: i64,
-    lines: Vec<String>,
-    overwrite: bool,
+    selections: Vec<ImportSelection>,
 ) -> Result<ImportResult, String> {
     let mut conn = db()?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let settings = read_settings(&conn)?;
+    let title_limit = settings.match_title_length;
+    let min_similarity = settings.min_similarity_threshold;
+    let threshold = settings.similarity_threshold;
+    // 一次提交里的作品会越来越多，每建一条就把新作品也补进这个表 —— 免得用户
+    // 把同一篇在两行里都写了、两行都勾上，结果建出两份一模一样的记录。
+    let mut works = author_works_for_match(&conn, author_id)?;
     let mut created = 0;
-    let mut updated = 0;
-    let mut skipped = 0;
-    for line in lines {
-        let Some((date, title)) = parse_line(&line) else {
-            skipped += 1;
-            continue;
-        };
-        let exists: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM works WHERE author_id=?1 AND title=?2 AND release_date=?3",
-                params![author_id, title, date],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        if exists.is_some() {
-            if overwrite {
-                updated += 1;
-            } else {
-                skipped += 1;
+    let mut matched = 0;
+    let mut pending: Vec<(i64, String)> = vec![];
+    {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for selection in &selections {
+            let title = selection.title.trim().to_string();
+            if title.is_empty() {
+                continue;
             }
-        } else {
-            insert_local_work(&tx, author_id, &title, &date).map_err(|e| e.to_string())?;
+            let date = selection.release_date.trim().to_string();
+            let source_name = if selection.source_path.is_empty() {
+                String::new()
+            } else {
+                file_name(Path::new(&selection.source_path))
+            };
+            if best_import_match(&works, &title, &source_name, title_limit, min_similarity)
+                .map(|(_, _, score)| score >= threshold)
+                .unwrap_or(false)
+            {
+                matched += 1;
+                continue;
+            }
+            let work_id = insert_local_work(&tx, author_id, &title, &date).map_err(|e| e.to_string())?;
             created += 1;
+            works.push((work_id, title));
+            if !selection.source_path.is_empty() {
+                pending.push((work_id, selection.source_path.clone()));
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    // 绑完整版 + 搬文件：跟详情里「绑定完整版文件」走的是同一个命令，
+    // 出错也只记数、不回滚（作品已经建好了，文件还能事后手动绑）
+    let mut failed = 0;
+    for (work_id, path) in pending {
+        if bind_work_moving_to_purchased(work_id, path).is_err() {
+            failed += 1;
         }
     }
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(ImportResult {
         created,
-        updated,
-        skipped,
+        matched,
+        failed,
     })
 }
 
@@ -15185,43 +15325,87 @@ fn read_import_file(path: String, column: usize) -> Result<Vec<String>, String> 
     Ok(values)
 }
 
+/// 文件夹导入认哪些扩展名（v1.2.92：从"只有 txt"放宽到 txt / epub / html）。
+fn import_folder_extension_allowed(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "txt" | "epub" | "html" | "htm"
+    )
+}
+
+/// 这条目录项算不算「一篇作品」。
 fn should_import_folder_entry(
     is_directory: bool,
-    is_txt: bool,
+    extension: &str,
     size: u64,
     minimum_size_bytes: u64,
 ) -> bool {
-    is_directory || (is_txt && size >= minimum_size_bytes)
+    if is_directory {
+        // 目录照旧收（有些人的"一篇"就是一个带图的文件夹）；
+        // 但同步落下的配图目录不是作品，跳过
+        return !extension.eq_ignore_ascii_case("images");
+    }
+    import_folder_extension_allowed(extension) && size >= minimum_size_bytes
 }
 
+/// 读一个「作品文件夹」，递归收下层所有 TXT / epub / HTML 的**完整路径**（v1.2.92）。
+///
+/// 以前只读第一层、只认 txt、而且只回文件名 —— 于是：
+/// ① 子文件夹里的作品全看不见；② epub / HTML 一个都进不来；
+/// ③ 拿到文件名也没法把文件绑成完整版（不知道它在哪）。
+/// 现在给的是完整路径，前端把它回传就能直接"绑成完整版 + 搬进完整版目录"。
+///
+/// `{标题}_images` 那种配图目录整棵跳过；符号链接不跟（防止绕圈）。
 #[tauri::command]
 fn read_import_folder(path: String, minimum_size_bytes: u64) -> Result<Vec<String>, String> {
-    let entries = fs::read_dir(&path).map_err(|e| format!("无法读取作品文件夹：{e}"))?;
-    let mut names = vec![];
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("无法读取作品文件夹内容：{e}"))?;
+    let root = PathBuf::from(&path);
+    if !root.is_dir() {
+        return Err("这个文件夹不在了，请重新选择".into());
+    }
+    let mut found: Vec<String> = vec![];
+    collect_import_folder_entries(&root, minimum_size_bytes, &mut found, 0);
+    found.sort();
+    Ok(found)
+}
+
+fn collect_import_folder_entries(
+    dir: &Path,
+    minimum_size_bytes: u64,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    // 防御：正常作品目录不会有这么深，真有也是软链绕圈
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
         let entry_path = entry.path();
-        let is_txt = entry_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.eq_ignore_ascii_case("txt"))
-            .unwrap_or(false);
-        let is_directory = entry_path.is_dir();
-        let size = if is_directory {
-            0
-        } else {
-            entry
-                .metadata()
-                .map_err(|e| format!("无法读取文件大小：{e}"))?
-                .len()
+        let Ok(kind) = entry.file_type() else {
+            continue;
         };
-        if should_import_folder_entry(is_directory, is_txt, size, minimum_size_bytes) {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
+        if kind.is_dir() {
+            if is_images_asset_dir(&entry_path) {
+                continue;
             }
+            collect_import_folder_entries(&entry_path, minimum_size_bytes, out, depth + 1);
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        let extension = entry_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_string();
+        let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if should_import_folder_entry(false, &extension, size, minimum_size_bytes) {
+            out.push(entry_path.to_string_lossy().to_string());
         }
     }
-    Ok(names)
 }
 
 #[tauri::command]
@@ -15725,7 +15909,7 @@ pub fn run() {
             work_reading_path,
             open_external_url,
             open_search_site,
-            preview_import,
+            preview_import_bytes,
             commit_import,
             read_import_file,
             read_import_folder,
@@ -15810,6 +15994,7 @@ mod tests {
         select_argument,
         extended_path_for_api, strip_extended_prefix,
         should_import_folder_entry, should_skip_small_content, similarity_percent, similarity_with_title_limit,
+        best_import_match, import_folder_extension_allowed, author_works_for_match, ImportCandidate, ImportSelection,
         sort_works_by_content_size,
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
         probe_latest_version, probe_update_asset, update_asset_names, update_client,
@@ -17395,10 +17580,52 @@ mod tests {
 
     #[test]
     fn folder_import_filters_only_small_txt_files() {
-        assert!(should_import_folder_entry(true, false, 0, 1024));
-        assert!(should_import_folder_entry(false, true, 1024, 1024));
-        assert!(!should_import_folder_entry(false, true, 1023, 1024));
-        assert!(!should_import_folder_entry(false, false, 4096, 1024));
+        assert!(should_import_folder_entry(true, "", 0, 1024));
+        assert!(should_import_folder_entry(false, "txt", 1024, 1024));
+        assert!(!should_import_folder_entry(false, "txt", 1023, 1024));
+        // v1.2.92：epub / html 也算作品（以前只认 txt，这两种一个都进不来）
+        assert!(should_import_folder_entry(false, "epub", 4096, 1024));
+        assert!(should_import_folder_entry(false, "HTML", 4096, 1024));
+        // 别的扩展名照旧不收
+        assert!(!should_import_folder_entry(false, "jpg", 4096, 1024));
+        // 同步落下的配图目录不是作品
+        assert!(!should_import_folder_entry(true, "images", 0, 1024));
+    }
+
+    /// v1.2.92：「新建作品」只看**相似度**，不再精确比「作者+标题+日期」三元组。
+    #[test]
+    fn import_match_falls_back_to_similarity_and_keeps_the_best() {
+        let works = vec![
+            (11_i64, "夜色温柔".to_string()),
+            (22, "旧城记".to_string()),
+            (33, "完全不相干的一本书".to_string()),
+        ];
+        // 完全同名 ⇒ 100 分，并且认到具体哪一篇
+        let (id, title, score) = best_import_match(&works, "旧城记", "", 0, 60).unwrap();
+        assert_eq!(id, 22);
+        assert_eq!(title, "旧城记");
+        assert_eq!(score, 100);
+        // 只是"像"也给（这正是撤掉精确判重的意义）——两边任意一侧多出来的内容会按比例扣分，
+        // 所以这里用只差一个字的候选，分数稳稳过门槛
+        let (id, _, score) = best_import_match(&works, "旧城集", "", 0, 60).unwrap();
+        assert_eq!(id, 22);
+        // 后缀再多就扣下去了：相似度 = 最长公共子串 3 / 较长一边 7 ≈ 42 分，够不着 60
+        assert!(best_import_match(&works, "旧城记（完整版）", "", 0, 60).is_none());
+        assert!(score >= 60, "相似度应当够门槛，实际 {score}");
+        // 谁都不像时返回 None（前端据此默认勾上）
+        assert!(best_import_match(&works, "毫无关系标题", "", 0, 60).is_none());
+        // 门槛抬高到 100 时，只有一模一样的才算"选到了"
+        assert!(best_import_match(&works, "旧城集", "", 0, 100).is_none());
+    }
+
+    /// 文件夹方式下，文件名比用户写的标题更像时以文件名去找（磁盘上那个名字才是真的）。
+    #[test]
+    fn import_match_uses_the_file_name_when_it_matches_better() {
+        let works = vec![(11_i64, "夜色温柔".to_string())];
+        // 标题是用户手写的残缺串，文件名是完整的 —— 取两者的高分
+        let (id, _, score) = best_import_match(&works, "夜色", "夜色温柔.txt", 0, 60).unwrap();
+        assert_eq!(id, 11);
+        assert!(score >= 60, "相似度应当够门槛，实际 {score}");
     }
 
     #[test]
