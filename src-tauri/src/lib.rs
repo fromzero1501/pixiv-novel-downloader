@@ -3509,6 +3509,161 @@ fn leave_work_series(author_id: i64, work_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+// ==================== 系列的新建 / 重命名 / 删除（v1.2.96） ====================
+//
+// 系列存在两张表里，**改一处不够**：
+//   - `series_catalog(author_id, id, title)`：系列本身（总览卡片读它）；
+//   - `works.series_id / .series_title / .series_order`：作品的从属关系，
+//     其中 `series_title` 是**冗余副本**（同步时跟作品一起写进来的）。
+// 所以重命名两处都要改 —— 只改目录表，详情页和「加入系列」弹窗里显示的仍是旧名。
+//
+// ⚠️ **手动改的名字会被下次同步冲掉**：同步时是
+// `INSERT … ON CONFLICT(author_id, id) DO UPDATE SET title=excluded.title`，
+// Pixiv 的系列名会盖回来。用户 2026-10-14 明确接受这一点，故不加"手动改过就不覆盖"的保护。
+
+/// 本地新建的系列 id 前缀。Pixiv 的系列 id 是一串数字，`local-` 开头绝不会撞上。
+const LOCAL_SERIES_ID_PREFIX: &str = "local-";
+
+/// 系列名去空白后不能是空的，也不能和**同一作者**下的别的系列重名
+/// （`series_catalog` 没有唯一约束，只能在命令里查）。
+///
+/// `exclude_id` 传 `Some` 时把那个系列自己排除在外 —— 重命名成"自己原来的名字"是允许的。
+fn ensure_series_title_free(
+    conn: &Connection,
+    author_id: i64,
+    title: &str,
+    exclude_id: Option<&str>,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("系列名不能为空".into());
+    }
+    let taken: Option<String> = conn
+        .query_row(
+            "SELECT id FROM series_catalog WHERE author_id=?1 AND title=?2 AND id<>?3",
+            params![author_id, title, exclude_id.unwrap_or("")],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if taken.is_some() {
+        return Err(format!("已经有一个叫「{title}」的系列了"));
+    }
+    Ok(())
+}
+
+/// 新建一个空系列（不建任何作品）。新建出来就能在总览里看到、也能把作品加进去。
+#[tauri::command]
+fn create_series(author_id: i64, title: String) -> Result<SeriesSummary, String> {
+    let conn = db()?;
+    let title = title.trim().to_string();
+    ensure_series_title_free(&conn, author_id, &title, None)?;
+    // 作者得存在，否则建出来是个孤儿系列（总览按 author_id 查，永远看不到）
+    let exists: Option<i64> = conn
+        .query_row("SELECT id FROM authors WHERE id=?1", [author_id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if exists.is_none() {
+        return Err("作者不存在".into());
+    }
+    // 本地 id 用毫秒时间戳 —— 同一毫秒内建两个系列才会撞，而这是人手点不出来的速度
+    let id = format!(
+        "{LOCAL_SERIES_ID_PREFIX}{}",
+        Utc::now().timestamp_millis()
+    );
+    conn.execute(
+        "INSERT INTO series_catalog (author_id, id, title) VALUES (?1, ?2, ?3)",
+        params![author_id, id, title],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(SeriesSummary {
+        id,
+        title,
+        work_count: 0,
+        purchased_count: 0,
+        preview_count: 0,
+        cover_path: String::new(),
+        max_order: 0,
+        read_count: 0,
+        gap_orders: Vec::new(),
+    })
+}
+
+/// 重命名系列：目录表 + 作品上的冗余副本一起改（见本节开头的说明）。
+#[tauri::command]
+fn rename_series(author_id: i64, series_id: String, title: String) -> Result<(), String> {
+    let mut conn = db()?;
+    let title = title.trim().to_string();
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT title FROM series_catalog WHERE author_id=?1 AND id=?2",
+            params![author_id, series_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(current) = current else {
+        return Err("这个系列不存在".into());
+    };
+    if current == title {
+        // 名字没变：不必写库（也免得"重名检查"把自己算进去）
+        return Ok(());
+    }
+    ensure_series_title_free(&conn, author_id, &title, Some(&series_id))?;
+    // 两处一起改，包事务：只改一边会让详情页显示的系列名和总览对不上
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "UPDATE series_catalog SET title=?1 WHERE author_id=?2 AND id=?3",
+            params![title, author_id, series_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "UPDATE works SET series_title=?1 WHERE author_id=?2 AND series_id=?3",
+            params![title, author_id, series_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 删除系列。**只解绑，不删作品** —— 系列里的作品留在库里，
+/// `series_id` / `series_title` / `series_order` 清空（等同于逐个 `leave_work_series`）。
+#[tauri::command]
+fn delete_series(author_id: i64, series_id: String) -> Result<usize, String> {
+    let mut conn = db()?;
+    let exists: Option<String> = conn
+        .query_row(
+            "SELECT id FROM series_catalog WHERE author_id=?1 AND id=?2",
+            params![author_id, series_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if exists.is_none() {
+        return Err("这个系列不存在".into());
+    }
+    // 解绑 + 删目录行是两件事，必须同一个事务：中途失败会留下"作品还挂在已删系列上"的脏状态
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    let unbound = transaction
+        .execute(
+            "UPDATE works SET series_id='', series_title='', series_order=0 WHERE author_id=?1 AND series_id=?2",
+            params![author_id, series_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM series_catalog WHERE author_id=?1 AND id=?2",
+            params![author_id, series_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())?;
+    Ok(unbound)
+}
+
 fn stem(path: &Path) -> String {
     path.file_stem()
         .and_then(|name| name.to_str())
@@ -16018,6 +16173,10 @@ pub fn run() {
             list_series,
             set_work_series,
             leave_work_series,
+            // v1.2.96：系列的新建 / 重命名 / 删除
+            create_series,
+            rename_series,
+            delete_series,
             scan_preview,
             scan_purchased,
             bind_work_moving_to_purchased,

@@ -455,6 +455,11 @@ const previewWatchLater = [
   { workId: 4, addedAt: previewDayAt(-2, 20, 30) },
 ];
 previewWorks.forEach((work, index) => { work.seriesId = index < 2 ? "demo-series-1" : ""; work.seriesTitle = index < 2 ? "雾海档案短篇系列" : ""; });
+// v1.2.96：系列目录在预览里也要是**内存可变**的（新建 / 重命名 / 删除当场见效），
+// 所以不能再像以前那样把 list_series 写死成常量。
+let previewSeries = [
+  { id: "demo-series-1", title: "雾海档案短篇系列", workCount: 2, purchasedCount: 1, previewCount: 1, coverPath: "", maxOrder: 3, readCount: 1, gapOrders: [2] },
+];
 
 // 浏览器预览用的筛选模板（真数据在 filter_views 表里）。预置一条是为了让
 // 「打开模板 → 条件写回 → 所有作品跟着筛」这条链在预览里开箱就能验到。
@@ -578,8 +583,37 @@ async function invoke(command, args = {}) {
       truncated: matched.length > limit,
     };
   }
-  // 系列序号故意留一个空号（1、3，缺 2），好让「缺篇检测」在预览里也验得到
-  if (command === "list_series") return [{ id: "demo-series-1", title: "雾海档案短篇系列", workCount: 2, purchasedCount: 1, previewCount: 1, coverPath: "", maxOrder: 3, readCount: 1, gapOrders: [2] }];
+  // 系列序号故意留一个空号（1、3，缺 2），好让「缺篇检测」在预览里也验得到。
+  // v1.2.96：系列改成**内存可变**（新建 / 重命名 / 删除要能在预览里看得出效果）
+  if (command === "list_series") return previewSeries.map((item) => ({ ...item }));
+  if (command === "create_series") {
+    const record = { id: `local-${Date.now()}-${previewSeries.length}`, title: String(args.title || "").trim(), workCount: 0, purchasedCount: 0, previewCount: 0, coverPath: "", maxOrder: 0, readCount: 0, gapOrders: [] };
+    if (!record.title) throw new Error("系列名不能为空");
+    if (previewSeries.some((item) => item.title === record.title)) throw new Error(`已经有一个叫「${record.title}」的系列了`);
+    previewSeries.push(record);
+    return { ...record };
+  }
+  if (command === "rename_series") {
+    const series = previewSeries.find((item) => item.id === args.seriesId);
+    if (!series) throw new Error("这个系列不存在");
+    const title = String(args.title || "").trim();
+    if (!title) throw new Error("系列名不能为空");
+    if (previewSeries.some((item) => item.id !== series.id && item.title === title)) throw new Error(`已经有一个叫「${title}」的系列了`);
+    series.title = title;
+    for (const work of previewWorks) if (work.seriesId === series.id) work.seriesTitle = title;
+    return undefined;
+  }
+  if (command === "delete_series") {
+    const index = previewSeries.findIndex((item) => item.id === args.seriesId);
+    if (index < 0) throw new Error("这个系列不存在");
+    // 只解绑，不删作品（和后端一个语义）
+    let unbound = 0;
+    for (const work of previewWorks) {
+      if (work.seriesId === args.seriesId) { work.seriesId = ""; work.seriesTitle = ""; work.seriesOrder = 0; unbound += 1; }
+    }
+    previewSeries.splice(index, 1);
+    return unbound;
+  }
   // 待补完整版工作台（v1.2.7）：mock 里「没有完整版」就等于 purchasedPath 为空。
   // authorName 按 authorId 现查，别统一写成第 1 位作者 —— 工作台第一层是按作者归堆的，
   // 名字全一样就看不出分组对不对了（真数据由 SQL JOIN 出来）
@@ -1160,6 +1194,9 @@ const icon = (name, size = 18) => {
     folderHeart: '<path d="M3 6.7A1.7 1.7 0 0 1 4.7 5H10l2 2h7.3A1.7 1.7 0 0 1 21 8.7v9.6a1.7 1.7 0 0 1-1.7 1.7H4.7A1.7 1.7 0 0 1 3 18.3Z"/><path d="M12 16.4c-1.8-1.2-2.8-2.4-2.8-3.6a1.5 1.5 0 0 1 2.8-.6 1.5 1.5 0 0 1 2.8.6c0 1.2-1 2.4-2.8 3.6Z"/>',
     filter: '<path d="M3.5 5.5h17l-6.6 7.7v5.6l-3.8 2.1v-7.7Z"/>',
     bookText: '<path d="M4 5.5A1.5 1.5 0 0 1 5.5 4H10a2 2 0 0 1 2 2 2 2 0 0 1 2-2h4.5A1.5 1.5 0 0 1 20 5.5v13a1.5 1.5 0 0 1-1.5 1.5H12a2 2 0 0 0-2 2 2 2 0 0 0-2-2H5.5A1.5 1.5 0 0 1 4 18.5Z"/><path d="M12 6v14"/>',
+    // v1.2.96：系列卡片右键菜单要用的两个
+    edit: '<path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17Z"/><path d="M14.5 6.5 17.5 9.5"/>',
+    trash: '<path d="M4 7h16"/><path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7"/><path d="M6.5 7 7.4 19a1.5 1.5 0 0 0 1.5 1.4h6.2a1.5 1.5 0 0 0 1.5-1.4L17.5 7"/><path d="M10.5 11v5.5M13.5 11v5.5"/>',
   };
   // 名字以 Filled 结尾的图标用实心填充（如 starFilled）
   const fill = name.endsWith("Filled") ? "currentColor" : "none";
@@ -1614,6 +1651,16 @@ function render() {
       restoreSearchFocus("series-search");
     };
   }
+  // 系列卡片右键菜单（v1.2.96）：重命名 / 删除系列。左键单击走 data-action="open-series-card"。
+  document.querySelectorAll(".series-card").forEach((card) => {
+    if (card.dataset.bound) return;
+    card.dataset.bound = "true";
+    card.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      const series = state.seriesItems.find((item) => String(item.id) === card.dataset.seriesId);
+      seriesCardMenu(series || { id: card.dataset.seriesId, title: card.dataset.seriesTitle || "", workCount: 0 });
+    });
+  });
   bindEvents();
   // 界面记忆的**唯一落盘点**：筛选、排序、搜索、切页最后都会走到这里，
   // 挂一处就够，加新筛选项不必再去追那十几处 data-action（详见「视图状态记忆」一节）
@@ -5141,6 +5188,7 @@ function renderSeriesView() {
   return renderShell(`
     <section class="topbar work-topbar"><div class="crumb-heading"><button class="back-button" title="返回作品库" data-action="close-series-view">${icon("back", 20)}</button><div class="series-head"><p class="section-kicker">作者作品库</p><h1>系列作品</h1></div>
       <div class="series-search-box">${icon("search", 15)}<input id="series-search" type="search" placeholder="搜索系列名" value="${escapeHtml(state.seriesQuery)}" autocomplete="off"></div>
+      <button class="icon-text-button" data-action="create-series" title="新建一个空系列，之后再把作品放进来；同一作者下不能重名">${icon("plus", 18)}<span>新建系列</span></button>
       <button class="icon-text-button" data-action="match-series-bundle" title="按系列名去「完整版自动匹配文件夹」里找文件，找到后弹窗勾选这个文件里含哪几篇">${icon("sync", 18)}<span>合集自动匹配</span></button></div></section>
     <section class="library-content"><div class="series-grid">${cards || '<div class="empty-state works-empty"><div class="empty-icon">' + icon("series", 26) + '</div><h2>还没有系列作品</h2><p>同步到的系列作品会显示在这里。</p></div>'}</div></section>`);
 }
@@ -5581,8 +5629,86 @@ async function setWorkSeries(workId, seriesId, seriesOrder) {
   toast("作品已加入系列", "success");
 }
 
-function seriesOrderOptions(maxOrder, selectedOrder) {
-  const upper = Math.max(1, Number(maxOrder || 0) + 1, Number(selectedOrder || 0));
+/**
+ * 新建系列（v1.2.96）。空系列是允许存在的 —— 后端 series_catalog 靠 LEFT JOIN 让它显示出来，
+ * 之后再往里放作品就行。
+ */
+async function createSeriesDialog(presetTitle = "") {
+  showModal(modal("新建系列", `
+    <form id="series-create-form" class="form-stack">
+      <label>系列名称 <input name="title" required maxlength="120" value="${escapeHtml(presetTitle)}" placeholder="例如：雾海档案短篇系列"><small>同一作者下不能重名。建好之后是空系列，再把作品放进来。</small></label>
+    </form>`, '<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" form="series-create-form" type="submit">新建</button>'));
+}
+
+async function submitCreateSeries(event) {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const title = String(values.title || "").trim();
+  if (!title) { toast("系列名不能为空", "error"); return; }
+  try {
+    await invoke("create_series", { authorId: state.activeAuthor.id, title });
+    closeModal();
+    await refreshSeriesView();
+    render();
+    toast(`已新建系列「${title}」`, "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/** 重命名系列（v1.2.96）：只改目录名 + 归属作品的 series_title，序号、绑定都不动。 */
+async function renameSeriesDialog(seriesId, currentTitle) {
+  showModal(modal("重命名系列", `
+    <form id="series-rename-form" class="form-stack">
+      <input type="hidden" name="seriesId" value="${escapeHtml(seriesId)}">
+      <label>系列名称 <input name="title" required maxlength="120" value="${escapeHtml(currentTitle)}"><small>下一轮同步如果 Pixiv 那边的系列名不同，这个名字会被同步覆盖回 Pixiv 的叫法。</small></label>
+    </form>`, '<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" form="series-rename-form" type="submit">保存</button>'));
+}
+
+async function submitRenameSeries(event) {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const title = String(values.title || "").trim();
+  if (!title) { toast("系列名不能为空", "error"); return; }
+  try {
+    await invoke("rename_series", { authorId: state.activeAuthor.id, seriesId: values.seriesId, title });
+    closeModal();
+    await refreshSeriesView();
+    render();
+    toast(`系列已更名为「${title}」`, "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/**
+ * 删除系列（v1.2.96，用户拍板「按解绑做」）：目录删掉，里面的作品**只解绑、不删作品**。
+ */
+function deleteSeriesConfirm(seriesId, title, workCount) {
+  const extra = workCount ? `里面的 ${workCount} 篇作品不会被删除，只是不再属于这个系列。` : "这个系列里还没有作品。";
+  confirmAction("删除系列", `确定删除系列「${title}」吗？${extra}`, "删除系列", async () => {
+    try {
+      const unbound = await invoke("delete_series", { authorId: state.activeAuthor.id, seriesId });
+      await refreshSeriesView();
+      render();
+      toast(unbound ? `已删除系列，${unbound} 篇作品已解绑` : "系列已删除", "success");
+    } catch (error) {
+      toast(String(error), "error");
+    }
+  });
+}
+
+/** 系列卡片右键菜单（v1.2.96）：重命名 / 删除系列。左键单击仍是打开系列详情。 */
+function seriesCardMenu(series) {
+  state.seriesMenuTarget = { id: series.id, title: series.title, workCount: series.workCount || 0 };
+  showModal(modal("系列操作", `<div class="menu-list">
+    <p class="menu-selection">系列：<b>${escapeHtml(series.title)}</b></p>
+    <button data-action="rename-series-menu">${icon("edit", 18)}重命名系列</button>
+    <button data-action="delete-series-menu">${icon("trash", 18)}删除系列</button>
+  </div>`, '<button class="quiet-button" data-action="close-modal">关闭</button>'));
+}
+
+function seriesOrderOptions(maxOrder, selectedOrder) {  const upper = Math.max(1, Number(maxOrder || 0) + 1, Number(selectedOrder || 0));
   return Array.from({ length: upper }, (_, index) => {
     const value = index + 1;
     return `<option value="${value}" ${value === Number(selectedOrder) ? "selected" : ""}>${value}</option>`;
@@ -5952,6 +6078,10 @@ async function bindEvents() {
       if (action === "open-all-series") await openAllWorksSeries(Number(authorId), element.dataset.seriesId, element.dataset.seriesTitle);
       if (action === "open-series-card") await openSeriesDetail(element.dataset.seriesId, element.dataset.seriesTitle, "overview");
       if (action === "close-series-view") await closeSeriesView();
+      // 系列的新建 / 重命名 / 删除（v1.2.96）
+      if (action === "create-series") await createSeriesDialog();
+      if (action === "rename-series-menu") { const target = state.seriesMenuTarget; closeModal(); if (target) await renameSeriesDialog(target.id, target.title); }
+      if (action === "delete-series-menu") { const target = state.seriesMenuTarget; closeModal(); if (target) deleteSeriesConfirm(target.id, target.title, target.workCount); }
       if (action === "set-work-series") {
         const form = document.querySelector("#series-form");
         const values = Object.fromEntries(new FormData(form).entries());
@@ -6673,6 +6803,17 @@ async function bindEvents() {
     });
   });
 
+  // 新建 / 重命名系列（v1.2.96）：各自一个 submit，理由和别的表单一样 —— 回车要能提交。
+  const seriesCreateForm = document.querySelector("#series-create-form");
+  if (seriesCreateForm && !seriesCreateForm.dataset.bound) {
+    seriesCreateForm.dataset.bound = "true";
+    seriesCreateForm.addEventListener("submit", submitCreateSeries);
+  }
+  const seriesRenameForm = document.querySelector("#series-rename-form");
+  if (seriesRenameForm && !seriesRenameForm.dataset.bound) {
+    seriesRenameForm.dataset.bound = "true";
+    seriesRenameForm.addEventListener("submit", submitRenameSeries);
+  }
   const authorForm = document.querySelector("#author-form");
   if (authorForm && !authorForm.dataset.bound) {
     authorForm.dataset.bound = "true";
