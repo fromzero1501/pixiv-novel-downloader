@@ -368,7 +368,8 @@ struct AppSettings {
     default_preview_dir: String,
     default_purchased_dir: String,
     auto_create_dirs: bool,
-    minimum_file_size_bytes: u64,
+    /// 「最小作品字数」（v1.2.89）：**字符数**。小于它的文本在导入 / 同步 / 自动匹配时忽略。0 = 不限。
+    minimum_text_count: u64,
     pixiv_delay_threshold: usize,
     pixiv_delay_seconds: u64,
     auto_group_dir: String,
@@ -1621,7 +1622,10 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
         default_preview_dir: setting(conn, "default_preview_dir")?,
         default_purchased_dir: setting(conn, "default_purchased_dir")?,
         auto_create_dirs: setting(conn, "auto_create_dirs")? == "1",
-        minimum_file_size_bytes: setting(conn, "minimum_file_size_bytes")?
+        // 「最小作品字数」（v1.2.89，原来是"最小文件大小/字节"）：老键只作兜底读取，别删
+        minimum_text_count: setting(conn, "minimum_text_count")
+            .or_else(|_| setting(conn, "minimum_file_size_bytes"))
+            .unwrap_or_else(|_| "0".to_string())
             .parse()
             .unwrap_or(0),
         pixiv_delay_threshold: setting(conn, "pixiv_delay_threshold")?
@@ -2573,10 +2577,12 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
     let conn = db()?;
     // 最小文件大小**调小** ⇒ 之前按旧阈值跳过的那些现在可能够大了，名单整体清空重来；
     // **调大**不用管（原来太小、现在只会更小）。用户 2026-10-13 定的规则。
-    let previous_min_size: u64 = setting(&conn, "minimum_file_size_bytes")?
+    let previous_min_size: u64 = setting(&conn, "minimum_text_count")
+        .or_else(|_| setting(&conn, "minimum_file_size_bytes"))
+        .unwrap_or_else(|_| "0".to_string())
         .parse::<u64>()
         .unwrap_or(0);
-    if settings.minimum_file_size_bytes < previous_min_size {
+    if settings.minimum_text_count < previous_min_size {
         let _ = conn.execute("DELETE FROM skipped_novels", []);
     }
     let values = [
@@ -2596,8 +2602,8 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
             },
         ),
         (
-            "minimum_file_size_bytes",
-            settings.minimum_file_size_bytes.to_string(),
+            "minimum_text_count",
+            settings.minimum_text_count.to_string(),
         ),
         (
             "pixiv_delay_threshold",
@@ -4143,7 +4149,7 @@ fn refresh_reading_image_count(conn: &Connection, work_id: i64) -> bool {
 
 fn sync_preview_entries(
     preview_dir: &Path,
-    minimum_file_size_bytes: u64,
+    minimum_text_count: u64,
 ) -> Result<Vec<SyncPreviewEntry>, String> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(preview_dir).map_err(|e| format!("无法读取预览版文件夹：{e}"))?
@@ -4169,11 +4175,13 @@ fn sync_preview_entries(
         if !is_cover && !is_preview {
             continue;
         }
-        if path.is_file()
-            && is_preview
-            && entry.metadata().map_err(|e| e.to_string())?.len() < minimum_file_size_bytes
-        {
-            continue;
+        // 「最小作品字数」（v1.2.89）：按**字符数**筛，不再看文件字节数。
+        // 数不出来的（非 txt）当作"没超"放行，免得误伤。
+        if path.is_file() && is_preview && minimum_text_count > 0 {
+            let count = text_word_count(&path.to_string_lossy()).unwrap_or(0) as u64;
+            if count > 0 && count < minimum_text_count {
+                continue;
+            }
         }
         let name = stem(&path);
         if !name.is_empty() {
@@ -6021,7 +6029,12 @@ fn pixiv_sync_impl(
     fs::create_dir_all(&preview_dir).map_err(|e| format!("无法创建预览版文件夹：{e}"))?;
     let purchased_dir = PathBuf::from(purchased_dir);
     fs::create_dir_all(&purchased_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
-    let preview_entries = sync_preview_entries(&preview_dir, minimum_file_size_bytes)?;
+    let minimum_text_count = setting(&conn, "minimum_text_count")
+        .or_else(|_| setting(&conn, "minimum_file_size_bytes"))
+        .unwrap_or_else(|_| "0".to_string())
+        .parse::<u64>()
+        .unwrap_or(0);
+    let preview_entries = sync_preview_entries(&preview_dir, minimum_text_count)?;
     let single_novel_id = pixiv_novel_id_from_url(&novel_url)?;
     let is_single_sync = single_novel_id.is_some();
     let start = parse_date_bound(&start_date, "开始日期")?;

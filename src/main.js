@@ -845,7 +845,7 @@ async function invoke(command, args = {}) {
     return;
   }
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
-  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumFileSizeBytes: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
+  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
   if (command === "save_app_settings") return args.settings;
   // 浏览器预览默认当作「已是最新版」；要看更新界面就把 window.__mockUpdateCheck 塞进来
   // 预览环境没有 Tauri 后端：给个默认「没填过 Cookie」，验证脚本可以塞 window.__mockCookieProbe 覆盖
@@ -8177,7 +8177,7 @@ async function submitImport() {
     const path = form.get("folderPath");
     if (!path) throw new Error("请先选择作品文件夹");
     const settings = await invoke("get_app_settings");
-    const minimumSizeBytes = Number(settings.minimumFileSizeBytes || 0);
+    const minimumSizeBytes = Number(settings.minimumTextCount || 0);
     lines = await invoke("read_import_folder", { path, minimumSizeBytes });
   } else {
     const form = new FormData(document.querySelector("#file-import-form"));
@@ -8510,11 +8510,10 @@ function collectSettings(form) {
   values.syncWorksOnNewAuthor = Boolean(form.querySelector('[name="syncWorksOnNewAuthor"]')?.checked);
   values.syncWorksOnStrayPromote = Boolean(form.querySelector('[name="syncWorksOnStrayPromote"]')?.checked);
   const unitBytes = { KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 };
-  const minimumFileSize = Number(values.minimumFileSize || 0);
-  const minimumFileSizeUnit = values.minimumFileSizeUnit;
-  if (!Number.isFinite(minimumFileSize) || minimumFileSize < 0 || !(minimumFileSizeUnit in unitBytes)) throw new Error("请输入有效的最小文件大小");
-  values.minimumFileSizeBytes = Math.ceil(minimumFileSize * unitBytes[minimumFileSizeUnit]);
-  if (!Number.isSafeInteger(values.minimumFileSizeBytes)) throw new Error("最小文件大小过大");
+  // 「最小作品字数」（v1.2.89）：直接是**字符数**，不再有单位换算
+  const minimumTextCount = Math.round(Number(values.minimumTextCount || 0));
+  if (!Number.isFinite(minimumTextCount) || minimumTextCount < 0) throw new Error("请输入有效的最小作品字数");
+  values.minimumTextCount = minimumTextCount;
   values.pixivDelayThreshold = Number(values.pixivDelayThreshold || 150);
   values.pixivDelaySeconds = Number(values.pixivDelaySeconds ?? 1);
   if (!Number.isInteger(values.pixivDelayThreshold) || values.pixivDelayThreshold < 1) throw new Error("抓取数量阈值至少为 1");
@@ -8608,7 +8607,7 @@ async function settingsModal() {
   state.settingsModalBusy = true;
   try {
   const settings = await invoke("get_app_settings");
-  const minimumSize = minimumSizeParts(settings.minimumFileSizeBytes);
+  const minimumSize = minimumSizeParts(settings.minimumTextCount);
   showModal(modal("设置（自动保存）", `<div class="settings-copy"><form id="settings-form" class="settings-form">
   <section class="settings-group is-account">
     <h3 class="settings-group-head"><span class="settings-group-no">1</span>Pixiv 账号</h3>
@@ -8621,7 +8620,7 @@ async function settingsModal() {
   <section class="settings-group is-storage">
     <h3 class="settings-group-head"><span class="settings-group-no">2</span>文件与目录</h3>
     <div class="settings-fields is-single">
-      <label>最小文件大小 <div class="size-input"><input name="minimumFileSize" type="number" min="0" step="0.1" value="${minimumSize.value}"><select name="minimumFileSizeUnit" aria-label="最小文件大小单位">${["KB", "MB", "GB"].map((unit) => `<option value="${unit}" ${minimumSize.unit === unit ? "selected" : ""}>${unit}</option>`).join("")}</select></div><small>导入文件夹和 Pixiv 同步时，会跳过小于此大小的文本内容；文件夹不受此限制。</small></label>
+      <label>最小作品字数 <div class="size-input"><input name="minimumTextCount" type="number" min="0" step="1" value="${minimumSize.value}"><span class="unit-fixed">字</span></div><small>导入文件夹和 Pixiv 同步时，会跳过小于这个字数的文本内容（按"去掉空白后的字符数"算）；文件夹不受此限制。</small></label>
       <label>预览版文件夹默认目录 <div class="path-input"><input name="defaultPreviewDir" value="${escapeHtml(settings.defaultPreviewDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-preview">选择目录</button></div></label>
       <label>完整版文件夹默认目录 <div class="path-input"><input name="defaultPurchasedDir" value="${escapeHtml(settings.defaultPurchasedDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-purchased">选择目录</button></div></label>
       <label>完整版自动匹配文件夹 <div class="path-input"><input name="autoGroupDir" value="${escapeHtml(settings.autoGroupDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-auto-group-dir">选择目录</button></div><small>将此文件夹（含其子文件夹）中的文件自动移动到对应作者的完整版文件夹中。同一本书匹配到多个作品时会列入手动选择，勾选几个作品就复制几份。</small></label>
