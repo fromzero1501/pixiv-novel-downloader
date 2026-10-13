@@ -5271,7 +5271,7 @@ async function continueSeriesReading() {
 }
 
 function renderEmptyWorks() {
-  return `<div class="empty-state works-empty"><div class="empty-icon">${icon("image", 26)}</div><h2>没有符合条件的作品</h2><p>导入作品名称，或调整当前的搜索与筛选条件。</p><button class="primary-button" data-action="import-works">${icon("plus", 18)}<span>导入作品</span></button></div>`;
+  return `<div class="empty-state works-empty"><div class="empty-icon">${icon("image", 26)}</div><h2>没有符合条件的作品</h2><p>新建作品，或调整当前的搜索与筛选条件。</p><button class="primary-button" data-action="import-works">${icon("plus", 18)}<span>新建作品</span></button></div>`;
 }
 
 function modal(title, body, footer = "", variantClass = "") {
@@ -5367,7 +5367,7 @@ function importModal() {
   showModal(modal("导入作品", `
     <div class="import-tabs"><button class="filter-button is-active" data-tab="paste">粘贴文本</button><button class="filter-button" data-tab="file">Excel / CSV</button><button class="filter-button" data-tab="folder">文件夹</button></div>
     <form id="paste-import-form" class="form-stack import-panel" data-panel="paste">
-      <label>固定开头 <input name="prefix" placeholder="例如：2025-" value="2025-"><small>只导入以该字符串开头的整行；行首日期会被提取。</small></label>
+      <label>固定开头 <input name="prefix" placeholder="例如：2025-"><small>只导入以该字符串开头的整行；行首日期会被提取。</small></label>
       <label>网页文本 <textarea name="text" rows="11" placeholder="每行一条作品名称，例如：\n2025-10-05（插画附+改编图文）～希儿&布洛妮娅.txt"></textarea></label>
     </form>
     <form id="file-import-form" class="form-stack import-panel is-hidden" data-panel="file">
@@ -5492,7 +5492,7 @@ async function bindEvents() {
   updateScrollJump();
   // 「所有作品」瀑布流的哨兵：每次重画都是一个新节点，这里重新挂一遍
   ensureLoadMoreObserver();
-  app.querySelectorAll('[data-action="import-works"] span').forEach((label) => { label.textContent = "导入作品名称"; });
+  app.querySelectorAll('[data-action="import-works"] span').forEach((label) => { label.textContent = "新建作品"; });
   app.querySelectorAll('[data-action="sync-pixiv"] span').forEach((label) => { label.textContent = "同步作品"; });
   const libraryActions = app.querySelector(".work-topbar .topbar-actions");
   if (libraryActions && state.activeAuthor && !state.seriesView && !state.bulkMode && !libraryActions.querySelector(".series-library-button")) {
@@ -8115,7 +8115,11 @@ async function submitImport() {
     lines = await invoke("read_import_file", { path, column: Number(form.get("column") || 1) });
   }
   const preview = await invoke("preview_import", { authorId: state.activeAuthor.id, lines });
-  const body = `<p class="import-summary">可新增 <strong>${preview.newCount}</strong> 条；重复 <strong>${preview.duplicateCount}</strong> 条；跳过 <strong>${preview.invalidCount}</strong> 条。</p>${preview.duplicates.length ? `<div class="duplicate-list">${preview.duplicates.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>` : ""}`;
+  // 被跳过的行也列出来（v1.2.81）：光说"跳过 1 条"用户只能猜是哪条、为什么
+  const invalidBlock = (preview.invalidLines || []).length
+    ? `<p class="import-note">下面这些行<strong>没被认出来</strong>，所以跳过了 —— 每行要写成「<strong>日期 + 标题</strong>」，日期必须是完整的 <code>YYYY-MM-DD</code>（月和日都补两位），日期后面才是标题：</p><div class="duplicate-list">${preview.invalidLines.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>`
+    : "";
+  const body = `<p class="import-summary">可新增 <strong>${preview.newCount}</strong> 条；重复 <strong>${preview.duplicateCount}</strong> 条；跳过 <strong>${preview.invalidCount}</strong> 条。</p>${preview.duplicates.length ? `<div class="duplicate-list">${preview.duplicates.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>` : ""}${invalidBlock}`;
   closeModal();
   showModal(modal("确认导入", body, `<button class="quiet-button" data-action="close-modal">取消</button><button class="quiet-button" data-action="commit-import" data-overwrite="false">跳过重复项</button><button class="primary-button" data-action="commit-import" data-overwrite="true">覆盖已有记录</button>`));
   document.querySelectorAll('[data-action="commit-import"]').forEach((button) => button.addEventListener("click", async () => {

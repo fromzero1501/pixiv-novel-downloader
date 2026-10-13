@@ -337,6 +337,8 @@ struct ImportPreview {
     new_count: usize,
     duplicate_count: usize,
     invalid_count: usize,
+    /// 被跳过的行**原文**（v1.2.81）：列给用户看，省得他猜"为什么这一条没进来"。
+    invalid_lines: Vec<String>,
     duplicates: Vec<String>,
 }
 
@@ -14842,6 +14844,7 @@ fn preview_import(author_id: i64, lines: Vec<String>) -> Result<ImportPreview, S
     let mut new_count = 0;
     let mut invalid_count = 0;
     let mut duplicates = vec![];
+    let mut invalid_lines = vec![];
     for line in lines {
         if let Some((date, title)) = parse_line(&line) {
             let exists: Option<i64> = conn
@@ -14859,12 +14862,16 @@ fn preview_import(author_id: i64, lines: Vec<String>) -> Result<ImportPreview, S
             }
         } else {
             invalid_count += 1;
+            // 只留前 60 个字符，免得一行超长把弹窗撑破
+            let preview: String = line.trim().chars().take(60).collect();
+            invalid_lines.push(preview);
         }
     }
     Ok(ImportPreview {
         new_count,
         duplicate_count: duplicates.len(),
         invalid_count,
+        invalid_lines,
         duplicates,
     })
 }
