@@ -181,6 +181,8 @@ const state = {
   pendingBundlePath: "",
   /** 系列作品页的搜索词（v1.2.70）：只搜系列名 */
   seriesQuery: "",
+  /** 「合集自动匹配」找到的「系列 id → 候选文件」（v1.2.74） */
+  seriesMatchFiles: new Map(),
   /** 合集索引（v1.2.68）：`workId -> 同属一个文件的其它作品`，用来挂「合集」徽标 */
   bundleIndex: new Map(),
   /**
@@ -1062,6 +1064,7 @@ async function invoke(command, args = {}) {
   if (command === "bind_series_bundle") return args.path;
   if (command === "list_bundles") return [];
   if (command === "match_series_files") return [];
+  if (command === "match_author_series") return [];
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
@@ -5087,48 +5090,70 @@ async function setCardRating(workId, value) {
  * 显示的都是**整本的字数**（用户 2026-10-13 明确要的口径）；磁盘占用则按路径去重。
  */
 /**
- * 「合集自动匹配」（v1.2.71 用户要求）：按**系列名**去「完整版自动匹配文件夹」里找文件。
+ * 「合集自动匹配」（v1.2.74 用户澄清）：用的是**这位作者的每一个系列名**，各去
+ * 「完整版自动匹配文件夹」里找一遍。
  *
- * 找一个就直接进「勾选篇数」那一步；找到多个先让你挑一个；一个都没找到就提示一句。
+ * 系列列表页没有"当前系列"，所以不能按单个系列名找（上一版就是这么错的）。
+ * 流程：列**找到了文件的**系列让你选一个 ⇒ 自动进那个系列的详情页 ⇒ 弹勾选篇数的窗。
  */
 async function matchSeriesBundle() {
-  const view = state.seriesView;
-  if (!view) {
-    toast("先进入某个系列的详情页", "info");
+  const author = state.activeAuthor;
+  if (!author) {
+    toast("先进入某位作者的系列作品页", "info");
     return;
   }
-  let files = [];
+  let matches = [];
   try {
-    files = await invoke("match_series_files", { title: String(view.title || "") });
+    matches = await invoke("match_author_series", { author: Number(author.id) });
   } catch (error) {
     toast(String(error), "error");
     return;
   }
-  if (!files.length) {
-    toast(`「完整版自动匹配文件夹」里没找到文件名含「${view.title}」的文件`, "info");
+  const hit = (matches || []).filter((item) => (item.files || []).length);
+  if (!hit.length) {
+    toast("这位作者的系列里，没有哪个名字能在「完整版自动匹配文件夹」里找到对应文件", "info");
     return;
   }
-  if (files.length === 1) {
-    await startSeriesBundle(files[0]);
-    return;
-  }
-  const rows = files.map((path) => {
-    const name = String(path).split(/[\\/]/).pop();
-    return `<label class="bundle-row"><input type="radio" name="series-file" value="${escapeHtml(path)}"${files.indexOf(path) === 0 ? " checked" : ""}><span class="bundle-title" title="${escapeHtml(path)}">${escapeHtml(name)}</span></label>`;
+  // 系列 id → 候选文件，选完「下一步」要按 id 把系列打开
+  state.seriesMatchFiles = new Map(hit.map((item) => [String(item.seriesId), item.files]));
+  const rows = hit.map((item, index) => {
+    const first = String(item.files[0] || "");
+    const name = first.split(/[\\/]/).pop();
+    return `<label class="bundle-row"><input type="radio" name="series-pick" value="${escapeHtml(String(item.seriesId))}"${index === 0 ? " checked" : ""}><span class="bundle-order">${item.files.length} 个候选</span><span class="bundle-title" title="${escapeHtml(item.seriesTitle)}">${escapeHtml(item.seriesTitle)}</span><span class="bundle-order" title="${escapeHtml(first)}">${escapeHtml(name)}</span></label>`;
   }).join("");
-  // 长得跟「自动匹配 → 标题匹配」那套弹窗保持一致：宽弹窗、一行一个、文件全路径做提示（v1.2.72）
-  showModal(modal(`自动匹配 · 找到 ${files.length} 个候选文件`,
-    `<p class="read-only-note">在「完整版自动匹配文件夹」里找到这些文件名含「${escapeHtml(view.title)}」的文件 —— 选一个，下一步再勾这个文件里含哪几篇。</p>
+  showModal(modal(`自动匹配 · ${hit.length} 个系列找到文件`,
+    `<p class="read-only-note">按系列名在「完整版自动匹配文件夹」里找到的对应关系 —— 选一个系列，下一步再勾这个文件里含哪几篇。（一位系列有多个候选时，先用文件名的第一个。）</p>
      <div class="bundle-list">${rows}</div>`,
-    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="pick-series-file" data-path="${escapeHtml(files[0])}">下一步</button>`,
+    `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="pick-series-match">下一步</button>`,
     "is-wide"));
-  // 「下一步」要带上真正选中的那个文件，radio 变了就更新按钮上的 path
-  document.querySelectorAll('input[name="series-file"]').forEach((box) => {
-    box.addEventListener("change", () => {
-      const button = document.querySelector('[data-action="pick-series-file"]');
-      if (button) button.dataset.path = box.value;
-    });
-  });
+}
+
+/** 「合集自动匹配」选定系列之后：先把系列详情打开，再弹勾选篇数的窗（v1.2.74） */
+async function confirmSeriesMatch() {
+  const picked = document.querySelector('input[name="series-pick"]:checked');
+  if (!picked) {
+    toast("先选一个系列", "info");
+    return;
+  }
+  const seriesId = String(picked.value);
+  const files = state.seriesMatchFiles.get(seriesId) || [];
+  const author = state.activeAuthor;
+  const series = (state.seriesItems || []).find((item) => String(item.id) === seriesId);
+  if (!files.length) {
+    toast("这个系列没有找到候选文件", "error");
+    return;
+  }
+  closeModal();
+  try {
+    await openSeriesDetail(seriesId, series ? series.title : "", state.seriesView ? state.seriesView.returnTo : null);
+    render();
+    if (files.length > 1) {
+      toast(`这个系列有 ${files.length} 个候选，先用「${String(files[0]).split(/[\\/]/).pop()}」`, "info");
+    }
+    await startSeriesBundle(files[0]);
+  } catch (error) {
+    toast(String(error), "error");
+  }
 }
 
 async function bindSeriesBundle() {
@@ -5977,6 +6002,7 @@ async function bindEvents() {
       if (action === "card-rate") await setCardRating(Number(element.dataset.workId), Number(element.dataset.rating));
       if (action === "match-series-bundle") await matchSeriesBundle();
       if (action === "pick-series-file") await startSeriesBundle(element.dataset.path);
+      if (action === "pick-series-match") await confirmSeriesMatch();
       if (action === "bind-series-bundle") await bindSeriesBundle();
       if (action === "confirm-series-bundle") await confirmSeriesBundle();
       if (action === "bundle-select-all") toggleBundleSelection(true);

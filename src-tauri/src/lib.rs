@@ -9721,6 +9721,50 @@ fn collect_series_candidates(dir: &Path, needle: &str, out: &mut Vec<String>, de
     }
 }
 
+/// 一个系列的匹配结果（v1.2.74）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SeriesMatch {
+    series_id: String,
+    series_title: String,
+    files: Vec<String>,
+}
+
+/// 把**这位作者的每个系列**都拿到「完整版自动匹配文件夹」里找一遍（v1.2.74 用户要求）。
+///
+/// 系列列表页没有"当前是哪个系列"，所以不能按单个系列名找 —— 用户的原话是
+/// 「用**这个作者的系列**来匹配」。返回的 `files` 可能为空（这个系列名没找到对应文件），
+/// 前端只列找到了的那些。
+#[tauri::command]
+fn match_author_series(author: i64) -> Result<Vec<SeriesMatch>, String> {
+    let conn = db()?;
+    let settings = read_settings(&conn)?;
+    let root = settings.auto_group_dir.trim().to_string();
+    if root.is_empty() {
+        return Err("还没设置「完整版自动匹配文件夹」—— 先去设置的文件与目录里指定一个".into());
+    }
+    let root = PathBuf::from(root);
+    if !root.is_dir() {
+        return Err("「完整版自动匹配文件夹」不在了，去设置里重新选一个".into());
+    }
+    let mut out: Vec<SeriesMatch> = Vec::new();
+    for series in list_series_impl(&conn, author)? {
+        let needle = series.title.trim().to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut files: Vec<String> = Vec::new();
+        collect_series_candidates(&root, &needle, &mut files, 0);
+        files.sort();
+        out.push(SeriesMatch {
+            series_id: series.id,
+            series_title: series.title,
+            files,
+        });
+    }
+    Ok(out)
+}
+
 /// 按**系列名**去「完整版自动匹配文件夹」里找候选文件（v1.2.71 用户要求）。
 ///
 /// 匹配口径：文件名（不含扩展名）**包含**系列名 —— 两边都去空白、忽略大小写。
@@ -15284,6 +15328,7 @@ pub fn run() {
             bind_work_moving_to_purchased,
             bind_series_bundle,
             match_series_files,
+            match_author_series,
             auto_group_purchased_files,
             confirm_manual_group,
             copy_previews_to_purchased,
