@@ -9991,6 +9991,113 @@ fn relink_bundle_after_removal(conn: &Connection, leaving_work_id: i64) -> Resul
     Ok(())
 }
 
+/// 把文件绑成某篇作品的**预览版**（v1.2.83）：搬进 `preview_dir`、按作品标题改名，
+/// 和完整版那套一个规矩 —— 用户要的是"绑定都要把文件自动移到对应文件夹、同时改名"。
+#[tauri::command]
+fn bind_work_preview(work_id: i64, path: String) -> Result<String, String> {
+    let conn = db()?;
+    if is_image_like_asset(Path::new(&path)) {
+        return Err("封面图 / 配图文件夹不能当作作品文件绑定，请选择文本、电子书或 HTML 文件".into());
+    }
+    let source = PathBuf::from(&path);
+    if !source.is_file() {
+        return Err("要绑定的文件不在了（可能被移走或改了名）".into());
+    }
+    let (author_id, title): (i64, String) = conn
+        .query_row(
+            "SELECT author_id, title FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| format!("找不到这篇作品：{e}"))?;
+    let preview_dir: String = conn
+        .query_row(
+            "SELECT preview_dir FROM authors WHERE id=?1",
+            [author_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    let preview_dir = preview_dir.trim().to_string();
+    if preview_dir.is_empty() {
+        return Err("这位作者还没绑定预览版文件夹 —— 先去作者设置里填上，再回来绑定".into());
+    }
+    let target_dir = PathBuf::from(&preview_dir);
+    fs::create_dir_all(&target_dir).map_err(|e| format!("无法创建预览版文件夹：{e}"))?;
+    let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let target = unique_target_path(&target_dir, &title, extension);
+    if source != target {
+        move_path(&source, &target)?;
+    }
+    conn.execute(
+        "UPDATE works SET preview_path=?1 WHERE id=?2",
+        params![target.to_string_lossy().to_string(), work_id],
+    )
+    .map_err(|e| e.to_string())?;
+    refresh_reading_image_count(&conn, work_id);
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// 把一张图绑成某篇作品的**封面**（v1.2.83 用户要求）。
+///
+/// 放哪儿看这篇作品的状态：**有完整版就放完整版目录，否则放预览版目录**。
+/// 文件名**照正文文件的主名**（只换扩展名）—— `resolve_cover_path()` 就是靠
+/// "同目录 + 同主名"把封面认出来的，名字不对等于白放。
+#[tauri::command]
+fn bind_work_cover(work_id: i64, path: String) -> Result<String, String> {
+    let conn = db()?;
+    let source = PathBuf::from(&path);
+    if !source.is_file() {
+        return Err("要绑定的图片不在了（可能被移走或改了名）".into());
+    }
+    let (author_id, purchased_path, preview_path): (i64, String, String) = conn
+        .query_row(
+            "SELECT author_id, purchased_path, preview_path FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| format!("找不到这篇作品：{e}"))?;
+    let purchased = purchased_path.trim().to_string();
+    let preview = preview_path.trim().to_string();
+    // 正文文件在哪，封面就放哪：有完整版优先完整版
+    let (body_path, folder_column) = if !purchased.is_empty() {
+        (purchased.clone(), "purchased_dir")
+    } else if !preview.is_empty() {
+        (preview.clone(), "preview_dir")
+    } else {
+        return Err("这篇还没绑正文文件 —— 先绑完整版或预览版，再绑封面".into());
+    };
+    let folder: String = conn
+        .query_row(
+            &format!("SELECT {folder_column} FROM authors WHERE id=?1"),
+            [author_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    let folder = folder.trim().to_string();
+    if folder.is_empty() {
+        return Err("这位作者还没绑定对应的文件夹 —— 先去作者设置里填上".into());
+    }
+    let target_dir = PathBuf::from(&folder);
+    fs::create_dir_all(&target_dir).map_err(|e| format!("无法创建文件夹：{e}"))?;
+    // 用正文文件的主名 + 图片自己的扩展名
+    let body = Path::new(&body_path);
+    let stem = body
+        .file_stem()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("jpg");
+    let target = unique_target_path(&target_dir, &stem, extension);
+    if source != target {
+        move_path(&source, &target)?;
+    }
+    conn.execute(
+        "UPDATE works SET cover_path=?1, cover_managed=1 WHERE id=?2",
+        params![target.to_string_lossy().to_string(), work_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(target.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, String> {
     let conn = db()?;
@@ -15446,6 +15553,8 @@ pub fn run() {
             scan_preview,
             scan_purchased,
             bind_work_moving_to_purchased,
+            bind_work_preview,
+            bind_work_cover,
             bind_series_bundle,
             match_author_series,
             auto_group_purchased_files,

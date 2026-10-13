@@ -1062,6 +1062,7 @@ async function invoke(command, args = {}) {
   if (command === "relocate_author_works") return { moved: 0, missing: 0 };
   if (command === "clear_skipped_novels") return 0;
   if (command === "bind_series_bundle") return args.path;
+  if (command === "bind_work_preview" || command === "bind_work_cover") return args.path;
   if (command === "list_bundles") return [];
   if (command === "match_author_series") return [];
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
@@ -3542,6 +3543,40 @@ async function detailSetVersion(workId, asFull) {
   toast(asFull ? "已设为完整版" : "已设为预览版", "success");
 }
 
+/** 详情里绑定**预览版**文件（v1.2.83）：点按钮走这里，拖拽走 `handleDropToBind`。 */
+async function detailBindPreview(workId) {
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: "文本 / 电子书", extensions: ["txt", "md", "html", "htm", "epub", "mobi", "azw3", "pdf"] }],
+  });
+  if (!picked) return;
+  try {
+    await invoke("bind_work_preview", { workId, path: picked });
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  await refreshAfterDetailChange();
+  toast("已绑定本地预览版内容", "success");
+}
+
+/** 详情里绑定**封面**（v1.2.83）：有完整版就进完整版目录、否则进预览版目录，同名同主名。 */
+async function detailBindCover(workId) {
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: "图片", extensions: ["jpg", "jpeg", "png", "webp", "gif", "bmp"] }],
+  });
+  if (!picked) return;
+  try {
+    await invoke("bind_work_cover", { workId, path: picked });
+  } catch (error) {
+    toast(String(error), "error");
+    return;
+  }
+  await refreshAfterDetailChange();
+  toast("已绑定封面", "success");
+}
+
 /** 详情里绑定完整版文件 */
 async function detailBindFile(workId) {
   captureDetailNote();
@@ -3583,11 +3618,12 @@ function dropZoneAt(position) {
   const y = Number(position.y ?? 0) / ratio;
   const hit = document.elementFromPoint(x, y);
   // 详情里的「拖动到此绑定完整版」和系列页的「拖动绑定合集文件」都是拖放区（v1.2.68）
-  return hit && hit.closest ? hit.closest("#bind-drop-zone, #bundle-drop-zone") : null;
+  // 详情页三个绑定区 + 系列页那个合集区（v1.2.83 起详情页有三个）
+  return hit && hit.closest ? hit.closest("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone") : null;
 }
 
 function highlightDropZone(zone) {
-  document.querySelectorAll("#bind-drop-zone, #bundle-drop-zone").forEach((el) => {
+  document.querySelectorAll("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone").forEach((el) => {
     el.classList.toggle("is-drop-active", el === zone);
   });
 }
@@ -3614,6 +3650,19 @@ async function handleDropToBind(payload) {
   }
   const workId = Number(state.workDetailId) || 0;
   if (!workId) return;
+  // 详情页另外两个绑定区（v1.2.83）：预览版 / 封面
+  if (zone.id === "preview-drop-zone" || zone.id === "cover-drop-zone") {
+    const isCover = zone.id === "cover-drop-zone";
+    try {
+      await invoke(isCover ? "bind_work_cover" : "bind_work_preview", { workId, path });
+    } catch (error) {
+      toast(String(error), "error");
+      return;
+    }
+    await refreshAfterDetailChange();
+    toast(isCover ? "已绑定封面" : "已绑定本地预览版内容", "success");
+    return;
+  }
   captureDetailNote();
   let movedPath = "";
   try {
@@ -3772,9 +3821,10 @@ function workDetailBody() {
       </dl>
       <div class="detail-actions">
         <button class="quiet-button" data-action="detail-set-version" data-work-id="${work.id}" data-as-full="${work.purchasedPath ? "0" : "1"}">${icon(work.purchasedPath ? "file" : "check", 16)}${work.purchasedPath ? "设为预览版" : "设为完整版"}</button>
-        <button class="quiet-button" data-action="detail-bind-file" data-work-id="${work.id}">${icon("folder", 16)}绑定完整版文件</button>
-        <div class="bind-drop-zone" id="bind-drop-zone" title="从资源管理器把作品文件（txt / epub / html…）拖到这里，直接绑成这篇的完整版">
-          ${icon("upload", 15)}<span>拖动到此绑定完整版</span>
+        <div class="detail-bind-row">
+          <button class="quiet-button bind-drop-zone" id="bind-drop-zone" data-action="detail-bind-file" data-work-id="${work.id}" title="点一下选文件，或者从资源管理器把文件拖到这里 —— 都会搬进完整版文件夹、按作品名改名">${icon("folder", 16)}<span>绑定完整版</span></button>
+          <button class="quiet-button bind-drop-zone" id="preview-drop-zone" data-action="detail-bind-preview" data-work-id="${work.id}" title="点一下选文件，或者把文件拖到这里 —— 都会搬进预览版文件夹、按作品名改名">${icon("image", 16)}<span>拖动到此绑定预览版</span></button>
+          <button class="quiet-button bind-drop-zone" id="cover-drop-zone" data-action="detail-bind-cover" data-work-id="${work.id}" title="点一下选图片，或者把图片拖到这里 —— 有完整版就放进完整版文件夹、否则放预览版文件夹，文件名跟正文同主名">${icon("image", 16)}<span>绑定封面</span></button>
         </div>
         <button class="quiet-button" data-action="detail-toggle-images" data-work-id="${work.id}">${icon("image", 16)}${work.hasImages ? "取消带图版" : "设为带图版"}</button>
       </div>
@@ -5850,6 +5900,8 @@ async function bindEvents() {
       if (action === "detail-open-directory") await invoke("open_work_directory", { workId: Number(workId) });
       if (action === "detail-set-version") await detailSetVersion(Number(workId), element.dataset.asFull === "1");
       if (action === "detail-bind-file") await detailBindFile(Number(workId));
+      if (action === "detail-bind-preview") await detailBindPreview(Number(workId));
+      if (action === "detail-bind-cover") await detailBindCover(Number(workId));
       if (action === "detail-toggle-images") await detailToggleImages(Number(workId));
       if (action === "detail-download") await detailDownload(Number(workId), element.dataset.format);
       if (action === "detail-delete") detailDeleteWork(Number(workId));

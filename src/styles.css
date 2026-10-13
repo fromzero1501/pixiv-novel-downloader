@@ -993,3 +993,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 /* 导入预览里那段"这些行没被认出来"的说明（v1.2.81） */
 .import-note { margin: 10px 0 6px; color: #7a6248; font-size: 12px; line-height: 1.6; }
 .import-note code { padding: 1px 4px; background: #f6f1e8; border-radius: 3px; font-size: 12px; }
+
+/* 详情页的绑定按钮排一行（v1.2.83）：三个都要能点、也都能拖 */
+.detail-bind-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; }
+.detail-bind-row .bind-drop-zone { flex: 1 1 auto; justify-content: center; }
