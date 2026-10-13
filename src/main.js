@@ -5152,7 +5152,9 @@ async function confirmSeriesMatch() {
   const series = (state.seriesItems || []).find((item) => String(item.id) === pair.seriesId);
   closeModal();
   try {
-    await openSeriesDetail(pair.seriesId, series ? series.title : pair.seriesTitle, state.seriesView ? state.seriesView.returnTo : null);
+    // returnTo 传 "overview"：这个详情是从「系列作品」列表进来的，返回就该回那张列表，
+    // 而不是作者作品库（v1.2.77 修）。`closeSeriesView()` 认这个值。
+    await openSeriesDetail(pair.seriesId, series ? series.title : pair.seriesTitle, "overview");
     render();
     await startSeriesBundle(pair.file);
   } catch (error) {
