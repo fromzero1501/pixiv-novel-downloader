@@ -5887,6 +5887,11 @@ async function bindEvents() {
       if (action === "detail-remove-tag") await removeDetailTag(Number(element.dataset.index));
       if (action === "detail-pick-collection") await openDetailPicker(Number(workId));
       if (action === "detail-open-path") await invoke("open_local_path", { path: element.dataset.path, parent: false });
+      if (action === "detail-open-dir") {
+        // 后端会带回一句"为什么没能选中文件"（比如路径超长），有就提示出来（v1.2.90）
+        const note = await invoke("open_local_path", { path: element.dataset.path, parent: true });
+        if (note) toast(String(note), "info");
+      }
       if (action === "detail-open-dir") await invoke("open_local_path", { path: element.dataset.path, parent: true });
       if (action === "detail-open-author") { closeModal(); await openAuthorLibrary(Number(authorId)); }
       if (action === "detail-open-work") {

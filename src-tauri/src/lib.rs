@@ -1622,12 +1622,9 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
         default_preview_dir: setting(conn, "default_preview_dir")?,
         default_purchased_dir: setting(conn, "default_purchased_dir")?,
         auto_create_dirs: setting(conn, "auto_create_dirs")? == "1",
-        // 「最小作品字数」（v1.2.89，原来是"最小文件大小/字节"）：老键只作兜底读取，别删
-        minimum_text_count: setting(conn, "minimum_text_count")
-            .or_else(|_| setting(conn, "minimum_file_size_bytes"))
-            .unwrap_or_else(|_| "0".to_string())
-            .parse()
-            .unwrap_or(0),
+        // 「最小作品字数」（v1.2.89，原来是"最小文件大小/字节"）。
+        // **不读老键**：老值是字节数，跟"字数"不是一个量纲，沿用过来只会更糊涂（用户重设一次就行）。
+        minimum_text_count: setting(conn, "minimum_text_count")?.parse().unwrap_or(0),
         pixiv_delay_threshold: setting(conn, "pixiv_delay_threshold")?
             .parse()
             .unwrap_or(150),
@@ -2577,11 +2574,7 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
     let conn = db()?;
     // 最小文件大小**调小** ⇒ 之前按旧阈值跳过的那些现在可能够大了，名单整体清空重来；
     // **调大**不用管（原来太小、现在只会更小）。用户 2026-10-13 定的规则。
-    let previous_min_size: u64 = setting(&conn, "minimum_text_count")
-        .or_else(|_| setting(&conn, "minimum_file_size_bytes"))
-        .unwrap_or_else(|_| "0".to_string())
-        .parse::<u64>()
-        .unwrap_or(0);
+    let previous_min_size: u64 = setting(&conn, "minimum_text_count")?.parse::<u64>().unwrap_or(0);
     if settings.minimum_text_count < previous_min_size {
         let _ = conn.execute("DELETE FROM skipped_novels", []);
     }
@@ -6029,11 +6022,7 @@ fn pixiv_sync_impl(
     fs::create_dir_all(&preview_dir).map_err(|e| format!("无法创建预览版文件夹：{e}"))?;
     let purchased_dir = PathBuf::from(purchased_dir);
     fs::create_dir_all(&purchased_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
-    let minimum_text_count = setting(&conn, "minimum_text_count")
-        .or_else(|_| setting(&conn, "minimum_file_size_bytes"))
-        .unwrap_or_else(|_| "0".to_string())
-        .parse::<u64>()
-        .unwrap_or(0);
+    let minimum_text_count = setting(&conn, "minimum_text_count")?.parse::<u64>().unwrap_or(0);
     let preview_entries = sync_preview_entries(&preview_dir, minimum_text_count)?;
     let single_novel_id = pixiv_novel_id_from_url(&novel_url)?;
     let is_single_sync = single_novel_id.is_some();
@@ -13860,50 +13849,16 @@ fn open_work_directory(work_id: i64) -> Result<String, String> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    let path = if !purchased.is_empty() {
+    // 完整版优先，没有就看预览版 —— 这一层只管"取哪条路径"
+    let path = if !purchased.trim().is_empty() {
         purchased
     } else {
         preview
     };
-    if path.is_empty() {
+    if path.trim().is_empty() {
         return Err("该作品还没有绑定本地文件".into());
     }
-    let target = PathBuf::from(&path);
-    // 绑定的本身就是目录（有些作品直接绑文件夹），那就只有打开目录这一种做法
-    if target.is_dir() {
-        open::that(&target).map_err(|e| format!("无法打开目录：{e}"))?;
-        return Ok(String::new());
-    }
-    // ⚠️ Windows 的资源管理器**打不开超过 260 字符的路径**，而且是静默失败（v1.2.85）。
-    // 用户 2026-10-13 遇到的就是这个：新建的作品标题很长 ⇒ 路径 273 字符 ⇒
-    // 点"打开所在目录"毫无反应，可文件其实在、程序也读得到。
-    // 这种时候只打开**所在目录**（父目录通常短得多），并把原因返回给前端说清楚。
-    if path.chars().count() > 260 {
-        let dir = target
-            .parent()
-            .map(Path::to_path_buf)
-            .filter(|dir| dir.exists())
-            .ok_or_else(|| "绑定的本地目录已不存在".to_string())?;
-        open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
-        return Ok("路径太长（超过 260 个字符），资源管理器没法定位到文件，已帮你打开它所在的目录".to_string());
-    }
-    let dir = target
-        .parent()
-        .map(Path::to_path_buf)
-        .filter(|dir| dir.exists())
-        .ok_or_else(|| "绑定的本地目录已不存在".to_string())?;
-    // 用户要的是「打开就能看见那个文件」，不是丢个目录让他自己翻，所以让资源管理器顺手选中它；
-    // 文件已经不在原地（自己挪走或删了）就别报错，打开它原来待的目录也算交代得过去
-    if target.exists() {
-        // 资源管理器"选中它"失败（explorer 起不来 / 参数异常）时**退回直接打开那个目录**，
-        // 别让用户点了没反应（v1.2.84）。explorer 成功也常返回非 0 退出码，所以只看能不能起。
-        if reveal_in_explorer(&target).is_err() {
-            open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
-        }
-    } else {
-        open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
-    }
-    Ok(String::new())
+    open_path_core(Path::new(path.trim()), true)
 }
 
 /// 打开任意一个本地路径：`parent=false` 直接打开它，`parent=true` 打开它所在的目录。
@@ -13912,27 +13867,85 @@ fn open_work_directory(work_id: i64) -> Result<String, String> {
 /// （可能是 txt、epub、封面图片，也可能直接是个目录），所以这里收 `path` 而不是 `work_id`。
 /// 这个命令原先只在文档里被前端调用过、后端从没实现 —— 详情页那排按钮点了只会报
 /// 「命令不存在」。别再删。
+/// 把超长路径换成 8.3 短名（`D:\400个~1\…\重度熟~1.EPU`）—— 资源管理器有 260 字符上限，
+/// 但短名一定够短（实测 273 字符能压到 32），于是"打开并选中"又可行了。
+/// 拿不到短名（卷禁用了 8.3 生成）就返回 None，调用方退回"只打开目录"。
+#[cfg(windows)]
+fn short_path_name(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut buffer = vec![0u16; 512];
+    let length = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buffer)) };
+    if length == 0 || length as usize >= buffer.len() {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer)))
+}
+
+#[cfg(not(windows))]
+fn short_path_name(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// 打开一个本地路径 —— **所有"打开 / 打开所在目录"都走这里**（v1.2.91）。
+///
+/// `reveal = true`  ⇒ 打开它所在的目录**并选中它**（是目录就直接打开；选中失败退回打开目录）；
+/// `reveal = false` ⇒ 直接打开这个路径本身。
+///
+/// **超过 260 字符的处理也只在这一个地方**：Windows 资源管理器打不开也选不中这么长的路径，
+/// 那就退一步只打开所在目录，并把原因作为返回值带回去（空串 = 一切正常，前端有内容就提示）。
+/// 抽出来的原因很实在 —— 之前 `open_work_directory` 和 `open_local_path` 各写了一份，
+/// 结果只修了其中一个，用户点另一处照样没反应（2026-10-14 用户点破）。
+fn open_path_core(path: &Path, reveal: bool) -> Result<String, String> {
+    if !path.exists() {
+        return Err(format!("路径已不存在：{}", path.to_string_lossy()));
+    }
+    if !reveal {
+        open::that(path).map_err(|e| format!("无法打开：{e}"))?;
+        return Ok(String::new());
+    }
+    if path.is_dir() {
+        open::that(path).map_err(|e| format!("无法打开目录：{e}"))?;
+        return Ok(String::new());
+    }
+    let parent_dir = || -> Result<PathBuf, String> {
+        path.parent()
+            .map(Path::to_path_buf)
+            .filter(|dir| dir.exists())
+            .ok_or_else(|| "所在目录已不存在".to_string())
+    };
+    if path.to_string_lossy().chars().count() > 260 {
+        // 先借道 8.3 短名再试一次"打开并选中"（v1.2.92）—— 短名够短，资源管理器就能认
+        if let Some(short) = short_path_name(path) {
+            if reveal_in_explorer(&short).is_ok() {
+                return Ok(String::new());
+            }
+        }
+        // 短名也不成（卷禁用了 8.3）⇒ 退一步只打开所在目录，并把原因说清楚
+        let dir = parent_dir()?;
+        open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
+        return Ok("路径太长（超过 260 个字符），资源管理器没法定位到文件，已帮你打开它所在的目录".to_string());
+    }
+    if reveal_in_explorer(path).is_err() {
+        // 选中失败也退回打开目录 —— 绝不让用户"点了没反应"
+        let dir = parent_dir()?;
+        open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
+    }
+    Ok(String::new())
+}
+
 #[tauri::command]
-fn open_local_path(path: String, parent: bool) -> Result<(), String> {
+fn open_local_path(path: String, parent: bool) -> Result<String, String> {
     let raw = path.trim();
     if raw.is_empty() {
         return Err("路径是空的".into());
     }
-    let target = PathBuf::from(raw);
-    if !target.exists() {
-        return Err(format!("路径已不存在：{raw}"));
-    }
-    if !parent {
-        open::that(&target).map_err(|e| format!("无法打开：{e}"))?;
-        return Ok(());
-    }
-    if target.is_dir() {
-        open::that(&target).map_err(|e| format!("无法打开目录：{e}"))?;
-    } else {
-        // 要的是「打开所在目录」，顺手在资源管理器里选中这个文件才算交代清楚
-        reveal_in_explorer(&target)?;
-    }
-    Ok(())
+    // 这一层只管"拿到路径"，打开 / 选中 / 超长怎么处理全在 `open_path_core` 里
+    open_path_core(Path::new(raw), parent)
 }
 
 /// 拼 explorer 的 `/select,` 参数：`/select,"<路径>"`（引号只包路径，不包 `/select,`）。

@@ -1,6 +1,6 @@
 [package]
 name = "collection-library"
-version = "1.2.89"
+version = "1.2.90"
 description = "Local collection library"
 authors = ["you"]
 edition = "2021"
@@ -38,4 +38,4 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 送系统回收站要调 shell32 的 SHFileOperationW（资源管理器按 Delete 走的就是它）。
 # 只加特性、不引新 crate —— windows 0.61.3 本来就在依赖图里。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
