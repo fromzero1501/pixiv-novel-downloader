@@ -1498,6 +1498,17 @@ fn author_after_marker(stem: &str) -> Option<String> {
     best
 }
 
+/// 作者名比较：**不区分大小写**（v1.2.97 用户要求）。
+///
+/// 文件名里写的 `mori` 和库里的 `Mori` 要认成同一位 —— 抓回来的作者名大小写
+/// 常常和文件名对不上（Pixiv 上是 `MORI`、文件名写 `Mori`），严格相等会把人判成
+/// 「不在库里」，进而在「指定作者自动匹配」里被拒。
+/// 用 `eq_ignore_ascii_case` 而不是 `to_lowercase()`：作者名里中日韩字占大头，
+/// 它们本来就没有大小写，只有 ASCII 那截需要忽略，省一次分配。
+fn author_name_eq(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
 /// 第二层：倒查作者库 —— 文件名尾部以「分隔符 + 作者名（或别名）」结尾。
 /// 只在库里确实有这个人时才认，避免把普通词误当人名。
 fn author_at_tail(stem: &str, authors: &[(i64, String, String)]) -> Option<DetectedAuthor> {
@@ -1509,7 +1520,9 @@ fn author_at_tail(stem: &str, authors: &[(i64, String, String)]) -> Option<Detec
     for token in tokens.iter().rev().take(3) {
         let token = token.trim();
         for (id, name, aliases) in authors {
-            if token == name.trim() || aliases.split('|').any(|alias| alias.trim() == token) {
+            if author_name_eq(token, name)
+                || aliases.split('|').any(|alias| author_name_eq(token, alias))
+            {
                 return Some(DetectedAuthor {
                     author_id: Some(*id),
                     name: token.to_string(),
@@ -1536,8 +1549,8 @@ fn detect_author_in_name(stem: &str, authors: &[(i64, String, String)]) -> Optio
                 authors
                     .iter()
                     .find(|(_, known, aliases)| {
-                        known.trim() == part.as_str()
-                            || aliases.split('|').any(|alias| alias.trim() == part.as_str())
+                        author_name_eq(known, part)
+                            || aliases.split('|').any(|alias| author_name_eq(alias, part))
                     })
                     .map(|(id, _, _)| (*id, part.clone()))
             });
@@ -1549,7 +1562,8 @@ fn detect_author_in_name(stem: &str, authors: &[(i64, String, String)]) -> Optio
             }
         }
         let matched = authors.iter().find(|(_, known, aliases)| {
-            known.trim() == name || aliases.split('|').any(|alias| alias.trim() == name)
+            author_name_eq(known, &name)
+                || aliases.split('|').any(|alias| author_name_eq(alias, &name))
         });
         return Some(DetectedAuthor {
             author_id: matched.map(|(id, _, _)| *id),
@@ -2158,11 +2172,11 @@ fn populate_work_display_info(work: &mut Work) {
     if !purchased_path.is_file() {
         return;
     }
-    // 有字数就显示字数，格式名只在**算不出字数**时才上场（v1.2.94 起 EPUB 也算得出，
-    // 于是它不再显示「EPUB」而显示字数；MOBI / PDF / HTML 仍是格式名）。
-    if work.word_count.unwrap_or(0) > 0 {
-        return;
-    }
+    // 有字数就显示字数（界面上字数在「EPUB」左边，见前端 `workContentMeta`）；
+    // **但 EPUB 是个例外**（v1.2.97 用户要求）：EPUB 也算得出字数之后，
+    // 卡片上就只剩一个数字、看不出这是电子书了 —— 所以 EPUB 即使有字数也要把
+    // 格式名带上，由前端拼成「4380字 EPUB」。MOBI / PDF / HTML 算不出字数，
+    // 走的还是下面那条"没有字数才显示格式名"的老路。
     let extension = purchased_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -2170,6 +2184,9 @@ fn populate_work_display_info(work: &mut Work) {
         .filter(|extension| !extension.is_empty())
         .map(str::to_ascii_uppercase)
         .unwrap_or_else(|| "文件".into());
+    if work.word_count.unwrap_or(0) > 0 && extension != "EPUB" {
+        return;
+    }
     // TXT 算不出字数（空文件）也不显示「TXT」—— 那是它自己坏/空，不该拿格式名顶替
     if extension != "TXT" {
         work.file_format = Some(extension);
@@ -8499,9 +8516,16 @@ fn collect_bookmark_authors(conn: &Connection) -> Result<Vec<(String, String)>, 
     Ok(authors)
 }
 
+/// 库里是否已经有叫这个名字的作者。**不区分大小写**（v1.2.97 用户要求）：
+/// `authors.name` 这一列没声明 `COLLATE`，SQLite 默认按 `BINARY` 比 —— `Mori` 和 `mori`
+/// 会被当成两个人，自动建作者时就重复建了。显式 `COLLATE NOCASE` 把两者视作同一个。
+///
+/// ⚠️ 这只是"判重"用的，没有动表上的 `UNIQUE` 约束（它仍是 BINARY）。所以大小写不同的
+/// 两个名字在库里**技术上仍能并存** —— 这里判出来之后就给它加 `(uid)` 后缀绕开了，
+/// 属于更保守的做法，不会因为约束冲突导致插入失败。
 fn author_name_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
-        "SELECT COUNT(*) FROM authors WHERE name = ?1",
+        "SELECT COUNT(*) FROM authors WHERE name = ?1 COLLATE NOCASE",
         [name],
         |row| row.get::<_, i64>(0),
     )
@@ -16637,9 +16661,39 @@ mod tests {
         assert!(detect_author_in_name("Stand by Me", &authors).is_none());
     }
 
+    /// v1.2.97：文件名里的作者名和库里的**不区分大小写**（Pixiv 上是 `MORI`、
+    /// 文件名写 `Mori` 是常事，严格相等会把人判成「不在库里」）。
     #[test]
-    fn detected_other_author_is_out_of_scope() {
-        // 没认出作者 → 参与匹配
+    fn author_name_match_ignores_ascii_case() {
+        let authors = vec![
+            (7_i64, "Mori".to_string(), "moR|Nagi".to_string()),
+            (9_i64, "蓝蓝天".to_string(), String::new()),
+        ];
+        // 第一层：显式「作者」标记，大小写不同也要认出来
+        let found = detect_author_in_name("夏の音 作者：mori", &authors).unwrap();
+        assert_eq!(found.author_id, Some(7), "mori 要认成库里的 Mori");
+        let upper = detect_author_in_name("夏の音 作者：MORI", &authors).unwrap();
+        assert_eq!(upper.author_id, Some(7));
+        // 别名同样不区分大小写
+        let alias = detect_author_in_name("夏の音 作者：NAGI", &authors).unwrap();
+        assert_eq!(alias.author_id, Some(7), "别名 nagi 要认成 Nagi");
+        // 第二层：倒查作者库，大小写不同也要认
+        assert_eq!(
+            detect_author_in_name("夏の音 - MORI", &authors).unwrap().author_id,
+            Some(7)
+        );
+        // 中日韩字本来没有大小写，行为不受影响
+        assert_eq!(
+            detect_author_in_name("甘雨的午后 - 蓝蓝天", &authors).unwrap().author_id,
+            Some(9)
+        );
+        // 单纯只差大小写、但库里确实没有的名字，仍然报「不在库」
+        let missing = detect_author_in_name("夏の音 作者：moriya", &authors).unwrap();
+        assert_eq!(missing.author_id, None, "moriya 不是 Mori，不能误认");
+    }
+
+    #[test]
+    fn detected_other_author_is_out_of_scope() {        // 没认出作者 → 参与匹配
         assert!(scope_allows_path(None, 5));
         // 认出的就是当前这位作者 → 参与匹配
         assert!(scope_allows_path(Some(5), 5));
@@ -18676,9 +18730,13 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
-    /// 有字数就不显示格式名（v1.2.94）：EPUB 算出字数后该显示「12 字」而不是「EPUB」。
+    /// v1.2.97：EPUB **即使有字数也要带上格式名**（用户要求卡片显示「4380字 EPUB」）。
+    ///
+    /// 这条以前是反的（v1.2.94 让 EPUB 有字数就不显示格式名），因为当时只顾着
+    /// 「字数比格式名有信息量」；但 EPUB 也算得出字数之后，卡片上就只剩一个数字、
+    /// 看不出这是本电子书了 —— 用户 2026-10-14 要求改回来并让字数排在格式名左边。
     #[test]
-    fn epub_with_a_word_count_hides_its_format_label() {
+    fn epub_keeps_its_format_label_even_with_a_word_count() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -18690,7 +18748,30 @@ mod tests {
 
         populate_work_display_info(&mut work);
 
-        assert_eq!(work.file_format, None, "有字数就不该再显示格式名");
+        assert_eq!(
+            work.file_format.as_deref(),
+            Some("EPUB"),
+            "EPUB 有字数也要带格式名，前端拼成「12345 字 EPUB」"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    /// 非 EPUB（MOBI 这种算不出字数的）仍是老规矩：没有字数才显示格式名。
+    /// 这一条和上面那条是一对，钉住「EPUB 是特例、别的格式没变」。
+    #[test]
+    fn non_epub_with_a_word_count_still_hides_its_format_label() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("collection-library-test-{suffix}.txt"));
+        fs::write(&path, "正文".as_bytes()).unwrap();
+        let mut work = content_size_work(1, Some(999), Some("MOBI"), 0);
+        work.purchased_path = path.to_string_lossy().to_string();
+
+        populate_work_display_info(&mut work);
+
+        assert_eq!(work.file_format, None, "有字数就不该再显示格式名（EPUB 之外没变）");
         fs::remove_file(path).unwrap();
     }
 

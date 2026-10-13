@@ -290,9 +290,9 @@ const state = {
 };
 
 const previewAuthors = [{ id: 1, name: "雾海档案", aliases: "雾海|档案屋", homepage: "https://www.pixiv.net/users/16208053", avatarPath: "D:\\头像\\雾海.png", notes: "", previewDir: "D:\\预览", purchasedDir: "D:\\已购", matchThreshold: 70, workCount: 48, purchasedCount: 19, imagesCount: 6, favoriteCount: 7, newCount: 3, starred: true }, { id: 2, name: "Mori", aliases: "", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 126, purchasedCount: 52, imagesCount: 14, favoriteCount: 16 }, { id: 3, name: "远野", aliases: "远野老师", homepage: "", avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, workCount: 33, purchasedCount: 8, imagesCount: 2, favoriteCount: 4 }];
-// 第 1 篇故意绑 .epub：字数是 0（EPUB 读不出正文），卡片上该显示「EPUB」而不是字数 ——
-// 预览数据必须和真机一个规矩，否则 v1.2.18 修的那个 bug 在这里根本复现不出来。
-const previewWorks = [{ id: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", releaseDate: "2025-10-05", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\希儿.epub", wordCount: 0, favorite: true }, { id: 2, title: "夏日短篇集", releaseDate: "2025-09-20", previewPath: "", coverPath: "", purchasedPath: "", wordCount: 4380, favorite: false }, { id: 3, title: "旧城的信", releaseDate: "2025-08-18", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\旧城的信.txt", wordCount: 20750, favorite: false }, { id: 4, title: "月色图文辑", releaseDate: "2025-07-09", previewPath: "", coverPath: "", purchasedPath: "", favorite: true }];
+// 第 1 篇故意绑 .epub **且带字数**（v1.2.97 起这个组合是重点）：EPUB 算出字数后
+// 卡片上要显示成「4380字 EPUB」—— 字数和格式名**同时**在，不是二选一。
+const previewWorks = [{ id: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", releaseDate: "2025-10-05", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\希儿.epub", wordCount: 4380, favorite: true }, { id: 2, title: "夏日短篇集", releaseDate: "2025-09-20", previewPath: "", coverPath: "", purchasedPath: "", wordCount: 4380, favorite: false }, { id: 3, title: "旧城的信", releaseDate: "2025-08-18", previewPath: "", coverPath: "", purchasedPath: "D:\\已购\\旧城的信.txt", wordCount: 20750, favorite: false }, { id: 4, title: "月色图文辑", releaseDate: "2025-07-09", previewPath: "", coverPath: "", purchasedPath: "", favorite: true }];
 
 // 瀑布流（v1.2.8）在预览里没法验：就 4 篇，翻页永远触发不到。
 // `window.__previewWorkScale = N` 把这 4 篇整体复制 N 份（id 与标题都错开），
@@ -365,7 +365,8 @@ previewWorks.forEach((work, index) => {
   // 处理时间（v1.2.8）：第 4 篇标成「3 天前」，正好验相对时间的渲染
   work.needFullMarkedAt = index === 3 ? new Date(Date.now() - 3 * 86400000).toISOString() : "";
   // 完整版不是 txt（EPUB / HTML…）才叫「阅读版」，卡片上显示格式名 ——
-  // 判据和 Rust 侧 `populate_work_display_info` 的 `extension != "TXT"` 是同一条
+  // 判据和 Rust 侧 `populate_work_display_info` 的 `extension != "TXT"` 是同一条。
+  // v1.2.97：EPUB 即使有字数也照样带 fileFormat（后端给，前端拼成「4380字 EPUB」）。
   work.fileFormat = ["EPUB", "", "", ""][index];
   if (work.wordCount === undefined) work.wordCount = 0;
 });
@@ -1354,10 +1355,18 @@ function wordCountLabel(value) {
   return `${new Intl.NumberFormat("zh-CN").format(value)} 字`;
 }
 
+/**
+ * 卡片上「日期 · 字数 / 格式」里那半截。
+ *
+ * v1.2.97：字数排在格式名**左边**（用户要求「4380字 EPUB」）。后端对 EPUB 会
+ * **同时**给出 wordCount 和 fileFormat（格式名不再被字数顶掉），所以这里两个都要画；
+ * 其余格式（TXT / MOBI / PDF / HTML）后端只会给其中一个，`filter` 一过就还是单独一个。
+ */
 function workContentMeta(work) {
-  if (work.wordCount) return `<span class="work-word-count">${wordCountLabel(work.wordCount)}</span>`;
-  if (work.fileFormat) return `<span class="work-word-count">${escapeHtml(work.fileFormat)}</span>`;
-  return "";
+  const parts = [];
+  if (work.wordCount) parts.push(`<span class="work-word-count">${wordCountLabel(work.wordCount)}</span>`);
+  if (work.fileFormat) parts.push(`<span class="work-word-count">${escapeHtml(work.fileFormat)}</span>`);
+  return parts.join(" ");
 }
 
 function syncLabel(value) {
@@ -1652,9 +1661,12 @@ function render() {
     };
   }
   // 系列卡片右键菜单（v1.2.96）：重命名 / 删除系列。左键单击走 data-action="open-series-card"。
+  // ⚠️ 防重绑用**独立标记** `seriesMenuBound`，绝不能占 `dataset.bound` ——
+  // `bindEvents()` 里那个 `[data-action]` 循环正是靠 `bound` 判重，占了它这卡片的
+  // **左键点击就永远绑不上**（现象：点系列卡片毫无反应，v1.2.96 踩过）。
   document.querySelectorAll(".series-card").forEach((card) => {
-    if (card.dataset.bound) return;
-    card.dataset.bound = "true";
+    if (card.dataset.seriesMenuBound) return;
+    card.dataset.seriesMenuBound = "true";
     card.addEventListener("contextmenu", (event) => {
       event.preventDefault();
       const series = state.seriesItems.find((item) => String(item.id) === card.dataset.seriesId);
