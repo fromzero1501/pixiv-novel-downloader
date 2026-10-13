@@ -217,6 +217,8 @@ body.is-bulk button { cursor: pointer; }
 .bundle-row:hover { border-color: #bcd7ef; background: #f2f8ff; }
 .bundle-row input { flex: 0 0 auto; }
 .bundle-order { flex: 0 0 auto; color: #6d8bab; font-size: 12px; }
+/* 「完整版 / 总篇数」小徽标（v1.2.80）：合集自动匹配候选行最左边那个 4/5 */
+.bundle-count-badge { flex: 0 0 auto; min-width: 40px; padding: 1px 6px; color: #3d7a55; background: #eef8f1; border: 1px solid #d3ebdc; border-radius: 4px; font-size: 12px; text-align: center; }
 .bundle-title { flex: 1 1 auto; overflow: hidden; color: #344f6b; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 /* 卡片标题上方的评分行（v1.2.68）：只显示星星，未评分是空心星；点一下即改评分 */
 .work-card-stars { display: flex; align-items: center; gap: 1px; margin: 0 0 3px; }

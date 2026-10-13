@@ -9698,8 +9698,19 @@ fn scan_purchased(author_id: i64, mode: String) -> Result<ScanPurchasedResult, S
 /// · 这批作品的 `purchased_path` 全指向它：**路径相同就说明它们同属一个合集**
 ///   （不额外加字段，避免"标记说是一伙的、路径却是散的"这种烂账）；
 /// · 磁盘占用等统计按路径去重（见 `scan_work_files_impl`），**整本只算一次**。
-/// 递归找「文件名含某个词」的文件（v1.2.71）。跳过封面图 / 配图这类派生物。
-fn collect_series_candidates(dir: &Path, needle: &str, out: &mut Vec<String>, depth: usize) {
+/// 递归找「和系列名够像」的文件（v1.2.80 改成按设置里的相似度）。
+///
+/// 用现成的 `similarity_with_title_limit(系列名, 文件名, 匹配作品名长度)` 打分 ——
+/// 跟「关联本地文件」那套是同一个算法、同一份设置，行为一致、不用另学一套。
+/// 达到 `threshold` 才算候选。跳过封面图 / 配图这类派生物。
+fn collect_series_candidates(
+    dir: &Path,
+    series_title: &str,
+    title_limit: i64,
+    threshold: i64,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
     if depth > 6 {
         return;
     }
@@ -9709,13 +9720,14 @@ fn collect_series_candidates(dir: &Path, needle: &str, out: &mut Vec<String>, de
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_series_candidates(&path, needle, out, depth + 1);
+            collect_series_candidates(&path, series_title, title_limit, threshold, out, depth + 1);
             continue;
         }
         if is_image_like_asset(&path) {
             continue;
         }
-        if file_stem(&path).to_lowercase().contains(needle) {
+        let stem = file_stem(&path);
+        if similarity_with_title_limit(series_title, &stem, title_limit) >= threshold {
             out.push(path.to_string_lossy().to_string());
         }
     }
@@ -9727,6 +9739,9 @@ fn collect_series_candidates(dir: &Path, needle: &str, out: &mut Vec<String>, de
 struct SeriesMatch {
     series_id: String,
     series_title: String,
+    /// 这个系列的总篇数 / 其中已绑完整版的篇数 —— 前端在每行左边显示成「4/5」（v1.2.80）
+    work_count: i64,
+    purchased_count: i64,
     files: Vec<String>,
 }
 
@@ -9747,18 +9762,30 @@ fn match_author_series(author: i64) -> Result<Vec<SeriesMatch>, String> {
     if !root.is_dir() {
         return Err("「完整版自动匹配文件夹」不在了，去设置里重新选一个".into());
     }
+    let settings = read_settings(&conn)?;
+    let title_limit = settings.match_title_length;
+    // 门槛取**这位作者的**「关联相似度」（设置里就有，默认 70）
+    let threshold: i64 = conn
+        .query_row(
+            "SELECT COALESCE(match_threshold, 70) FROM authors WHERE id=?1",
+            [author],
+            |row| row.get(0),
+        )
+        .unwrap_or(70);
     let mut out: Vec<SeriesMatch> = Vec::new();
     for series in list_series_impl(&conn, author)? {
-        let needle = series.title.trim().to_lowercase();
-        if needle.is_empty() {
+        let title = series.title.trim().to_string();
+        if title.is_empty() {
             continue;
         }
         let mut files: Vec<String> = Vec::new();
-        collect_series_candidates(&root, &needle, &mut files, 0);
+        collect_series_candidates(&root, &title, title_limit, threshold, &mut files, 0);
         files.sort();
         out.push(SeriesMatch {
             series_id: series.id,
             series_title: series.title,
+            work_count: series.work_count,
+            purchased_count: series.purchased_count,
             files,
         });
     }

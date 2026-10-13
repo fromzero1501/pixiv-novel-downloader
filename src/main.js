@@ -5118,7 +5118,7 @@ async function matchSeriesBundle() {
   const pairs = [];
   for (const item of hit) {
     for (const file of item.files) {
-      pairs.push({ seriesId: String(item.seriesId), seriesTitle: item.seriesTitle, file });
+      pairs.push({ seriesId: String(item.seriesId), seriesTitle: item.seriesTitle, workCount: item.workCount, purchasedCount: item.purchasedCount, file });
     }
   }
   if (!pairs.length) {
@@ -5128,10 +5128,12 @@ async function matchSeriesBundle() {
   state.seriesMatchPairs = pairs;
   const rows = pairs.map((pair, index) => {
     const name = String(pair.file).split(/[\\/]/).pop();
-    return `<label class="bundle-row"><input type="radio" name="series-pick" value="${index}"${index === 0 ? " checked" : ""}><span class="bundle-order" title="${escapeHtml(pair.seriesTitle)}">${escapeHtml(pair.seriesTitle)}</span><span class="bundle-title" title="${escapeHtml(pair.file)}">${escapeHtml(name)}</span></label>`;
+    // 左边那个「4/5」= 这个系列的完整版篇数 / 总篇数（v1.2.80 用户要求）
+    const ratio = `${pair.purchasedCount || 0}/${pair.workCount || 0}`;
+    return `<label class="bundle-row"><input type="radio" name="series-pick" value="${index}"${index === 0 ? " checked" : ""}><span class="bundle-count-badge" title="这个系列：完整版 ${pair.purchasedCount || 0} 篇 / 共 ${pair.workCount || 0} 篇">${ratio}</span><span class="bundle-order" title="${escapeHtml(pair.seriesTitle)}">${escapeHtml(pair.seriesTitle)}</span><span class="bundle-title" title="${escapeHtml(pair.file)}">${escapeHtml(name)}</span></label>`;
   }).join("");
   showModal(modal(`自动匹配 · ${pairs.length} 个候选文件`,
-    `<p class="read-only-note">按系列名在「完整版自动匹配文件夹」里找到的对应关系 —— 选一个（左边是系列名、右边是文件名），下一步再勾这个文件里含哪几篇。</p>
+    `<p class="read-only-note">按设置里的「关联相似度」在「完整版自动匹配文件夹」里匹配出来的 —— 选一个（最左是「完整版 / 总篇数」、中间系列名、右边文件名），下一步再勾这个文件里含哪几篇。</p>
      <div class="bundle-list">${rows}</div>`,
     `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="pick-series-match">下一步</button>`,
     "is-wide"));
