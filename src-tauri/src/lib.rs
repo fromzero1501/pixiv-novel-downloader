@@ -3820,13 +3820,26 @@ fn insert_local_work(
     title: &str,
     release_date: &str,
 ) -> rusqlite::Result<i64> {
+    // 本地新建的作品没有 Pixiv 作品号 ⇒ **软件内部随机生成一个**（v1.2.84 用户要求）。
+    // 带 `local-` 前缀：一看就知道是本地生成的，也绝不会跟 Pixiv 的纯数字 ID 撞上。
+    // （库里那条唯一索引本来就排除空值，所以这只是"给个身份"，不解决什么冲突；
+    //   但有号之后，按号认领的那些功能看待它就跟普通作品一样了。）
+    let novel_id = format!(
+        "local-{:x}{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0),
+        author_id
+    );
     conn.execute(
-        "INSERT INTO works (author_id, title, release_date, has_images) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO works (author_id, title, release_date, has_images, pixiv_novel_id) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             author_id,
             title,
             release_date,
-            title_indicates_images(title) as i64
+            title_indicates_images(title) as i64,
+            novel_id
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -10090,8 +10103,9 @@ fn bind_work_cover(work_id: i64, path: String) -> Result<String, String> {
     if source != target {
         move_path(&source, &target)?;
     }
+    // ⚠️ `works` 表只有 `cover_path`，没有 `cover_managed` 这一列（v1.2.84 修，之前报 no such column）
     conn.execute(
-        "UPDATE works SET cover_path=?1, cover_managed=1 WHERE id=?2",
+        "UPDATE works SET cover_path=?1 WHERE id=?2",
         params![target.to_string_lossy().to_string(), work_id],
     )
     .map_err(|e| e.to_string())?;
@@ -13847,7 +13861,11 @@ fn open_work_directory(work_id: i64) -> Result<(), String> {
     // 用户要的是「打开就能看见那个文件」，不是丢个目录让他自己翻，所以让资源管理器顺手选中它；
     // 文件已经不在原地（自己挪走或删了）就别报错，打开它原来待的目录也算交代得过去
     if target.exists() {
-        reveal_in_explorer(&target)?;
+        // 资源管理器"选中它"失败（explorer 起不来 / 参数异常）时**退回直接打开那个目录**，
+        // 别让用户点了没反应（v1.2.84）。explorer 成功也常返回非 0 退出码，所以只看能不能起。
+        if reveal_in_explorer(&target).is_err() {
+            open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
+        }
     } else {
         open::that(&dir).map_err(|e| format!("无法打开目录：{e}"))?;
     }
@@ -16400,7 +16418,8 @@ mod tests {
                  author_id INTEGER NOT NULL,
                  title TEXT NOT NULL,
                  release_date TEXT NOT NULL,
-                 has_images INTEGER NOT NULL DEFAULT 0
+                 has_images INTEGER NOT NULL DEFAULT 0,
+                 pixiv_novel_id TEXT NOT NULL DEFAULT ''
              );",
         )
         .unwrap();
