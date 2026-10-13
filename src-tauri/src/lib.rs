@@ -504,6 +504,9 @@ struct PixivDownloadCandidate {
     is_preview: bool,
     /// Pixiv 简介，同步时顺手带上，落进 works.synopsis。
     synopsis: String,
+    /// 列表接口给的**正文字符数**（`textCount`，v1.2.87）。-1 / 0 = 接口没给。
+    /// 落库时直接写成 `works.word_count` —— 字数**只有这一份**，不另开一列（用户 2026-10-13 定的）。
+    text_count: i64,
 }
 
 #[derive(Clone)]
@@ -6570,6 +6573,7 @@ fn pixiv_sync_impl(
             series_order,
             is_preview,
             synopsis: description,
+            text_count: body.get("textCount").and_then(Value::as_i64).unwrap_or(-1),
         });
     }
     const COVER_CONCURRENCY: usize = 4;
@@ -6671,7 +6675,11 @@ fn pixiv_sync_impl(
             let has_images = image_saved > 0
                 || title_indicates_images(&work.title)
                 || detail_has_embedded_images(&work.embedded_images);
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, has_images as i64, image_saved as i64, work.synopsis]).is_err() {
+            // 字数只有一份（v1.2.87）：**接口给了就用接口的**（跟 Pixiv 页面对得上，
+            // 而且是 epub / html 那些本地数不出字数的作品的唯一来源）；
+            // 接口没给就写 -1，让后台按 txt 本地算 —— 还是同一列 `word_count`。
+            let stored_word_count: i64 = if work.text_count > 0 { work.text_count } else { -1 };
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis, word_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, has_images as i64, image_saved as i64, work.synopsis, stored_word_count]).is_err() {
             result.failed_count += 1;
             continue;
         }
