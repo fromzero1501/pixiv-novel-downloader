@@ -1063,7 +1063,6 @@ async function invoke(command, args = {}) {
   if (command === "clear_skipped_novels") return 0;
   if (command === "bind_series_bundle") return args.path;
   if (command === "list_bundles") return [];
-  if (command === "match_series_files") return [];
   if (command === "match_author_series") return [];
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
   if (command === "sync_pixiv_novels") {
@@ -6001,7 +6000,6 @@ async function bindEvents() {
       // 合集 EPUB
       if (action === "card-rate") await setCardRating(Number(element.dataset.workId), Number(element.dataset.rating));
       if (action === "match-series-bundle") await matchSeriesBundle();
-      if (action === "pick-series-file") await startSeriesBundle(element.dataset.path);
       if (action === "pick-series-match") await confirmSeriesMatch();
       if (action === "bind-series-bundle") await bindSeriesBundle();
       if (action === "confirm-series-bundle") await confirmSeriesBundle();

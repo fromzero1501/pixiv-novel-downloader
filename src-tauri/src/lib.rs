@@ -9765,36 +9765,6 @@ fn match_author_series(author: i64) -> Result<Vec<SeriesMatch>, String> {
     Ok(out)
 }
 
-/// 按**系列名**去「完整版自动匹配文件夹」里找候选文件（v1.2.71 用户要求）。
-///
-/// 匹配口径：文件名（不含扩展名）**包含**系列名 —— 两边都去空白、忽略大小写。
-/// 比如系列名 `A`，能匹配到 `A(1-5).txt`、`[作者] A 1-5.txt` 这类。
-/// 找不到不算错，返回空数组让前端提示；目录没配 / 不在了才报错（那是真没法找）。
-#[tauri::command]
-fn match_series_files(title: String) -> Result<Vec<String>, String> {
-    let conn = db()?;
-    let settings = read_settings(&conn)?;
-    // 参数名故意用**单个词** `title`（v1.2.73）：多词参数在 snake_case / camelCase 之间
-    // 会撞上转换歧义 —— 前端传 seriesTitle、后端要 series_title 时直接报
-    // "missing required key"。单词名没有这个问题，两边怎么写都对得上。
-    let needle = title.trim().to_lowercase();
-    if needle.is_empty() {
-        return Err("这个系列还没有名字 —— 先给系列起个名字再来匹配".into());
-    }
-    let root = settings.auto_group_dir.trim().to_string();
-    if root.is_empty() {
-        return Err("还没设置「完整版自动匹配文件夹」—— 先去设置的文件与目录里指定一个".into());
-    }
-    let root = PathBuf::from(root);
-    if !root.is_dir() {
-        return Err("「完整版自动匹配文件夹」不在了，去设置里重新选一个".into());
-    }
-    let mut found: Vec<String> = Vec::new();
-    collect_series_candidates(&root, &needle, &mut found, 0);
-    found.sort();
-    Ok(found)
-}
-
 #[tauri::command]
 fn bind_series_bundle(work_ids: Vec<i64>, path: String) -> Result<String, String> {
     let mut conn = db()?;
@@ -15327,7 +15297,6 @@ pub fn run() {
             scan_purchased,
             bind_work_moving_to_purchased,
             bind_series_bundle,
-            match_series_files,
             match_author_series,
             auto_group_purchased_files,
             confirm_manual_group,
