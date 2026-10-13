@@ -4977,7 +4977,6 @@ function renderSeriesView() {
           <span class="series-progress" title="系列里读过的篇数（已读 + 在读都算）">读过 ${readCount} / ${total}</span>
           ${gaps.length ? `<span class="series-gap" title="按序号算出来缺的篇目：第 ${gaps.join("、")} 篇">${icon("info", 15)}<span>${seriesGapLabel(gaps)}</span></span>` : ""}
           <button class="icon-text-button" data-action="export-series-epub" data-series-id="${escapeHtml(state.seriesView.id)}" data-series-title="${escapeHtml(state.seriesView.title)}" title="把这个系列里的作品打成一整本 EPUB">${icon("download", 18)}<span>合成一本 EPUB</span></button>
-          <button class="icon-text-button" data-action="match-series-bundle" title="按系列名去「完整版自动匹配文件夹」里找文件，找到后弹窗勾选这个文件里含哪几篇">${icon("sync", 18)}<span>合集自动匹配</span></button>
           <button class="icon-text-button bind-drop-zone" id="bundle-drop-zone" data-action="bind-series-bundle" title="有些文件是整个系列合成一本的：从资源管理器把文件拖到这里（或者点一下选文件），再把本系列的作品勾进这个合集 —— 文件会搬进完整版目录、按「系列名(篇范围)」命名">${icon("archive", 18)}<span>拖动绑定合集文件</span></button>
           <button class="primary-button" data-action="series-continue" title="${nextUnread ? `接着打开：${escapeHtml(nextUnread.title)}` : "这个系列都读过了"}" ${nextUnread ? "" : "disabled"}>${icon("arrow", 18)}<span>${readCount ? "继续读" : "从头读"}</span></button>
         </div>
@@ -4991,8 +4990,9 @@ function renderSeriesView() {
     : state.seriesItems;
   const cards = visibleSeries.map((series) => `<article class="series-card" data-action="open-series-card" data-series-id="${escapeHtml(series.id)}" data-series-title="${escapeHtml(series.title)}" tabindex="0">${series.coverPath ? `<img src="${asset(series.coverPath)}" alt="${escapeHtml(series.title)} 的封面">` : `<div class="series-card-placeholder">${icon("series", 30)}</div>`}<div class="series-card-copy"><h2>${escapeHtml(series.title)}</h2><p><strong>${series.workCount}</strong> 部作品 · 完整版 ${series.purchasedCount} · 预览版 ${series.previewCount}</p>${series.readCount ? `<p class="series-read">读过 ${series.readCount} / ${series.workCount}</p>` : ""}${(series.gapOrders || []).length ? `<p class="series-gap-line">${icon("info", 13)}<span>${seriesGapLabel(series.gapOrders)}</span></p>` : ""}</div></article>`).join("");
   return renderShell(`
-    <section class="topbar work-topbar"><div class="crumb-heading"><button class="back-button" title="返回作品库" data-action="close-series-view">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库</p><h1>系列作品</h1></div></div>
-      <div class="series-search-box">${icon("search", 16)}<input id="series-search" type="search" placeholder="搜索系列名" value="${escapeHtml(state.seriesQuery)}" autocomplete="off"></div></section>
+    <section class="topbar work-topbar"><div class="crumb-heading"><button class="back-button" title="返回作品库" data-action="close-series-view">${icon("back", 20)}</button><div class="series-head"><p class="section-kicker">作者作品库</p><h1>系列作品</h1></div>
+      <div class="series-search-box">${icon("search", 15)}<input id="series-search" type="search" placeholder="搜索系列名" value="${escapeHtml(state.seriesQuery)}" autocomplete="off"></div>
+      <button class="icon-text-button" data-action="match-series-bundle" title="按系列名去「完整版自动匹配文件夹」里找文件，找到后弹窗勾选这个文件里含哪几篇">${icon("sync", 18)}<span>合集自动匹配</span></button></div></section>
     <section class="library-content"><div class="series-grid">${cards || '<div class="empty-state works-empty"><div class="empty-icon">' + icon("series", 26) + '</div><h2>还没有系列作品</h2><p>同步到的系列作品会显示在这里。</p></div>'}</div></section>`);
 }
 
@@ -5116,8 +5116,10 @@ async function matchSeriesBundle() {
     const name = String(path).split(/[\\/]/).pop();
     return `<label class="bundle-row"><input type="radio" name="series-file" value="${escapeHtml(path)}"${files.indexOf(path) === 0 ? " checked" : ""}><span class="bundle-title" title="${escapeHtml(path)}">${escapeHtml(name)}</span></label>`;
   }).join("");
-  showModal(modal("选一个文件",
-    `<div class="bundle-list">${rows}</div>`,
+  // 长得跟「自动匹配 → 标题匹配」那套弹窗保持一致：宽弹窗、一行一个、文件全路径做提示（v1.2.72）
+  showModal(modal(`自动匹配 · 找到 ${files.length} 个候选文件`,
+    `<p class="read-only-note">在「完整版自动匹配文件夹」里找到这些文件名含「${escapeHtml(view.title)}」的文件 —— 选一个，下一步再勾这个文件里含哪几篇。</p>
+     <div class="bundle-list">${rows}</div>`,
     `<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="pick-series-file" data-path="${escapeHtml(files[0])}">下一步</button>`,
     "is-wide"));
   // 「下一步」要带上真正选中的那个文件，radio 变了就更新按钮上的 path
@@ -9671,8 +9673,11 @@ function restoreCardAnchor(bucket) {
     : `.author-card[data-author-id="${anchor.id}"]`;
   const card = document.querySelector(selector);
   if (!card) { restoreScrollTop(fallback); return; }
-  // 留 8px 余量，别让卡片紧贴窗口上沿
-  restoreScrollTop(Math.max(0, card.getBoundingClientRect().top + currentScrollTop() - 8));
+  // 留出**顶栏高度**的余量（v1.2.72 修）：原来只留 8px，等于把这张卡顶到窗口最上沿，
+  // 卡上面的操作栏（返回、搜索、筛选、批量…）全被滚出视野 —— 用户每次进页面都看不到它们。
+  const header = document.querySelector(".work-topbar") || document.querySelector(".topbar");
+  const gap = header ? Math.max(8, Math.round(header.getBoundingClientRect().height) + 12) : 8;
+  restoreScrollTop(Math.max(0, card.getBoundingClientRect().top + currentScrollTop() - gap));
 }
 
 function restoreScrollTop(top) {
