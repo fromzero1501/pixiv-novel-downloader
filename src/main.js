@@ -203,6 +203,11 @@ const state = {
   readFilter: [],
   /** 作品详情弹窗正在展示的作品 id（null = 没开） */
   workDetailId: null,
+  /**
+   * 详情这篇的作品对象快照（开详情时存一份）。列表重查会把不再符合筛选的作品踢出去
+   * （比如「完整版」筛选里把一篇设成预览版），详情就靠这份快照继续画下去。
+   */
+  detailWorkSnapshot: null,
   /** 详情弹窗里那篇作品当前所在的收藏夹 id（打开时查一次，改完刷新） */
   detailCollectionIds: [],
   /** 详情弹窗里「阅读版」文件的落盘路径（没有就空串，那一行不显示） */
@@ -763,6 +768,10 @@ async function invoke(command, args = {}) {
   if (command === "remove_watch_later") { const index = previewWatchLater.findIndex((entry) => entry.workId === args.workId); if (index >= 0) previewWatchLater.splice(index, 1); return; }
   if (command === "clear_watch_later") { previewWatchLater.length = 0; return; }
   if (command === "toggle_has_images") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.hasImages = !work.hasImages; return; }
+  // 切换完整版 / 预览版（详情里的「设为预览版 / 设为完整版」按钮）。预览里没有真文件系统，
+  // 就只把 purchasedPath 置空 / 补一个假路径 —— 卡片和详情的版本字样全看这个字段。
+  if (command === "mark_work_as_preview") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.purchasedPath = ""; return; }
+  if (command === "mark_work_as_full") { const work = previewWorks.find((item) => item.id === args.workId); if (work && !work.purchasedPath) work.purchasedPath = `D:\\已购\\${work.title}.txt`; return; }
   // 作品个人元数据（v1.2.0）：评分 / 阅读状态 / 笔记
   if (command === "set_work_meta") {
     const work = previewWorks.find((item) => item.id === args.workId);
@@ -3277,6 +3286,7 @@ async function openWorkDetail(workId) {
   const work = findWork(workId);
   if (!work) { toast("没找到这篇作品，刷新一下", "error"); return; }
   state.workDetailId = workId;
+  state.detailWorkSnapshot = work;
   state.detailSynopsisOpen = false;
   state.detailTagFocus = false;
   // 阅读版路径拿不到（没生成过）不算错误，只是那一行不显示
@@ -3346,7 +3356,7 @@ function bindDetailExtras() {
 function captureDetailNote() {
   const textarea = document.querySelector("#work-detail-note");
   if (!textarea || !state.workDetailId) return false;
-  const work = findWork(state.workDetailId);
+  const work = detailWork();
   const value = textarea.value.trim().slice(0, 200);
   if (!work || (work.note || "") === value) return false;
   work.note = value;
@@ -3358,7 +3368,7 @@ function captureDetailNote() {
 async function saveDetailNote() {
   const textarea = document.querySelector("#work-detail-note");
   if (!textarea || !state.workDetailId) return;
-  const work = findWork(state.workDetailId);
+  const work = detailWork();
   if (!work) return;
   const value = textarea.value.trim().slice(0, 200);
   if ((work.note || "") === value) return;
@@ -3375,7 +3385,7 @@ async function saveDetailNote() {
 async function setDetailMeta(patch) {
   if (!state.workDetailId) return;
   captureDetailNote();
-  const work = findWork(state.workDetailId);
+  const work = detailWork();
   try {
     await invoke("set_work_meta", { workId: state.workDetailId, readState: null, rating: null, note: null, ...patch });
     if (work) Object.assign(work, patch);
@@ -3445,7 +3455,7 @@ function detailTagList(work) {
 }
 
 async function writeDetailTags(tags) {
-  const work = findWork(state.workDetailId);
+  const work = detailWork();
   if (!work) return;
   captureDetailNote();
   try {
@@ -3460,7 +3470,7 @@ async function writeDetailTags(tags) {
 
 async function addDetailTag() {
   const input = document.querySelector("#work-detail-tag-input");
-  const work = findWork(state.workDetailId);
+  const work = detailWork();
   if (!input || !work) return;
   const value = input.value.trim();
   if (!value) return;
@@ -3471,7 +3481,7 @@ async function addDetailTag() {
 }
 
 async function removeDetailTag(index) {
-  const work = findWork(state.workDetailId);
+  const work = detailWork();
   if (!work) return;
   const tags = detailTagList(work);
   if (index < 0 || index >= tags.length) return;
@@ -3544,7 +3554,13 @@ async function refreshAfterDetailChange() {
   // word_count 标回 -1。这里就地把当前详情这篇补算掉 —— 否则卡片上要等下次开软件
   // 那轮全库补算才有字数。
   await recountWorkWordCount(state.workDetailId);
+  const before = findWork(state.workDetailId);
+  if (before) state.detailWorkSnapshot = before;
   await refreshVisibleList();
+  // 重查完再拿一次：能拿到就换成列表里那份（最新数据），拿不到（被筛选踢出去了）
+  // 就留着上面那份快照，详情继续画。
+  const after = findWork(state.workDetailId);
+  if (after) state.detailWorkSnapshot = after;
   render();
   refreshDetailDom();
 }
@@ -3742,21 +3758,34 @@ async function detailDownload(workId, format) {
   await downloadReadingVersion(workId, format === "epub" ? "epub" : "html");
 }
 
-/** 详情里的删除作品。详情可以从任意页面打开，所以用 findWork 找，别只看 state.works。 */
+/** 详情里的删除作品。详情可以从任意页面打开，所以用 detailWork 找（列表里没有也靠快照兜住）。 */
 function detailDeleteWork(workId) {
-  const work = findWork(workId);
+  const work = findWork(workId) || state.detailWorkSnapshot;
   if (!work) return;
   confirmAction("确认删除作品", `删除“${work.title}”只会移除软件记录和路径绑定，不会删除磁盘中的原始文件。`, "删除作品", async () => {
     await invoke("delete_work", { workId });
     closeModal();
     state.workDetailId = null;
+    state.detailWorkSnapshot = null;
     await refreshAfterDetailChange();
     toast("作品记录已删除，原始文件未受影响", "success");
   });
 }
 
+/**
+ * 详情弹窗当前这一篇。
+ *
+ * 为什么不能直接用 `findWork`：列表重查会**按当前筛选剔除掉不再符合条件的作品**
+ * —— 在「完整版」筛选里把一篇设成预览版，重查后它就不在 `state.works` 里了，
+ * 详情立刻变成「这篇作品已经不在了」（v1.2.x 用户报的）。所以详情一开就把这篇存进
+ * `state.detailWorkSnapshot`，列表里找不到时回落到快照 —— 弹窗开着的样子不变。
+ */
+function detailWork() {
+  return findWork(state.workDetailId) || state.detailWorkSnapshot || null;
+}
+
 function workDetailBody() {
-  const work = findWork(state.workDetailId);
+  const work = detailWork();
   if (!work) return '<p class="match-note">这篇作品已经不在了，关掉重新打开一次。</p>';
   const rating = Number(work.rating) || 0;
   const readState = Number(work.readState) || 0;
@@ -3783,14 +3812,11 @@ function workDetailBody() {
   const synopsisLong = synopsis.length > 140;
   const synopsisOpen = !synopsisLong || state.detailSynopsisOpen;
   const readingPath = String(state.detailReadingPath || "");
-  // 简介有三种状态，后两种 `synopsis` 都是空串，只能靠 synopsisChecked 分开说：
-  // 有内容 / 问过 Pixiv 且确认作者没写 / 还没问过（点了「补抓简介」能拉）。
-  // 混成一句「这篇还没有简介」的话，作者明明没写的作品会让用户一直去点补抓 —— 白等还喂风控。
+  // 简介只有两态：有内容 / 空。空的一律说「作者没写简介」—— 不管有没有向 Pixiv 问过，
+  // 都不再提示「去设置里补抓」（那会让用户白等一轮还喂风控）。
   const synopsisBody = synopsis
     ? `<p class="detail-synopsis ${synopsisOpen ? "" : "is-clamped"}">${synopsisHtml(work.synopsis)}</p>${synopsisLong ? `<button class="quiet-button detail-more" data-action="detail-toggle-synopsis">${state.detailSynopsisOpen ? "收起简介" : "展开全文"}</button>` : ""}`
-    : work.synopsisChecked
-      ? '<p class="match-note">作者没写简介 —— 这篇已经向 Pixiv 问过了，那边本来就没有简介内容。</p>'
-      : '<p class="match-note">这篇还没有简介。同步过的作品可以在设置里用「补抓简介」拉一次。</p>';
+    : '<p class="match-note">作者没写简介</p>';
   // 阅读版和正文指向同一个文件时就不必单列一行
   const showReadingRow = Boolean(readingPath) && readingPath !== work.purchasedPath && readingPath !== work.previewPath;
 
@@ -5963,7 +5989,7 @@ async function bindEvents() {
         // 前端这份内存镜像得守同一条规矩，否则本来已读的作品点一下开会当场显示成「在读」
         const openedId = Number(workId);
         await invoke("open_work", { workId: openedId });
-        const opened = findWork(openedId);
+        const opened = findWork(openedId) || state.detailWorkSnapshot;
         if (opened) opened.readState = Math.max(Number(opened.readState) || 0, 1);
         refreshDetailDom();
       }
