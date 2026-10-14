@@ -7089,12 +7089,14 @@ async function scanPreview() {
   }
   const result = await invoke("scan_preview", { authorId: state.activeAuthor.id });
   await refreshWorks();
-  if (result.createdCount || result.boundCount || result.ambiguousCount) {
+  if (result.createdCount || result.boundCount || result.ambiguousCount || result.skippedFullCount) {
     const details = [];
     if (result.createdCount) details.push(`新增作品 ${result.createdCount} 个`);
     if (result.boundCount) details.push(`新增关联 ${result.boundCount} 个`);
     if (result.ambiguousCount) details.push(`${result.ambiguousCount} 个同分候选未自动关联`);
-    toast(details.join("；"), result.ambiguousCount ? "info" : "success");
+    // v1.2.100：这些是"已经是完整版所以没绑预览版"的 —— 不说一声用户会以为漏绑了
+    if (result.skippedFullCount) details.push(`${result.skippedFullCount} 个已经是完整版、跳过`);
+    toast(details.join("；"), result.ambiguousCount || result.skippedFullCount ? "info" : "success");
   }
   else toast("未找到可匹配的预览版内容或封面，请检查名称与目录第一层文件", "info");
   await refreshActiveAuthor();

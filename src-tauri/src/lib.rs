@@ -230,6 +230,9 @@ struct ScanPreviewResult {
     ambiguous_count: usize,
     created_count: usize,
     bound_count: usize,
+    /// v1.2.100：扫到、但**已经是完整版**所以没绑预览版的条目数（单份模型）。
+    /// 单独记一笔是为了能跟用户交代 —— 否则点了按钮"没反应"会让人纳闷。
+    skipped_full_count: usize,
 }
 
 #[derive(Serialize)]
@@ -4589,14 +4592,17 @@ fn sibling_assets(text_path: &Path) -> Vec<PathBuf> {
 ///
 /// `sibling_assets` 只认「与正文同名」的 `{正文名}.jpg`；封面若是别的文件名
 /// （用户手动指定过、或 Pixiv 原始命名），就得单独跟着走一趟。
-/// `move_path` 对「源不存在 / 目标已存在」是幂等的，重复调用安全。
+///
+/// ⚠️ v1.2.100 起改成**覆盖式**（用户要求「转版本时封面也要移动过去，不需要有两份」）：
+/// 目标目录里若已经躺着同名封面，就把它送回收站再搬。以前这里走 `move_path`，
+/// 而那个函数"目标存在就跳过"—— 于是完整版、预览版两边各留一份，谁也没清掉。
 fn move_cover_along(cover_path: &str, target_dir: &Path) -> Result<(), String> {
     if cover_path.trim().is_empty() {
         return Ok(());
     }
     let cover = Path::new(cover_path);
     if let Some(name) = cover.file_name() {
-        move_path(cover, &target_dir.join(name))?;
+        move_path_overwriting(cover, &target_dir.join(name))?;
     }
     Ok(())
 }
@@ -4627,6 +4633,27 @@ fn follow_cover_path(old_cover: &str, new_text: &Path) -> String {
     old_cover.to_string()
 }
 
+/// 作品在预览版 / 完整版之间搬家时，把正文旁边的附属物一起搬过去（v1.2.100 收口）。
+///
+/// **封面这类图片走覆盖式**：目标目录里已有同名图就送回收站、让新的顶上 ——
+/// 用户明确要求转版本后不能留两份封面（老做法是 `move_path`，目标存在就跳过，
+/// 于是两边各留一份）。配图文件夹、同名 html / epub 仍走 `move_path`
+/// （目标存在就跳过）：那几个是目录或多份产物，覆盖有误删风险，不值当。
+fn move_sibling_assets_along(text_path: &Path, target_dir: &Path) -> Result<(), String> {
+    for asset in sibling_assets(text_path) {
+        let Some(name) = asset.file_name() else {
+            continue;
+        };
+        let target = target_dir.join(name);
+        if is_image_file_name(&name.to_string_lossy()) {
+            move_path_overwriting(&asset, &target)?;
+        } else {
+            move_path(&asset, &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// 把预览版目录里的作品搬到完整版目录（单份模型：一个作品只占一边）。
 /// 正文、配图文件夹、图文 HTML、封面都会跟着搬。
 fn move_sync_preview_to_purchased(
@@ -4639,14 +4666,11 @@ fn move_sync_preview_to_purchased(
         .ok_or_else(|| "预览版文件名称无效".to_string())?;
     let purchased_preview = purchased_dir.join(name);
     move_path(preview_path, &purchased_preview)?;
-    for asset in sibling_assets(preview_path) {
-        if let Some(asset_name) = asset.file_name() {
-            move_path(&asset, &purchased_dir.join(asset_name))?;
-        }
-    }
+    // v1.2.100：附属物统一走这个 —— 封面覆盖（不留两份），其余照旧
+    move_sibling_assets_along(preview_path, purchased_dir)?;
     if let Some(cover) = cover_path {
         if let Some(cover_name) = cover.file_name() {
-            move_path(cover, &purchased_dir.join(cover_name))?;
+            move_path_overwriting(cover, &purchased_dir.join(cover_name))?;
         }
     }
     Ok(purchased_preview.to_string_lossy().to_string())
@@ -9713,6 +9737,7 @@ fn scan_preview_existing(author_id: i64) -> Result<ScanPreviewResult, String> {
         ambiguous_count: ambiguous,
         created_count: 0,
         bound_count: 0,
+        skipped_full_count: 0,
     })
 }
 
@@ -9737,11 +9762,33 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
     }
     let entries = fs::read_dir(&dir).map_err(|e| format!("无法读取预览版文件夹：{e}"))?;
     let mut works = preview_works_for_author(&conn, author_id)?;
+    // v1.2.100：**已经有完整版**（且那份文件还在）的作品 id —— 它们不该再被绑预览版。
+    // 单份模型是一篇作品只占一边（见 `move_sync_preview_to_purchased` 的注释）；
+    // 以前这一步不看 purchased_path，会把预览版目录里的同名文件也认领过去，
+    // 库里就变成"完整版 + 预览版"两条路径都挂着（v1.2.99 用户问出来的）。
+    // 判据跟「关联完整版文件」用的是同一条：`needs_a_purchased_file` 为假才算真有完整版。
+    let full_bound: HashSet<i64> = {
+        let mut statement = conn
+            .prepare("SELECT id, purchased_path FROM works WHERE author_id=?1")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([author_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|(_, purchased)| !needs_a_purchased_file(purchased))
+            .map(|(id, _)| id)
+            .collect()
+    };
     let mut previews = 0;
     let mut covers = 0;
     let mut ambiguous = 0;
     let mut created = 0;
     let mut bound = 0;
+    let mut skipped_full = 0;
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -9821,6 +9868,13 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
                 bound += 1;
             }
         } else {
+            // v1.2.100：已经是完整版的（且那份文件还在）就**不绑预览版** ——
+            // 单份模型，一篇作品只占一边。多半是预览版目录里那份小样还没清掉，
+            // 认领它只会让库里多一条对不上号的路径。封面在上面那条分支，不受这里影响。
+            if full_bound.contains(&matched_id) {
+                skipped_full += 1;
+                continue;
+            }
             let current: String = conn
                 .query_row(
                     "SELECT preview_path FROM works WHERE id=?1",
@@ -9845,6 +9899,7 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
         ambiguous_count: ambiguous,
         created_count: created,
         bound_count: bound,
+        skipped_full_count: skipped_full,
     })
 }
 
@@ -10444,9 +10499,10 @@ fn bind_work_preview(work_id: i64, path: String) -> Result<String, String> {
     let target_dir = PathBuf::from(&preview_dir);
     fs::create_dir_all(&target_dir).map_err(|e| format!("无法创建预览版文件夹：{e}"))?;
     let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let target = unique_target_path(&target_dir, &title, extension);
+    // v1.2.100：绑定改成**覆盖式**（用户要求）—— 同名文件直接替换，不再堆 `标题 (1)`
+    let target = binding_target_path(&conn, &target_dir, &title, extension, work_id);
     if source != target {
-        move_path(&source, &target)?;
+        move_path_overwriting(&source, &target)?;
     }
     conn.execute(
         "UPDATE works SET preview_path=?1 WHERE id=?2",
@@ -10506,9 +10562,11 @@ fn bind_work_cover(work_id: i64, path: String) -> Result<String, String> {
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
     let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("jpg");
-    let target = unique_target_path(&target_dir, &stem, extension);
+    // v1.2.100：绑定改成**覆盖式**（用户要求）—— 换封面时直接替换掉同名那张，
+    // 不再堆成 `标题 (1).jpg`；老那张会送回收站（能捞回来）
+    let target = binding_target_path(&conn, &target_dir, &stem, extension, work_id);
     if source != target {
-        move_path(&source, &target)?;
+        move_path_overwriting(&source, &target)?;
     }
     // ⚠️ `works` 表只有 `cover_path`，没有 `cover_managed` 这一列（v1.2.84 修，之前报 no such column）
     conn.execute(
@@ -10548,9 +10606,11 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, S
     fs::create_dir_all(&target_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
 
     let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let target = unique_target_path(&target_dir, &title, extension);
+    // v1.2.100：绑定改成**覆盖式**（用户要求）—— 同名文件直接替换，不再堆 `标题 (1)`。
+    // 那份同名文件若正被别的作品绑着，`binding_target_path` 会自己退回加序号的做法。
+    let target = binding_target_path(&conn, &target_dir, &title, extension, work_id);
     if source != target {
-        move_path(&source, &target)?;
+        move_path_overwriting(&source, &target)?;
     }
     // 这篇原来要是在某个合集里，走之前先把合集收尾（改名 + 剩余作品的路径跟着改）
     relink_bundle_after_removal(&conn, work_id)?;
@@ -10560,6 +10620,9 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, S
     )
     .map_err(|e| e.to_string())?;
     refresh_reading_image_count(&conn, work_id);
+    // v1.2.100：这份文件确实带配图就顺手标成「带图版」（用户要求）——
+    // 放在字数/图片数都算完之后，`image_count` 才是刚更新的值
+    mark_has_images_if_illustrated(&conn, work_id, &target);
     Ok(target.to_string_lossy().to_string())
 }
 
@@ -10612,6 +10675,105 @@ fn unique_target_path(target_dir: &Path, work_title: &str, extension: &str) -> P
         }
         counter += 1;
     }
+}
+
+/// 覆盖式搬文件：目标位置已经有东西时，**先把它送进系统回收站**（不是硬删，能捞回来），
+/// 再把源搬过去。
+///
+/// 只在"这次动作就是要替换掉那一份"时用 —— 别拿它替换 `move_path`：
+/// 那个函数"目标存在就跳过"是防误覆盖的通用保险，动它会把同步、搬家一大片逻辑一起带偏。
+///
+/// 目录一律不动（递归覆盖太危险），调用方只会在文件上用它。
+fn move_path_overwriting(source: &Path, destination: &Path) -> Result<(), String> {
+    if source == destination || !source.exists() {
+        return Ok(());
+    }
+    if destination.exists() {
+        if destination.is_dir() {
+            return Ok(());
+        }
+        recycle_to_bin(destination)?;
+    }
+    move_path(source, destination)
+}
+
+/// 这个路径是不是**正被别的作品绑着**（正文或封面都算）。
+///
+/// 覆盖式绑定前的安全阀：两篇作品标题撞名时会指向同一个候选路径，
+/// 直接覆盖就把别人的正文毁了 —— 那种情况得退回"加 (1) 另存一份"。
+/// 只查作品的路径字段，不碰磁盘。
+fn path_bound_to_another_work(conn: &Connection, path: &Path, work_id: i64) -> bool {
+    let key = path_key(&path.to_string_lossy());
+    let Ok(mut statement) = conn.prepare(
+        "SELECT purchased_path, preview_path, cover_path FROM works WHERE id<>?1",
+    ) else {
+        return false;
+    };
+    let Ok(rows) = statement.query_map([work_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) else {
+        return false;
+    };
+    for row in rows.flatten() {
+        for candidate in [row.0, row.1, row.2] {
+            if !candidate.trim().is_empty() && path_key(candidate.trim()) == key {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 「绑定」用的目标路径（v1.2.100 用户要求改成覆盖式）。
+///
+/// 跟 `unique_target_path` 的区别：同名文件**直接覆盖**，不再顺手改名成 `标题 (1).txt` ——
+/// 否则每换一次绑定就往目录里多堆一份，库里指向新的、旧的那份变成没人管的垃圾。
+///
+/// **一个安全阀**：那份同名文件如果正被**别的作品**绑着（两篇作品标题撞了），
+/// 就不能覆盖（覆盖会毁掉别人的正文），退回加序号的老做法。
+fn binding_target_path(
+    conn: &Connection,
+    target_dir: &Path,
+    work_title: &str,
+    extension: &str,
+    work_id: i64,
+) -> PathBuf {
+    let candidate = direct_target_path(target_dir, work_title, extension);
+    if !candidate.exists() {
+        return candidate;
+    }
+    if path_bound_to_another_work(conn, &candidate, work_id) {
+        return unique_target_path(target_dir, work_title, extension);
+    }
+    candidate
+}
+
+/// 绑完完整版之后，这份文件确实带配图就把它标成「带图版」（v1.2.100 用户要求）。
+///
+/// 判据两条，命中一条就算：
+///   · `image_count > 0` —— 电子书 / HTML 里数出来的配图张数（`refresh_reading_image_count` 刚更新过）
+///   · 正文旁边有 `{正文名}_images` 配图目录 —— **txt 的图放在目录里**，
+///     `count_reading_images` 不认 txt、数不出张数，只看张数会漏掉它
+///
+/// **只单向补标**：本来有标记的保持不动，数不出图也**不撤** ——
+/// 撤掉会误伤用户手动标的「带图版」。
+fn mark_has_images_if_illustrated(conn: &Connection, work_id: i64, text_path: &Path) {
+    let count: i64 = conn
+        .query_row("SELECT image_count FROM works WHERE id=?1", [work_id], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    if count <= 0 && !novel_images_dir(text_path).is_dir() {
+        return;
+    }
+    let _ = conn.execute(
+        "UPDATE works SET has_images=1 WHERE id=?1 AND has_images<>1",
+        [work_id],
+    );
 }
 
 /// 把源文件分发到若干个目标：
@@ -11164,11 +11326,8 @@ fn copy_previews_to_purchased(
         // 单份模型：整份搬过去（配图文件夹、图文 HTML、封面一起），预览版目录不留副本。
         if source != destination {
             move_path(&source, &destination)?;
-            for asset in sibling_assets(&source) {
-                if let Some(asset_name) = asset.file_name() {
-                    move_path(&asset, &purchased_dir.join(asset_name))?;
-                }
-            }
+            // v1.2.100：附属物统一走这个 —— 封面覆盖（不留两份），其余照旧
+            move_sibling_assets_along(&source, &purchased_dir)?;
             move_cover_along(&old_cover, &purchased_dir)?;
             result.copied_count += 1;
         }
@@ -11212,11 +11371,8 @@ fn mark_work_as_preview(work_id: i64) -> Result<(), String> {
         };
         let destination = preview_dir.join(name);
         move_path(&source, &destination)?;
-        for asset in sibling_assets(&source) {
-            if let Some(asset_name) = asset.file_name() {
-                move_path(&asset, &preview_dir.join(asset_name))?;
-            }
-        }
+        // v1.2.100：附属物统一走这个 —— 封面覆盖（不留两份），其余照旧
+        move_sibling_assets_along(&source, &preview_dir)?;
         move_cover_along(&old_cover, &preview_dir)?;
         let next_cover = follow_cover_path(&old_cover, &destination);
         conn.execute(
@@ -16759,6 +16915,8 @@ mod tests {
         should_import_folder_entry, should_skip_small_content, similarity_percent, similarity_with_title_limit,
         best_import_match, import_folder_extension_allowed, author_works_for_match, ImportCandidate, ImportSelection,
         attach_import_cover, epub_first_image, xml_attr,
+        binding_target_path, mark_has_images_if_illustrated, move_path_overwriting,
+        move_sibling_assets_along,
         sort_works_by_content_size,
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
         probe_latest_version, probe_update_asset, update_asset_names, update_client,
@@ -21146,6 +21304,177 @@ mod tests {
         assert_eq!(xml_attr(spaced, "href").as_deref(), Some("x.jpg"));
         // 属性不存在就是 None，别瞎猜
         assert_eq!(xml_attr(spaced, "properties"), None);
+    }
+
+    /// v1.2.100：「绑定」的目标路径是**覆盖式**的 —— 同名文件直接替换，
+    /// 不再堆成 `标题 (1).txt`（用户要求：换一次绑不该多出一份垃圾）。
+    /// 唯一的例外：那份同名文件正被**别的作品**绑着，那时必须退回加序号，
+    /// 否则会把别人的正文盖掉。
+    #[test]
+    fn binding_target_overwrites_unless_another_work_owns_the_file() {
+        let root = std::env::temp_dir().join(format!("bind-target-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE works (
+                 id INTEGER PRIMARY KEY,
+                 purchased_path TEXT NOT NULL DEFAULT '',
+                 preview_path TEXT NOT NULL DEFAULT '',
+                 cover_path TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO works (id) VALUES (1)", []).unwrap();
+
+        // 目录里还没有这个文件 ⇒ 直接用原名
+        assert_eq!(
+            binding_target_path(&conn, &root, "某篇", "txt", 1),
+            root.join("某篇.txt")
+        );
+
+        // 文件在、但**没人绑**（库里没有任何一行指向它）⇒ 覆盖，仍是原名、不带序号
+        let occupied = root.join("某篇.txt");
+        fs::write(&occupied, "旧的").unwrap();
+        assert_eq!(
+            binding_target_path(&conn, &root, "某篇", "txt", 1),
+            occupied,
+            "没人占就覆盖，不该加 (1)"
+        );
+
+        // 文件在、而且是**这篇自己**原来绑着的 ⇒ 照样覆盖（就是换掉自己那份）
+        conn.execute(
+            "UPDATE works SET purchased_path=?1 WHERE id=1",
+            [occupied.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            binding_target_path(&conn, &root, "某篇", "txt", 1),
+            occupied,
+            "自己那份也该覆盖"
+        );
+
+        // 文件在、而且**被别的作品**绑着 ⇒ 退回加序号，绝不覆盖别人的正文
+        conn.execute(
+            "INSERT INTO works (id, purchased_path) VALUES (2, ?1)",
+            [occupied.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            binding_target_path(&conn, &root, "某篇", "txt", 1),
+            root.join("某篇 (1).txt"),
+            "别人的文件不能盖"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.2.100：绑完整版之后，这份文件确实带图就标成「带图版」。
+    /// 判据两条 —— 数出配图张数 > 0（电子书 / HTML），或正文旁边有
+    /// `{正文名}_images` 配图目录（txt 的图在目录里、数不出张数）。
+    /// 而且**只补标、不撤标**。
+    #[test]
+    fn binding_an_illustrated_file_marks_it_as_pictured() {
+        let root = std::env::temp_dir().join(format!("has-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE works (
+                 id INTEGER PRIMARY KEY,
+                 image_count INTEGER NOT NULL DEFAULT 0,
+                 has_images INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        let has_images = |id: i64| -> i64 {
+            conn.query_row("SELECT has_images FROM works WHERE id=?1", [id], |row| row.get(0))
+                .unwrap()
+        };
+
+        let with_dir = root.join("带图的书.txt");
+        fs::write(&with_dir, "正文").unwrap();
+        conn.execute("INSERT INTO works (id) VALUES (1)", []).unwrap();
+        // 既数不出图、旁边也没配图目录 ⇒ 别乱标
+        mark_has_images_if_illustrated(&conn, 1, &with_dir);
+        assert_eq!(has_images(1), 0, "真没图就不该标");
+
+        // 正文旁边出现 `_images` 配图目录 ⇒ 标上（txt 就是这种情况）
+        fs::create_dir_all(root.join("带图的书_images")).unwrap();
+        mark_has_images_if_illustrated(&conn, 1, &with_dir);
+        assert_eq!(has_images(1), 1, "配图目录也算带图");
+
+        // 数出来的张数 > 0 同样要标（电子书 / HTML 走这条）
+        let plain = root.join("电子书.txt");
+        fs::write(&plain, "正文").unwrap();
+        conn.execute("INSERT INTO works (id, image_count) VALUES (2, 7)", [])
+            .unwrap();
+        mark_has_images_if_illustrated(&conn, 2, &plain);
+        assert_eq!(has_images(2), 1, "数得出张数就算带图");
+
+        // **只补标、不撤标**：没图也不能把已有的标记抹掉
+        conn.execute("INSERT INTO works (id, has_images) VALUES (3, 1)", [])
+            .unwrap();
+        mark_has_images_if_illustrated(&conn, 3, &plain);
+        assert_eq!(has_images(3), 1, "没图也不能撤掉已有的标记");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.2.100：转版本时正文旁边的附属物一起走，**同名封面要覆盖**
+    ///（用户要求「不需要有两份封面」）。
+    #[test]
+    fn version_switch_overwrites_the_cover_instead_of_leaving_two() {
+        let root = std::env::temp_dir().join(format!("siblings-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let preview = root.join("预览");
+        let full = root.join("完整");
+        fs::create_dir_all(&preview).unwrap();
+        fs::create_dir_all(&full).unwrap();
+
+        let text = preview.join("某篇.txt");
+        fs::write(&text, "正文").unwrap();
+        fs::create_dir_all(preview.join("某篇_images")).unwrap();
+        fs::write(preview.join("某篇.jpg"), "新封面").unwrap();
+        // 完整版目录里已经躺着一张**旧**的同名封面 —— 这正是"两份封面"的来源
+        fs::write(full.join("某篇.jpg"), "旧封面").unwrap();
+
+        move_sibling_assets_along(&text, &full).unwrap();
+
+        assert!(!preview.join("某篇.jpg").exists(), "旧的那份不该留在预览版目录");
+        assert_eq!(
+            fs::read_to_string(full.join("某篇.jpg")).unwrap(),
+            "新封面",
+            "同名封面要覆盖成新的"
+        );
+        assert!(full.join("某篇_images").is_dir(), "配图目录照旧搬过去");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 覆盖式搬文件：目标空着时就是普通搬家（源消失、内容到位），
+    /// 源已经不在时幂等返回（转版本那条路上会被重复调用）。
+    /// 覆盖那半截会真往回收站丢文件，不在这里测 —— 拼它的
+    /// `recycle_to_bin` 和 `move_path` 各自都有测试。
+    #[test]
+    fn overwriting_move_behaves_like_a_normal_move_when_free() {
+        let root = std::env::temp_dir().join(format!("move-over-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("源.txt");
+        fs::write(&source, "内容").unwrap();
+        let target = root.join("目标.txt");
+        move_path_overwriting(&source, &target).unwrap();
+        assert!(!source.exists(), "源该被搬走");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "内容");
+
+        // 源已经不在 ⇒ 什么都不做、也不报错
+        assert!(move_path_overwriting(&source, &target).is_ok());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// v1.2.18 / v1.2.94：EPUB 假字数的两口子迁移。
