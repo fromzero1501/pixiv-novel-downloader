@@ -4564,7 +4564,7 @@ function renderStray() {
         <span class="bookmark-status">${state.straySummary.workCount || 0} 篇 · ${state.straySummary.authorCount || 0} 位作者</span>
         ${state.bulkMode
           ? `<strong class="bulk-count">已选 ${state.selectedWorkIds.size} 篇</strong>`
-          : `<button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button><button class="icon-text-button" data-action="promote-stray-batch" title="批量转正：进选择模式，勾选 / 框选要转正的作品，再点批量条上的「转正」">${icon("star", 18)}<span>批量转正</span></button><button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button>`}
+          : `<button class="icon-text-button" data-action="import-works">${icon("plus", 18)}<span>新建作品</span></button><button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button><button class="icon-text-button" data-action="promote-stray-batch" title="批量转正：进选择模式，勾选 / 框选要转正的作品，再点批量条上的「转正」">${icon("star", 18)}<span>批量转正</span></button><button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button>`}
       </div>
     </section>
     ${state.bulkMode ? bulkBar(works) : ""}
@@ -6617,6 +6617,7 @@ async function bindEvents() {
       if (action === "copy-selected-full") await copySelectedToFull();
       if (action === "set-images-selected") await setSelectedHasImages();
       if (action === "delete-selected") await deleteSelectedWorks();
+      if (action === "delete-selected-files") await deleteSelectedWorksWithFiles();
       // 批量操作扩展（v1.2.0）
       if (action === "bulk-read-state") await bulkSetReadState(Number(element.dataset.readState));
       if (action === "bulk-add-collection") bulkCollectionPicker();
@@ -7354,7 +7355,7 @@ function bulkBar(works) {
       ${group("整理", `<button class="bulk-button" data-action="bulk-read-state" data-read-state="2" ${disabled}>设已读</button><button class="bulk-button" data-action="bulk-read-state" data-read-state="0" ${disabled}>设未读</button><button class="bulk-button" data-action="bulk-rating-modal" ${disabled}>设评分</button><button class="bulk-button" data-action="bulk-add-collection" ${disabled}>加入收藏夹</button><button class="bulk-button" data-action="bulk-remove-collection" ${disabled}>移出收藏夹</button><button class="bulk-button" data-action="bulk-tag-modal" ${disabled}>改标签</button>`)}
       ${group("文件", `<button class="bulk-button" data-action="backfill-images" title="按设置里选的格式，给勾选的作品重新下载阅读版并绑定" ${disabled}>补下配图</button><button class="bulk-button" data-action="download-selected-reading" data-format="epub" ${disabled}>重新下载 EPUB 版</button>`)}
       ${group("输出", `<button class="bulk-button" data-action="export-selected" ${disabled}>导出清单</button>`)}
-      <div class="bulk-bar-group is-danger"><button class="danger-button" data-action="delete-selected" ${disabled}>删除已选</button></div>
+      <div class="bulk-bar-group is-danger"><button class="danger-button" data-action="delete-selected" ${disabled}>删除作品</button><button class="danger-button" data-action="delete-selected-files" ${disabled}>彻底删除</button></div>
     </section>`;
 }
 
@@ -7520,12 +7521,44 @@ function cardSelectedText(card) {
 async function deleteSelectedWorks() {
   const workIds = [...state.selectedWorkIds];
   if (!workIds.length) return;
-  confirmAction("确认批量删除", `将删除 ${workIds.length} 条作品记录和路径绑定，不会删除磁盘中的原始文件。`, "删除已选作品", async () => {
+  confirmAction("确认批量删除", `将删除 ${workIds.length} 条作品记录和路径绑定，不会删除磁盘中的原始文件。`, "删除作品", async () => {
     await invoke("delete_works", { workIds });
     state.bulkMode = false; state.selectedWorkIds.clear();
     await refreshWorks(); await refreshActiveAuthor(); render();
     toast(`已删除 ${workIds.length} 条作品记录，原始文件未受影响`, "success");
   });
+}
+
+/** 批量彻底删除（v1.3.12，用户要求）：记录 + 磁盘文件（送回收站）—— 逐篇复用单篇「彻底删除」。 */
+async function deleteSelectedWorksWithFiles() {
+  const workIds = [...state.selectedWorkIds];
+  if (!workIds.length) return;
+  confirmAction(
+    "确认批量彻底删除",
+    `将删除这 ${workIds.length} 篇作品的记录，并把它们绑定的文件与封面送进回收站（可在系统回收站还原，不是物理删除）。正被其他作品绑着的文件会自动保留。`,
+    "彻底删除",
+    async () => {
+      let removed = 0, recycled = 0, skippedShared = 0, failed = 0, firstError = "";
+      for (const workId of workIds) {
+        try {
+          const result = await invoke("delete_work_with_files", { workId });
+          recycled += result?.recycled || 0;
+          skippedShared += result?.skippedShared || 0;
+          failed += result?.failed || 0;
+          removed += 1;
+        } catch (error) {
+          if (!firstError) firstError = String(error);
+        }
+      }
+      state.bulkMode = false; state.selectedWorkIds.clear();
+      await refreshWorks(); await refreshActiveAuthor(); render();
+      const bits = [`${removed} 篇已彻底删除（${recycled} 个文件送进回收站）`];
+      if (skippedShared) bits.push(`${skippedShared} 个文件还绑着其他作品、已保留`);
+      if (failed) bits.push(`${failed} 个文件没能删除`);
+      if (removed < workIds.length) bits.push(`${workIds.length - removed} 篇没删成${firstError ? `（${firstError}）` : ""}`);
+      toast(bits.join("；"), skippedShared || failed || removed < workIds.length ? "info" : "success");
+    },
+  );
 }
 
 async function copySelectedToFull() {
@@ -8589,6 +8622,12 @@ async function submitImport() {
   }
 }
 
+/** 「新建作品」的归属（v1.3.12）：作者页 = 当前作者；**散篇页 = "散篇"占位作者**（id 0 哨兵，
+ *  后端会取/建这个名字的散篇作者 —— 散篇库按 stray 作者分组，它会自然出现在列表里）。 */
+function importTargetAuthor() {
+  return state.activeAuthor || { id: 0, name: "散篇" };
+}
+
 /** 「新建作品」第一步的实际干活部分（拆出来只为让上面那道防重入闸能 try/finally 收干净）。 */
 async function runImportPreview() {
   const pastePanel = document.querySelector('[data-panel="paste"]');
@@ -8618,7 +8657,7 @@ async function runImportPreview() {
     if (!path) throw new Error("请先选择 Excel 或 CSV 文件");
     lines = await invoke("read_import_file", { path, column: Number(form.get("column") || 1) });
   }
-  const preview = await invoke("preview_import_bytes", { authorId: state.activeAuthor.id, lines });
+  const preview = await invoke("preview_import_bytes", { authorId: importTargetAuthor().id, lines });
   const candidates = preview.candidates || [];
   if (!candidates.length && !(preview.invalidLines || []).length) {
     toast("这个来源里没找到任何作品名", "info");
@@ -8684,7 +8723,7 @@ function confirmImportPreview() {
   }
   const folderPicked = picked.filter((item) => item.sourcePath).length;
   const lines = [
-    `将在「${state.activeAuthor.name}」名下新建 ${picked.length} 篇作品。`,
+    `将在「${importTargetAuthor().name}」名下新建 ${picked.length} 篇作品。`,
     folderPicked ? `其中 ${folderPicked} 篇会把对应文件绑成完整版，并把文件搬进这位作者的完整版目录。` : "",
     "新建之后不能一键撤销，请确认勾选的是你要的那些。",
   ].filter(Boolean).join("");
@@ -8694,10 +8733,12 @@ function confirmImportPreview() {
       releaseDate: item.releaseDate || "",
       sourcePath: item.sourcePath || "",
     }));
-    const result = await invoke("commit_import", { authorId: state.activeAuthor.id, selections });
+    const result = await invoke("commit_import", { authorId: importTargetAuthor().id, selections });
     state.pendingImport = null;
     await refreshWorks();
     await refreshAuthors();
+    // v1.3.12：散篇页也能发起「新建作品」（导入到"散篇"名下）—— 把散篇列表也刷上
+    if (state.homeView === "stray") await refreshStrayWorks();
     render();
     // v1.2.99：新建的作品字数是 -1（未算）。这里不补算的话要等**下次重启软件**
     // 才会被后台补上 —— 刚导入的 epub 就会一直显示不出字数（用户 2026-10-14 报的）。

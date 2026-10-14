@@ -6991,11 +6991,6 @@ fn pixiv_sync_impl(
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     let conn = db()?;
-    // v1.3.11：下载下限跟着设置项「最小作品字数」走（以前读的是改名前的旧键
-    // `minimum_file_size_bytes`，新设置管不到同步 —— 用户报「同步时突破了字数限制」）。
-    let minimum_text_count = setting(&conn, "minimum_text_count")?
-        .parse::<u64>()
-        .unwrap_or(0);
     let delay_threshold = setting(&conn, "pixiv_delay_threshold")?
         .parse::<usize>()
         .unwrap_or(150);
@@ -7030,6 +7025,8 @@ fn pixiv_sync_impl(
     fs::create_dir_all(&preview_dir).map_err(|e| format!("无法创建预览版文件夹：{e}"))?;
     let purchased_dir = PathBuf::from(purchased_dir);
     fs::create_dir_all(&purchased_dir).map_err(|e| format!("无法创建完整版文件夹：{e}"))?;
+    // v1.3.11：同步下载与"复用本地文件"的下限都跟着设置项「最小作品字数」走（以前下载那条
+    // 读的是改名前的旧键 `minimum_file_size_bytes`，新设置管不到同步 —— 用户报「同步时突破了字数限制」）。
     let minimum_text_count = setting(&conn, "minimum_text_count")?.parse::<u64>().unwrap_or(0);
     let preview_entries = sync_preview_entries(&preview_dir, minimum_text_count)?;
     let single_novel_id = pixiv_novel_id_from_url(&novel_url)?;
@@ -16449,9 +16446,31 @@ fn best_import_match(
 ///
 /// 返回**每一条都带匹配结果**的候选，前端一行一个复选框：
 /// **没匹配到的默认勾选、匹配到的默认不勾**，勾了才建。
+/// v1.3.12：散篇页的「新建作品」—— author_id 给 0（哨兵）时，作品归到"散篇"占位作者名下
+///（没有就建一个：name="散篇"、stray=1；目录照建，这样"绑成完整版"那条路有地方搬）。
+/// 散篇库本来就是按 stray 作者分组显示的，它建好后会自然出现在列表里。
+fn resolve_import_author(conn: &Connection, author_id: i64) -> Result<i64, String> {
+    if author_id != 0 {
+        return Ok(author_id);
+    }
+    if let Ok(id) = conn.query_row(
+        "SELECT id FROM authors WHERE name='散篇' AND stray=1",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        return Ok(id);
+    }
+    conn.execute("INSERT INTO authors (name, stray) VALUES ('散篇', 1)", [])
+        .map_err(|e| e.to_string())?;
+    let author_id = conn.last_insert_rowid();
+    let _ = apply_default_dirs(conn, author_id);
+    Ok(author_id)
+}
+
 #[tauri::command]
 fn preview_import_bytes(author_id: i64, lines: Vec<String>) -> Result<ImportPreview, String> {
     let conn = db()?;
+    let author_id = resolve_import_author(&conn, author_id)?;
     Ok(build_import_preview(&conn, author_id, lines)?)
 }
 
@@ -16541,6 +16560,7 @@ fn commit_import(
     selections: Vec<ImportSelection>,
 ) -> Result<ImportResult, String> {
     let mut conn = db()?;
+    let author_id = resolve_import_author(&conn, author_id)?;
     let settings = read_settings(&conn)?;
     let title_limit = settings.match_title_length;
     let min_similarity = settings.min_similarity_threshold;
