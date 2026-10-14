@@ -1009,6 +1009,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .import-folder svg { flex: 0 0 auto; margin-top: 1px; color: #7c93ab; }
 .import-folder span { min-width: 0; word-break: break-all; }
 .import-match { flex: 0 0 auto; max-width: 42%; color: #a35a2c; background: #fdf3e8; border: 1px solid #f2dfc8; border-radius: 999px; padding: 1px 9px; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; align-self: center; }
+.import-near { flex: 0 0 auto; max-width: 42%; color: #4a6f9a; background: #eef5ff; border: 1px solid #d8e8f8; border-radius: 999px; padding: 1px 9px; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; align-self: center; }
 .import-faint { flex: 0 0 auto; color: #9aabbd; font-size: 11.5px; align-self: center; }
 
 /* 详情页的绑定按钮排一行（v1.2.83）：三个都要能点、也都能拖 */

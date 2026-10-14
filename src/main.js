@@ -1122,7 +1122,7 @@ async function invoke(command, args = {}) {
     if (window.__previewImportResult) return window.__previewImportResult;
     return {
       candidates: (args.lines || []).map((line, index) => ({
-        line, title: String(line).trim(), releaseDate: "", sourcePath: "", matchedWorkId: 0, matchedTitle: "", matchedScore: 0,
+        line, title: String(line).trim(), releaseDate: "", sourcePath: "", matchedWorkId: 0, matchedTitle: "", matchedScore: 0, matchedStrong: false,
       })).filter((item) => item.title).map((item, index) => ({ ...item, title: item.title || `第 ${index + 1} 行` })),
       invalidLines: [],
     };
@@ -8562,11 +8562,14 @@ async function runImportPreview() {
     : "";
   const matchedCount = candidates.filter((item) => item.matchedWorkId).length;
   const rows = candidates.map((item, index) => {
-    // 没匹配到 ⇒ 默认勾选；匹配到了 ⇒ 默认不勾，右边写明撞上了哪一篇
+    // v1.3.3：达到**最小相似度**的匹配全部摆出来、一律默认不勾（要建自己勾）。
+    // 「撞上」＝达到关联相似度（橙色）；「相近」＝只过最小相似度（浅色，建之前建议核对）。
     const checked = item.matchedWorkId ? "" : " checked";
     const badge = item.matchedWorkId
-      ? `<span class="import-match" title="本地已有这篇作品">撞上：${escapeHtml(item.matchedTitle)}（${item.matchedScore}%）</span>`
-      : (item.matchedScore ? `<span class="import-faint">本地没有相近的作品（最像的只有 ${item.matchedScore}%）</span>` : `<span class="import-faint">本地没有相近的作品</span>`);
+      ? (item.matchedStrong
+        ? `<span class="import-match" title="本地已有这篇作品">撞上：${escapeHtml(item.matchedTitle)}（${item.matchedScore}%）</span>`
+        : `<span class="import-near" title="本地有相似的作品，建之前建议核对">相近：${escapeHtml(item.matchedTitle)}（${item.matchedScore}%）</span>`)
+      : `<span class="import-faint">本地没有相近的作品</span>`;
     // 文件夹方式直接显示**文件名原文**（v1.2.99 用户要求）—— 带后缀，一眼看出哪篇是 txt、哪篇是 epub；
     // 路径不在这儿重复了，顶部统一显示一次。粘贴 / Excel 没有源文件，只能显示解析出来的标题。
     const label = item.sourcePath
@@ -8577,7 +8580,7 @@ async function runImportPreview() {
     return `<label class="import-row" data-index="${index}"><input type="checkbox" data-import-pick${checked}><span class="import-row-main"><strong title="${escapeHtml(label)}">${escapeHtml(shown)}</strong></span>${badge}</label>`;
   }).join("");
   const folderLine = folderPath ? `<p class="import-folder">${icon("folder", 15)}<span>${escapeHtml(folderPath)}</span></p>` : "";
-  const body = `${folderLine}<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品够像，已经自动取消勾选。勾上的才会新建${usingFolder ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）" : ""}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
+  const body = `${folderLine}<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品相近（达到最小相似度），已经自动取消勾选。勾上的才会新建${usingFolder ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）" : ""}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
   closeModal();
   // v1.3.2：弹窗加宽到 960 档（和「选择要关联的作品」「选择要分组到的作品」一致）——文件名一长这里太挤
   showModal(modal("预览新建结果", body, `<button class="quiet-button" data-action="close-modal">取消</button><span class="footer-spacer"></span><button class="quiet-button" data-action="import-toggle-all" data-checked="true">全选</button><button class="quiet-button" data-action="import-toggle-all" data-checked="false">全不选</button><button class="primary-button" data-action="import-confirm">确认新建</button>`, "is-wide"));

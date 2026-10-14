@@ -392,6 +392,9 @@ struct ImportCandidate {
     matched_title: String,
     /// 相似度（0~100）；以文件名去比时返回的是文件名那边的分数
     matched_score: i64,
+    /// 匹配够不够"确定"：达到**关联相似度**才是 true（前端显示成「撞上」）；
+    /// false 而 `matched_work_id` 非零的是「相近」档（只过最小相似度）。v1.3.3
+    matched_strong: bool,
 }
 
 #[derive(Serialize)]
@@ -16085,18 +16088,12 @@ fn build_import_preview(
             invalid_lines.push(preview);
             continue;
         };
-        let (matched_work_id, matched_title, matched_score) =
+        let (matched_work_id, matched_title, matched_score, matched_strong) =
             match best_import_match(&works, &title, &source_name, title_limit, min_similarity) {
-                Some((id, matched, score)) => {
-                    // 只有"够像"（达到关联相似度）才把它说成"匹配到的作品"，
-                    // 否则那点分数不足为凭，列出来反而误导
-                    if score >= threshold {
-                        (id, matched, score)
-                    } else {
-                        (0, String::new(), score)
-                    }
-                }
-                None => (0, String::new(), 0),
+                // v1.3.3：达到**最小相似度**的匹配一律保留作品名与分数摆给用户看；
+                // 够不够"确定"由 `matched_strong` 区分（≥ 关联相似度才算「撞上」）。
+                Some((id, matched, score)) => (id, matched, score, score >= threshold),
+                None => (0, String::new(), 0, false),
             };
         candidates.push(ImportCandidate {
             line: line.clone(),
@@ -16110,6 +16107,7 @@ fn build_import_preview(
             matched_work_id,
             matched_title,
             matched_score,
+            matched_strong,
         });
     }
     Ok(ImportPreview {
@@ -17309,7 +17307,7 @@ mod tests {
         select_argument,
         extended_path_for_api, strip_extended_prefix,
         should_import_folder_entry, should_skip_small_content, similarity_percent, similarity_with_title_limit,
-        best_import_match, import_folder_extension_allowed, author_works_for_match, ImportCandidate, ImportSelection,
+        best_import_match, build_import_preview, import_folder_extension_allowed, author_works_for_match, ImportCandidate, ImportSelection,
         attach_import_cover, epub_first_image, xml_attr,
         binding_target_path, mark_has_images_if_illustrated, move_path_overwriting,
         move_sibling_assets_along,
@@ -18976,6 +18974,61 @@ mod tests {
         let (id, _, score) = best_import_match(&works, "夜色", "夜色温柔.txt", 0, 60).unwrap();
         assert_eq!(id, 11);
         assert!(score >= 60, "相似度应当够门槛，实际 {score}");
+    }
+
+    /// v1.3.3：达到**最小相似度**的匹配一律保留（含作品名）——
+    /// 只过最小相似度的一档 `matched_strong=false`（前端「相近」、默认不勾），
+    /// 达到关联相似度的 `true`（前端「撞上」）；低于最小相似度的才是"没有相近的作品"。
+    #[test]
+    fn import_preview_keeps_the_name_for_matches_above_the_minimum_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+             CREATE TABLE works (id INTEGER PRIMARY KEY, author_id INTEGER NOT NULL DEFAULT 1, title TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title) VALUES (22, 1, '旧城记（完整版）'), (33, 1, '完全不相干的一本书')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('min_similarity_threshold', '40'), ('similarity_threshold', '60')",
+            [],
+        )
+        .unwrap();
+        let preview = build_import_preview(
+            &conn,
+            1,
+            vec![
+                "旧城记".to_string(),
+                "旧城记（完整版）".to_string(),
+                "qqqq".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(preview.candidates.len(), 3);
+        // ① 够最小相似度（3/7 ≈ 42）、不够关联相似度 —— 名字要留着，但不算「撞上」
+        let near = &preview.candidates[0];
+        assert_eq!(near.matched_work_id, 22);
+        assert_eq!(near.matched_title, "旧城记（完整版）");
+        assert!(
+            near.matched_score >= 40 && near.matched_score < 60,
+            "应当落在最小~关联之间，实际 {}",
+            near.matched_score
+        );
+        assert!(!near.matched_strong);
+        // ② 完全同名 ⇒ 100 分，算「撞上」
+        let strong = &preview.candidates[1];
+        assert_eq!(strong.matched_work_id, 22);
+        assert_eq!(strong.matched_score, 100);
+        assert!(strong.matched_strong);
+        // ③ 低于最小相似度 ⇒ 什么都不留
+        let none = &preview.candidates[2];
+        assert_eq!(none.matched_work_id, 0);
+        assert!(none.matched_title.is_empty());
+        assert_eq!(none.matched_score, 0);
+        assert!(!none.matched_strong);
     }
 
     #[test]
