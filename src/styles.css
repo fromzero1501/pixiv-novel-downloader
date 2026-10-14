@@ -17,6 +17,9 @@ button { cursor: pointer; }
 .back-floater { position: fixed; left: 20px; top: 20px; z-index: 16; width: 40px; height: 40px; display: grid; place-items: center; color: #33506f; background: rgba(255,255,255,.95); border: 1px solid #d3e0ee; border-radius: 11px; box-shadow: 0 6px 18px rgba(30,60,95,.16); }
 .back-floater:hover { color: #1764c5; border-color: #a7c9ef; background: #fff; }
 .section-kicker { margin: 0 0 8px; color: #5b7799; font-size: 13px; font-weight: 650; }.topbar h1 { margin: 0; font-size: 34px; line-height: 1.1; letter-spacing: 0; }.topbar-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; align-items: center; }
+/* 「所有作品」标题旁的篇数（v1.3.16）：跟着筛选 / 正文搜索实时变动 */
+.all-works-title { display: flex; align-items: baseline; gap: 12px; }
+.works-total { color: #7b8ea4; font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .primary-button, .icon-text-button, .quiet-button { border: 1px solid transparent; min-height: 38px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border-radius: 7px; padding: 0 14px; font-weight: 650; }
 .primary-button { background: #176bd3; color: #fff; box-shadow: 0 6px 14px rgba(23,107,211,.18); }.primary-button:hover { background: #0e5fc2; }
 .icon-text-button, .quiet-button { background: #fff; color: #425b79; border-color: #d9e3ef; }.icon-text-button:hover, .quiet-button:hover { color: #1764c5; border-color: #b8d3ef; background: #fafdff; }

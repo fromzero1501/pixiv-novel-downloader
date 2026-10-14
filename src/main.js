@@ -3314,9 +3314,13 @@ function matchesAdvancedFilters(work) {
  * （散篇是"我贴一篇、它下一篇"的流水账，用户 2026-10-14 要求默认按添加时间倒序，
  * 所以散篇页把「最近添加」放在第一项并当作默认值）。作品库 / 所有作品不传，选项不变。
  */
-function sortSelect(current, withAdded = false) {
+function sortSelect(current, withAdded = false, withHits = false) {
   const added = withAdded ? `<option value="added_desc" ${current === "added_desc" ? "selected" : ""}>最近添加</option>` : "";
-  return `<select class="sort-select" id="sort-select" aria-label="排序">${added}<option value="date_desc" ${current === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${current === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${current === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${current === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="rating_desc" ${current === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>`;
+  // 「命中从多到少」（v1.3.16）：只在「所有作品」的正文搜索结果态下出现（withHits）；
+  // 其它时候这个值既不在下拉里、也不生效 —— 选着它的期间离开正文搜索，下拉回落显示第一项，
+  // 本次选择留在 state 里，下次正文搜索时它还会重新出现并保持勾选。
+  const hits = withHits ? `<option value="hits_desc" ${current === "hits_desc" ? "selected" : ""}>命中从多到少</option>` : "";
+  return `<select class="sort-select" id="sort-select" aria-label="排序">${hits}${added}<option value="date_desc" ${current === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${current === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${current === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${current === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="images_desc" ${current === "images_desc" ? "selected" : ""}>图片从多到少</option><option value="rating_desc" ${current === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>`;
 }
 
 function renderWorks() {
@@ -3364,6 +3368,13 @@ function renderAllWorks() {
   const filtered = collapseSerialWorks(state.allWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
   // 正文结果模式：再叠一层「正文命中」集合（正文只有这页能做全库搜）
   const visible = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
+  // 「命中从多到少」（v1.3.16）：只在正文结果模式下生效；命中数相同的保持原顺序（日期新→旧）
+  if (body && state.sort === "hits_desc") {
+    visible.sort((left, right) => (Number(body.hitMap.get(right.id)?.hitCount) || 0) - (Number(body.hitMap.get(left.id)?.hitCount) || 0));
+  }
+  // 顶部「共 N 篇」：跟着筛选 / 正文搜索走（和底部「已显示 x / y 篇」的 y 同源）；
+  // 正文扫描中还没出结果，先给个占位，免得中途闪一个 0
+  const totalLabel = body && body.running ? "共 … 篇" : `共 ${visible.length} 篇`;
   // 瀑布流：只画前 allWorksShown 张，剩下的滚到底再说（库里一千四百多篇，一次铺完很卡）
   const shown = visible.slice(0, Math.max(ALL_WORKS_PAGE, state.allWorksShown));
   const cards = shown.map((work) => `
@@ -3385,7 +3396,7 @@ function renderAllWorks() {
       ${remaining > 0 ? '<div data-role="all-works-sentinel" class="load-more-sentinel" aria-hidden="true"></div>' : ""}`
     : "";
   return renderShell(`
-    <section class="topbar work-topbar"><div><p class="section-kicker">全部作者</p><h1>所有作品</h1></div><div class="topbar-actions"><button class="icon-text-button" data-action="export-all">${icon("download", 18)}<span>导出清单</span></button></div></section>
+    <section class="topbar work-topbar"><div><p class="section-kicker">全部作者</p><div class="all-works-title"><h1>所有作品</h1><span class="works-total">${totalLabel}</span></div></div><div class="topbar-actions"><button class="icon-text-button" data-action="export-all">${icon("download", 18)}<span>导出清单</span></button></div></section>
     <section class="library-content">
       <div class="library-tools">
         <div class="search-field-wrap"><label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.allWorksQuery)}" autocomplete="off"></label>${state.searchField === "body" ? textSearchHistoryPanel() : ""}</div>
@@ -3396,7 +3407,7 @@ function renderAllWorks() {
         ${serialFilterButton(state.allWorks)}
         ${characterNameToggle()}
         ${filterButton()}
-        ${sortSelect(state.sort)}
+        ${sortSelect(state.sort, false, Boolean(body))}
       </div>
       ${filterPanel()}
       ${bodySearchHeader(body, visible.length) || '<div class="read-only-note">所有作品仅供搜索、筛选与打开查看。</div>'}

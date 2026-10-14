@@ -3400,6 +3400,8 @@ fn list_works(
         "title_asc" => " ORDER BY title COLLATE NOCASE ASC",
         // 「字数从多到少」的字数要读文件才知道，SQL 排不了：先按日期打个底，取回数据后再在 Rust 里重排
         "words_desc" => " ORDER BY release_date DESC, id DESC",
+        // 配图从多到少（v1.3.16）：image_count 是同步 / 绑阅读版时写好的列，直接排
+        "images_desc" => " ORDER BY image_count DESC, release_date DESC, id DESC",
         // 评分从高到低，没打分的（0）自动沉底
         "rating_desc" => " ORDER BY rating DESC, release_date DESC, id DESC",
         _ => " ORDER BY release_date DESC, id DESC",
@@ -3457,6 +3459,8 @@ fn list_all_works(
         "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
         // 同 list_works：「字数从多到少」只在 SQL 里给个日期底序，最终顺序在 Rust 里排
         "words_desc" => " ORDER BY w.release_date DESC, w.id DESC",
+        // 配图从多到少（v1.3.16）：直接走 image_count 列
+        "images_desc" => " ORDER BY w.image_count DESC, w.release_date DESC, w.id DESC",
         "rating_desc" => " ORDER BY w.rating DESC, w.release_date DESC, w.id DESC",
         _ => " ORDER BY w.release_date DESC, w.id DESC",
     });
@@ -10164,6 +10168,8 @@ fn list_stray_works(
         "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
         // 「字数从多到少」要读文件才知道，SQL 排不了：先按日期打底，取回后在 Rust 里重排
         "words_desc" => " ORDER BY w.release_date DESC, w.id DESC",
+        // 配图从多到少（v1.3.16）：直接走 image_count 列
+        "images_desc" => " ORDER BY w.image_count DESC, w.release_date DESC, w.id DESC",
         "rating_desc" => " ORDER BY w.rating DESC, w.release_date DESC, w.id DESC",
         // 散篇页的默认排序（v1.2.91，用户要求）：**按添加时间倒序**，后添加的排前面。
         // 表里没有单独的"入库时间"列，但 `works.id` 是 INTEGER PRIMARY KEY（自增），
@@ -14119,6 +14125,8 @@ fn list_collection_works(
         "date_asc" => " ORDER BY w.release_date ASC, w.id ASC",
         "title_asc" => " ORDER BY w.title COLLATE NOCASE ASC",
         "date_desc" => " ORDER BY w.release_date DESC, w.id DESC",
+        // 配图从多到少（v1.3.16）：直接走 image_count 列
+        "images_desc" => " ORDER BY w.image_count DESC, w.release_date DESC, w.id DESC",
         // 默认按「什么时候收进来的」：收藏夹里最自然的就是新收的排前面
         _ => " ORDER BY cw.added_at DESC, w.id DESC",
     });
