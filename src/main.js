@@ -99,15 +99,11 @@ const state = {
   /** 防抖用：正在追加下一页时不要再触发一次 */
   allWorksLoadingMore: false,
   /**
-   * 正文搜索（v1.2.11）：后端不建索引，每次现扫绑定的本地正文，所以整页结果都放这儿。
-   *
-   * `textSearchPool` 是全库作品（用来给正文命中找 work 对象 —— 后端只回 workId），
-   * 特意不跟 `allWorks` 共用：那是个列表页的状态，搜索不该顺手把它的分页数也重置了。
-   * `textSearchMetaHits` 是「标题/简介/标签」那一档，先出来；`textSearchHits` 是正文扫描结果，后补上。
+   * 正文搜索（v1.2.11；v1.3.14 起没有独立页面 —— 在哪个列表页搜就在哪儿出结果）。
+   * 后端不建索引、每次现扫本地文件；结果放这里，由列表页结合当前筛选就地渲染。
+   * `textSearchMeta` 是这一轮的扫描统计（扫了多少篇、用时多长）。
    */
   textSearchQuery: "",
-  textSearchPool: [],
-  textSearchMetaHits: [],
   textSearchHits: [],
   textSearchMeta: null,
   textSearchRunning: false,
@@ -1424,10 +1420,12 @@ async function refreshWorks() {
     return;
   }
   if (!state.activeAuthor) return;
+  // 「正文内容」档：列表不带搜索词（正文命中由前端按 hit 集合过滤），免得被当标题搜了
+  const bodyMode = state.searchField === "body";
   state.works = await invoke("list_works", {
     authorId: state.activeAuthor.id,
-    query: state.workQuery,
-    searchField: state.searchField,
+    query: bodyMode ? "" : state.workQuery,
+    searchField: bodyMode ? "title" : state.searchField,
     status: state.status,
     favoritesOnly: state.authorFavoritesOnly,
     imagesFilter: state.imagesFilter,
@@ -1437,9 +1435,11 @@ async function refreshWorks() {
 }
 
 async function refreshAllWorks() {
+  // 「正文内容」档：列表不带搜索词（正文命中由前端按 hit 集合过滤），免得被当标题搜了
+  const bodyMode = state.searchField === "body";
   state.allWorks = await invoke("list_all_works", {
-    query: state.allWorksQuery,
-    searchField: state.searchField,
+    query: bodyMode ? "" : state.allWorksQuery,
+    searchField: bodyMode ? "title" : state.searchField,
     status: state.status,
     favoritesOnly: state.allWorksFavoritesOnly,
     imagesFilter: state.imagesFilter,
@@ -1556,10 +1556,12 @@ async function refreshAuthorCollectionAuthors() {
 
 async function refreshCollectionWorks() {
   if (!state.activeCollection) return;
+  // 「正文内容」档：列表不带搜索词（正文命中由前端按 hit 集合过滤），免得被当标题搜了
+  const bodyMode = state.searchField === "body";
   state.collectionWorks = await invoke("list_collection_works", {
     collectionId: state.activeCollection.id,
-    query: state.collectionQuery,
-    searchField: state.searchField,
+    query: bodyMode ? "" : state.collectionQuery,
+    searchField: bodyMode ? "title" : state.searchField,
     status: state.status,
     imagesFilter: state.imagesFilter,
     alsoInCollectionId: state.collectionFilter,
@@ -1651,7 +1653,6 @@ function render() {
       : state.homeView === "watchLater" ? renderWatchLater()
       : state.homeView === "missingFull" ? renderMissingFull()
       : state.homeView === "filterViews" ? renderFilterViews()
-      : state.homeView === "textSearch" ? renderTextSearch()
       : state.homeView === "pixivBookmarks" ? renderPixivBookmarks()
       : state.homeView === "stray" ? renderStray()
       : state.homeView === "help" ? renderHelp() : renderAuthors());
@@ -1718,7 +1719,7 @@ function findWork(workId) {
   // v1.3.10：**散篇页（state.strayWorks）也补进来** —— 用户在散篇库里右键，
   // 卡片明明在眼前，findWork 却找不到 → 右键静默无反应（2026-10-14 用户报的
   // 「最新添加的 2 个散篇右键弹不出详情」。渲染用哪份数据，这里就得收哪份）。
-  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.textSearchPool, ...state.strayWorks, ...state.history.map((entry) => entry.work), ...state.watchLater.map((entry) => entry.work), ...state.pixivBookmarks.filter((item) => item.work).map((item) => item.work)].find((work) => work.id === target);
+  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.strayWorks, ...state.history.map((entry) => entry.work), ...state.watchLater.map((entry) => entry.work), ...state.pixivBookmarks.filter((item) => item.work).map((item) => item.work)].find((work) => work.id === target);
 }
 
 async function openSeriesDetail(seriesId, seriesTitle, returnTo = "works") {
@@ -1802,7 +1803,6 @@ function renderShell(content) {
         <button class="rail-button ${state.homeView === "watchLater" && !state.activeAuthor ? "is-active" : ""}" title="稍后再看" aria-label="稍后再看" data-action="go-watch-later">${icon("bookmark", 20)}</button>
         <button class="rail-button ${state.homeView === "missingFull" && !state.activeAuthor ? "is-active" : ""}" title="待补完整版" aria-label="待补完整版" data-action="go-missing-full">${icon("archive", 20)}</button>
         <button class="rail-button ${state.homeView === "filterViews" && !state.activeAuthor ? "is-active" : ""}" title="筛选模板" aria-label="筛选模板" data-action="go-filter-views">${icon("star", 20)}</button>
-        <button class="rail-button ${state.homeView === "textSearch" && !state.activeAuthor ? "is-active" : ""}" title="正文搜索" aria-label="正文搜索" data-action="go-text-search">${icon("bookText", 20)}</button>
         <button class="rail-button ${state.homeView === "help" && !state.activeAuthor ? "is-active" : ""}" title="帮助" aria-label="帮助" data-action="help">${icon("help", 20)}</button>
       </nav>
       <div class="rail-footer">
@@ -3168,64 +3168,52 @@ function syncTextSearchHistoryPanel() {
   panel.hidden = !state.textSearchHistoryOpen || !state.textSearchHistory.length;
 }
 
-function renderTextSearch() {
-  const pool = state.textSearchPool;
-  const metaHits = state.textSearchMetaHits;
-  const meta = state.textSearchMeta;
-  const hits = state.textSearchHits;
-  const metaCards = metaHits.map((work) => linkedWorkCard(work)).join("");
-  const bodyCards = hits
-    .map((hit) => {
-      const work = pool.find((item) => item.id === hit.workId);
-      return work ? linkedWorkCard(work, textHitSnippets(hit)) : "";
-    })
-    .join("");
+/**
+ * 「正文内容」档的**就地**搜索（v1.3.14）。
+ *
+ * 原来正文搜索是一个独立页面（v1.2.11）；用户 2026-10-14 要求「没必要单独搞个页面 ——
+ * 所有作品那儿就能搜，还能叠那些筛选」。现在改成：在哪个列表页搜，就在哪儿出结果 ——
+ * `search_full_text` 扫全库，本函数把「这一页的作品」和「正文命中的作品」取交集，
+ * 页面自己的筛选（版本 / 配图 / 评分 / 字数 / 收藏……）照常叠在上面。
+ *
+ * 返回 null = 当前不在正文结果模式（照常画普通列表）。
+ */
+function bodySearchContext(query) {
+  const needle = String(query || "").trim();
+  if (state.searchField !== "body" || !needle || state.textSearchQuery !== needle) return null;
+  return {
+    needle,
+    running: state.textSearchRunning,
+    meta: state.textSearchMeta,
+    hitMap: new Map((state.textSearchHits || []).map((hit) => [Number(hit.workId), hit])),
+    hitCount: (state.textSearchHits || []).length,
+  };
+}
 
-  let bodySection = "";
-  if (state.textSearchRunning) {
-    bodySection = `<div class="text-search-progress">${icon("sync", 18)}<span>正在扫全库正文…（读本地文件，不联网）</span></div>`;
-  } else if (meta) {
-    const notes = [];
-    if (meta.truncated) notes.push(`命中太多，只列了前 ${hits.length} 篇`);
-    if (meta.missingCount) notes.push(`${meta.missingCount} 篇没有可读的正文（没绑阅读版、或者文件不在原处），已跳过`);
-    bodySection = `
-      <div class="text-search-section">
-        <div class="text-search-heading">
-          <h2>正文里命中 <em>${hits.length}</em> 篇</h2>
-          <span class="text-search-stats">扫过 ${meta.scannedCount} 篇正文 · 用时 ${meta.elapsedMs} 毫秒</span>
-        </div>
-        ${notes.length ? `<div class="read-only-note">${notes.map((note) => escapeHtml(note)).join("　")}</div>` : ""}
-        ${bodyCards
-          ? `<div class="works-grid">${bodyCards}</div>`
-          : `<div class="empty-state works-empty"><h2>正文里没搜到「${escapeHtml(state.textSearchQuery)}」</h2><p>换个词试试；如果是想找某个设定，把范围调成「标题 + 简介」可能更合适。</p></div>`}
-      </div>`;
-  }
+/// 正文结果上方那一段：扫描中给进度提示，扫完给命中统计（含「当前筛选下 N 篇」）
+function bodySearchHeader(ctx, shownCount) {
+  if (!ctx) return "";
+  if (ctx.running) return `<div class="text-search-progress">${icon("sync", 18)}<span>正在扫全库正文…（读本地文件，不联网）</span></div>`;
+  if (!ctx.meta) return "";
+  const notes = [];
+  if (ctx.meta.truncated) notes.push(`命中太多，只列了前 ${ctx.hitCount} 篇`);
+  if (ctx.meta.missingCount) notes.push(`${ctx.meta.missingCount} 篇没有可读的正文（没绑阅读版、或者文件不在原处），已跳过`);
+  const filteredNote = ctx.hitCount && shownCount !== ctx.hitCount ? `（当前筛选下 ${shownCount} 篇）` : "";
+  return `<div class="text-search-heading"><h2>正文里命中 <em>${ctx.hitCount}</em> 篇${filteredNote}</h2><span class="text-search-stats">扫过 ${ctx.meta.scannedCount} 篇正文 · 用时 ${ctx.meta.elapsedMs} 毫秒</span></div>${notes.length ? `<div class="read-only-note">${notes.map((note) => escapeHtml(note)).join("　")}</div>` : ""}`;
+}
 
-  return renderShell(`
-    <section class="topbar work-topbar">
-      <div><p class="section-kicker">库内检索</p><h1>正文搜索</h1></div>
-    </section>
-    <section class="library-content">
-      <div class="text-search-bar">
-        <div class="text-search-field">
-          <label class="search-field is-large"><span>${icon("search", 20)}</span><input id="text-search-input" type="search" placeholder="在本地正文里搜索，按回车" value="${escapeHtml(state.textSearchQuery)}" autocomplete="off"></label>
-          ${textSearchHistoryPanel()}
-        </div>
-        <button class="primary-button" data-action="run-text-search">${icon("search", 18)}<span>搜索</span></button>
-      </div>
-      <div class="read-only-note">搜的是<strong>本地正文文件</strong>（txt / md / html / EPUB 内页），不联网、不建索引 —— 每次现扫一遍，所以按回车才跑，打字时不动。想找「那句台词在哪篇里」，用这一档。</div>
-      ${!state.textSearchQuery
-        ? `<div class="empty-state works-empty"><div class="empty-icon">${icon("bookText", 26)}</div><h2>输入正文里的几个字</h2><p>正文里的字都能搜到，比只搜标题精确得多；命中的前后文会直接列在卡片上。</p></div>`
-        : `
-        <div class="text-search-section">
-          <div class="text-search-heading">
-            <h2>标题 / 简介 / 标签里命中 <em>${metaHits.length}</em> 篇</h2>
-            <span class="text-search-stats">数据库直接查，先看这个</span>
-          </div>
-          ${metaCards ? `<div class="works-grid">${metaCards}</div>` : `<div class="empty-state works-empty"><p>标题、简介、标签里都没有这个词。</p></div>`}
-        </div>
-        ${bodySection}`}
-    </section>`);
+/// 正文结果为空时的提示（扫描中 / 出错时不出，交给格子的默认空态或干脆留白）
+function bodySearchEmpty(ctx, shownCount) {
+  if (!ctx || shownCount || ctx.running || !ctx.meta) return "";
+  if (!ctx.hitCount) return `<div class="empty-state works-empty"><h2>正文里没搜到「${escapeHtml(ctx.needle)}」</h2><p>换个词试试；如果是想找某个设定，把范围调成「标题 + 简介」可能更合适。</p></div>`;
+  return `<div class="empty-state works-empty"><h2>正文命中 ${ctx.hitCount} 篇，但当前筛选下没有</h2><p>把筛选放宽一点再看看。</p></div>`;
+}
+
+/// 卡片上挂的命中片段（不在正文结果模式、或这篇没命中时返回空串）
+function bodySearchSnippet(ctx, workId) {
+  if (!ctx) return "";
+  const hit = ctx.hitMap.get(Number(workId));
+  return hit ? textHitSnippets(hit) : "";
 }
 
 /** 正文命中的片段：命中处前后各截一段，中间那几个字高亮 */
@@ -3237,35 +3225,31 @@ function textHitSnippets(hit) {
 }
 
 /**
- * 从别处的搜索框跳进正文搜索页（搜索范围选了「正文内容」再按回车）。
- * 原词带过去、顺手就跑 —— 跳过来还要再按一次回车太别扭。
+ * 正文「就地」搜索：先把当前列表换成「不带搜索词」的版本（筛选照旧），再扫盘。
+ * 结果由各列表页自己渲染（见 `bodySearchContext`），不再有独立页面。
  */
-async function openTextSearch(query) {
-  state.authorReturnTo = null;
-  state.activeAuthor = null;
-  state.seriesView = null;
-  state.seriesItems = [];
-  state.homeView = "textSearch";
+async function runBodySearchInPlace(query) {
+  if (state.homeView === "collections" && state.activeCollection) {
+    state.collectionQuery = query;
+    await refreshCollectionWorks();
+  } else {
+    state[state.homeView === "allWorks" && !state.activeAuthor ? "allWorksQuery" : "workQuery"] = query;
+    if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks();
+  }
   await runTextSearch(query);
 }
 
 /**
- * 跑一次正文搜索。两段请求**一起发出去**，谁也不需要等谁：
- * 一段查数据库（快），一段让后端扫盘（慢），慢的先落地也无所谓。
+ * 扫一遍本地正文（后端现扫，不联网）。结果记进 state，由列表页结合筛选就地渲染 ——
+ * v1.3.14 起没有独立页面；原来「先标题/简介、后正文」的两段式也去掉了。
  */
 async function runTextSearch(query) {
-  // 没传词就以**框里的值**为准，而不是 state。
-  // 输入法上屏那一下，有的中文输入法在 Chromium 里只发 compositionend、不补 input 事件，
-  // state 会停在旧值上；回车一直读的是 DOM 值所以看着正常，点搜索按钮却会拿着空 state 去搜
-  // —— 顺手把框里的话也一起清掉。以框为准，两条路就同源了。
-  const box = app.querySelector("#text-search-input");
-  const raw = query == null ? (box ? box.value : state.textSearchQuery) : query;
-  const needle = String(raw).trim();
+  // 只认传进来的词（旧版还会去读独立页面那个输入框，v1.3.14 页面没了）
+  const needle = String(query == null ? state.textSearchQuery : query).trim();
   state.textSearchQuery = needle;
-  state.textSearchMetaHits = [];
   state.textSearchHits = [];
   state.textSearchMeta = null;
-  // 真跑了才记一笔，顺手把历史下拉收起来；空词不进历史（从别处跳进来也会走到这儿）
+  // 真跑了才记一笔，顺手把历史下拉收起来；空词不进历史
   state.textSearchHistoryOpen = false;
   rememberTextSearch(needle);
   if (!needle) {
@@ -3275,46 +3259,19 @@ async function runTextSearch(query) {
   }
   state.textSearchRunning = true;
   render();
-
-  const shared = { status: "all", sort: state.sort, collectionId: 0, favoritesOnly: false, imagesFilter: "all" };
-  const metaRequest = invoke("list_all_works", { ...shared, query: needle, searchField: "title_synopsis_tags" });
-  // 正文结果只回 workId，卡片要完整对象 —— 顺手把全库作品拉一份存着（只拉一次，之后复用）
-  const poolRequest = state.textSearchPool.length
-    ? Promise.resolve(state.textSearchPool)
-    : invoke("list_all_works", { ...shared, query: "", searchField: "title" });
-  // 先把失败接住：它可能比另一段先失败，那时还没人 await 它
-  const bodyRequest = invoke("search_full_text", { query: needle, limit: TEXT_SEARCH_HIT_LIMIT })
-    .then((result) => ({ result }))
-    .catch((error) => ({ error: String(error) }));
-
   try {
-    const [pool, metaHits] = await Promise.all([poolRequest, metaRequest]);
+    const result = await invoke("search_full_text", { query: needle, limit: TEXT_SEARCH_HIT_LIMIT });
     if (state.textSearchQuery !== needle) return; // 词已经改了，这批作废
-    if (pool.length) state.textSearchPool = pool;
-    state.textSearchMetaHits = metaHits;
-    render();
-    restoreSearchFocus("text-search-input");
+    state.textSearchHits = result.hits || [];
+    state.textSearchMeta = result;
   } catch (error) {
     if (state.textSearchQuery !== needle) return;
-    state.textSearchRunning = false;
-    toast(`搜索失败：${error}`, "error");
-    render();
-    return;
-  }
-
-  const body = await bodyRequest;
-  if (state.textSearchQuery !== needle) return;
-  if (body.error) {
     state.textSearchHits = [];
     state.textSearchMeta = null;
-    toast(`正文搜索失败：${body.error}`, "error");
-  } else {
-    state.textSearchHits = body.result.hits || [];
-    state.textSearchMeta = body.result;
+    toast(`正文搜索失败：${error}`, "error");
   }
   state.textSearchRunning = false;
   render();
-  restoreSearchFocus("text-search-input");
 }
 
 /**
@@ -3352,7 +3309,9 @@ function sortSelect(current, withAdded = false) {
 
 function renderWorks() {
   const author = state.activeAuthor;
-  const works = collapseSerialWorks(state.works).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+  const body = bodySearchContext(state.workQuery);
+  const filtered = collapseSerialWorks(state.works).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+  const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
   const cards = works.map((work) => `
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
@@ -3360,7 +3319,7 @@ function renderWorks() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
+      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}${bodySearchSnippet(body, work.id)}</div>
     </article>`).join("");
 
   return renderShell(`
@@ -3371,7 +3330,7 @@ function renderWorks() {
     ${state.bulkMode ? bulkBar(works) : ""}
     <section class="library-content">
       <div class="library-tools">
-        <label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.workQuery)}" autocomplete="off"></label>
+        <div class="search-field-wrap"><label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.workQuery)}" autocomplete="off"></label>${state.searchField === "body" ? textSearchHistoryPanel() : ""}</div>
         ${searchFieldSelect(state.searchField)}
         <div class="filter-group" role="group" aria-label="版本状态">${STATUS_FILTERS.map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button favorite-filter ${state.authorFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
@@ -3383,14 +3342,18 @@ function renderWorks() {
       </div>
       ${filterPanel()}
       <div class="binding-bar"><div><strong>本地文件</strong><span>${author.previewDir ? "预览版目录已绑定" : "尚未绑定预览版目录"} · ${author.purchasedDir ? "完整版目录已绑定" : "尚未绑定完整版目录"}</span><em class="sync-status">Pixiv ${syncLabel(author.pixivLastSyncAt)}</em></div><div><button class="quiet-button" data-action="scan-preview">${icon("folder", 17)}关联预览版文件</button><button class="quiet-button" data-action="scan-purchased">${icon("upload", 17)}关联完整版文件</button></div></div>
-      <div class="works-grid">${cards || renderEmptyWorks()}</div>
+      ${bodySearchHeader(body, works.length)}
+      <div class="works-grid">${cards || bodySearchEmpty(body, works.length) || (body ? "" : renderEmptyWorks())}</div>
     </section>`);
 }
 
 function renderAllWorks() {
+  const body = bodySearchContext(state.allWorksQuery);
   const filtered = collapseSerialWorks(state.allWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+  // 正文结果模式：再叠一层「正文命中」集合（正文只有这页能做全库搜）
+  const visible = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
   // 瀑布流：只画前 allWorksShown 张，剩下的滚到底再说（库里一千四百多篇，一次铺完很卡）
-  const shown = filtered.slice(0, Math.max(ALL_WORKS_PAGE, state.allWorksShown));
+  const shown = visible.slice(0, Math.max(ALL_WORKS_PAGE, state.allWorksShown));
   const cards = shown.map((work) => `
     <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}
@@ -3399,12 +3362,12 @@ function renderAllWorks() {
         ${workCharacterNames(work)}
         ${workReadToggle(work)}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}${bodySearchSnippet(body, work.id)}</div>
     </article>`).join("");
-  const remaining = filtered.length - shown.length;
-  const footer = filtered.length
+  const remaining = visible.length - shown.length;
+  const footer = visible.length
     ? `<div class="load-more-foot">
-        <span class="load-more-count">已显示 <strong>${shown.length}</strong> / ${filtered.length} 篇</span>
+        <span class="load-more-count">已显示 <strong>${shown.length}</strong> / ${visible.length} 篇</span>
         ${remaining > 0 ? `<button class="quiet-button" data-action="load-more-all-works">再加载 ${Math.min(ALL_WORKS_PAGE, remaining)} 篇</button>` : `<span class="load-more-done">到底了</span>`}
       </div>
       ${remaining > 0 ? '<div data-role="all-works-sentinel" class="load-more-sentinel" aria-hidden="true"></div>' : ""}`
@@ -3413,7 +3376,7 @@ function renderAllWorks() {
     <section class="topbar work-topbar"><div><p class="section-kicker">全部作者</p><h1>所有作品</h1></div><div class="topbar-actions"><button class="icon-text-button" data-action="export-all">${icon("download", 18)}<span>导出清单</span></button></div></section>
     <section class="library-content">
       <div class="library-tools">
-        <label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.allWorksQuery)}" autocomplete="off"></label>
+        <div class="search-field-wrap"><label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.allWorksQuery)}" autocomplete="off"></label>${state.searchField === "body" ? textSearchHistoryPanel() : ""}</div>
         ${searchFieldSelect(state.searchField)}
         <div class="filter-group" role="group" aria-label="版本状态">${STATUS_FILTERS.map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button favorite-filter ${state.allWorksFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
@@ -3424,8 +3387,8 @@ function renderAllWorks() {
         ${sortSelect(state.sort)}
       </div>
       ${filterPanel()}
-      <div class="read-only-note">所有作品仅供搜索、筛选与打开查看。</div>
-      <div class="works-grid">${cards || '<div class="empty-state works-empty"><h2>没有符合条件的作品</h2></div>'}</div>
+      ${bodySearchHeader(body, visible.length) || '<div class="read-only-note">所有作品仅供搜索、筛选与打开查看。</div>'}
+      <div class="works-grid">${cards || bodySearchEmpty(body, visible.length) || (body ? "" : '<div class="empty-state works-empty"><h2>没有符合条件的作品</h2></div>')}</div>
       ${footer}
     </section>`);
 }
@@ -4233,8 +4196,10 @@ function renderCollections() {
 
 function renderCollectionWorks() {
   const collection = state.activeCollection;
-  const works = collapseSerialWorks(state.collectionWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
-  const cards = works.map((work) => linkedWorkCard(work)).join("");
+  const body = bodySearchContext(state.collectionQuery);
+  const filtered = collapseSerialWorks(state.collectionWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+  const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
+  const cards = works.map((work) => linkedWorkCard(work, bodySearchSnippet(body, work.id))).join("");
   return renderShell(`
     <section class="topbar work-topbar">
       <div class="crumb-heading"><button class="back-button" title="返回收藏夹列表" data-action="back-to-collections">${icon("back", 20)}</button><div><p class="section-kicker">收藏夹</p><h1>${escapeHtml(collection.name)}</h1></div></div>
@@ -4242,7 +4207,7 @@ function renderCollectionWorks() {
     </section>
     <section class="library-content">
       <div class="library-tools">
-        <label class="search-field"><span>${icon("search", 19)}</span><input id="collection-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.collectionQuery)}" autocomplete="off"></label>
+        <div class="search-field-wrap"><label class="search-field"><span>${icon("search", 19)}</span><input id="collection-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.collectionQuery)}" autocomplete="off"></label>${state.searchField === "body" ? textSearchHistoryPanel() : ""}</div>
         ${searchFieldSelect(state.searchField)}
         <div class="filter-group" role="group" aria-label="版本状态">${STATUS_FILTERS.map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button images-filter ${state.imagesFilter === "has" ? "is-active" : ""}" data-action="images-only" title="只看有配图的作品（等同高级筛选里的「配图 · 有图」）">${icon("image", 17)}<span>仅看带图版</span></button>
@@ -4252,7 +4217,8 @@ function renderCollectionWorks() {
         <select class="sort-select" id="collection-sort" aria-label="排序"><option value="added_desc" ${state.collectionSort === "added_desc" ? "selected" : ""}>最近收藏</option><option value="date_desc" ${state.collectionSort === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${state.collectionSort === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${state.collectionSort === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${state.collectionSort === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="rating_desc" ${state.collectionSort === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>
       </div>
       ${filterPanel()}
-      <div class="works-grid">${cards || `<div class="empty-state works-empty"><h2>${state.collectionQuery || state.status !== "all" || state.imagesFilter !== "all" ? "没有符合条件的作品" : "这个收藏夹还是空的"}</h2><p>在任意作品卡上点心形图标，就能把它收进来。</p></div>`}</div>
+      ${bodySearchHeader(body, works.length)}
+      <div class="works-grid">${cards || bodySearchEmpty(body, works.length) || (body ? "" : `<div class="empty-state works-empty"><h2>${state.collectionQuery || state.status !== "all" || state.imagesFilter !== "all" ? "没有符合条件的作品" : "这个收藏夹还是空的"}</h2><p>在任意作品卡上点心形图标，就能把它收进来。</p></div>`)}</div>
     </section>`);
 }
 
@@ -4610,7 +4576,9 @@ function strayVisibleWorks() {
 }
 
 function renderStray() {
-  const works = strayVisibleWorks();
+  const body = bodySearchContext(state.workQuery);
+  const filtered = strayVisibleWorks();
+  const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
   const cards = works.map((work) => `
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}
@@ -4619,7 +4587,7 @@ function renderStray() {
         ${workCharacterNames(work)}
         ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="stray-promote-button" data-action="promote-stray-work" data-work-id="${work.id}" data-author-id="${work.authorId}" title="把「${escapeHtml(work.authorName || "这位作者")}」转成正式作者">${icon("star", 14)}<span>散篇转正</span></button>${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}${bodySearchSnippet(body, work.id)}</div>
     </article>`).join("");
   const empty = state.straySummary.workCount
     ? '<div class="empty-state works-empty"><h2>没有匹配的作品</h2></div>'
@@ -4637,7 +4605,7 @@ function renderStray() {
     ${state.bulkMode ? bulkBar(works) : ""}
     <section class="library-content">
       <div class="library-tools">
-        <label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.workQuery)}" autocomplete="off"></label>
+        <div class="search-field-wrap"><label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.workQuery)}" autocomplete="off"></label>${state.searchField === "body" ? textSearchHistoryPanel() : ""}</div>
         ${searchFieldSelect(state.searchField)}
         <div class="filter-group" role="group" aria-label="版本状态">${STATUS_FILTERS.map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button favorite-filter ${state.authorFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
@@ -4647,8 +4615,8 @@ function renderStray() {
         ${sortSelect(state.sort, true)}
       </div>
       ${filterPanel()}
-      <div class="read-only-note">这里的作品是「下下来的时候，作者还没在库里」自动建档收进来的 —— 作者不占作者库的卡，作品本身和别处一样能用。想让哪位作者正式留下，点封面上的「散篇转正」（或右上角「批量转正」），作品会跟着他一起回到作者库里。</div>
-      <div class="works-grid">${cards || empty}</div>
+      ${bodySearchHeader(body, works.length) || '<div class="read-only-note">这里的作品是「下下来的时候，作者还没在库里」自动建档收进来的 —— 作者不占作者库的卡，作品本身和别处一样能用。想让哪位作者正式留下，点封面上的「散篇转正」（或右上角「批量转正」），作品会跟着他一起回到作者库里。</div>'}
+      <div class="works-grid">${cards || bodySearchEmpty(body, works.length) || (body ? "" : empty)}</div>
     </section>`);
 }
 
@@ -4804,9 +4772,11 @@ async function refreshStray() {
 async function refreshStrayWorks() {
   // 和作品库同一套筛选口径（v1.2.33）：散篇页的工具栏就是作品库那排，
   // 条件一律交给后端按同一份 SQL 规则筛，前端只负责画。
+  // 「正文内容」档：列表不带搜索词（正文命中由前端按 hit 集合过滤），免得被当标题搜了
+  const bodyMode = state.searchField === "body";
   state.strayWorks = (await invoke("list_stray_works", {
-    query: state.workQuery,
-    searchField: state.searchField,
+    query: bodyMode ? "" : state.workQuery,
+    searchField: bodyMode ? "title" : state.searchField,
     status: state.status,
     favoritesOnly: state.authorFavoritesOnly,
     imagesFilter: state.imagesFilter,
@@ -6001,7 +5971,8 @@ async function bindEvents() {
           restoreSearchFocus("work-search");
           return;
         }
-        await openTextSearch(query);
+        await runBodySearchInPlace(query);
+        restoreSearchFocus("work-search");
         return;
       }
       const inAllWorks = state.homeView === "allWorks" && !state.activeAuthor;
@@ -6022,7 +5993,23 @@ async function bindEvents() {
       if (workSearch.dataset.skipNextInput) { delete workSearch.dataset.skipNextInput; return; }
       await commitWorkSearch(event.target.value);
     };
+    workSearch.onfocus = () => {
+      // 历史下拉只在「正文内容」档 + 空框时展开（跟原来独立页面一个规矩）
+      if (state.searchField !== "body" || workSearch.value.trim()) return;
+      state.textSearchHistoryOpen = true;
+      syncTextSearchHistoryPanel();
+    };
+    workSearch.onblur = () => {
+      state.textSearchHistoryOpen = false;
+      syncTextSearchHistoryPanel();
+    };
     workSearch.onkeydown = async (event) => {
+      if (event.key === "Escape" && state.textSearchHistoryOpen) {
+        event.preventDefault();
+        state.textSearchHistoryOpen = false;
+        syncTextSearchHistoryPanel();
+        return;
+      }
       if (event.key !== "Enter" || event.isComposing || workSearch.dataset.composing) return;
       event.preventDefault();
       await commitWorkSearch(event.currentTarget.value, true);
@@ -6040,7 +6027,8 @@ async function bindEvents() {
           restoreSearchFocus("collection-search");
           return;
         }
-        await openTextSearch(query);
+        await runBodySearchInPlace(query);
+        restoreSearchFocus("collection-search");
         return;
       }
       state.collectionQuery = query;
@@ -6059,7 +6047,22 @@ async function bindEvents() {
       if (collectionSearch.dataset.skipNextInput) { delete collectionSearch.dataset.skipNextInput; return; }
       await commitCollectionSearch(event.target.value);
     };
+    collectionSearch.onfocus = () => {
+      if (state.searchField !== "body" || collectionSearch.value.trim()) return;
+      state.textSearchHistoryOpen = true;
+      syncTextSearchHistoryPanel();
+    };
+    collectionSearch.onblur = () => {
+      state.textSearchHistoryOpen = false;
+      syncTextSearchHistoryPanel();
+    };
     collectionSearch.onkeydown = async (event) => {
+      if (event.key === "Escape" && state.textSearchHistoryOpen) {
+        event.preventDefault();
+        state.textSearchHistoryOpen = false;
+        syncTextSearchHistoryPanel();
+        return;
+      }
       if (event.key !== "Enter" || event.isComposing || collectionSearch.dataset.composing) return;
       event.preventDefault();
       await commitCollectionSearch(event.currentTarget.value, true);
@@ -6137,48 +6140,6 @@ async function bindEvents() {
       if (event.isComposing || bookmarkSearch.dataset.composing) return;
       if (bookmarkSearch.dataset.skipNextInput) { delete bookmarkSearch.dataset.skipNextInput; return; }
       commitBookmarkSearch(event.target.value);
-    };
-  }
-  // 散篇页（v1.2.33）改用作品库那套工具栏，搜索框也换成 #work-search，复用上面的绑定；
-  // 专用的 #stray-search 绑定与 state.strayQuery 一并撤掉。
-  const textSearchBox = app.querySelector("#text-search-input");
-  if (textSearchBox) {
-    textSearchBox.oncompositionstart = () => { textSearchBox.dataset.composing = "true"; };
-    textSearchBox.oncompositionend = (event) => {
-      delete textSearchBox.dataset.composing;
-      // 上屏这一下必须自己把词记进来：部分中文输入法在 Chromium 里只发 compositionend、
-      // 不补 input 事件，只删标记不记账的话 state 会一直空着（另外四个搜索框都是这么写的）。
-      state.textSearchQuery = event.target.value;
-    };
-    // 打字时只记账、不搜：一次搜索要把全库正文读一遍，挂在输入事件上必然卡
-    textSearchBox.oninput = (event) => {
-      if (event.isComposing || textSearchBox.dataset.composing) return;
-      state.textSearchQuery = event.target.value;
-      // 每敲一下都重判：清空到没字了就重新把历史露出来
-      state.textSearchHistoryOpen = !event.target.value.trim() && state.textSearchHistory.length > 0;
-      syncTextSearchHistoryPanel();
-    };
-    // 历史下拉只在**空框**时展开 —— 框里有词时展开会盖住上一次的结果，那是用户更想看的东西
-    textSearchBox.onfocus = () => {
-      if (textSearchBox.value.trim()) return;
-      state.textSearchHistoryOpen = true;
-      syncTextSearchHistoryPanel();
-    };
-    textSearchBox.onblur = () => {
-      state.textSearchHistoryOpen = false;
-      syncTextSearchHistoryPanel();
-    };
-    textSearchBox.onkeydown = async (event) => {
-      if (event.key === "Escape") {
-        // 浮层开着时 Esc 的语义是「关掉它」，顺手挡掉 type=search 自带的清空
-        event.preventDefault();
-        state.textSearchHistoryOpen = false;
-        syncTextSearchHistoryPanel();
-        return;
-      }
-      if (event.key !== "Enter" || event.isComposing || textSearchBox.dataset.composing) return;
-      event.preventDefault();
-      await runTextSearch(event.currentTarget.value);
     };
   }
   // 点历史项时别让输入框先失焦 —— 一失焦 onblur 就把面板收走，click 根本落不到按钮上
@@ -6421,17 +6382,18 @@ async function bindEvents() {
       }
       // 筛选模板（v1.2.9）
       if (action === "go-filter-views") { state.authorReturnTo = null; state.activeAuthor = null; state.seriesView = null; state.seriesItems = []; state.homeView = "filterViews"; await refreshAllWorks(); if (!state.collections.length) await refreshCollections(); await refreshFilterViews(); render(); }
-      if (action === "go-text-search") { state.authorReturnTo = null; state.activeAuthor = null; state.seriesView = null; state.seriesItems = []; state.homeView = "textSearch"; render(); const box = document.querySelector("#text-search-input"); if (box) box.focus(); }
-      if (action === "run-text-search") await runTextSearch();
+      // 历史下拉挂在哪个搜索框下面（.search-field-wrap 里），就把词填进哪个框、按那页的规矩就地搜
+      const historyHostId = element.closest(".search-field-wrap")?.querySelector("input")?.id === "collection-search" ? "collection-search" : "work-search";
       if (action === "use-text-search-history") {
         state.textSearchHistoryOpen = false;
-        await runTextSearch(element.dataset.query);
+        await runBodySearchInPlace(element.dataset.query || "");
+        restoreSearchFocus(historyHostId);
       }
       if (action === "remove-text-search-history") {
         // 删完重画一遍：面板里少一行、剩下的位置全变，一并对齐（下拉这时本来就该开着）
         removeTextSearchHistory(element.dataset.query);
         render();
-        restoreSearchFocus("text-search-input");
+        restoreSearchFocus(historyHostId);
       }
       if (action === "clear-text-search-history") {
         clearTextSearchHistory();
@@ -9988,7 +9950,7 @@ async function autoCheckUpdateOnStartup() {
  * 加一条快捷键往这儿补一行，说明里自动就有了，不会两边对不上。
  */
 const SHORTCUTS = [
-  { keys: "Ctrl + 1 ~ 7", text: "切到第 1~7 个导航页（作者库 / 所有作品 / 收藏 / 历史 / 待补 / 筛选模板 / 正文搜索）", scope: "全局" },
+  { keys: "Ctrl + 1 ~ 6", text: "切到第 1~6 个导航页（作者库 / 所有作品 / 收藏 / 历史 / 待补 / 筛选模板）", scope: "全局" },
   { keys: "Ctrl + K", text: "跳到当前页的搜索框", scope: "全局" },
   { keys: "?", text: "显示这份快捷键说明", scope: "全局" },
   { keys: "Esc", text: "关掉最上面的弹窗；没弹窗时退出批量操作并清空选择", scope: "全局" },
@@ -10000,7 +9962,7 @@ const SHORTCUTS = [
   { keys: "Ctrl + A", text: "批量操作下全选本页", scope: "批量模式" },
 ];
 
-/** 侧栏那七个导航页对应的 data-action，顺序就是 Ctrl+1~7 的顺序 */
+/** 侧栏那六个导航页对应的 data-action，顺序就是 Ctrl+1~6 的顺序（v1.3.14 起没有正文搜索页了） */
 const NAV_SHORTCUT_ACTIONS = [
   "go-home",
   "go-all-works",
@@ -10008,7 +9970,6 @@ const NAV_SHORTCUT_ACTIONS = [
   "go-history",
   "go-missing-full",
   "go-filter-views",
-  "go-text-search",
 ];
 
 /** 焦点在输入框里时不能抢键 —— 打字的空格、方向键都得留给输入框自己 */
@@ -10106,7 +10067,7 @@ function handleGlobalShortcuts(event) {
   }
 
   // 导航页切换：Ctrl+数字。webview 里没有标签页，不会跟浏览器抢这一组键
-  if ((event.ctrlKey || event.metaKey) && !event.altKey && /^[1-7]$/.test(key)) {
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && /^[1-6]$/.test(key)) {
     const nav = document.querySelector(`.rail-button[data-action="${NAV_SHORTCUT_ACTIONS[Number(key) - 1]}"]`);
     if (nav) { event.preventDefault(); nav.click(); }
     return;
@@ -10486,7 +10447,9 @@ async function restoreViewState() {
     if (!state.collections.length) await refreshCollections();
     await refreshFilterViews();
   } else if (view === "textSearch") {
-    state.homeView = "textSearch";
+    // v1.3.14：独立正文搜索页已取消 —— 上次停在那儿就落到「所有作品」
+    state.homeView = "allWorks";
+    await refreshAllWorks();
   } else if (view === "help") {
     state.homeView = "help";
   } else {
@@ -10506,11 +10469,6 @@ async function restoreViewState() {
   expandShownForAnchor(bucket);
   render();
   restoreCardAnchor(bucket);
-  // 正文搜索：把词放回框里，并重跑那次搜索（后端现扫本地文件，几百毫秒，不挡界面）。
-  // 只放词不重跑的话框里有字、下面却写着「搜一下试试」，看着像坏了
-  if (state.homeView === "textSearch" && state.textSearchQuery.trim()) {
-    await runTextSearch(state.textSearchQuery);
-  }
   return true;
 }
 
