@@ -895,7 +895,7 @@ async function invoke(command, args = {}) {
     return;
   }
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
-  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }] };
+  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }], ...(window.__mockAppSettings || {}) };
   if (command === "save_app_settings") return args.settings;
   // 浏览器预览默认当作「已是最新版」；要看更新界面就把 window.__mockUpdateCheck 塞进来
   // 预览环境没有 Tauri 后端：给个默认「没填过 Cookie」，验证脚本可以塞 window.__mockCookieProbe 覆盖
@@ -920,7 +920,20 @@ async function invoke(command, args = {}) {
   if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh.monlor.com/", "https://ghfile.geekertao.top/", "https://gh-proxy.net/"];
   if (command === "refresh_reading_image_counts") return { scannedCount: 0, updatedCount: 0 };
   if (command === "read_pixiv_cookie_file") return "";
-  if (command === "sync_pixiv_author_profile") return { id: args.authorId ?? null, name: "Pixiv 作者", homepage: args.homepage, avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, pixivLastSyncAt: "", avatarManaged: false };
+  if (command === "sync_pixiv_author_profile") {
+    // 无头脚本要验"同步失败且没填名字就拦住保存"：塞 window.__mockSyncProfileError 让它抛
+    if (window.__mockSyncProfileError) throw new Error(String(window.__mockSyncProfileError));
+    return { id: args.authorId ?? null, name: "Pixiv 作者", homepage: args.homepage, avatarPath: "", notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70, pixivLastSyncAt: "", avatarManaged: false };
+  }
+  // v1.3.4：新增作者允许"只填主页"——预览里把保存真的收进 previewAuthors，列表才看得到新作者
+  if (command === "save_author") {
+    const input = args.author || {};
+    const existing = previewAuthors.find((item) => input.id && item.id === Number(input.id));
+    const id = existing ? existing.id : previewAuthors.reduce((max, item) => Math.max(max, item.id), 0) + 1;
+    const record = { id, name: String(input.name || "").trim(), aliases: input.aliases || "", homepage: input.homepage || "", avatarPath: input.avatarPath || "", notes: input.notes || "", previewDir: input.previewDir || "", purchasedDir: input.purchasedDir || "", matchThreshold: 70, workCount: 0, purchasedCount: 0, imagesCount: 0, favoriteCount: 0, newCount: 0, starred: false };
+    if (existing) Object.assign(existing, record); else previewAuthors.push(record);
+    return { ...record };
+  }
   if (command === "update_work_tags") { const work = previewWorks.find((item) => item.id === args.workId); if (work) work.tags = args.tags.join("|"); return; }
   if (command === "copy_previews_to_purchased") return { copiedCount: args.workIds.length, boundCount: args.workIds.length, skippedCount: 0 };
   // 真机打开的是作品绑定的阅读版文件；浏览器预览里没有本地文件，什么都不做
@@ -5597,7 +5610,7 @@ function authorModal(author = {}) {
     <form id="author-form" class="form-stack">
       <input type="hidden" name="id" value="${author.id || ""}">
       <input type="hidden" name="avatarManaged" value="${author.avatarManaged ? "true" : "false"}">
-      <label>作者名称 <input name="name" required maxlength="80" value="${escapeHtml(author.name || "")}" placeholder="例如：某位作者"></label>
+      <label>作者名称 <input name="name" maxlength="80" value="${escapeHtml(author.name || "")}" placeholder="例如：某位作者"><small>可以留空 —— 填了下面的 Pixiv 主页时，保存会先同步回作者名再存。</small></label>
       <div class="form-field">作者别名
         <div class="alias-editor" data-author-alias>
           <div class="tag-editor-list">${aliasChips(author.aliases)}</div>
@@ -6886,10 +6899,18 @@ async function bindEvents() {
         const isNewAuthor = !author.id;
         author.avatarManaged = author.avatarManaged === "true";
         author.aliases = authorAliases().join("|");
-        // 新建作者时**默认同步一次**（v1.2.55 用户要求）：以 Pixiv 上的为准 ——
-        // 你填的名字只是拿来找人的线索，同步到了就用同步的覆盖它。
-        // 同步失败不拦着保存，但要让你知道（按你填的先存下来）。
-        if (isNewAuthor && String(author.homepage || "").trim()) {
+        // 名称可以留空（v1.3.4 用户要求）—— 但"名称 + 主页"不能都空：
+        // 都空时既没名字可存、也没线索可同步。留空的名字由下面的自动同步补上。
+        const hasName = String(author.name || "").trim() !== "";
+        if (!hasName && !String(author.homepage || "").trim()) {
+          toast("请填作者名，或填 Pixiv 作者主页（保存时会自动同步名称）", "error");
+          return;
+        }
+        // 自动同步一次（v1.2.55）：以 Pixiv 上的为准 —— 你填的名字只是拿来找人的线索，
+        // 同步到了就用同步的覆盖它。v1.3.4 起**名字留空时也走**（编辑时清空名字靠主页补名同理）。
+        // 同步失败不拦着保存，但要让你知道（按你填的先存下来）——**除非名字也空着**，
+        // 那就没东西可存，必须当场拦住说清楚。
+        if (String(author.homepage || "").trim() && (isNewAuthor || !hasName)) {
           try {
             const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage: author.homepage });
             // 同步回来的 profile 带 id ⇒ 说明库里**已经有这位**（典型的：他还在「散篇」里，
@@ -6903,6 +6924,10 @@ async function bindEvents() {
               author.avatarManaged = Boolean(profile.avatarManaged);
             }
           } catch (error) {
+            if (!String(author.name || "").trim()) {
+              toast(`作者信息同步失败：${error}。没填作者名，没法保存 —— 填个名字、或修正主页链接再试。`, "error");
+              return;
+            }
             toast(`作者信息同步失败：${error}（先按你填的保存）`, "error");
           }
         }
