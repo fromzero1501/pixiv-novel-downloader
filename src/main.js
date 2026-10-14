@@ -975,6 +975,11 @@ async function invoke(command, args = {}) {
   }
   if (command === "auto_group_purchased_files") {
     const byCharacter = args.mode === "character";
+    // v1.3.10：预览里"真的"给一篇补上完整版绑定 —— 无头脚本才能验"刷新后卡片立刻出现完整版角标"
+    if (!byCharacter) {
+      const bound = previewWorks.find((item) => item.id === 2);
+      if (bound && !bound.purchasedPath) bound.purchasedPath = "D:\\已购\\夏日短篇集.epub";
+    }
     return {
       autoMovedCount: byCharacter ? 0 : 3,
       manualSelections: [
@@ -1701,7 +1706,10 @@ function findWork(workId) {
   // 待补工作台和正文搜索结果也要算进来：那儿的卡片和别处长得一模一样，少了它点标题
   // 只会弹「没找到这篇作品」—— 明明就在眼前。（稍后再看页目前只走「打开文件」，
   // 用不到查对象，但一并留着，免得以后给它加个「开详情」就踩这个坑。）
-  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.textSearchPool, ...state.history.map((entry) => entry.work), ...state.watchLater.map((entry) => entry.work), ...state.pixivBookmarks.filter((item) => item.work).map((item) => item.work)].find((work) => work.id === target);
+  // v1.3.10：**散篇页（state.strayWorks）也补进来** —— 用户在散篇库里右键，
+  // 卡片明明在眼前，findWork 却找不到 → 右键静默无反应（2026-10-14 用户报的
+  // 「最新添加的 2 个散篇右键弹不出详情」。渲染用哪份数据，这里就得收哪份）。
+  return [...state.works, ...state.seriesItems, ...state.allWorks, ...state.collectionWorks, ...state.missingFull, ...state.textSearchPool, ...state.strayWorks, ...state.history.map((entry) => entry.work), ...state.watchLater.map((entry) => entry.work), ...state.pixivBookmarks.filter((item) => item.work).map((item) => item.work)].find((work) => work.id === target);
 }
 
 async function openSeriesDetail(seriesId, seriesTitle, returnTo = "works") {
@@ -7225,6 +7233,12 @@ async function autoGroupPurchasedFiles(authorId = null, authorName = "", mode = 
       toast(byCharacter ? "没有角色的名字能对上，换个方式或用「匹配标题」试试" : "没有找到需要分组的文件", "info");
     }
     await refreshAuthors();
+    // v1.3.10：这条路会从 作者库 / 作者作品库 / 所有作品 / 散篇页 多处发起 ——
+    // 得把**发起页**的数据也刷掉，否则卡片上的「完整版」角标要等切页重进才出现
+    //（用户 2026-10-14：「用作品库的『关联完整版』关联后，没有显示完整版的图标 —— 退出重进才有」）。
+    if (state.homeView === "stray") { await refreshStray(); await refreshStrayWorks(); }
+    else if (state.homeView === "allWorks") await refreshAllWorks();
+    else if (state.activeAuthor) { await refreshWorks(); await refreshActiveAuthor(); }
     render();
     fillWordCountsInBackground(true); // 自动移动/绑定后文件路径变了，字数要当场补上
   } catch (error) {
