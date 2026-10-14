@@ -326,6 +326,10 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 /* 正在检查作者主页：同步的前置阶段，用中性蓝，别跟「核对完成」的绿混 */
 .sync-floater-row.is-checking progress::-webkit-progress-value { background: #bcd7f2; }
 .sync-floater-row.is-checking .sync-row-title { color: #2f6ba8; }
+/* 已盘点、等待抓取（两段式同步的中间态，v1.3.15）：淡蓝，跟「检查中」区分开 */
+.sync-floater-row.is-scanned progress::-webkit-progress-value { background: #cfe0f2; }
+.sync-floater-row.is-scanned .sync-row-title { color: #52789e; }
+.sync-floater-row.is-scanned .sync-row-name { color: #3c628c; }
 .sync-floater-row.is-missing progress::-webkit-progress-value { background: #d4dae1; }
 .sync-floater-row.is-missing .sync-row-title { color: #7b8794; }
 .sync-floater-row.is-missing .sync-row-name { color: #7b8794; }

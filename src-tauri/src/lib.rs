@@ -475,6 +475,9 @@ struct PixivSyncResult {
     failed_reasons: Vec<String>,
     /// 疑似被 Pixiv 限流、提前中止
     throttled: bool,
+    /// 「只盘点」（v1.3.15 两段式批量同步的第一段）核对出的新作品清单。
+    /// 只有 `scan_only` 调用会带值；普通同步恒为空数组。
+    candidates: Vec<String>,
 }
 
 /// 「同步前作者状态探测」的结果。
@@ -6988,6 +6991,12 @@ fn pixiv_sync_impl(
     end_date: String,
     novel_url: String,
     batch_key: i64,
+    // v1.3.15 两段式批量同步（见前端 `syncAllAuthors`）：
+    // `scan_only` = 第一段「只盘点」；`candidates_override` + `fetch_mode` = 第二段「带清单抓取」。
+    // 单作者同步 / 点名下载三个都不传，行为与以前完全一致。
+    scan_only: bool,
+    candidates_override: Option<Vec<String>>,
+    fetch_mode: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     let conn = db()?;
@@ -7028,7 +7037,12 @@ fn pixiv_sync_impl(
     // v1.3.11：同步下载与"复用本地文件"的下限都跟着设置项「最小作品字数」走（以前下载那条
     // 读的是改名前的旧键 `minimum_file_size_bytes`，新设置管不到同步 —— 用户报「同步时突破了字数限制」）。
     let minimum_text_count = setting(&conn, "minimum_text_count")?.parse::<u64>().unwrap_or(0);
-    let preview_entries = sync_preview_entries(&preview_dir, minimum_text_count)?;
+    // 只盘点（两段式第一段）不落盘、用不到「复用本地文件」的匹配表，跳过这趟目录扫描
+    let preview_entries = if scan_only {
+        Vec::new()
+    } else {
+        sync_preview_entries(&preview_dir, minimum_text_count)?
+    };
     let single_novel_id = pixiv_novel_id_from_url(&novel_url)?;
     let is_single_sync = single_novel_id.is_some();
     let start = parse_date_bound(&start_date, "开始日期")?;
@@ -7057,6 +7071,25 @@ fn pixiv_sync_impl(
     } else {
         pixiv_user_id(&homepage)?
     };
+    // v1.3.15 两段式：第二段（带清单）不重扫列表 —— 候选清单在盘点段已经核对好，直接开始抓详情；
+    // 第一段「只盘点」和单作者同步走下面的原逻辑（抓列表 → 预筛 → 核对出新作品）。
+    let mut result = PixivSyncResult {
+        downloaded_count: 0,
+        reused_preview_count: 0,
+        skipped_existing_count: 0,
+        skipped_date_count: 0,
+        skipped_size_count: 0,
+        failed_count: 0,
+        cancelled: false,
+        last_sync_at: last_sync.map(|date| date.to_rfc3339()).unwrap_or_default(),
+        failed_reasons: Vec::new(),
+        throttled: false,
+        candidates: Vec::new(),
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(provided) = candidates_override {
+        candidates = provided;
+    } else {
     let mut novels: Vec<String> = if let Some(novel_id) = single_novel_id {
         vec![novel_id]
     } else {
@@ -7142,18 +7175,6 @@ fn pixiv_sync_impl(
         .map_err(|e| e.to_string())?
         .collect::<Result<HashSet<String>, _>>()
         .map_err(|e| e.to_string())?;
-    let mut result = PixivSyncResult {
-        downloaded_count: 0,
-        reused_preview_count: 0,
-        skipped_existing_count: 0,
-        skipped_date_count: 0,
-        skipped_size_count: 0,
-        failed_count: 0,
-        cancelled: false,
-        last_sync_at: last_sync.map(|date| date.to_rfc3339()).unwrap_or_default(),
-        failed_reasons: Vec::new(),
-        throttled: false,
-    };
     let _total = novels.len();
     // ── 前置过滤（v1.2.20）──────────────────────────────────────────────
     // 原来只按 known_novel_ids 剔掉「已同步」的，剩下的**全部逐篇抓详情**，
@@ -7164,7 +7185,6 @@ fn pixiv_sync_impl(
     //
     // 判据只用 pixiv_novel_id 精确匹配，**不比标题**：
     // 标题判重容易误杀（同名篇目、标题改过），而 ID 是唯一的。
-    let mut candidates: Vec<String> = Vec::new();
     let list_meta: Vec<(String, PixivNovelListMeta)> = if is_single_sync {
         // 单篇同步（按链接）只有一篇，走列表接口没意义，直接进详情
         Vec::new()
@@ -7232,6 +7252,13 @@ fn pixiv_sync_impl(
             candidates.push(novel_id);
         }
     }
+    } // ← else 分支到此结束（v1.3.15 两段式：候选清单在上面两种来源里都已就绪）
+
+    if scan_only {
+        // 第一段「只盘点」：把核对出的新作品清单带回去就收工 —— 不抓详情、不写盘。
+        result.candidates = candidates;
+        return Ok(result);
+    }
 
     let _ = app.emit(
         "pixiv-sync-progress",
@@ -7253,11 +7280,16 @@ fn pixiv_sync_impl(
     // 作者**又都在串行路径里每篇睡 `delay_seconds`**（那条路的成立条件是
     // `candidates.len() <= threshold`）⇒ 既没起到节流作用，又白等了几十轮。
     //
-    // 现在：先看这一位自己的量会不会把整轮累计顶过阈值 —— 会，就整轮切到串行；
-    // 不会，就走并发（并发路径每次调用只用一次网络往返，比串行+睡眠快得多）。
-    let took_sequential = {
-        let before = take_pixiv_sync_batch_slot(batch_key, candidates.len());
-        before.saturating_add(candidates.len()) > delay_threshold
+    // v1.3.15：两段式的第二段带着 `fetch_mode` 来 —— 节奏在「总数汇总」时一次定好
+    // （总数超过阈值 ⇒ 逐篇串行+间隔；没超过 ⇒ 并发），不再靠游标累积、中途切换。
+    // 没传 fetch_mode 的入口（单作者同步 / 点名下载）保持上面的游标判定。
+    let took_sequential = match fetch_mode.as_deref() {
+        Some("serial") => true,
+        Some("concurrent") => false,
+        _ => {
+            let before = take_pixiv_sync_batch_slot(batch_key, candidates.len());
+            before.saturating_add(candidates.len()) > delay_threshold
+        }
     };
     let use_request_delay = took_sequential && delay_seconds > 0;
     let mut details = Vec::with_capacity(candidates.len());
@@ -7790,16 +7822,22 @@ fn pixiv_sync_impl(
 /// **返回状态而不是 Err**：连不上属于「不确定」，前端要照常往下同步 ——
 /// 不能因为一次网络抖动就把整轮同步打断，更不能顺手把作者判成销号。
 #[tauri::command]
-fn check_pixiv_author(author_id: i64) -> Result<PixivAuthorStatus, String> {
-    let conn = db()?;
-    let (homepage, cookie): (String, String) = conn
-        .query_row(
-            "SELECT a.homepage, COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), '') FROM authors a WHERE a.id=?1",
-            [author_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(check_pixiv_author_impl(&conn, author_id, &homepage, &cookie))
+async fn check_pixiv_author(author_id: i64) -> Result<PixivAuthorStatus, String> {
+    // v1.3.15：批量同步「并行盘点」会同时给好几位作者发探测 —— 这条命令必须挪到后台线程，
+    // 否则同步命令按 Tauri 的调度规则跑在主线程上，几位一起发起也只是互相排队、还占界面线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db()?;
+        let (homepage, cookie): (String, String) = conn
+            .query_row(
+                "SELECT a.homepage, COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), '') FROM authors a WHERE a.id=?1",
+                [author_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(check_pixiv_author_impl(&conn, author_id, &homepage, &cookie))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 探测本体。判据走纯函数 `classify_author_status`，这里只负责发请求和落库。
@@ -7856,15 +7894,31 @@ async fn sync_pixiv_novels(
     end_date: String,
     novel_url: String,
     batch_key: Option<i64>,
+    scan_only: Option<bool>,
+    candidates: Option<Vec<String>>,
+    fetch_mode: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     clear_pixiv_sync_cancel(author_id);
-    // 累计游标的键：批量同步（「同步所有作者」）由前端传 0，让整轮几十位作者
-    // 共用一个计数器 —— 节流判断按**整轮累计量**走，不再被拆散（见 PIXIV_SYNC_BATCH_CURSOR）。
-    // 单作者同步 / 点名下载不传，退回按 author_id 记，各自独立。
+    // 累计游标的键：**单作者同步 / 点名下载**不传 batch_key，退回按 author_id 记，各自独立。
+    // （v1.3.15 起「同步所有作者」不再走游标：前端盘点完汇总总数后一次定档，
+    // 通过 fetch_mode 传进来；游标那套只留给没带 fetch_mode 的入口。）
     let cursor_key = batch_key.unwrap_or(author_id);
+    // scan_only / candidates / fetch_mode 是 v1.3.15 两段式批量同步的三个口子（见 syncAllAuthors）：
+    // 第一段只盘点带 scan_only；第二段带 candidates + fetch_mode。普通调用都不传，行为不变。
+    let scan_only = scan_only.unwrap_or(false);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        pixiv_sync_impl(author_id, start_date, end_date, novel_url, cursor_key, app)
+        pixiv_sync_impl(
+            author_id,
+            start_date,
+            end_date,
+            novel_url,
+            cursor_key,
+            scan_only,
+            candidates,
+            fetch_mode,
+            app,
+        )
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -9542,7 +9596,7 @@ fn download_bookmark_novel_impl(
     drop(conn);
     let url = format!("https://www.pixiv.net/novel/show.php?id={novel_id}");
     // 「点名下载」只有一篇，不需要调流；游标键沿用作者 id 就行（不会被读）
-    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, author_id, app.clone())?;
+    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, author_id, false, None, None, app.clone())?;
     if result.downloaded_count == 0 {
         if result.throttled {
             return Err("被 Pixiv 限流了，停一会儿再试".into());
