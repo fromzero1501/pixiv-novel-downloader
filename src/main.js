@@ -459,6 +459,8 @@ previewWorks.forEach((work, index) => { work.seriesId = index < 2 ? "demo-series
 let previewSeries = [
   { id: "demo-series-1", title: "雾海档案短篇系列", workCount: 2, purchasedCount: 1, previewCount: 1, coverPath: "", maxOrder: 3, readCount: 1, gapOrders: [2] },
 ];
+// 无头脚本要往系列列表里注入"第二个系列"来测「更换系列」，暴露一手（同 __previewWorks 的做法）
+window.__previewSeries = previewSeries;
 
 // 浏览器预览用的筛选模板（真数据在 filter_views 表里）。预置一条是为了让
 // 「打开模板 → 条件写回 → 所有作品跟着筛」这条链在预览里开箱就能验到。
@@ -677,7 +679,6 @@ async function invoke(command, args = {}) {
     return { updated: 0, remaining: 0 };
   }
   if (command === "set_work_series") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.seriesId = args.seriesId; work.seriesTitle = "雾海档案短篇系列"; work.seriesOrder = args.seriesOrder; } return; }
-  if (command === "leave_work_series") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.seriesId = ""; work.seriesTitle = ""; work.seriesOrder = 0; } return; }
   if (command === "backfill_work_covers") return { fixedCount: 0, failedCount: 0, skippedCount: 0, failedTitles: [] };
   // 收藏夹：真数据在 collection_works 关联表里，mock 里挂在作品对象上（collectionIds）
   // 筛选模板（v1.2.9）：真数据在 filter_views 表里，这里存内存就够预览用
@@ -5722,15 +5723,6 @@ async function refreshSeriesView() {
   }
 }
 
-async function leaveWorkSeries(workId) {
-  await invoke("leave_work_series", { authorId: state.activeAuthor.id, workId });
-  closeModal();
-  await refreshWorks();
-  await refreshSeriesView();
-  render();
-  toast("作品已退出系列", "success");
-}
-
 async function setWorkSeries(workId, seriesId, seriesOrder) {
   await invoke("set_work_series", { authorId: state.activeAuthor.id, workId, seriesId, seriesOrder });
   closeModal();
@@ -5835,23 +5827,27 @@ async function chooseSeriesForWork(workId) {
     return;
   }
   closeModal();
-  if (work.seriesId) {
-    const current = series.find((item) => item.id === work.seriesId);
-    if (!current) throw new Error("当前作品所属系列不存在");
-    const selectedOrder = work.seriesOrder || Math.max(1, Number(current.maxOrder || 0) + 1);
-    showModal(modal("更改系列序号", `<form id="series-form" class="form-stack"><input type="hidden" name="seriesId" value="${escapeHtml(work.seriesId)}"><label>当前系列<input value="${escapeHtml(current.title)}" readonly></label><label>系列序号<select name="seriesOrder">${seriesOrderOptions(current.maxOrder, selectedOrder)}</select><small>不能与同一系列中的其他作品重复。</small></label></form>`, '<button class="quiet-button" data-action="close-modal">取消</button><button class="danger-button" data-action="leave-series" data-work-id="' + workId + '">退出此系列</button><button class="primary-button" data-action="set-work-series" data-work-id="' + workId + '">保存</button>'));
-    return;
-  }
-  const options = series.map((item) => `<option value="${escapeHtml(item.id)}" data-max-order="${item.maxOrder || 0}">${escapeHtml(item.title)}</option>`).join("");
-  showModal(modal("加入系列", `<form id="series-form" class="form-stack"><label>选择系列<select name="seriesId" id="series-id">${options}</select></label><label>系列序号<select name="seriesOrder" id="series-order"></select><small>不能与同一系列中的其他作品重复。</small></label></form>`, '<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="set-work-series" data-work-id="' + workId + '">保存</button>'));
+  // v1.3.8：合并成一个「调整系列」弹窗 —— 有系列也能**更换系列**（当前系列从只读变下拉），
+  // 切换时序号联动；用户要求的「退出此系列」按钮撤掉。
+  const options = series
+    .map((item) => `<option value="${escapeHtml(item.id)}" data-max-order="${item.maxOrder || 0}" ${item.id === work.seriesId ? "selected" : ""}>${escapeHtml(item.title)}</option>`)
+    .join("");
+  const current = series.find((item) => item.id === work.seriesId) || null;
+  const defaultOrder = current
+    ? work.seriesOrder || Math.max(1, Number(current.maxOrder || 0) + 1)
+    : Math.max(1, Number(series[0]?.maxOrder || 0) + 1);
+  showModal(modal("调整系列", `<form id="series-form" class="form-stack"><label>选择系列<select name="seriesId" id="series-id">${options}</select></label><label>系列序号<select name="seriesOrder" id="series-order">${seriesOrderOptions(Math.max(Number(current?.maxOrder || 0), defaultOrder), defaultOrder)}</select><small>不能与同一系列中的其他作品重复；换系列时序号会自动改成新系列末尾。</small></label></form>`, '<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="set-work-series" data-work-id="' + workId + '">保存</button>'));
   const seriesSelect = document.querySelector("#series-id");
   const orderSelect = document.querySelector("#series-order");
   const populateOrders = () => {
     const maxOrder = Number(seriesSelect.selectedOptions[0]?.dataset.maxOrder || 0);
-    orderSelect.innerHTML = seriesOrderOptions(maxOrder, maxOrder + 1);
+    // 切回「原来那个系列」给回它自己的序号；切到别的系列默认追加到末尾
+    const selected = String(seriesSelect.value) === String(work.seriesId || "") && work.seriesOrder
+      ? work.seriesOrder
+      : maxOrder + 1;
+    orderSelect.innerHTML = seriesOrderOptions(maxOrder, selected);
   };
   seriesSelect.onchange = populateOrders;
-  populateOrders();
 }
 
 async function bindEvents() {
@@ -6198,7 +6194,6 @@ async function bindEvents() {
         const values = Object.fromEntries(new FormData(form).entries());
         await setWorkSeries(Number(workId), values.seriesId, Number(values.seriesOrder));
       }
-      if (action === "leave-series") await leaveWorkSeries(Number(workId));
       if (action === "remove-author-alias") removeAuthorAlias(Number(element.dataset.index));
       // 已收藏 ⇒ 再点一下＝**直接取消**（用户 2026-10-12 的规则）；没收藏才弹选择器。
       // 想改归属就进详情里那个「调整」入口（那边的语义才是不动收藏状态、只换夹子）。

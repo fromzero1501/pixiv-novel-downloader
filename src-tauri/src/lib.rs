@@ -2764,8 +2764,20 @@ fn get_app_settings() -> Result<AppSettings, String> {
     read_settings(&db()?)
 }
 
+/// 保存设置（v1.3.8：写库包一个事务 + 挪到后台线程跑）。
+///
+/// 原来 25 条 upsert **每条各自提交**、又是**同步命令**（Tauri 里跑在界面主线程）——
+/// 设置是「停手 0.5 秒就自动保存」，打字时每隔半秒吃一口两百多毫秒的主线程阻塞，
+/// 顿感非常明显。实测（`.workbuddy/probe/settings-save-latency.py`，库副本）：
+/// 25 条独立提交 251ms，包一个事务 10ms。
 #[tauri::command]
-fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
+async fn save_app_settings(settings: AppSettings) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || save_app_settings_impl(settings))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn save_app_settings_impl(mut settings: AppSettings) -> Result<AppSettings, String> {
     if settings.pixiv_delay_threshold == 0 {
         return Err("抓取数量阈值必须至少为 1".into());
     }
@@ -2811,13 +2823,8 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
         cleaned_mirrors.push(format!("{mirror}/"));
     }
     settings.update_mirrors = cleaned_mirrors;
-    let conn = db()?;
-    // 最小文件大小**调小** ⇒ 之前按旧阈值跳过的那些现在可能够大了，名单整体清空重来；
-    // **调大**不用管（原来太小、现在只会更小）。用户 2026-10-13 定的规则。
+    let mut conn = db()?;
     let previous_min_size: u64 = setting(&conn, "minimum_text_count")?.parse::<u64>().unwrap_or(0);
-    if settings.minimum_text_count < previous_min_size {
-        let _ = conn.execute("DELETE FROM skipped_novels", []);
-    }
     let values = [
         (
             "pixiv_cookie",
@@ -2933,9 +2940,19 @@ fn save_app_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
             },
         ),
     ];
-    for (key, value) in values {
-        conn.execute("INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value]).map_err(|e| e.to_string())?;
+    // v1.3.8：全部写进**一个事务**提交 —— 25 条各自提交时每次 commit 都要落盘，
+    // 实测 251ms；包一个事务 10ms。「最小文件大小调小 ⇒ 清空跳过名单」也一起放进来，
+    // 和设置本身同生共死。
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // 最小文件大小**调小** ⇒ 之前按旧阈值跳过的那些现在可能够大了，名单整体清空重来；
+    // **调大**不用管（原来太小、现在只会更小）。用户 2026-10-13 定的规则。
+    if settings.minimum_text_count < previous_min_size {
+        let _ = tx.execute("DELETE FROM skipped_novels", []);
     }
+    for (key, value) in values {
+        tx.execute("INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value]).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
     read_settings(&conn)
 }
 
@@ -3640,21 +3657,6 @@ fn set_work_series(
     Ok(())
 }
 
-#[tauri::command]
-fn leave_work_series(author_id: i64, work_id: i64) -> Result<(), String> {
-    if db()?
-        .execute(
-            "UPDATE works SET series_id='', series_title='', series_order=0 WHERE id=?1 AND author_id=?2",
-            params![work_id, author_id],
-        )
-        .map_err(|e| e.to_string())?
-        == 0
-    {
-        return Err("作品不存在或不属于当前作者".into());
-    }
-    Ok(())
-}
-
 // ==================== 系列的新建 / 重命名 / 删除（v1.2.96） ====================
 //
 // 系列存在两张表里，**改一处不够**：
@@ -3777,7 +3779,7 @@ fn rename_series(author_id: i64, series_id: String, title: String) -> Result<(),
 }
 
 /// 删除系列。**只解绑，不删作品** —— 系列里的作品留在库里，
-/// `series_id` / `series_title` / `series_order` 清空（等同于逐个 `leave_work_series`）。
+/// `series_id` / `series_title` / `series_order` 清空（等同于逐个把作品移出系列）。
 #[tauri::command]
 fn delete_series(author_id: i64, series_id: String) -> Result<usize, String> {
     let mut conn = db()?;
@@ -17805,7 +17807,6 @@ pub fn run() {
             list_series_works,
             list_series,
             set_work_series,
-            leave_work_series,
             // v1.2.96：系列的新建 / 重命名 / 删除
             create_series,
             rename_series,
