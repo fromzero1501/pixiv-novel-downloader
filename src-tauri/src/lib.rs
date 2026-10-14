@@ -6964,14 +6964,18 @@ fn existing_sync_target(
 /// 给了具体作品链接的属于「点名下载」：散篇转正 / 添加散篇 / 作者卡里贴链接都是，
 /// 用户指哪篇就下哪篇，再短也下。
 ///
-/// 实测（2026-10-04）：收藏里最短的 6 篇是 174–3359 字，全被 10KB 这条悄悄跳过，
+/// 实测（2026-10-04）：收藏里最短的 6 篇是 174–3359 字，全被这条悄悄跳过，
 /// 还被当成「失败」报出去（默认文案还说「作品可能已删除」），作品其实好好的。
+///
+/// v1.3.11：判据从**正文字节数**换成**正文字数** —— 与设置项「最小作品字数」同口径。
+/// 以前读的是 v1.2.89 改名前的旧键 `minimum_file_size_bytes`（老库里残留着老值），
+/// 用户在新版里设的「最小作品字数」根本管不到同步，于是报「同步时突破了字数限制」。
 fn should_skip_small_content(
     is_single_sync: bool,
-    content_bytes: usize,
-    minimum_file_size_bytes: u64,
+    word_count: usize,
+    minimum_word_count: u64,
 ) -> bool {
-    !is_single_sync && (content_bytes as u64) < minimum_file_size_bytes
+    !is_single_sync && (word_count as u64) < minimum_word_count
 }
 
 /// 「本轮同步的累计抓取游标」键：整库 / 批量同步用 0，单作者同步用 author_id。
@@ -6987,7 +6991,9 @@ fn pixiv_sync_impl(
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
     let conn = db()?;
-    let minimum_file_size_bytes = setting(&conn, "minimum_file_size_bytes")?
+    // v1.3.11：下载下限跟着设置项「最小作品字数」走（以前读的是改名前的旧键
+    // `minimum_file_size_bytes`，新设置管不到同步 —— 用户报「同步时突破了字数限制」）。
+    let minimum_text_count = setting(&conn, "minimum_text_count")?
         .parse::<u64>()
         .unwrap_or(0);
     let delay_threshold = setting(&conn, "pixiv_delay_threshold")?
@@ -7212,11 +7218,10 @@ fn pixiv_sync_impl(
                 result.skipped_size_count += 1;
                 continue;
             }
-            // 按列表接口给的正文字数**预判**太小：UTF-8 一个汉字最多 3 字节，
-            // 所以 `textCount × 3 < 阈值` 意味着"必然太小"，可以安全跳过、不用抓详情。
-            // 拿不到字数（-1）就不预筛，交给抓回来之后再判。
+            // 按列表接口给的正文字数**预判**太小：列表给了字数就直接跟「最小作品字数」比，
+            // 比阈值小就必然跳过、不用抓详情。拿不到字数（-1）就不预筛，交给抓回来之后再判。
             if meta.text_count > 0
-                && (meta.text_count as u64).saturating_mul(3) < minimum_file_size_bytes
+                && (meta.text_count as u64) < minimum_text_count
             {
                 let _ = mark_skipped_novel(&conn, &novel_id, author_id, "太小（按正文字数预估）");
                 result.skipped_size_count += 1;
@@ -7580,7 +7585,7 @@ fn pixiv_sync_impl(
             continue;
         }
         // 点名下载不吃这条下限，见 `should_skip_small_content`
-        if should_skip_small_content(is_single_sync, content.len(), minimum_file_size_bytes) {
+        if should_skip_small_content(is_single_sync, count_non_whitespace(&content), minimum_text_count) {
             // 中间地带那批（字数预判不出来）在这儿才落地：也记一笔，下次不再抓（v1.2.61）
             let _ = mark_skipped_novel(&conn, &novel_id, author_id, "太小（抓回来才知道）");
             result.skipped_size_count += 1;
@@ -7666,40 +7671,57 @@ fn pixiv_sync_impl(
                 .and_then(|_| fs::write(&cover_temp, &cover))
                 .and_then(|_| fs::rename(&text_temp, &text_path))
                 .and_then(|_| fs::rename(&cover_temp, &cover_path));
-            // 阅读版按设置写成 HTML 或 EPUB；配图刚下好，两种格式共用同一批文件。
-            let reading_result = write_result.map_err(|e| e.to_string()).and_then(|_| {
-                write_reading_output(
-                    &text_path,
-                    reading_format,
-                    "",
-                    &work.content,
-                    &slots,
-                    &ReadingWriteMeta {
-                        novel_id: &work.novel_id,
-                        title: &work.title,
-                        author_name: &author_name,
-                        release_date: &work.release_date,
-                        tags: &work.tags,
-                        synopsis: &work.synopsis,
-                        image_count: image_saved,
-                    },
-                )
-            });
-            let reading_path = match reading_result {
-                Ok(path) => path,
-                Err(_) => {
+            // v1.3.11：**只有图文作品才生成阅读版** —— 阅读版的职责是把配图打包带走；
+            // 一张配图都没有的纯文字作品，txt 就是最终形态，别再套一层 html/epub
+            //（用户 2026-10-14：「新建作者同步作品时，所有作品都是 epub，没图的 txt 就行了」）。
+            // 判据用"真实配图槽位"（`slots`）：标题写着"插画"、正文里其实没图的作品也留 txt。
+            let bound_path = if slots.is_empty() {
+                if write_result.is_err() {
                     let _ = fs::remove_file(&text_temp);
                     let _ = fs::remove_file(&cover_temp);
                     result.failed_count += 1;
                     continue;
                 }
+                // 纯文字：没有配图就没有 `_images/` 中转产物，txt 直接当绑定文件
+                text_path.clone()
+            } else {
+                // 阅读版按设置写成 HTML 或 EPUB；配图刚下好，两种格式共用同一批文件。
+                let reading_result = write_result.map_err(|e| e.to_string()).and_then(|_| {
+                    write_reading_output(
+                        &text_path,
+                        reading_format,
+                        "",
+                        &work.content,
+                        &slots,
+                        &ReadingWriteMeta {
+                            novel_id: &work.novel_id,
+                            title: &work.title,
+                            author_name: &author_name,
+                            release_date: &work.release_date,
+                            tags: &work.tags,
+                            synopsis: &work.synopsis,
+                            image_count: image_saved,
+                        },
+                    )
+                });
+                match reading_result {
+                    Ok(path) => {
+                        // v1.3.1：作品只绑一个文件 —— 绑到刚写好的阅读版上，然后把中转产物
+                        // （正文 txt、`_images/` 配图目录）送回收站。图和正文都已经进阅读版了。
+                        // 注意顺序：先确认阅读版在盘上（`discard_sync_intermediates` 内部会查），
+                        // 再删 txt，免得阅读版落空时把作品抹掉。
+                        discard_sync_intermediates(&text_path, &path);
+                        path
+                    }
+                    Err(_) => {
+                        let _ = fs::remove_file(&text_temp);
+                        let _ = fs::remove_file(&cover_temp);
+                        result.failed_count += 1;
+                        continue;
+                    }
+                }
             };
-            // v1.3.1：作品只绑一个文件 —— 绑到刚写好的阅读版上，然后把中转产物
-            // （正文 txt、`_images/` 配图目录）送回收站。图和正文都已经进阅读版了。
-            // 注意顺序：先确认阅读版在盘上（`discard_sync_intermediates` 内部会查），
-            // 再删 txt，免得阅读版落空时把作品抹掉。
-            discard_sync_intermediates(&text_path, &reading_path);
-            let reading_value = reading_path.to_string_lossy().to_string();
+            let reading_value = bound_path.to_string_lossy().to_string();
             let (preview_value, purchased_value) = if work.is_preview {
                 (reading_value.clone(), String::new())
             } else {
@@ -10409,7 +10431,8 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    let minimum_file_size_bytes = setting(&conn, "minimum_file_size_bytes")?
+    // v1.3.11：下限跟着「最小作品字数」走（和 `sync_preview_entries` 那份判据同一条）
+    let minimum_text_count = setting(&conn, "minimum_text_count")?
         .parse::<u64>()
         .unwrap_or(0);
     let match_title_length: i64 = setting(&conn, "match_title_length")?
@@ -10477,10 +10500,12 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
         if !is_cover && !is_preview {
             continue;
         }
-        if path.is_file()
-            && entry.metadata().map_err(|e| e.to_string())?.len() < minimum_file_size_bytes
-        {
-            continue;
+        // v1.3.11：按**字数**筛，不再看文件字节数（同 `sync_preview_entries` 那份判据）。
+        if path.is_file() && is_preview && minimum_text_count > 0 {
+            let count = text_word_count(&path.to_string_lossy()).unwrap_or(0) as u64;
+            if count > 0 && count < minimum_text_count {
+                continue;
+            }
         }
         let key = stem(&path);
         if key.is_empty() {
@@ -12797,11 +12822,16 @@ fn download_reading_version_impl(
     format: ReadingFormat,
     progress: &mut dyn FnMut(usize, usize, String),
 ) -> Result<WorkReadingResult, String> {
-    progress(0, 3, "正在从 Pixiv 抓取作品详情…".to_string());
+    // v1.3.10：进度按「总步数 = 配图张数 + 2（抓取一格、生成一格）」报 —— 前端进度条与
+    // 悬浮球上的环要跟着「配图 x/N」真实推进；原来整个配图阶段卡在 1/3 上不动，
+    // 用户报「圆球上的进度是假的，根本没跟着走」。
+    progress(0, 0, "正在从 Pixiv 抓取作品详情…".to_string());
     let (assets, client) = prepare_novel_assets(work_id)?;
     let images_dir = novel_images_dir(&assets.text_path);
+    let total_steps = assets.slots.len() + 2;
+    progress(1, total_steps, format!("正在下载配图 0/{}…", assets.slots.len()));
     let mut on_image = |done: usize, total: usize| {
-        progress(1, 3, format!("正在下载配图 {done}/{total}…"));
+        progress(1 + done, total_steps, format!("正在下载配图 {done}/{total}…"));
     };
     let (saved, failed) = download_novel_images(&client, &assets.slots, &images_dir, &mut on_image);
     if !assets.slots.is_empty() {
@@ -12828,7 +12858,7 @@ fn download_reading_version_impl(
             .map_err(|e| e.to_string())?;
     }
     let cover_file = ensure_novel_cover(&client, &assets);
-    progress(2, 3, format!("正在生成 {} 版…", format.label()));
+    progress(assets.slots.len() + 1, total_steps, format!("正在生成 {} 版…", format.label()));
     let (output_path, missing_count, size_bytes) = match format {
         ReadingFormat::Html => {
             let html = render_novel_html(
@@ -18866,21 +18896,22 @@ mod tests {
     /// 用户指了哪一篇，就下哪一篇。
     #[test]
     fn point_named_download_ignores_the_minimum_size() {
-        const LIMIT: u64 = 10240;
-        // 实测那 6 篇的字节数：432 / 1286 / 4370 / 6564 / 7173 / 9943
-        for bytes in [432usize, 1286, 4370, 6564, 7173, 9943] {
+        // v1.3.11：判据从字节换成**字数**（跟设置项「最小作品字数」同口径），样例同步换算。
+        const LIMIT: u64 = 3000;
+        // 那 6 篇的字数（原字节数 ÷ 3 上下）：144 / 428 / 1456 / 2188 / 2391 / 3314
+        for words in [144usize, 428, 1456, 2188, 2391] {
             assert!(
-                should_skip_small_content(false, bytes, LIMIT),
-                "整库同步该跳过 {bytes} 字节的残篇"
+                should_skip_small_content(false, words, LIMIT),
+                "整库同步该跳过 {words} 字的残篇"
             );
             assert!(
-                !should_skip_small_content(true, bytes, LIMIT),
-                "点名下载不能跳过 {bytes} 字节这一篇"
+                !should_skip_small_content(true, words, LIMIT),
+                "点名下载不能跳过 {words} 字这一篇"
             );
         }
-        // 够大的：两边都不跳
-        assert!(!should_skip_small_content(false, 20480, LIMIT));
-        assert!(!should_skip_small_content(true, 20480, LIMIT));
+        // 够长的：两边都不跳
+        assert!(!should_skip_small_content(false, 3314, LIMIT));
+        assert!(!should_skip_small_content(true, 3314, LIMIT));
         // 下限设成 0（用户关掉了）时谁都不跳
         assert!(!should_skip_small_content(false, 1, 0));
     }

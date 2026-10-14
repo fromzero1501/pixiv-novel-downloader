@@ -77,6 +77,9 @@ const state = {
   settingsSaveTimer: 0,
   /** 设置表单攒着未落盘的改动（v1.3.9：编辑期间不保存，失焦/关窗时凭它决定要不要写） */
   settingsDirty: false,
+  /** 刚换过封面的作品 → 时间戳（v1.3.11）：同名覆盖换封面时给图片 URL 加缓存破坏参数，
+      否则浏览器/WebView 拿缓存里的旧图，要退出重进才刷新（用户 2026-10-14 报的）。 */
+  coverBusts: {},
   seriesView: null,
   seriesItems: [],
   /**
@@ -1133,7 +1136,13 @@ async function invoke(command, args = {}) {
   if (command === "relocate_author_works") return { moved: 0, missing: 0 };
   if (command === "clear_skipped_novels") return 0;
   if (command === "bind_series_bundle") return args.path;
-  if (command === "bind_work_preview" || command === "bind_work_cover") return args.path;
+  if (command === "bind_work_preview") return args.path;
+  if (command === "bind_work_cover") {
+    // v1.3.11：预览里"真的"换封面 —— 无头脚本验"绑定后封面 URL 立刻带缓存破坏参数"
+    const work = previewWorks.find((item) => item.id === args.workId);
+    if (work) work.coverPath = args.path;
+    return args.path;
+  }
   if (command === "list_bundles") return [];
   if (command === "match_author_series") return [];
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
@@ -2373,7 +2382,12 @@ function renderNoMatchedAuthors() {
 
 // 作品卡上只有「封面图」和「标题」带 work-open 类，只有点这两处才会打开文件
 function workCover(work) {
-  if (work.coverPath) return `<img class="work-open" src="${asset(work.coverPath)}" alt="${escapeHtml(work.title)} 的封面" loading="lazy" onerror="this.closest('.work-cover')?.classList.add('is-missing');this.remove()">`;
+  if (work.coverPath) {
+    // v1.3.11：刚换过封面的作品带一个缓存破坏参数 —— 换封面往往是同名覆盖（路径不变），
+    // 浏览器/WebView 会拿缓存里的旧图，不退出重进看不到新封面（用户 2026-10-14 报的）。
+    const bust = state.coverBusts[work.id] ? `?t=${state.coverBusts[work.id]}` : "";
+    return `<img class="work-open" src="${asset(work.coverPath)}${bust}" alt="${escapeHtml(work.title)} 的封面" loading="lazy" onerror="this.closest('.work-cover')?.classList.add('is-missing');this.remove()">`;
+  }
   return `<div class="cover-placeholder work-open"><span>${icon("image", 28)}</span><small>暂无封面</small></div>`;
 }
 
@@ -3712,6 +3726,11 @@ async function detailBindPreview(workId) {
   toast("已绑定本地预览版内容", "success");
 }
 
+/** 换过封面的作品记一个时间戳：给封面 URL 加缓存破坏参数（v1.3.11，见 workCover）。 */
+function markCoverFresh(workId) {
+  state.coverBusts[Number(workId)] = Date.now();
+}
+
 /** 详情里绑定**封面**（v1.2.83）：有完整版就进完整版目录、否则进预览版目录，同名同主名。 */
 async function detailBindCover(workId) {
   const picked = await open({
@@ -3725,6 +3744,7 @@ async function detailBindCover(workId) {
     toast(String(error), "error");
     return;
   }
+  markCoverFresh(workId);
   await refreshAfterDetailChange();
   toast("已绑定封面", "success");
 }
@@ -3811,6 +3831,7 @@ async function handleDropToBind(payload) {
       toast(String(error), "error");
       return;
     }
+    if (isCover) markCoverFresh(workId);
     await refreshAfterDetailChange();
     toast(isCover ? "已绑定封面" : "已绑定本地预览版内容", "success");
     return;
@@ -3937,7 +3958,7 @@ function workDetailBody() {
     ? `${escapeHtml(work.seriesTitle)}${work.seriesOrder > 0 ? ` · 第 ${work.seriesOrder} 篇` : ""}`
     : "未加入系列";
   const cover = work.coverPath
-    ? `<img src="${asset(work.coverPath)}" alt="${escapeHtml(work.title)} 的封面" onerror="this.remove()">`
+    ? `<img src="${asset(work.coverPath)}${state.coverBusts[work.id] ? `?t=${state.coverBusts[work.id]}` : ""}" alt="${escapeHtml(work.title)} 的封面" onerror="this.remove()">`
     : `<span class="detail-cover-placeholder">${icon("image", 30)}</span>`;
   const pixivUrl = work.pixivNovelId ? `https://www.pixiv.net/novel/show.php?id=${work.pixivNovelId}` : "";
   // 作者主页（v1.2.33）：没有主页就不画那颗按钮
