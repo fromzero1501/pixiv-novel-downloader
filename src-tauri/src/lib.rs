@@ -11345,6 +11345,8 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, S
     // v1.2.100：这份文件确实带配图就顺手标成「带图版」（用户要求）——
     // 放在字数/图片数都算完之后，`image_count` 才是刚更新的值
     mark_has_images_if_illustrated(&conn, work_id, &target);
+    // v1.3.7：拿到完整版后，旧预览版文件自动清（回收站）＋封面搬进完整版目录
+    clear_redundant_preview_for_bound_work(&conn, work_id, &target);
     Ok(target.to_string_lossy().to_string())
 }
 
@@ -11564,6 +11566,8 @@ fn distribute_file(
         refresh_reading_image_count(conn, *work_id);
         // v1.3.6：自动归组也算「绑完整版」，带图就补标带图版（和单作品绑定一个口径）
         mark_has_images_if_illustrated(conn, *work_id, path);
+        // v1.3.7：拿到完整版后旧预览版自动清理（同手动绑定）
+        clear_redundant_preview_for_bound_work(conn, *work_id, path);
         return Ok(Distributed {
             bound_count: 1,
             skipped_count,
@@ -11595,6 +11599,8 @@ fn distribute_file(
         .map_err(|e| e.to_string())?;
         refresh_reading_image_count(conn, *work_id);
         mark_has_images_if_illustrated(conn, *work_id, path);
+        // v1.3.7：拿到完整版后旧预览版自动清理（同手动绑定）
+        clear_redundant_preview_for_bound_work(conn, *work_id, path);
     }
     Ok(Distributed {
         bound_count: resolved.len(),
@@ -12384,6 +12390,102 @@ struct PreviewCleanupSummary {
 /// 完整版丢了还去清预览版，等于把这篇作品从磁盘上抹掉。
 fn preview_is_redundant(purchased_exists: bool) -> bool {
     purchased_exists
+}
+
+/// 作品**刚拿到完整版**之后的自动清尾（v1.3.7 用户要求）：旧预览版该清的清、该搬的搬。
+///
+/// 由「绑定完整版」的两条路径统一调用（手动绑定 / 扫描确认都走 `bind_work_moving_to_purchased`，
+/// 自动归组走 `distribute_file`），规则和设置里「清理多余预览版」同一个口径：
+///   · 预览版文件 → 回收站（**被别的作品绑着就不删**，只清本作品的记录 —— 合集共享要保别人的）；
+///   · 预览版旁边的同名附属物：`_images` 配图目录搬进完整版目录（目标已有就回收旧的）、
+///     同名 html / epub 送回收站；
+///   · 封面只要在预览版目录里，就搬进完整版目录（覆盖式）并改写库里的路径；
+///     封面只剩死路径时也顺手跟着完整版重新认一遍。
+///
+/// **静默执行**：任何一步失败都不拦绑定（绑定本身已经完成）；删的都是回收站，可还原。
+fn clear_redundant_preview_for_bound_work(conn: &Connection, work_id: i64, purchased_path: &Path) {
+    let Ok((preview, cover)) = conn.query_row(
+        "SELECT ifnull(preview_path,''), ifnull(cover_path,'') FROM works WHERE id=?1",
+        [work_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ) else {
+        return;
+    };
+    let preview = preview.trim().to_string();
+    if preview.is_empty() {
+        return;
+    }
+    // 预览记录指着的就是刚绑上的那份文件（同一路径）⇒ 只清记录、绝不删文件
+    if path_key(&preview) == path_key(&purchased_path.to_string_lossy()) {
+        let _ = conn.execute("UPDATE works SET preview_path='' WHERE id=?1", [work_id]);
+        return;
+    }
+    let Some(full_dir) = purchased_path.parent().map(|dir| dir.to_path_buf()) else {
+        return;
+    };
+    let preview_path = PathBuf::from(&preview);
+    let mut new_cover = cover.trim().to_string();
+
+    if preview_path.is_file() {
+        let shared: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM works WHERE id<>?1 AND (purchased_path=?2 OR preview_path=?2)",
+                params![work_id, preview.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if shared == 0 {
+            let _ = recycle_to_bin(&preview_path);
+            let cover_key = path_key(cover.trim());
+            for asset in sibling_assets(&preview_path) {
+                if !asset.exists() || path_key(&asset.to_string_lossy()) == cover_key {
+                    continue;
+                }
+                let Some(name) = asset.file_name().map(|value| value.to_owned()) else {
+                    continue;
+                };
+                if asset.is_dir() {
+                    let destination = full_dir.join(&name);
+                    if destination.exists() {
+                        let _ = recycle_to_bin(&asset);
+                    } else {
+                        let _ = move_path(&asset, &destination);
+                    }
+                } else {
+                    let _ = recycle_to_bin(&asset);
+                }
+            }
+        }
+    }
+
+    // 封面：在预览版目录里就搬进完整版目录，并把库里的路径改写过去
+    if !cover.trim().is_empty() {
+        let cover_path = PathBuf::from(cover.trim());
+        let inside_preview = cover_path.parent().is_some_and(|parent| {
+            preview_path.parent().is_some_and(|preview_dir| {
+                path_key(&parent.to_string_lossy()) == path_key(&preview_dir.to_string_lossy())
+            })
+        });
+        if !cover_path.is_file() {
+            // 封面只剩死路径：跟着完整版重新认一遍（新正文旁的同名图也会被认出来）
+            new_cover = follow_cover_path(cover.trim(), purchased_path);
+        } else if inside_preview {
+            let _ = move_cover_along(cover.trim(), &full_dir);
+            let followed = follow_cover_path(cover.trim(), purchased_path);
+            if followed != cover.trim() {
+                // 新位置已经就位，把预览目录里可能残留的那份收走
+                if path_key(&followed) != path_key(cover.trim()) && cover_path.is_file() {
+                    let _ = recycle_to_bin(&cover_path);
+                }
+                new_cover = followed;
+            }
+        }
+    }
+
+    let _ = conn.execute(
+        "UPDATE works SET preview_path='', cover_path=?1 WHERE id=?2",
+        params![new_cover, work_id],
+    );
 }
 
 /// 把一份文件 / 目录送进 **Windows 回收站**（v0.3.61：用户要求别自建回收目录，
@@ -17927,6 +18029,7 @@ mod tests {
         migrate_epub_word_counts, migrate_docx_word_counts,
         pixiv_client, fetch_pixiv_novel_detail, json_string, plan_novel_images,
         download_novel_images,
+        clear_redundant_preview_for_bound_work,
         apply_author_status, check_pixiv_author_impl, classify_author_status,
         title_indicates_images, unique_target_path, write_reading_output,
         text_has_raw_novel_image_tokens, detail_has_embedded_images,
@@ -20242,6 +20345,126 @@ mod tests {
         fs::write(&epub, "x").unwrap();
         assert!(!clear_image_flags_for_plain_txt(&conn, 3, &epub));
         assert_eq!(flags(3), (12, 1));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.3.7：拿到完整版后自动清预览 —— 预览文件进回收站、`_images` 搬去完整版目录、
+    /// 封面跟着搬且库路径改写；被别的作品绑着（合集共享）时只清记录不删文件；
+    /// 预览与完整版是同一路径时绝不删文件。
+    #[test]
+    fn bound_purchased_clears_the_redundant_preview() {
+        let root = std::env::temp_dir().join(format!("clear-preview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let preview_dir = root.join("预览");
+        let full_dir = root.join("完整");
+        fs::create_dir_all(&preview_dir).unwrap();
+        fs::create_dir_all(&full_dir).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE works (
+               id INTEGER PRIMARY KEY,
+               preview_path TEXT NOT NULL DEFAULT '',
+               purchased_path TEXT NOT NULL DEFAULT '',
+               cover_path TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+        let paths = |id: i64| -> (String, String) {
+            conn.query_row(
+                "SELECT preview_path, cover_path FROM works WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        // ① 正常清：预览文件 + `作品_images` + 预览目录里的封面
+        let preview_file = preview_dir.join("作品.txt");
+        fs::write(&preview_file, "预览正文").unwrap();
+        let images_dir = preview_dir.join("作品_images");
+        fs::create_dir_all(&images_dir).unwrap();
+        fs::write(images_dir.join("001.jpg"), b"x").unwrap();
+        let cover = preview_dir.join("作品封面.jpg");
+        fs::write(&cover, b"cover").unwrap();
+        let purchased_file = full_dir.join("作品.epub");
+        fs::write(&purchased_file, b"full").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, preview_path, purchased_path, cover_path) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![
+                preview_file.to_string_lossy().to_string(),
+                purchased_file.to_string_lossy().to_string(),
+                cover.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+
+        clear_redundant_preview_for_bound_work(&conn, 1, &purchased_file);
+
+        assert!(!preview_file.exists(), "预览版文件应当进回收站");
+        assert!(!cover.exists(), "预览目录里的封面应当被搬走");
+        assert!(
+            full_dir.join("作品封面.jpg").is_file(),
+            "封面应当已经在完整版目录"
+        );
+        assert!(
+            full_dir.join("作品_images").join("001.jpg").is_file(),
+            "配图目录应当搬进完整版目录"
+        );
+        assert!(!images_dir.exists(), "旧位置的配图目录不该留着");
+        let (preview_left, cover_now) = paths(1);
+        assert_eq!(preview_left, "", "预览版记录要清空");
+        assert!(
+            cover_now.contains("完整") && cover_now.ends_with("作品封面.jpg"),
+            "封面路径要改写到完整版目录：{cover_now}"
+        );
+
+        // ② 被别的作品绑着（合集共享）⇒ 文件不删、只清本作品记录
+        let shared_preview = preview_dir.join("共享.txt");
+        fs::write(&shared_preview, "预览").unwrap();
+        let other_full = full_dir.join("共享.epub");
+        fs::write(&other_full, b"full2").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, preview_path) VALUES (2, ?1)",
+            rusqlite::params![shared_preview.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, preview_path, purchased_path) VALUES (3, ?1, ?2)",
+            rusqlite::params![
+                shared_preview.to_string_lossy().to_string(),
+                other_full.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+
+        clear_redundant_preview_for_bound_work(&conn, 3, &other_full);
+
+        assert!(shared_preview.exists(), "文件被别的作品绑着，绝不能删");
+        assert_eq!(paths(3).0, "", "本作品的预览记录要清空");
+        assert_eq!(paths(2).0, shared_preview.to_string_lossy(), "别人的记录不能动");
+
+        // ③ 预览与完整版是同一路径 ⇒ 只清记录、文件必须还在
+        let same = full_dir.join("同一份.txt");
+        fs::write(&same, "正文").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, preview_path, purchased_path) VALUES (4, ?1, ?1)",
+            rusqlite::params![same.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        clear_redundant_preview_for_bound_work(&conn, 4, &same);
+        assert!(same.exists(), "同一份文件绝不能删");
+        assert_eq!(paths(4).0, "");
+
+        // ④ 死路径 ⇒ 只清记录
+        conn.execute(
+            "INSERT INTO works (id, preview_path) VALUES (5, 'D:/不存在的/死路径.txt')",
+            [],
+        )
+        .unwrap();
+        clear_redundant_preview_for_bound_work(&conn, 5, &other_full);
+        assert_eq!(paths(5).0, "");
 
         fs::remove_dir_all(&root).unwrap();
     }

@@ -189,8 +189,6 @@ const state = {
   seriesMatchPairs: [],
   /** 合集索引（v1.2.68）：`workId -> 同属一个文件的其它作品`，用来挂「合集」徽标 */
   bundleIndex: new Map(),
-  /** 批量同步浮层是不是收起来了（v1.2.86）：作者一多那串进度条能占半屏 */
-  syncFloaterCollapsed: false,
   /**
    * 阅读状态筛选（v1.2.0）：`all` / `unread`（未读） / `reading`（在读，＝「继续读」清单）。
    * 三个列表页共用一份 —— 切页面还留着，比每个页面各存一份更好用。
@@ -1915,11 +1913,14 @@ function syncTaskTitle(task) {
 function syncFloater() {
   const task = state.syncTask;
   if (!task) return "";
+  // v1.3.7：收起态＝右下角一枚悬浮小球（点球展开；状态记在 task.collapsed 上，换新任务自动回展开）
+  if (task.collapsed) return syncFloaterBall(task);
   if (task.authors) return batchSyncFloater(task);
   return `<div class="sync-floater" id="sync-floater">
     <div class="sync-floater-head">
       <strong>${icon("sync", 16)}<span id="sync-progress-label">${escapeHtml(task.label)}</span></strong>
       <span class="sync-floater-count" id="sync-progress-count">${syncCountText(task)}</span>
+      <button class="sync-floater-fold" data-action="toggle-sync-floater">收起</button>
     </div>
     <progress id="sync-progress-bar" value="${task.current}" max="${Math.max(task.total, 1)}"></progress>
     <div class="sync-floater-foot">
@@ -1930,6 +1931,32 @@ function syncFloater() {
       </div>
     </div>
   </div>`;
+}
+
+/// 悬浮小球上的环形进度参数（球的渲染与它的精准更新共用一份计算，别两处各写一套）。
+function syncBallParts(task) {
+  const total = Math.max(0, Number(task.total) || 0);
+  const current = Math.min(Math.max(0, Number(task.current) || 0), total);
+  const circumference = 2 * Math.PI * 15.5;
+  const dash = (total > 0 ? current / total : 0) * circumference;
+  const tip = [task.label || "处理中", total > 0 ? `${current}/${total}` : "", task.title || ""]
+    .filter(Boolean)
+    .join(" · ");
+  return { dash: dash.toFixed(1), circumference: circumference.toFixed(1), tip };
+}
+
+/// 收起态的悬浮小球（v1.3.7 用户要求「一般软件那种悬浮窗的小球」）：
+/// 圆形按钮 + 一圈环形进度，点它展开回卡片。根节点挂着 `#sync-floater` 这个 id，
+/// `updateSyncFloater` 靠它找到球、只更新进度环（不重绘主界面）。
+function syncFloaterBall(task) {
+  const { dash, circumference, tip } = syncBallParts(task);
+  return `<button class="sync-ball" id="sync-floater" data-action="toggle-sync-floater" title="${escapeHtml(tip)}" aria-label="展开进度浮层">
+    <svg class="sync-ball-ring" viewBox="0 0 36 36" aria-hidden="true">
+      <circle class="sync-ball-track" cx="18" cy="18" r="15.5"></circle>
+      <circle class="sync-ball-fill" cx="18" cy="18" r="15.5" stroke-dasharray="${dash} ${circumference}"></circle>
+    </svg>
+    <span class="sync-ball-icon">${icon("sync", 16)}</span>
+  </button>`;
 }
 
 // 右上角的计数文案。**跑完之后不能再按 `current / total` 报**：
@@ -2000,12 +2027,11 @@ function batchSyncFloater(task) {
     </div>`;
   }).join("");
   const finished = task.authors.filter(syncRowSettled).length;
-  const collapsed = Boolean(state.syncFloaterCollapsed);
-  return `<div class="sync-floater is-batch${collapsed ? " is-collapsed" : ""}" id="sync-floater">
+  return `<div class="sync-floater is-batch" id="sync-floater">
     <div class="sync-floater-head">
       <strong>${icon("sync", 16)}<span id="sync-progress-label">${escapeHtml(task.label)}</span></strong>
       <span class="sync-floater-count" id="sync-progress-count">${finished} / ${task.authors.length}</span>
-      <button class="sync-floater-fold" data-action="toggle-sync-floater">${collapsed ? "展开" : "收起"}</button>
+      <button class="sync-floater-fold" data-action="toggle-sync-floater">收起</button>
     </div>
     <div class="sync-floater-rows">${rows}</div>
     <div class="sync-floater-foot">
@@ -2021,6 +2047,14 @@ function updateSyncFloater() {
   const task = state.syncTask;
   const box = document.querySelector("#sync-floater");
   if (!task || !box) return;
+  // v1.3.7：收起态的小球只更新进度环与提示文字（不重绘主界面）
+  if (task.collapsed) {
+    const { dash, circumference, tip } = syncBallParts(task);
+    const ring = box.querySelector(".sync-ball-fill");
+    if (ring) ring.setAttribute("stroke-dasharray", `${dash} ${circumference}`);
+    box.title = tip;
+    return;
+  }
   // 底部按钮：同步＝终止同步；批量下载阅读版＝隐藏进度
   const foot = box.querySelector("[data-floater-foot]");
   if (foot) {
@@ -6738,13 +6772,11 @@ async function bindEvents() {
       if (action === "confirm-auto-group-author") await confirmAutoGroupAuthor();
       if (action === "confirm-pixiv-sync") await syncPixivWorks();
       if (action === "cancel-pixiv-sync") await cancelPixivSync();
+      // v1.3.7：收起＝换成右下角小球、展开＝换回卡片 —— 两个形态是两套 DOM，直接重渲染
       if (action === "toggle-sync-floater") {
-        state.syncFloaterCollapsed = !state.syncFloaterCollapsed;
-        const box = document.getElementById("sync-floater");
-        if (box) {
-          box.classList.toggle("is-collapsed", state.syncFloaterCollapsed);
-          const button = box.querySelector(".sync-floater-fold");
-          if (button) button.textContent = state.syncFloaterCollapsed ? "展开" : "收起";
+        if (state.syncTask) {
+          state.syncTask.collapsed = !state.syncTask.collapsed;
+          render();
         }
       }
       // 批量下载阅读版没法中断，只能把进度浮层收起来；任务照跑，结束时照常弹提示
@@ -9143,13 +9175,6 @@ async function flushSettingsSave(form) {
   }
 }
 
-function minimumSizeParts(bytes) {
-  const value = Number(bytes || 0);
-  const units = [["GB", 1024 ** 3], ["MB", 1024 ** 2], ["KB", 1024]];
-  const matched = units.find(([, size]) => value > 0 && value % size === 0) || ["KB", 1024];
-  return { value: value / matched[1], unit: matched[0] };
-}
-
 async function settingsModal() {
   // 只允许开一层（2026-10-12 用户截图报的：连点几次之后底部堆了一排「关闭」）。
   // 它是 async 的 —— 连着点两下会**同时**过下面那个 await、各开一层；而 closeModal()
@@ -9159,7 +9184,6 @@ async function settingsModal() {
   state.settingsModalBusy = true;
   try {
   const settings = await invoke("get_app_settings");
-  const minimumSize = minimumSizeParts(settings.minimumTextCount);
   showModal(modal("设置（自动保存）", `<div class="settings-copy"><form id="settings-form" class="settings-form">
   <section class="settings-group is-account">
     <h3 class="settings-group-head"><span class="settings-group-no">1</span>Pixiv 账号</h3>
@@ -9172,7 +9196,7 @@ async function settingsModal() {
   <section class="settings-group is-storage">
     <h3 class="settings-group-head"><span class="settings-group-no">2</span>文件与目录</h3>
     <div class="settings-fields is-single">
-      <label>最小作品字数 <div class="size-input"><input name="minimumTextCount" type="number" min="0" step="1" value="${minimumSize.value}"><span class="unit-fixed">字</span></div><small>导入文件夹和 Pixiv 同步时，会跳过小于这个字数的文本内容（按"去掉空白后的字符数"算）；文件夹不受此限制。</small></label>
+      <label>最小作品字数 <div class="size-input"><input name="minimumTextCount" type="number" min="0" step="1" value="${Math.max(0, Math.round(Number(settings.minimumTextCount || 0)))}"><span class="unit-fixed">字</span></div><small>导入文件夹和 Pixiv 同步时，会跳过小于这个字数的文本内容（按"去掉空白后的字符数"算）；文件夹不受此限制。</small></label>
       <label>预览版文件夹默认目录 <div class="path-input"><input name="defaultPreviewDir" value="${escapeHtml(settings.defaultPreviewDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-preview">选择目录</button></div></label>
       <label>完整版文件夹默认目录 <div class="path-input"><input name="defaultPurchasedDir" value="${escapeHtml(settings.defaultPurchasedDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-default-purchased">选择目录</button></div></label>
       <label>完整版自动匹配文件夹 <div class="path-input"><input name="autoGroupDir" value="${escapeHtml(settings.autoGroupDir || "")}" readonly><button type="button" class="quiet-button" data-action="pick-auto-group-dir">选择目录</button></div><small>将此文件夹（含其子文件夹）中的文件自动移动到对应作者的完整版文件夹中。同一本书匹配到多个作品时会列入手动选择，勾选几个作品就复制几份。</small></label>
