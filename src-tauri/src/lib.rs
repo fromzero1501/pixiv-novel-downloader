@@ -15640,8 +15640,14 @@ fn commit_import(
     // 出错也只记数、不回滚（作品已经建好了，文件还能事后手动绑）
     let mut failed = 0;
     for (work_id, path) in pending {
-        if bind_work_moving_to_purchased(work_id, path).is_err() {
-            failed += 1;
+        match bind_work_moving_to_purchased(work_id, path) {
+            Ok(target) => {
+                // v1.2.98：**只有新建作品这条路**顺手把 epub 的首图提出来当封面
+                // （用户 2026-10-14 拍板：正常作品是同步来的、自带封面，不必走这一步）。
+                // 失败不影响什么，作品照样是建好的。
+                attach_import_cover(&conn, work_id, Path::new(&target));
+            }
+            Err(_) => failed += 1,
         }
     }
     Ok(ImportResult {
@@ -15649,6 +15655,103 @@ fn commit_import(
         matched,
         failed,
     })
+}
+
+/// 从 EPUB 里取**第一张图**的原始字节与扩展名，取不到返回 `None`（v1.2.98）。
+///
+/// 按 zip 内的物理顺序走（和 `count_epub_images` 同一个遍历口径），跳过目录项与
+/// `META-INF/`（那里是 epub 自己的元数据，不是书里的图）。
+///
+/// ⚠️ **不解码、不重编码**，原样返回字节：项目里的 `image` crate 只编了 jpeg 特性，
+/// PNG / WebP 根本解不了；原样写还不会掉画质，顺带支持 svg 这种矢量图。
+fn epub_first_image(path: &Path) -> Option<(Vec<u8>, String)> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    for index in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(index) else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        if name.to_ascii_lowercase().starts_with("meta-inf/") {
+            continue;
+        }
+        if !is_image_file_name(&name) {
+            continue;
+        }
+        let extension = Path::new(&name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut bytes = Vec::new();
+        if entry.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+            continue;
+        }
+        return Some((bytes, extension));
+    }
+    None
+}
+
+/// 把导入进来的 EPUB 首图，**存成这个作品的封面**。
+///
+/// 位置与命名（用户 2026-10-14 明确要求「按作品版本放到对应文件夹，也要改名」）：
+/// 走的是**正文文件自己的位置**，于是两条都天然满足 ——
+///   · **目录**：`epub_path` 是 `bind_work_moving_to_purchased` 搬完之后的落点，
+///     作品是完整版就在完整版目录（将来若有预览版，也同样是它自己的目录）；
+///   · **文件名**：正文已经按作品标题命名为 `标题.epub`，取同 stem 就是 `标题.png`。
+///     重名时正文是 `标题 (1).epub`，封面跟着叫 `标题 (1).png` —— 这样才和正文成对，
+///     也不会跟另一个同名作品的封面撞上。
+///
+/// **只在「新建作品」导入时调**（用户拍板：正常作品是同步来的、自带封面），
+/// 而且**只在作品还没有封面时**才做 —— 两道判据，任一命中就直接跳过：
+///   1. 库里 `cover_path` 已经有值、且那个文件还在 ⇒ 有封面，不动；
+///   2. 目标位置 `标题.{原扩展名}` 已经有文件 ⇒ 也不覆盖（同名图就是约定的封面位）。
+///
+/// 图找不到 / 写不进磁盘 ⇒ 静默跳过，**不影响作品建出来、也不影响绑定成功**。
+fn attach_import_cover(conn: &Connection, work_id: i64, epub_path: &Path) {
+    let is_epub = epub_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("epub"));
+    if !is_epub {
+        return;
+    }
+    // 判据 1：库里已经有封面、且文件还在
+    let existing: String = conn
+        .query_row("SELECT cover_path FROM works WHERE id=?1", [work_id], |row| {
+            row.get(0)
+        })
+        .unwrap_or_default();
+    if !existing.trim().is_empty() && Path::new(&existing).is_file() {
+        return;
+    }
+    let Some((bytes, extension)) = epub_first_image(epub_path) else {
+        return;
+    };
+    // 扩展名拿不出来就按 jpg 记（图片字节本身是什么无所谓，显示层只认路径）
+    let extension = if extension.is_empty() { "jpg".to_string() } else { extension };
+    let target = epub_path.with_extension(&extension);
+    // 判据 2：这个位置已经有图了，别盖
+    if target.exists() {
+        return;
+    }
+    if fs::write(&target, &bytes).is_err() {
+        return;
+    }
+    if conn
+        .execute(
+            "UPDATE works SET cover_path=?1 WHERE id=?2",
+            params![target.to_string_lossy().to_string(), work_id],
+        )
+        .is_ok()
+    {
+        // 封面文件名变了 ⇒ `count_epub_images` 那个「排除封面」的判据跟着变，重算一次
+        refresh_reading_image_count(conn, work_id);
+    }
 }
 
 #[tauri::command]
@@ -16361,6 +16464,7 @@ mod tests {
         extended_path_for_api, strip_extended_prefix,
         should_import_folder_entry, should_skip_small_content, similarity_percent, similarity_with_title_limit,
         best_import_match, import_folder_extension_allowed, author_works_for_match, ImportCandidate, ImportSelection,
+        attach_import_cover, epub_first_image,
         sort_works_by_content_size,
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
         probe_latest_version, probe_update_asset, update_asset_names, update_client,
@@ -20494,6 +20598,124 @@ mod tests {
 
         // 目录分支也要认 epub（v1.2.94 之前只认 txt，会漏掉）
         assert_eq!(file_word_count(&epub).map(|n| n as i64), Some(12));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.2.98：新建作品导入 epub 时，取**首图**当封面。
+    /// 四条边界一起钉住：只认 epub；取第一张图（跳过 META-INF 与目录项）；
+    /// **已有封面时一个字都不动**；没图/非 epub 就别写。
+    #[test]
+    fn import_cover_takes_the_first_epub_image_only_when_there_is_none() {
+        let root = std::env::temp_dir().join(format!("import-cover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE works (
+                 id INTEGER PRIMARY KEY,
+                 cover_path TEXT NOT NULL DEFAULT '',
+                 preview_path TEXT NOT NULL DEFAULT '',
+                 purchased_path TEXT NOT NULL DEFAULT '',
+                 image_count INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+
+        // 一本「首图是 png」的 epub；META-INF 里也塞一张图，它不该被当成书里的图
+        let epub = root.join("无封面作品.epub");
+        {
+            let mut writer = zip::ZipWriter::new(fs::File::create(&epub).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("META-INF/container.xml", options).unwrap();
+            writer.write_all(b"<container/>").unwrap();
+            writer.start_file("META-INF/logo.png", options).unwrap();
+            writer.write_all(b"meta-inf-png").unwrap();
+            writer.start_file("OEBPS/images/first.png", options).unwrap();
+            writer.write_all(b"first-png-bytes").unwrap();
+            writer.start_file("OEBPS/images/second.jpg", options).unwrap();
+            writer.write_all(b"second-jpg-bytes").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let (bytes, extension) = epub_first_image(&epub).expect("该有图");
+        assert_eq!(bytes, b"first-png-bytes".to_vec(), "要的是第一张图，不是第二张");
+        assert_eq!(extension, "png", "META-INF 里的不算，首图是 OEBPS 下那张 png");
+
+        // 没有封面 ⇒ 写出同名图、库里跟着指过去
+        conn.execute(
+            "INSERT INTO works (id, purchased_path) VALUES (7, ?1)",
+            [epub.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        attach_import_cover(&conn, 7, &epub);
+        let cover: String = conn
+            .query_row("SELECT cover_path FROM works WHERE id=7", [], |row| row.get(0))
+            .unwrap();
+        let written = epub.with_extension("png");
+        assert_eq!(cover, written.to_string_lossy(), "库里要指向写出来的那张图");
+        assert_eq!(fs::read(&written).unwrap(), b"first-png-bytes".to_vec());
+
+        // 已经有封面（文件就在磁盘上）⇒ 不换、不覆盖
+        let other = root.join("已有封面作品.epub");
+        fs::copy(&epub, &other).unwrap();
+        let kept = root.join("已有封面作品.png");
+        fs::write(&kept, b"kept-cover").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, cover_path, purchased_path) VALUES (8, ?1, ?2)",
+            rusqlite::params![
+                kept.to_string_lossy().to_string(),
+                other.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+        attach_import_cover(&conn, 8, &other);
+        let kept_after: String = conn
+            .query_row("SELECT cover_path FROM works WHERE id=8", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept_after, kept.to_string_lossy(), "有封面就不该被换掉");
+        assert_eq!(fs::read(&kept).unwrap(), b"kept-cover".to_vec(), "已有封面文件不该被覆盖");
+
+        // 没有图的 epub ⇒ 什么都不写
+        let plain = root.join("没图.epub");
+        {
+            let mut writer = zip::ZipWriter::new(fs::File::create(&plain).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file("OEBPS/ch1.xhtml", options).unwrap();
+            writer.write_all("<p>只有正文</p>".as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(epub_first_image(&plain).is_none());
+        conn.execute(
+            "INSERT INTO works (id, purchased_path) VALUES (9, ?1)",
+            [plain.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        attach_import_cover(&conn, 9, &plain);
+        let none_cover: String = conn
+            .query_row("SELECT cover_path FROM works WHERE id=9", [], |row| row.get(0))
+            .unwrap();
+        assert!(none_cover.is_empty(), "没图就别写封面");
+        assert!(!plain.with_extension("jpg").exists());
+
+        // 不是 epub 的一律不碰（这条守住「只在导入 epub 时提首图」）
+        let txt = root.join("普通作品.txt");
+        fs::write(&txt, "正文").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, purchased_path) VALUES (10, ?1)",
+            [txt.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        attach_import_cover(&conn, 10, &txt);
+        assert!(
+            conn.query_row("SELECT cover_path FROM works WHERE id=10", [], |row| row
+                .get::<_, String>(0))
+                .unwrap()
+                .is_empty(),
+            "txt 不该提封面"
+        );
 
         fs::remove_dir_all(&root).unwrap();
     }
