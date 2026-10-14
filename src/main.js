@@ -1930,14 +1930,28 @@ function syncFloater() {
 }
 
 /// 悬浮小球上的环形进度参数（球的渲染与它的精准更新共用一份计算，别两处各写一套）。
+/// **球的环与展开态那根进度条同源（用户 2026-10-14：「根进度条完全一致就行了，
+/// 只不过进度条是直线，悬浮窗是圈」）**：同一份 value / max 换算成环上的弧长。
+/// 批量同步没有单根条，就用「已收尾作者数 + 正在跑那位的篇数比例」当整体进度。
 function syncBallParts(task) {
   const total = Math.max(0, Number(task.total) || 0);
   const current = Math.min(Math.max(0, Number(task.current) || 0), total);
   const circumference = 2 * Math.PI * 15.5;
-  const dash = (total > 0 ? current / total : 0) * circumference;
-  const tip = [task.label || "处理中", total > 0 ? `${current}/${total}` : "", task.title || ""]
-    .filter(Boolean)
-    .join(" · ");
+  let ratio;
+  let tip;
+  if (task.authors) {
+    const settled = task.authors.filter(syncRowSettled).length;
+    const running = task.authors.find((item) => item.status === "running" || item.status === "checking");
+    const runningRatio = running && running.total > 0 ? Math.min(running.current / running.total, 1) : 0;
+    ratio = task.authors.length ? (settled + runningRatio) / task.authors.length : 0;
+    tip = [task.label || "处理中", `已完成 ${settled} / ${task.authors.length} 位作者`].join(" · ");
+  } else {
+    ratio = total > 0 ? current / total : 0;
+    tip = [task.label || "处理中", total > 0 ? `${current}/${total}` : "", task.title || ""]
+      .filter(Boolean)
+      .join(" · ");
+  }
+  const dash = ratio * circumference;
   return { dash: dash.toFixed(1), circumference: circumference.toFixed(1), tip };
 }
 
@@ -1953,6 +1967,57 @@ function syncFloaterBall(task) {
     </svg>
     <span class="sync-ball-icon">${icon("sync", 16)}</span>
   </button>`;
+}
+
+/**
+ * 悬浮图标「每完成一格进度转一整圈」（v1.3.13 用户要求：不要从头到尾一直转 ——
+ * 常驻旋转和进度没关系、整段看不出变化；改成进度每前进一格，图标恰好转一整圈）。
+ *
+ * 记数挂在任务对象上（`stageDone` / `stageKey`），换新任务自动从头计，重绘也不会丢；
+ * 进度回退（阶段切换时 current 会重置）不计圈，阶段名变了补一圈 ——
+ * 「抓取详情 → 下载封面」这种大步骤完成也能看到一下。
+ * 一次事件跳过多格（并发抓取一次跳 6）最多连转两圈，防止突然狂转。
+ * 动画用 WAAPI 现点现转：重绘出来的图标天然静止，不会自己转起来。
+ */
+function advanceStageSpin(task, box) {
+  let units;
+  let phaseKey;
+  if (task.authors) {
+    // 按作者分行的任务（含「新增作者自动同步」「转正自动同步」这种只有一行的）：
+    // 已收尾的作者按它的篇数算满、正在跑的那位按已处理篇数算 —— 一格 = 一篇
+    const running = task.authors.find((item) => item.status === "running" || item.status === "checking");
+    units = task.authors.reduce((sum, item) => {
+      if (item === running) return sum + Math.max(0, Number(item.current) || 0);
+      return sum + (syncRowSettled(item) ? Math.max(Number(item.total) || 0, 1) : 0);
+    }, 0);
+    phaseKey = String(running?.title || "").replace(/\d+/g, "#");
+  } else {
+    units = Math.floor(Math.max(0, Number(task.current) || 0));
+    phaseKey = String(task.title || "").replace(/\d+/g, "#");
+  }
+  if (task.stageDone === undefined) {
+    // 第一次只记底账、不给圈 —— 开任务或换页面重画时别先转一下
+    task.stageDone = units;
+    task.stageKey = phaseKey;
+    return;
+  }
+  let turns = 0;
+  if (units > task.stageDone) turns = Math.min(units - task.stageDone, 2);
+  else if (phaseKey !== task.stageKey) turns = 1;
+  task.stageDone = units;
+  task.stageKey = phaseKey;
+  if (turns > 0) spinFloaterIcon(box, turns);
+}
+
+/// 现场起一段「转 N 整圈」动画。上一次没转完就取消重来（从中途角度接新圈会跳，取消最干脆）。
+function spinFloaterIcon(box, turns) {
+  const svg = box.querySelector(".sync-ball-icon svg") || box.querySelector(".sync-floater-head strong svg");
+  if (!svg || typeof svg.animate !== "function") return;
+  svg.getAnimations().forEach((animation) => animation.cancel());
+  svg.animate([{ transform: "rotate(0deg)" }, { transform: `rotate(${turns * 360}deg)` }], {
+    duration: 620 * turns,
+    easing: "ease-in-out",
+  });
 }
 
 // 右上角的计数文案。**跑完之后不能再按 `current / total` 报**：
@@ -2043,6 +2108,8 @@ function updateSyncFloater() {
   const task = state.syncTask;
   const box = document.querySelector("#sync-floater");
   if (!task || !box) return;
+  // v1.3.13：图标不再常驻旋转 —— 进度每前进一格（或大阶段切换）转一整圈，收起/展开两态同一个行为
+  advanceStageSpin(task, box);
   // v1.3.7：收起态的小球只更新进度环与提示文字（不重绘主界面）
   if (task.collapsed) {
     const { dash, circumference, tip } = syncBallParts(task);

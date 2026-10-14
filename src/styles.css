@@ -243,7 +243,7 @@ button.app-version:hover { color: #1764c5; text-decoration: underline; }
 .sync-ball-track { fill: none; stroke: #e8f0f9; stroke-width: 3; }
 .sync-ball-fill { fill: none; stroke: #176bd3; stroke-width: 3; stroke-linecap: round; transition: stroke-dasharray .3s ease; }
 .sync-ball-icon { display: grid; place-items: center; color: #176bd3; }
-.sync-ball-icon svg { width: 17px; height: 17px; animation: sync-spin 1.6s linear infinite; }
+.sync-ball-icon svg { width: 17px; height: 17px; }
 .work-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; min-height: 21px; }
 .work-tags span { display: inline-flex; align-items: center; gap: 3px; color: #5a7695; background: #eef5fc; border: 1px solid #d9e8f6; border-radius: 4px; padding: 2px 5px; font-size: 12px; line-height: 1.2; overflow-wrap: anywhere; }
 .work-tags svg { flex: 0 0 auto; color: #4c82bc; }
@@ -289,7 +289,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .sync-floater-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .sync-floater-head strong { display: inline-flex; align-items: center; gap: 7px; min-width: 0; color: #2b4665; font-size: 13px; font-weight: 700; }
 .sync-floater-head strong span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sync-floater-head strong svg { flex: none; color: #176bd3; animation: sync-spin 1.6s linear infinite; }
+.sync-floater-head strong svg { flex: none; color: #176bd3; }
 .sync-floater-count { flex: none; color: #5d7893; font-size: 12px; font-weight: 700; }
 .sync-floater progress { width: 100%; height: 8px; appearance: none; border: 0; border-radius: 4px; overflow: hidden; background: #e8f0f9; }
 .sync-floater progress::-webkit-progress-bar { background: #e8f0f9; }
@@ -329,7 +329,6 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .sync-floater-row.is-missing progress::-webkit-progress-value { background: #d4dae1; }
 .sync-floater-row.is-missing .sync-row-title { color: #7b8794; }
 .sync-floater-row.is-missing .sync-row-name { color: #7b8794; }
-@keyframes sync-spin { to { transform: rotate(360deg); } }
 
 /* 右下角「回到顶部 / 滚到底部」：列表长到需要滚动时才出现；有同步进度浮层时自动抬到它上面 */
 .scroll-jump { position: fixed; right: 22px; bottom: calc(22px + var(--floater-offset, 0px)); z-index: 15; display: grid; gap: 8px; }
