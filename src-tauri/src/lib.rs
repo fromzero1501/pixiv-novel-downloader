@@ -235,21 +235,6 @@ struct ScanPreviewResult {
     skipped_full_count: usize,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScanPurchasedResult {
-    bound_count: usize,
-    /// 已经绑定过（文件在库里能对上）而跳过的文件数，用来给用户一个交代
-    skipped_count: usize,
-    selections: Vec<PurchasedSelection>,
-    /// 文件名里写了作者、但这位作者不在作者库里的文件。按作者名分组，纯展示不给下拉框。
-    #[serde(default)]
-    unknown_author_groups: Vec<UnknownAuthorGroup>,
-    /// 文件名里写的作者是库里另一位作者（不是当前这位）的文件数，已跳过不参与匹配。
-    #[serde(default)]
-    other_author_count: usize,
-}
-
 /// 「作者不在库」的文件分组：组标题是作者名，下面列文件名
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -260,34 +245,10 @@ struct UnknownAuthorGroup {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PurchasedSelection {
-    path: String,
-    candidates: Vec<WorkCandidate>,
-    /// 文件名里认出来的作者名（没有就是空串）
-    #[serde(default)]
-    author_name: String,
-    /// 按角色匹配时文件里命中到的角色名（按标题匹配时为空）
-    #[serde(default)]
-    matched_characters: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WorkCandidate {
-    work_id: i64,
-    title: String,
-    similarity: i64,
-    /// 按角色匹配时，这个作品标题与文件共有的角色名
-    #[serde(default)]
-    matched_characters: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct AutoGroupResult {
     auto_moved_count: usize,
     manual_selections: Vec<ManualGroupSelection>,
-    /// 同 ScanPurchasedResult.unknown_author_groups
+    /// 文件名里写了作者、但这位作者不在作者库里的文件（按作者名分组）
     #[serde(default)]
     unknown_author_groups: Vec<UnknownAuthorGroup>,
 }
@@ -1621,16 +1582,6 @@ fn detect_author_in_name(stem: &str, authors: &[(i64, String, String)]) -> Optio
         });
     }
     author_at_tail(stem, authors)
-}
-
-/// 认出的作者该不该参与匹配：
-/// - 没认出作者 → 参与（走原来的全量匹配）
-/// - 认出的就是当前正在扫的这位作者 → 参与
-/// - 认出的是库里另一位作者 → 这个文件不属于这个目录，不参与
-///
-/// 单独抽成纯函数是为了能测：这里比的是**作者 ID**，绝不要拿它去和作品 ID 比。
-fn scope_allows_path(detected_author_id: Option<i64>, current_author_id: i64) -> bool {
-    detected_author_id.map_or(true, |id| id == current_author_id)
 }
 
 /// 文件名（不含目录、不含扩展名），用于认作者和各种匹配。
@@ -10473,7 +10424,7 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
     // 单份模型是一篇作品只占一边（见 `move_sync_preview_to_purchased` 的注释）；
     // 以前这一步不看 purchased_path，会把预览版目录里的同名文件也认领过去，
     // 库里就变成"完整版 + 预览版"两条路径都挂着（v1.2.99 用户问出来的）。
-    // 判据跟「关联完整版文件」用的是同一条：`needs_a_purchased_file` 为假才算真有完整版。
+    // 判据：`needs_a_purchased_file` 为假才算真有完整版。
     let full_bound: HashSet<i64> = {
         let mut statement = conn
             .prepare("SELECT id, purchased_path FROM works WHERE author_id=?1")
@@ -10625,255 +10576,6 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
 /// 说明同步时就已经关联好了，不该再被翻出来重绑一遍。
 fn needs_a_purchased_file(purchased_path: &str) -> bool {
     purchased_path.trim().is_empty() || !Path::new(purchased_path.trim()).exists()
-}
-
-/// 扫一遍完整版目录，挑出真正待关联的文件，同时报出跳过了多少个「早就绑好」的。
-/// 排除两类：封面图 / 配图文件夹（不是作品文件），以及已经绑在某个作品上的文件。
-fn collect_pending_purchased_files(
-    dir: &Path,
-    bound_files: &HashSet<String>,
-) -> Result<(Vec<PathBuf>, usize), String> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("无法读取完整版文件夹：{e}"))?;
-    let mut paths: Vec<PathBuf> = vec![];
-    let mut skipped = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if is_image_like_asset(&path) {
-            continue;
-        }
-        if bound_files.contains(&path_key(&path.to_string_lossy())) {
-            skipped += 1;
-            continue;
-        }
-        paths.push(path);
-    }
-    Ok((paths, skipped))
-}
-
-#[tauri::command]
-fn scan_purchased(author_id: i64, mode: String) -> Result<ScanPurchasedResult, String> {
-    let mode = resolve_match_mode(&mode)?;
-    let conn = db()?;
-    let settings = read_settings(&conn)?;
-    let threshold = settings.similarity_threshold;
-    let min_threshold = settings.min_similarity_threshold;
-    let match_title_length = settings.match_title_length;
-    let dir: String = conn
-        .query_row(
-            "SELECT purchased_dir FROM authors WHERE id=?1",
-            [author_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    // 库里所有已经指到某个文件上的完整版路径：这些文件早就关联好了，
-    // 每次点「关联完整版文件」都不该再把它们翻出来让人重绑一遍。
-    let mut bound_statement = conn
-        .prepare("SELECT purchased_path FROM works WHERE purchased_path <> ''")
-        .map_err(|e| e.to_string())?;
-    let bound_files: HashSet<String> = bound_statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|value| path_key(&value))
-        .collect();
-    drop(bound_statement);
-    // 待关联的只有「文本 / 电子书 / HTML（以及用户自己整理的文件夹）」里还没绑过的那些
-    let (paths, skipped_count) = collect_pending_purchased_files(Path::new(&dir), &bound_files)?;
-    // 参与匹配的作品：已经有完整版且文件还躺在磁盘上的，说明这件作品不用再关联了
-    // （真要换文件，走作品卡右键的「绑定完整版文件」）。绑定丢失的仍留在候选里，方便补回来。
-    let works: Vec<(i64, String)> = {
-        let mut statement = conn
-            .prepare("SELECT id, title, purchased_path FROM works WHERE author_id=?1")
-            .map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map([author_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|(_, _, purchased)| needs_a_purchased_file(purchased))
-            .map(|(id, title, _)| (id, title))
-            .collect()
-    };
-    // 作者库：用来认文件名里写的作者名（名称与别名都认）
-    let authors: Vec<(i64, String, String)> = {
-        let mut statement = conn
-            .prepare("SELECT id, name, aliases FROM authors")
-            .map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-    };
-    // 按角色匹配时才需要角色索引；作品标题的角色集先算好，免得每个文件都重算一遍
-    let character_index = if mode == MatchMode::Character {
-        character_match_index(&conn)
-    } else {
-        vec![]
-    };
-    let work_characters: HashMap<i64, Vec<String>> = works
-        .iter()
-        .map(|(id, title)| (*id, characters_in_text(title, &character_index)))
-        .collect();
-    let mut unknown_author_groups: Vec<UnknownAuthorGroup> = vec![];
-    // 文件名写着别的作者（那位作者在库里）的文件数：不参与匹配，但要让用户知道
-    let mut other_author_count = 0usize;
-    let mut scored_paths: Vec<(PathBuf, Vec<(i64, String, i64, Vec<String>)>, String, Vec<String>)> = vec![];
-    for path in paths {
-        let stem = file_stem(&path);
-        let detected = detect_author_in_name(&stem, &authors);
-        // 文件名里写了作者、但库里没这个人 —— 不参与匹配，单独分组展示
-        if let Some(author) = &detected {
-            if author.author_id.is_none() {
-                match unknown_author_groups
-                    .iter_mut()
-                    .find(|group| group.author == author.name)
-                {
-                    Some(group) => group.files.push(file_name(&path)),
-                    None => unknown_author_groups.push(UnknownAuthorGroup {
-                        author: author.name.clone(),
-                        files: vec![file_name(&path)],
-                    }),
-                }
-                continue;
-            }
-        }
-        // 认出了作者就只在这位作者的作品里找。注意 works 已经按当前作者筛过：
-        // 书名里写的正是这位作者 → 照常匹配；写的是库里另一位作者 → 这个文件不属于
-        // 这里（要归到别人名下请用「完整版自动匹配」），跳过并计数，不要拿作者 ID
-        // 去和作品 ID 比大小，两者不是一套编号。
-        if !scope_allows_path(detected.as_ref().and_then(|author| author.author_id), author_id) {
-            other_author_count += 1;
-            continue;
-        }
-        let scope: Vec<(i64, String)> = works.clone();
-        let file_characters = if mode == MatchMode::Character {
-            characters_in_text(&stem, &character_index)
-        } else {
-            vec![]
-        };
-        let mut candidates: Vec<(i64, String, i64, Vec<String>)> = match mode {
-            // 按标题：原来的相似度逻辑，一个字没改
-            MatchMode::Title => scope
-                .iter()
-                .map(|(id, title)| {
-                    (
-                        *id,
-                        title.clone(),
-                        similarity_with_title_limit(title, &file_name(&path), match_title_length),
-                        vec![],
-                    )
-                })
-                .filter(|(_, _, similarity, _)| *similarity >= min_threshold)  // 过滤低于最小阈值的
-                .collect(),
-            // 按角色：标题与文件名有共同角色即可，不算相似度、不看阈值
-            MatchMode::Character => scope
-                .iter()
-                .filter_map(|(id, title)| {
-                    let shared = shared_characters(
-                        &file_characters,
-                        work_characters.get(id).map(|list| list.as_slice()).unwrap_or(&[]),
-                    );
-                    if shared.is_empty() {
-                        None
-                    } else {
-                        let count = shared.len() as i64;
-                        Some((*id, title.clone(), count, shared))
-                    }
-                })
-                .collect(),
-        };
-        candidates.sort_by(|left, right| right.2.cmp(&left.2));
-        if candidates.is_empty() {
-            continue;
-        }
-        scored_paths.push((
-            path,
-            candidates,
-            detected.map(|author| author.name).unwrap_or_default(),
-            file_characters,
-        ));
-    }
-
-    let mut strong_usage: HashMap<i64, usize> = HashMap::new();
-    for (_, candidates, _, _) in &scored_paths {
-        for (work_id, _, similarity, _) in candidates
-            .iter()
-            .filter(|(_, _, similarity, _)| *similarity >= threshold)
-        {
-            let _ = similarity;
-            *strong_usage.entry(*work_id).or_default() += 1;
-        }
-    }
-
-    let mut bound_count = 0;
-    let mut selections = vec![];
-    for (path, candidates, author_name, file_characters) in scored_paths {
-        let strong: Vec<(i64, String, i64, Vec<String>)> = candidates
-            .iter()
-            .filter(|(_, _, similarity, _)| *similarity >= threshold)
-            .cloned()
-            .collect();
-        // 按角色匹配时一律不自动绑定 —— 命中的每一条都由用户手动确认
-        if mode == MatchMode::Title
-            && strong.len() == 1
-            && strong_usage.get(&strong[0].0) == Some(&1)
-        {
-            conn.execute(
-                "UPDATE works SET purchased_path=?1 WHERE id=?2",
-                params![path.to_string_lossy(), strong[0].0],
-            )
-            .map_err(|e| e.to_string())?;
-            refresh_reading_image_count(&conn, strong[0].0);
-            bound_count += 1;
-            continue;
-        }
-        let options: Vec<(i64, String, i64, Vec<String>)> = if mode == MatchMode::Character {
-            candidates
-        } else if strong.is_empty() {
-            candidates.into_iter().take(3).collect()
-        } else {
-            strong
-        };
-        if !options.is_empty() {
-            selections.push(PurchasedSelection {
-                path: path.to_string_lossy().to_string(),
-                author_name,
-                matched_characters: file_characters,
-                candidates: options
-                    .into_iter()
-                    .map(|(work_id, title, similarity, matched)| WorkCandidate {
-                        work_id,
-                        title,
-                        similarity,
-                        matched_characters: matched,
-                    })
-                    .collect(),
-            });
-        }
-    }
-    Ok(ScanPurchasedResult {
-        bound_count,
-        skipped_count,
-        selections,
-        unknown_author_groups,
-        other_author_count,
-    })
 }
 
 
@@ -17812,7 +17514,6 @@ pub fn run() {
             rename_series,
             delete_series,
             scan_preview,
-            scan_purchased,
             bind_work_moving_to_purchased,
             bind_work_preview,
             bind_work_cover,
@@ -17945,7 +17646,6 @@ mod tests {
         AUTHOR_ORDER_BY,
         bind_work_to_reading, build_novel_epub, build_search_url, clip_match_title,
         collect_files_recursively,
-        collect_pending_purchased_files,
         compress_cover,
         compress_series_orders,
         direct_target_path, distribute_file, epub_target_path, existing_sync_target, file_name,
@@ -17956,7 +17656,7 @@ mod tests {
         is_within_date_range, matched_sync_preview, move_cover_along, move_path, name_key,
         sibling_assets,
         characters_in_text, detect_author_in_name, file_stem, merge_builtin_characters,
-        resolve_match_mode, scope_allows_path, shared_characters, MatchMode,
+        resolve_match_mode, shared_characters, MatchMode,
         needs_a_purchased_file,
         normalize_aliases, normalize_author_homepage, normalize_pixiv_cookie,
         pixiv_uid_from_cookie, probe_pixiv_cookie,
@@ -18311,15 +18011,6 @@ mod tests {
         // 单纯只差大小写、但库里确实没有的名字，仍然报「不在库」
         let missing = detect_author_in_name("夏の音 作者：moriya", &authors).unwrap();
         assert_eq!(missing.author_id, None, "moriya 不是 Mori，不能误认");
-    }
-
-    #[test]
-    fn detected_other_author_is_out_of_scope() {        // 没认出作者 → 参与匹配
-        assert!(scope_allows_path(None, 5));
-        // 认出的就是当前这位作者 → 参与匹配
-        assert!(scope_allows_path(Some(5), 5));
-        // 认出的作者是库里另一位（注意：比较的是作者 ID，不是作品 ID）→ 不参与
-        assert!(!scope_allows_path(Some(7), 5));
     }
 
     #[test]
@@ -18796,29 +18487,6 @@ mod tests {
         let existing = root.join("已关联的书.txt");
         fs::write(&existing, "正文").unwrap();
         assert!(!needs_a_purchased_file(&existing.to_string_lossy()));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn already_bound_purchased_files_are_not_offered_again() {
-        // 目录里：一个早就绑好的、一个待关联的、一张封面、一个配图文件夹
-        let root = std::env::temp_dir().join(format!("purchased-pending-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("已关联的书.txt"), "正文").unwrap();
-        fs::write(root.join("还没关联的书.txt"), "正文").unwrap();
-        fs::write(root.join("封面.jpg"), "x").unwrap();
-        fs::create_dir_all(root.join("带图版的书_images")).unwrap();
-        let bound: std::collections::HashSet<String> = ["已关联的书.txt"]
-            .iter()
-            .map(|name| path_key(&root.join(name).to_string_lossy()))
-            .collect();
-
-        let (pending, skipped) = collect_pending_purchased_files(&root, &bound).unwrap();
-        let names: Vec<String> = pending.iter().map(|path| file_name(path)).collect();
-        // 已绑定的、封面、配图文件夹都不在待关联列表里
-        assert_eq!(names, vec!["还没关联的书.txt"]);
-        assert_eq!(skipped, 1);
         let _ = fs::remove_dir_all(&root);
     }
 

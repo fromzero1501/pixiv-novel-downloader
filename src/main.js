@@ -75,6 +75,8 @@ const state = {
   settings: null,
   /** 设置面板自动保存的防抖定时器：关弹窗时要抢在 DOM 被移除之前把改动落盘 */
   settingsSaveTimer: 0,
+  /** 设置表单攒着未落盘的改动（v1.3.9：编辑期间不保存，失焦/关窗时凭它决定要不要写） */
+  settingsDirty: false,
   seriesView: null,
   seriesItems: [],
   /**
@@ -970,30 +972,6 @@ async function invoke(command, args = {}) {
     // 稍微等一下，好让进度浮层在浏览器预览里也能看清（真机上是真实耗时）
     await new Promise((resolve) => setTimeout(resolve, 700));
     return { format, exportedCount: args.workIds.length, skippedCount: 0, failedCount: 0, imageCount: args.workIds.length * 4, totalBytes: args.workIds.length * 3355443, lastPath: `D:\\已购\\希儿.${format}`, failedTitles: [] };
-  }
-  if (command === "scan_purchased") {
-    const byCharacter = args.mode === "character";
-    // 故意给一个超长文件名，用来在浏览器预览里检查弹窗宽度与省略号
-    return {
-      boundCount: byCharacter ? 0 : 2,
-      skippedCount: 12,
-      selections: [
-        {
-          path: "D:\\完整版\\这是一个特别特别长的小说文件名用来验证关联弹窗会不会被撑宽（插画附+改编图文）～整份合集～第一卷到第七卷全收录～特别加长版用来触发省略号显示效果确认没有横向滚动条",
-          authorName: "雾海档案",
-          matchedCharacters: byCharacter ? ["希儿", "布洛妮娅"] : [],
-          candidates: [
-            { workId: 1, title: "（插画附+改编图文）～希儿&布洛妮娅", similarity: 92, matchedCharacters: byCharacter ? ["希儿", "布洛妮娅"] : [] },
-            { workId: 2, title: "夏日短篇集", similarity: 61, matchedCharacters: [] },
-            { workId: 4, title: "月色图文辑～甘雨", similarity: 44, matchedCharacters: byCharacter ? ["甘雨"] : [] },
-          ],
-        },
-      ],
-      unknownAuthorGroups: [
-        { author: "藤原さくら", files: ["D:\\完整版\\【作者：藤原さくら】甘雨と旅人の夜.txt", "D:\\完整版\\【作者：藤原さくら】绫波、結婚します.epub"] },
-        { author: "夜凪", files: ["D:\\完整版\\【作者：夜凪】长离的雨夜.txt"] },
-      ],
-    };
   }
   if (command === "auto_group_purchased_files") {
     const byCharacter = args.mode === "character";
@@ -5597,11 +5575,13 @@ function showModal(markup) {
 function closeModal() {
   // 设置面板是自动保存的：趁表单还在 DOM 里，把还压在防抖里的改动先收下来写掉，关上不丢
   const settingsForm = document.querySelector("#settings-form");
-  if (settingsForm && state.settingsSaveTimer) {
+  // v1.3.9：文本类输入框在编辑期间不保存（只标 settingsDirty）——直接关窗也要把攒着的改动收下来
+  if (settingsForm && (state.settingsSaveTimer || state.settingsDirty)) {
     window.clearTimeout(state.settingsSaveTimer);
     state.settingsSaveTimer = 0;
     try {
       const values = collectSettings(settingsForm);
+      state.settingsDirty = false;
       invoke("save_app_settings", { settings: values })
         .then(() => { state.searchSites = values.searchSites; state.settings = { ...state.settings, ...values }; })
         .catch((error) => toast(`设置没保存：${error}`, "error"));
@@ -6169,14 +6149,15 @@ async function bindEvents() {
       if (action === "import-works") importModal();
       if (action === "sync-pixiv") pixivSyncModal();
       if (action === "scan-preview") await scanPreview();
-      if (action === "scan-purchased") pickMatchMode({ action: "scan-purchased" }, "关联完整版文件", "先选择用哪种方式在作者的作品里找对应作品。");
+      // v1.3.9：和作者库的「指定作者自动匹配」并成同一套 —— 作者固定为当前作品库这位（不再先选作者）。
+      // 匹配范围＝设置里的「完整版自动匹配文件夹」（这是「指定作者自动匹配」的既定语义）。
+      if (action === "scan-purchased") pickMatchMode({ action: "auto-group", authorId: state.activeAuthor.id, authorName: state.activeAuthor.name }, "关联完整版文件", `先选择用哪种方式在「${escapeHtml(state.activeAuthor.name)}」的作品里匹配（匹配范围＝设置里的「完整版自动匹配文件夹」）。`);
       if (action === "pick-match-mode") {
         const mode = element.dataset.mode === "character" ? "character" : "title";
         const intent = state.pendingMatch;
         state.pendingMatch = null;
         closeModal();
-        if (intent?.action === "scan-purchased") await scanPurchased(mode);
-        else if (intent?.action === "auto-group") await autoGroupPurchasedFiles(intent.authorId ?? null, intent.authorName || "", mode);
+        if (intent?.action === "auto-group") await autoGroupPurchasedFiles(intent.authorId ?? null, intent.authorName || "", mode);
         return;
       }
       // 作品卡上的「三个点」现在直接开详情页，原来那个菜单的功能都搬进详情里了
@@ -6780,7 +6761,6 @@ async function bindEvents() {
       if (action === "export-backup") await exportBackup();
       if (action === "restore-backup") await restoreBackup();
       if (action === "clean-preview-versions") await cleanupPreviewVersions();
-      if (action === "confirm-matches") await confirmMatches();
       if (action === "confirm-manual-group") await confirmManualGroup();
       if (action === "confirm-action") await runConfirmedAction();
     } catch (error) { toast(String(error), "error"); }
@@ -7074,19 +7054,32 @@ async function bindEvents() {
       }
     });
     settingsForm.dataset.bound = "true";
-    // 自动保存：表单里任何一处改动（含槽位里后插的输入框）停手半秒就写库，不再有「保存设置」按钮
+    // 自动保存（v1.3.9 起**只在不编辑的时候存**，用户 2026-10-14 定）：打字期间一次库都不写，
+    // 光标离开输入框（失焦）或编辑结束后统一落盘。老的「停手半秒就保存」在数字 / 关键词这类
+    // 连着敲的框上仍有顿感 —— 保存再快也不该插进输入过程里。
+    const isTextEditingControl = (element) => {
+      const tag = element?.tagName;
+      if (tag === "TEXTAREA") return true;
+      if (tag !== "INPUT") return false;
+      return !["checkbox", "radio", "file", "color", "range"].includes((element.type || "text").toLowerCase());
+    };
     settingsForm.addEventListener("input", (event) => {
       // 又在改网址了：上一条「已自动清洗」的说明已经过期，先撤掉
       event.target?.closest?.(".search-site-item")?.querySelector(".search-site-hint")?.remove();
-      scheduleSettingsSave(settingsForm);
+      state.settingsDirty = true;
+      setSettingsSaveState("改动待保存…", "busy");
+      // 勾选 / 下拉这类没有"正在编辑"的状态：立即保存；文本类等失焦（见下面的 focusout）
+      if (!isTextEditingControl(event.target)) scheduleSettingsSave(settingsForm);
     });
-    // 网址失焦时自动清洗（行是后加的，所以走委托）：改了就写回输入框并说明改了什么
+    // 光标离开输入框：先做网址自动清洗（行是后加的，走委托），然后把攒着的改动落盘
     settingsForm.addEventListener("focusout", (event) => {
       const input = event.target?.closest?.(".search-site-url");
-      if (!input) return;
-      const before = input.value;
-      cleanSearchUrlInput(input);
-      if (input.value !== before) scheduleSettingsSave(settingsForm);
+      if (input) {
+        const before = input.value;
+        cleanSearchUrlInput(input);
+        if (input.value !== before) state.settingsDirty = true;
+      }
+      if (state.settingsDirty) scheduleSettingsSave(settingsForm, 150);
     });
     settingsForm.addEventListener("change", () => scheduleSettingsSave(settingsForm));
     // 表单里已经没有提交按钮，万一按回车触发隐式提交，就当一次「立刻保存」处理
@@ -7206,39 +7199,6 @@ async function scanPreview() {
   else toast("未找到可匹配的预览版内容或封面，请检查名称与目录第一层文件", "info");
   await refreshActiveAuthor();
   render();
-}
-
-async function scanPurchased(mode = "title") {
-  if (!state.activeAuthor.purchasedDir) {
-    throw new Error("请先在作者设置中选择完整版文件夹");
-  }
-  const byCharacter = mode === "character";
-  const result = await invoke("scan_purchased", { authorId: state.activeAuthor.id, mode });
-  // 同步时下下来就已经绑好的文件，后端直接跳过、不会再列出来让人重绑一遍
-  const skipped = result.skippedCount || 0;
-  const skipNote = skipped ? `，另有 ${skipped} 个文件已关联过、已跳过` : "";
-  const unknownGroups = result.unknownAuthorGroups || [];
-  const unknownCount = unknownGroups.reduce((sum, group) => sum + group.files.length, 0);
-  const unknownNote = unknownCount ? `，另有 ${unknownCount} 个文件的作者不在作者库里，已单独列出` : "";
-  // 文件名写着库里另一位作者的文件：不属于这个目录，后端已跳过
-  const otherNote = result.otherAuthorCount ? `，${result.otherAuthorCount} 个文件写着别的作者、已跳过` : "";
-  if (result.selections.length) {
-    // 按角色匹配时后端不做任何自动绑定，全部交给用户确认
-    const head = byCharacter
-      ? `按角色找到 ${result.selections.length} 个候选文件，请逐个确认`
-      : `已自动绑定 ${result.boundCount} 个作品${skipNote}，${result.selections.length} 个完整版文件待您选择`;
-    toast(`${head}${byCharacter ? unknownNote : ""}${otherNote}`, "info");
-    showPurchasedSelections(result.selections, unknownGroups, mode);
-  } else if (unknownCount) {
-    toast(`${byCharacter ? "没有角色的名字能对上" : "没有新的完整版文件需要关联"}，另有 ${unknownCount} 个文件的作者不在作者库里${otherNote}`, "info");
-    showPurchasedSelections([], unknownGroups, mode);
-  } else if (result.boundCount === 0 && skipped) {
-    toast(`没有新的完整版文件需要关联，${skipped} 个文件此前已关联${otherNote}`, "info");
-  } else if (byCharacter) {
-    toast(`没有角色的名字能对上，换个方式或用「匹配标题」试试${otherNote}`, "info");
-  } else toast(`已自动绑定 ${result.boundCount} 个完整版作品${skipNote}${otherNote}`, "success");
-  await refreshWorks(); await refreshActiveAuthor(); render();
-  fillWordCountsInBackground(true); // 刚绑上的文件是新的，字数要当场补上
 }
 
 // 自动匹配：authorId 为空＝全库匹配；传入作者 id 时只在这位作者的作品里匹配
@@ -8299,36 +8259,6 @@ function unknownAuthorSection(groups, withCandidates = false) {
   </section>`;
 }
 
-function showPurchasedSelections(selections, unknownGroups = [], mode = "title") {
-  // 结构与「自动匹配」的选择弹窗对齐：宽弹窗 + 文件名超长时省略号（不再把弹窗撑宽）
-  const byCharacter = mode === "character";
-  const rows = selections.map((selection) => {
-    const fileName = selection.path.split(/[\\/]/).pop();
-    const options = [`<option value="">暂不绑定</option>`]
-      .concat(selection.candidates.map((candidate) => {
-        // 按角色匹配时括号里给命中的角色名，比相似度更能说明为什么是它
-        const tail = byCharacter && candidate.matchedCharacters && candidate.matchedCharacters.length
-          ? `角色：${candidate.matchedCharacters.join("、")}`
-          : `${candidate.similarity}%`;
-        return `<option value="${candidate.workId}">${escapeHtml(candidate.title)}（${escapeHtml(tail)}）</option>`;
-      }))
-      .join("");
-    const hint = `<span class="group-file-hint">${selection.candidates.length} 个候选作品</span>`;
-    return `<div class="group-item">
-      <div class="group-file">${authorTagHtml(selection.authorName)}<span class="group-file-main"><span class="group-file-name" title="${escapeHtml(selection.path)}">${escapeHtml(fileName)}</span>${characterTagsHtml(selection.matchedCharacters)}</span>${hint}</div>
-      <div class="group-options"><label class="match-row"><span>关联到作品</span><select data-purchased-path="${escapeHtml(selection.path)}">${options}</select></label></div>
-    </div>`;
-  }).join("");
-  const note = byCharacter
-    ? `按角色名匹配出来的候选：角色名对得上就会列在这里，不管标题像不像，所以请逐个确认。下拉框括号里是命中的角色名。`
-    : `有多个候选作品时请手动选择；未达到相似度阈值的文件仅列出相似度最高的 3 个作品。`;
-  const empty = selections.length ? "" : `<p class="match-note">没有需要确认的文件。</p>`;
-  showModal(modal("选择要关联的作品",
-    `<p class="match-note">${note}</p>${empty}<div class="match-list">${rows}</div>${unknownAuthorSection(unknownGroups)}`,
-    `<button class="quiet-button" data-action="close-modal">稍后处理</button><button class="primary-button" data-action="confirm-matches" ${selections.length ? "" : "disabled"}>确认绑定</button>`,
-    "is-wide"));
-}
-
 function showManualGroupSelections(selections, unknownGroups = [], mode = "title", preselect = false) {
   const byCharacter = mode === "character";
   const rows = selections.map((selection, groupIndex) => {
@@ -8376,27 +8306,6 @@ function showManualGroupSelections(selections, unknownGroups = [], mode = "title
     `<button class="quiet-button" data-action="close-modal">稍后处理</button>
      <button class="primary-button" data-action="confirm-manual-group" ${selections.length ? "" : "disabled"}>确认分组</button>`
   , "is-wide"));
-}
-
-async function confirmMatches() {
-  const selections = [...document.querySelectorAll("[data-purchased-path]")].map((select) => ({ workId: Number(select.value), path: select.dataset.purchasedPath })).filter((item) => item.workId);
-  let renamedCount = 0;
-  for (const item of selections) {
-    try {
-      const newPath = await invoke("bind_work_moving_to_purchased", item);
-      if (newPath !== item.path) renamedCount++;
-    } catch (error) {
-      console.error("绑定失败:", error);
-      toast(`绑定失败: ${error}`, "error");
-    }
-  }
-  closeModal(); await refreshWorks(); await refreshActiveAuthor(); render();
-  fillWordCountsInBackground(true); // 绑定完整版会改路径，字数要当场补上
-  if (renamedCount > 0) {
-    toast(`已确认绑定 ${selections.length} 个完整版作品，其中 ${renamedCount} 个文件已重命名`, "success");
-  } else {
-    toast(`已确认绑定 ${selections.length} 个完整版作品`, "success");
-  }
 }
 
 async function confirmManualGroup() {
@@ -9163,6 +9072,7 @@ async function flushSettingsSave(form) {
   if (!form || !form.isConnected) return;
   try {
     const values = await persistSettings(form);
+    state.settingsDirty = false;
     const time = new Date().toTimeString().slice(0, 8);
     setSettingsSaveState(`已自动保存 ${time}${values.searchSites.length ? `（${values.searchSites.length} 个搜索网站）` : ""}`, "done");
   } catch (error) {
@@ -9292,7 +9202,7 @@ async function settingsModal() {
     </div>
     </div>
   </section>  </section>
-</form>`, "", "is-wide"));
+</form>`, `<span class="settings-save-state" id="settings-save-state"></span>`, "is-wide"));
   bindCharacterEditorInputs();
   await renderCharacterEditor();
   renderSearchSiteEditor(settings.searchSites || []);
