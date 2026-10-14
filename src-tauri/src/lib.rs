@@ -792,6 +792,48 @@ fn migrate_epub_word_counts(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// v1.3.5：DOCX 从这一版起能算出字数（解包读 `word/document.xml`）。
+/// 和 v1.2.94 的 EPUB 同款处理：把老库里那些「已经算过、但结果是 0」的 DOCX 标回未算（-1），
+/// 让启动那轮 `refresh_word_counts` 重新算一遍 —— 否则它们永远停在 0，用户看不到新功能。
+///
+/// 只跑一次（`app_settings` 里一个 flag 守）。
+fn migrate_docx_word_counts(conn: &Connection) -> Result<(), String> {
+    if setting(conn, "docx_word_counts_reset")? == "1" {
+        return Ok(());
+    }
+    let rows: Vec<(i64, String, String)> = {
+        let mut statement = conn
+            .prepare("SELECT id, purchased_path, preview_path FROM works")
+            .map_err(|e| e.to_string())?;
+        let mapped = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for (id, purchased_path, preview_path) in rows {
+        // 和 `refresh_word_counts_impl` 同一套取路径规矩：完整版优先
+        let path = if purchased_path.trim().is_empty() {
+            preview_path
+        } else {
+            purchased_path
+        };
+        if extension_of(Path::new(&path)).as_deref() != Some("docx") {
+            continue;
+        }
+        conn.execute("UPDATE works SET word_count = -1 WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+    }
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('docx_word_counts_reset', '1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn db() -> Result<Connection, String> {
     let path = app_data_dir()?.join("library.db");
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
@@ -1082,6 +1124,8 @@ fn db() -> Result<Connection, String> {
     // 让启动那轮后台补算重新算一遍（否则它们永远停在 0，用户看不到新功能）。
     // 必须排在上面那条 v1.2.18 的迁移之后，两条各管各的、都只跑一次。
     let _ = migrate_epub_word_counts(&conn);
+    // DOCX 从 v1.3.5 起同理（解包读 document.xml）—— 老库里停在 0 的 DOCX 也标回未算。
+    let _ = migrate_docx_word_counts(&conn);
     // 常见角色名表：用于「按角色匹配」的自动匹配 / 关联完整版文件。
     // game 只用来分组展示，不参与匹配；name 与 aliases（`|` 分隔）都会拿去匹配。
     let _ = conn.execute(
@@ -2069,12 +2113,20 @@ fn epub_file_word_count(path: &Path) -> Option<usize> {
     Some(count_non_whitespace(&epub_text(path)?))
 }
 
-/// 能当「正文」数出字数的扩展名白名单：txt 与 epub（v1.2.94 起收了 epub）。
+/// DOCX 的字数（v1.3.5）：和 EPUB 同一套路 —— 解包抽正文，再按同一口径数非空白字符。
+/// 失败（坏包 / 加密 / 没有 document.xml）返回 None，界面照旧显示格式名「DOCX」而不是假字数。
+fn docx_file_word_count(path: &Path) -> Option<usize> {
+    Some(count_non_whitespace(&docx_text(path)?))
+}
+
+/// 能当「正文」数出字数的扩展名白名单：txt、epub（v1.2.94 起）、docx（v1.3.5 起）。
 ///
-/// txt 是直接读文本；epub 要先解包（见 `epub_file_word_count`）。
-/// 其余（MOBI / AZW3 / PDF / HTML）**故意不在里面** —— 解析复杂度和收益不成正比，
+/// txt 是直接读文本；epub 要先解包（见 `epub_file_word_count`）；
+/// docx 同样是 zip+XML（见 `docx_file_word_count`），中文提取干净。
+/// 其余（MOBI / AZW3 / PDF / HTML）**故意不在里面** —— 解析复杂度和收益不成正比
+///（PDF 尤甚：没有 ToUnicode 映射的中文 PDF 提出来是乱码，数出来的就是假字数），
 /// 它们照旧算不出字数、界面显示格式名。
-const TEXT_BODY_EXTENSIONS: &[&str] = &["txt", "epub"];
+const TEXT_BODY_EXTENSIONS: &[&str] = &["txt", "epub", "docx"];
 
 fn is_text_body_path(path: &Path) -> bool {
     extension_of(path)
@@ -2094,11 +2146,12 @@ fn extension_of(path: &Path) -> Option<String> {
         .filter(|extension| !extension.is_empty())
 }
 
-/// 单个文件的字数：txt 直接读、epub 先解包；其余格式返回 None（＝算不出）。
+/// 单个文件的字数：txt 直接读、epub / docx 先解包；其余格式返回 None（＝算不出）。
 fn file_word_count(path: &Path) -> Option<usize> {
     match extension_of(path)?.as_str() {
         "txt" => text_file_word_count(path),
         "epub" => epub_file_word_count(path),
+        "docx" => docx_file_word_count(path),
         _ => None,
     }
 }
@@ -3084,6 +3137,74 @@ fn epub_text(path: &Path) -> Option<String> {
     (!out.trim().is_empty()).then_some(out)
 }
 
+/// 从 DOCX 里抽出正文（v1.3.5）：解包读 `word/document.xml`。
+///
+/// 和 EPUB 同理：失败（坏包 / 加密 / 找不到 document.xml）返回 None，
+/// 让这一篇进「没找到正文」名单，不能因为一个坏文件把整次搜索带崩。
+fn docx_text(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    // 标准路径是 `word/document.xml`；个别工具会换大小写，忽略大小写找一遍
+    let mut target: Option<String> = None;
+    for index in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(index) {
+            if entry.name().eq_ignore_ascii_case("word/document.xml") {
+                target = Some(entry.name().to_string());
+                break;
+            }
+        }
+    }
+    let mut entry = archive.by_name(&target?).ok()?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes).ok()?;
+    let text = docx_document_text(&decode_text_bytes(&bytes));
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// DOCX 的 `word/document.xml` → 纯文本。
+///
+/// 只认两件事：`<w:t>` 里的文字算正文 —— `<w:instrText>`（域代码）、`<w:delText>`
+/// （修订删掉的文字）天然被排除，不会混进字数；段落 `<w:p`、换行 `<w:br` 处断行，
+/// 制表 `<w:tab` 补一个制表符。手写扫描和项目里其它 XML 处理（epub 抽正文、封面判据）同风格。
+///
+/// 实体（`&amp;` 这些）不还原 —— 和 html 那条路一致，对字数和检索的影响可以忽略。
+fn docx_document_text(xml: &str) -> String {
+    let source = strip_xml_comments(xml);
+    let mut out = String::with_capacity(source.len());
+    let mut index = 0usize;
+    let mut capturing = false;
+    while index < source.len() {
+        if source.as_bytes()[index] == b'<' {
+            let Some(offset) = source[index..].find('>') else {
+                break;
+            };
+            let tag = &source[index + 1..index + offset];
+            let closing = tag.starts_with('/');
+            let name = tag
+                .trim_start_matches('/')
+                .split(|character: char| character.is_whitespace() || character == '/')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            match name.as_str() {
+                // 只有 `<w:t>` 的内容是正文；`w:tab` / `w:tbl` / `w:tblPr` 这些前缀像的都不算
+                "w:t" => capturing = !closing,
+                "w:p" | "w:br" => push_line_break(&mut out),
+                "w:tab" => out.push('\t'),
+                _ => {}
+            }
+            index += offset + 1;
+            continue;
+        }
+        let character = source[index..].chars().next().unwrap_or(' ');
+        if capturing {
+            out.push(character);
+        }
+        index += character.len_utf8();
+    }
+    out
+}
+
 /// 一篇作品的正文纯文本：txt/md 直接读，html 剥标签，epub 抽内页。
 /// 认不出的扩展名返回 None（不是错误 —— 大部分作品本来就没绑阅读版）。
 fn text_search_document(path: &Path) -> Option<String> {
@@ -3109,6 +3230,8 @@ fn text_search_document(path: &Path) -> Option<String> {
             }
             epub_text(path)
         }
+        // v1.3.5：docx 解包读 document.xml（和字数用的是同一个提取器，不会两处漂）
+        "docx" => docx_text(path),
         _ => None,
     }
 }
@@ -4489,10 +4612,14 @@ fn sync_preview_entries(
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .map(|extension| {
+                    // v1.3.5：pdf / docx / doc 也算作品文件（绑定对话框本来就认它们）
                     extension.eq_ignore_ascii_case("txt")
                         || extension.eq_ignore_ascii_case("epub")
                         || extension.eq_ignore_ascii_case("html")
                         || extension.eq_ignore_ascii_case("htm")
+                        || extension.eq_ignore_ascii_case("pdf")
+                        || extension.eq_ignore_ascii_case("docx")
+                        || extension.eq_ignore_ascii_case("doc")
                 })
                 .unwrap_or(false);
         if !is_cover && !is_preview {
@@ -9915,10 +10042,14 @@ fn scan_preview_existing(author_id: i64) -> Result<ScanPreviewResult, String> {
                     .and_then(|ext| ext.to_str())
                     .map(|ext| {
                         // v1.3.1：作品现在绑的就是 epub / html 阅读版，扫描关联时得认它们。
+                        // v1.3.5：pdf / docx / doc 同类放行。
                         ext.eq_ignore_ascii_case("txt")
                             || ext.eq_ignore_ascii_case("epub")
                             || ext.eq_ignore_ascii_case("html")
                             || ext.eq_ignore_ascii_case("htm")
+                            || ext.eq_ignore_ascii_case("pdf")
+                            || ext.eq_ignore_ascii_case("docx")
+                            || ext.eq_ignore_ascii_case("doc")
                     })
                     .unwrap_or(false)
             {
@@ -10006,10 +10137,14 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| {
+                    // v1.3.5：pdf / docx / doc 也算作品文件（和绑定对话框同一口径）
                     ext.eq_ignore_ascii_case("txt")
                         || ext.eq_ignore_ascii_case("epub")
                         || ext.eq_ignore_ascii_case("html")
                         || ext.eq_ignore_ascii_case("htm")
+                        || ext.eq_ignore_ascii_case("pdf")
+                        || ext.eq_ignore_ascii_case("docx")
+                        || ext.eq_ignore_ascii_case("doc")
                 })
                 .unwrap_or(false);
         if !is_cover && !is_preview {
@@ -16631,11 +16766,13 @@ fn read_import_file(path: String, column: usize) -> Result<Vec<String>, String> 
     Ok(values)
 }
 
-/// 文件夹导入认哪些扩展名（v1.2.92：从"只有 txt"放宽到 txt / epub / html）。
+/// 文件夹导入认哪些扩展名（v1.2.92：从"只有 txt"放宽到 txt / epub / html；
+/// v1.3.5 再加 pdf / docx / doc —— 它们和 mobi 一样属于「能绑、能开、算不出字数」的一档，
+/// 其中 docx 还进得了字数与检索，见 `docx_text()`）。
 fn import_folder_extension_allowed(extension: &str) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "txt" | "epub" | "html" | "htm"
+        "txt" | "epub" | "html" | "htm" | "pdf" | "docx" | "doc"
     )
 }
 
@@ -17362,7 +17499,7 @@ mod tests {
         EXPORT_COL_COVER_PATH, EXPORT_COL_NOVEL_ID, EXPORT_COL_IMAGES, EXPORT_COL_SYNOPSIS,
         text_word_count, is_text_body_path, TEXT_BODY_EXTENSIONS,
         file_word_count, epub_file_word_count, count_non_whitespace, extension_of,
-        migrate_epub_word_counts,
+        migrate_epub_word_counts, migrate_docx_word_counts,
         apply_author_status, check_pixiv_author_impl, classify_author_status,
         title_indicates_images, unique_target_path, write_reading_output,
         text_has_raw_novel_image_tokens, detail_has_embedded_images,
@@ -18934,6 +19071,10 @@ mod tests {
         // v1.2.92：epub / html 也算作品（以前只认 txt，这两种一个都进不来）
         assert!(should_import_folder_entry(false, "epub", 4096, 1024));
         assert!(should_import_folder_entry(false, "HTML", 4096, 1024));
+        // v1.3.5：pdf / docx / doc 也算作品
+        assert!(should_import_folder_entry(false, "pdf", 4096, 1024));
+        assert!(should_import_folder_entry(false, "docx", 4096, 1024));
+        assert!(should_import_folder_entry(false, "DOC", 4096, 1024));
         // 别的扩展名照旧不收
         assert!(!should_import_folder_entry(false, "jpg", 4096, 1024));
         // 同步落下的配图目录不是作品
@@ -21581,6 +21722,51 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// v1.3.5：DOCX 能算字数、能检索，口径和 TXT / EPUB 同一条（非空白字符）。
+    /// 同时钉住：`<w:instrText>`（域代码）与 `<w:delText>`（修订删文）**不算**正文。
+    #[test]
+    fn docx_word_count_and_search_ignore_non_body_text() {
+        let root = std::env::temp_dir().join(format!("docx-words-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let docx = root.join("真文档.docx");
+        {
+            let mut writer = zip::ZipWriter::new(fs::File::create(&docx).unwrap());
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            // 正文两段；域代码与修订删文各来一段（都不该算进正文）
+            let body = concat!(
+                r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="x"><w:body>"#,
+                r#"<w:p><w:r><w:t>一二三四五</w:t></w:r></w:p>"#,
+                r#"<w:p><w:r><w:instrText>PAGE MERGEFORMAT</w:instrText><w:t>六七八</w:t></w:r></w:p>"#,
+                r#"<w:p><w:del><w:r><w:delText>不该算的字</w:delText></w:r></w:del></w:p>"#,
+                r#"<w:p><w:r><w:t xml:space="preserve">九十</w:t></w:r></w:p>"#,
+                r#"</w:body></w:document>"#,
+            );
+            writer.start_file("word/document.xml", options).unwrap();
+            writer.write_all(body.as_bytes()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // 正文一共「一二三四五六七八九十」＝10 个字；域代码 / 删文 / 标签都不算
+        let count = text_word_count(&docx.to_string_lossy()).unwrap();
+        assert_eq!(count, 10, "DOCX 字数按非空白字符算，且排除域代码与修订删文");
+        assert_eq!(file_word_count(&docx).map(|n| n as i64), Some(10));
+
+        // 全文检索能读出同一份正文（和字数共用提取器，不会两处漂）
+        let text = text_search_document(&docx).expect("docx 应当能抽出正文");
+        assert!(text.contains("一二三四五") && text.contains("九十"));
+        assert!(!text.contains("MERGEFORMAT") && !text.contains("不该算的字"));
+
+        // 坏包算不出 —— 不能把 zip 字节当乱码数进去（同 v1.2.18 的教训）
+        let broken = root.join("坏文档.docx");
+        fs::write(&broken, [0x50_u8, 0x4b, 0x03, 0x04, 0xff, 0x00]).unwrap();
+        assert_eq!(text_word_count(&broken.to_string_lossy()), None);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// v1.2.98：新建作品导入 epub 时，取**首图**当封面。
     /// 四条边界一起钉住：只认 epub；取第一张图（跳过 META-INF 与目录项）；
     /// **已有封面时一个字都不动**；没图/非 epub 就别写。
@@ -22074,13 +22260,34 @@ mod tests {
         assert_eq!(stored(2), 5, "txt 不能动");
         assert_eq!(stored(3), 0, "MOBI 不是 epub，不能动");
 
-        // 两条迁移都只跑一次：再调不该有任何改动
+        // v1.3.5 那条：DOCX 停在 0 的也标回未算；pdf 之类的不能动
+        let docx_path = root.join("丁的文档.docx");
+        fs::write(&docx_path, b"PK-not-really").unwrap();
+        let pdf_path = root.join("戊的文档.pdf");
+        fs::write(&pdf_path, b"%PDF-1.4").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, title, purchased_path, word_count) VALUES (4, '丁的 docx', ?1, 0), (5, '戊的 pdf', ?2, 0)",
+            rusqlite::params![
+                docx_path.to_string_lossy().to_string(),
+                pdf_path.to_string_lossy().to_string()
+            ],
+        )
+        .unwrap();
+        migrate_docx_word_counts(&conn).unwrap();
+        assert_eq!(stored(4), -1, "DOCX 要重新排队等重算");
+        assert_eq!(stored(5), 0, "PDF 不是 docx，不能动");
+
+        // 三条迁移都只跑一次：再调不该有任何改动
         conn.execute("UPDATE works SET word_count = 0 WHERE id = 1", [])
+            .unwrap();
+        conn.execute("UPDATE works SET word_count = 0 WHERE id = 4", [])
             .unwrap();
         migrate_epub_word_counts(&conn).unwrap();
         migrate_word_counts_for_non_text_files(&conn).unwrap();
+        migrate_docx_word_counts(&conn).unwrap();
         assert_eq!(stored(1), 0, "epub 迁移只跑一次");
         assert_eq!(stored(3), 0, "非文本迁移只跑一次");
+        assert_eq!(stored(4), 0, "docx 迁移只跑一次");
 
         fs::remove_dir_all(&root).unwrap();
     }

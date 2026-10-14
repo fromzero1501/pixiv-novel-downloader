@@ -3675,7 +3675,7 @@ async function detailSetVersion(workId, asFull) {
 async function detailBindPreview(workId) {
   const picked = await open({
     multiple: false,
-    filters: [{ name: "文本 / 电子书", extensions: ["txt", "md", "html", "htm", "epub", "mobi", "azw3", "pdf"] }],
+    filters: [{ name: "文本 / 电子书", extensions: ["txt", "md", "html", "htm", "epub", "mobi", "azw3", "pdf", "docx", "doc"] }],
   });
   if (!picked) return;
   try {
@@ -3711,7 +3711,7 @@ async function detailBindFile(workId) {
   const path = await open({
     directory: false,
     multiple: false,
-    filters: [{ name: "作品文件", extensions: ["txt", "md", "html", "htm", "xhtml", "epub", "mobi", "azw", "azw3", "fb2", "lit", "pdf"] }],
+    filters: [{ name: "作品文件", extensions: ["txt", "md", "html", "htm", "xhtml", "epub", "mobi", "azw", "azw3", "fb2", "lit", "pdf", "docx", "doc"] }],
   });
   if (!path) return;
   let movedPath = "";
@@ -5434,7 +5434,7 @@ async function bindSeriesBundle() {
   }
   const path = await open({
     multiple: false,
-    filters: [{ name: "文本 / 电子书", extensions: ["txt", "md", "html", "htm", "epub", "mobi", "azw3", "pdf"] }],
+    filters: [{ name: "文本 / 电子书", extensions: ["txt", "md", "html", "htm", "epub", "mobi", "azw3", "pdf", "docx", "doc"] }],
   });
   if (!path) return;
   await startSeriesBundle(path);
@@ -5636,7 +5636,7 @@ function importModal() {
       <label>选择 Excel 或 CSV 文件 <div class="path-input"><input name="filePath" readonly placeholder="尚未选择文件"><button type="button" class="quiet-button" data-action="pick-import-file">选择文件</button></div></label>
     </form>
     <form id="folder-import-form" class="form-stack import-panel is-hidden" data-panel="folder">
-      <label>选择作品文件夹 <div class="path-input"><input name="folderPath" readonly placeholder="尚未选择文件夹"><button type="button" class="quiet-button" data-action="pick-import-folder">选择文件夹</button></div><small>会递归找出文件夹里所有的 <strong>TXT、EPUB、HTML</strong> 文件（以及自定义分组用的文件夹），文件名里的发布日期会自动提取。勾中新建的会顺手<strong>绑成完整版并搬进这位作者的完整版目录</strong>。最小作品字数可在设置中调整。</small></label>
+      <label>选择作品文件夹 <div class="path-input"><input name="folderPath" readonly placeholder="尚未选择文件夹"><button type="button" class="quiet-button" data-action="pick-import-folder">选择文件夹</button></div><small>会递归找出文件夹里所有的 <strong>TXT、EPUB、HTML、PDF、Word</strong> 文件（以及自定义分组用的文件夹），文件名里的发布日期会自动提取。勾中新建的会顺手<strong>绑成完整版并搬进这位作者的完整版目录</strong>。最小作品字数可在设置中调整。</small></label>
     </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="submit-import">预览新建结果</button>`));
 }
 
