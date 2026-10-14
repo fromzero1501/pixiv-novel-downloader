@@ -4585,6 +4585,28 @@ fn refresh_reading_image_count(conn: &Connection, work_id: i64) -> bool {
     .is_ok()
 }
 
+/// 绑定换成「纯 txt」（旁边没有 `_images` 配图目录）时，把带图标记和图片数一起清掉（v1.3.6）。
+///
+/// 起因：epub 转 txt 后卡片上还挂着图片角标 —— 图已经不在（txt 显示不了图、`_images`
+/// 也早被回收），旧阅读版留下的 `image_count` / `has_images` 却没人清。
+/// **有 `_images` 目录的图文 txt 不算**（那种本来就该是带图版，见 v1.2.100 的口径）。
+///
+/// 返回是否真的清过（调用方一般不看）。
+fn clear_image_flags_for_plain_txt(conn: &Connection, work_id: i64, path: &Path) -> bool {
+    if extension_of(path).as_deref() != Some("txt") {
+        return false;
+    }
+    if novel_images_dir(path).is_dir() {
+        return false;
+    }
+    conn.execute(
+        "UPDATE works SET image_count=0, has_images=0 WHERE id=?1 AND (image_count<>0 OR has_images<>0)",
+        [work_id],
+    )
+    .map(|changed| changed > 0)
+    .unwrap_or(false)
+}
+
 fn sync_preview_entries(
     preview_dir: &Path,
     minimum_text_count: u64,
@@ -5199,10 +5221,14 @@ fn plan_novel_images(
 }
 
 /// 下载配图，返回（成功张数，失败张数）。已存在的图不重复下载。
+///
+/// `on_progress(done, total)` 每处理完一张（含本来就存在的）回调一次 —— 单篇生成阅读版
+/// 拿它更新右下角进度浮层；同步等不需要细进度的调用点传空闭包即可（v1.3.6）。
 fn download_novel_images(
     client: &Client,
     slots: &[NovelImageSlot],
     images_dir: &Path,
+    on_progress: &mut dyn FnMut(usize, usize),
 ) -> (usize, usize) {
     if slots.is_empty() {
         return (0, 0);
@@ -5212,10 +5238,12 @@ fn download_novel_images(
     }
     let mut saved = 0;
     let mut failed = 0;
-    for slot in slots {
+    let total = slots.len();
+    for (index, slot) in slots.iter().enumerate() {
         let target = images_dir.join(&slot.file_name);
         if target.exists() {
             saved += 1;
+            on_progress(index + 1, total);
             continue;
         }
         match fetch_pixiv_cover(client, &slot.url) {
@@ -5233,6 +5261,7 @@ fn download_novel_images(
             }
             _ => failed += 1,
         }
+        on_progress(index + 1, total);
     }
     (saved, failed)
 }
@@ -5679,6 +5708,321 @@ fn epub_image_media_type(file_name: &str) -> &'static str {
     } else {
         "image/jpeg"
     }
+}
+
+// ============================ PDF 阅读版（v1.3.6） ============================
+//
+// 用 krilla（纯 Rust，MIT / Apache-2.0）写 PDF；字体取系统黑体做**子集嵌入**
+// （只嵌用到的字，一本几十万字的书字体部分也只有几十 KB）；正文逐字测量换行、
+// 自动分页；配图按其原文位置居中插入、封面放首页。探针（`examples/pdf_probe.rs`）
+// 已实测：中文渲染 / 混排 / 分页 / JPEG 直嵌 / 体积全部正常。
+
+/// 找一个能嵌入 PDF 的中文字体：黑体优先，其次楷体 / 仿宋 / 等线（都是**独立 TTF**，
+/// 可直接子集嵌入；`msyh.ttc` 这类集合字体不行）。返回（路径, 字节），
+/// 一个都找不到返回 None —— 调用方给出明确报错，不静默降级。
+fn find_pdf_font() -> Option<(PathBuf, Vec<u8>)> {
+    const CANDIDATES: &[&str] = &["simhei.ttf", "simkai.ttf", "simfang.ttf", "Deng.ttf"];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("SystemRoot") {
+        dirs.push(PathBuf::from(root).join("Fonts"));
+    }
+    dirs.push(PathBuf::from("C:/Windows/Fonts"));
+    for dir in dirs {
+        for name in CANDIDATES {
+            let path = dir.join(name);
+            if let Ok(bytes) = fs::read(&path) {
+                if !bytes.is_empty() {
+                    return Some((path, bytes));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 按文件扩展名选 krilla 的解码入口；失败返回 None（调用方计 missing）。
+/// JPEG 会原样直嵌（不重编码、不涨体积），PNG / GIF / WebP 由 krilla 解码。
+fn pdf_image_from_bytes(bytes: &[u8], path: &Path) -> Option<krilla::image::Image> {
+    let data: krilla::Data = std::sync::Arc::new(bytes.to_vec()).into();
+    let extension = extension_of(path).unwrap_or_default();
+    let result = match extension.as_str() {
+        "png" => krilla::image::Image::from_png(data, true),
+        "gif" => krilla::image::Image::from_gif(data, true),
+        "webp" => krilla::image::Image::from_webp(data, true),
+        _ => krilla::image::Image::from_jpeg(data, true),
+    };
+    result.ok()
+}
+
+/// PDF 的页面与排版参数（A4，四周留白约两厘米）。
+const PDF_PAGE_W: f32 = 595.28;
+const PDF_PAGE_H: f32 = 841.89;
+const PDF_MARGIN_X: f32 = 58.0;
+const PDF_MARGIN_TOP: f32 = 62.0;
+const PDF_MARGIN_BOTTOM: f32 = 58.0;
+const PDF_BODY_SIZE: f32 = 12.0;
+const PDF_BODY_LINE: f32 = 21.0;
+
+/// PDF 排版里的一行：一段文字，或一张图。
+enum PdfRow {
+    Text {
+        text: String,
+        size: f32,
+        indent: f32,
+        height: f32,
+    },
+    Picture {
+        image: krilla::image::Image,
+        width: f32,
+        height: f32,
+    },
+}
+
+/// 简易分页器：从页顶往下码行，放不下就翻页。
+struct PdfPager {
+    pages: Vec<Vec<PdfRow>>,
+    cursor: f32,
+}
+
+impl PdfPager {
+    fn new() -> Self {
+        Self {
+            pages: vec![Vec::new()],
+            cursor: PDF_MARGIN_TOP,
+        }
+    }
+
+    fn ensure_room(&mut self, height: f32) {
+        if self.cursor + height > PDF_PAGE_H - PDF_MARGIN_BOTTOM {
+            self.pages.push(Vec::new());
+            self.cursor = PDF_MARGIN_TOP;
+        }
+    }
+
+    fn push(&mut self, row: PdfRow, height: f32) {
+        self.ensure_room(height);
+        self.cursor += height;
+        self.pages.last_mut().unwrap().push(row);
+    }
+
+    fn gap(&mut self, height: f32) {
+        self.ensure_room(height);
+        self.cursor += height;
+    }
+}
+
+/// 生成一篇作品的 PDF 阅读版（v1.3.6）：正文流式排版 + 配图 + 封面，返回 PDF 字节。
+///
+/// 返回 `(missing, bytes)`：`missing` 是"拿不到 / 解不开、没能嵌进去"的图片数
+/// （会由调用方并进结果里报数）。失败（没有可用字体等）返回 Err，绝不出半成品。
+fn render_novel_pdf(
+    title: &str,
+    author_name: &str,
+    release_date: &str,
+    content: &str,
+    slots: &[NovelImageSlot],
+    images_dir: &Path,
+    cover_path: &str,
+) -> Result<(usize, Vec<u8>), String> {
+    use krilla::geom::{Point, Size, Transform};
+    use krilla::page::PageSettings;
+    use krilla::text::{Font, TextDirection};
+
+    let Some((_font_path, font_bytes)) = find_pdf_font() else {
+        return Err(
+            "找不到可嵌入 PDF 的中文字体（黑体 / 楷体 / 仿宋 / 等线），生成不了 PDF".into(),
+        );
+    };
+    let font_data: std::sync::Arc<Vec<u8>> = std::sync::Arc::new(font_bytes);
+    let face =
+        ttf_parser::Face::parse(&font_data, 0).map_err(|e| format!("字体解析失败：{e}"))?;
+    let upm = face.units_per_em() as f32;
+    let ascent = face.ascender() as f32 / upm;
+    let font = Font::new(font_data.clone().into(), 0)
+        .ok_or("PDF 字体加载失败：字体文件无法被排版引擎解析")?;
+
+    let advance = |ch: char, size: f32| -> f32 {
+        face.glyph_index(ch)
+            .and_then(|id| face.glyph_hor_advance(id))
+            .map(|units| units as f32 / upm * size)
+            .unwrap_or(size * 0.5)
+    };
+    let max_w = PDF_PAGE_W - PDF_MARGIN_X * 2.0;
+    let max_img_h = PDF_PAGE_H - PDF_MARGIN_TOP - PDF_MARGIN_BOTTOM - 40.0;
+
+    let mut pager = PdfPager::new();
+    let mut missing = 0usize;
+
+    // 一段文本按宽度换行后入页（first_indent 只作用于首行）
+    let push_text_block =
+        |pager: &mut PdfPager, text: &str, size: f32, line: f32, first_indent: f32| {
+            let mut current = String::new();
+            let mut width = 0.0;
+            let mut indent = first_indent;
+            for ch in text.chars() {
+                let ch_width = advance(ch, size);
+                if width + ch_width > max_w - indent && !current.is_empty() {
+                    pager.push(
+                        PdfRow::Text {
+                            text: std::mem::take(&mut current),
+                            size,
+                            indent,
+                            height: line,
+                        },
+                        line,
+                    );
+                    width = 0.0;
+                    indent = 0.0;
+                }
+                current.push(ch);
+                width += ch_width;
+            }
+            if !current.is_empty() {
+                pager.push(
+                    PdfRow::Text {
+                        text: current,
+                        size,
+                        indent,
+                        height: line,
+                    },
+                    line,
+                );
+            }
+        };
+
+    // 标题 + 作者 · 日期
+    push_text_block(&mut pager, title, 19.0, 30.0, 0.0);
+    pager.gap(6.0);
+    let meta_line = {
+        let author = author_name.trim();
+        let date = release_date.trim();
+        match (author.is_empty(), date.is_empty()) {
+            (false, false) => format!("{author} · {date}"),
+            (false, true) => author.to_string(),
+            (true, false) => date.to_string(),
+            (true, true) => String::new(),
+        }
+    };
+    if !meta_line.is_empty() {
+        push_text_block(&mut pager, &meta_line, 10.5, 18.0, 0.0);
+    }
+    pager.gap(16.0);
+
+    // 封面（可缺省）
+    if !cover_path.trim().is_empty() {
+        if let Ok(bytes) = fs::read(cover_path) {
+            if let Some(image) = pdf_image_from_bytes(&bytes, Path::new(cover_path)) {
+                let (pw, ph) = image.size();
+                if pw > 0 && ph > 0 {
+                    let scale =
+                        (max_w * 0.5 / pw as f32).min(max_img_h / ph as f32).min(1.0);
+                    let width = pw as f32 * scale;
+                    let height = ph as f32 * scale;
+                    pager.push(PdfRow::Picture { image, width, height }, height);
+                    pager.gap(20.0);
+                }
+            }
+        }
+    }
+
+    // 正文：按配图 token 把原文切成"文本段 / 图片"交替，文本段再按行分段排版
+    let push_text_segment = |pager: &mut PdfPager, segment: &str| {
+        for line in segment.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            push_text_block(
+                pager,
+                trimmed,
+                PDF_BODY_SIZE,
+                PDF_BODY_LINE,
+                PDF_BODY_SIZE * 2.0,
+            );
+            pager.gap(6.0);
+        }
+    };
+    let mut rest = content;
+    for slot in slots {
+        let Some(position) = rest.find(&slot.token) else {
+            continue;
+        };
+        let (before, after) = rest.split_at(position);
+        push_text_segment(&mut pager, before);
+        let image_path = images_dir.join(&slot.file_name);
+        match fs::read(&image_path)
+            .ok()
+            .and_then(|bytes| pdf_image_from_bytes(&bytes, &image_path))
+        {
+            Some(image) => {
+                let (pw, ph) = image.size();
+                if pw == 0 || ph == 0 {
+                    missing += 1;
+                } else {
+                    let scale = (max_w / pw as f32).min(max_img_h / ph as f32).min(1.0);
+                    let width = pw as f32 * scale;
+                    let height = ph as f32 * scale;
+                    pager.gap(8.0);
+                    pager.push(PdfRow::Picture { image, width, height }, height);
+                    pager.gap(10.0);
+                }
+            }
+            None => missing += 1,
+        }
+        rest = &after[slot.token.len()..];
+    }
+    push_text_segment(&mut pager, rest);
+
+    // 渲染：krilla 的坐标是左上原点、y 向下
+    let mut document = krilla::Document::new();
+    for rows in &pager.pages {
+        let mut page = document.start_page_with(
+            PageSettings::from_wh(PDF_PAGE_W, PDF_PAGE_H).expect("页面尺寸为正数"),
+        );
+        let mut surface = page.surface();
+        let mut cursor = PDF_MARGIN_TOP;
+        for row in rows {
+            match row {
+                PdfRow::Text {
+                    text,
+                    size,
+                    indent,
+                    height,
+                } => {
+                    let baseline = cursor + size * ascent;
+                    surface.draw_text(
+                        Point::from_xy(PDF_MARGIN_X + indent, baseline),
+                        font.clone(),
+                        *size,
+                        text,
+                        false,
+                        TextDirection::Auto,
+                    );
+                    cursor += height;
+                }
+                PdfRow::Picture {
+                    image,
+                    width,
+                    height,
+                } => {
+                    let x = PDF_MARGIN_X + (max_w - width) / 2.0;
+                    surface.push_transform(&Transform::from_translate(x, cursor));
+                    surface.draw_image(
+                        image.clone(),
+                        Size::from_wh(*width, *height).expect("图片尺寸为正数"),
+                    );
+                    surface.pop();
+                    cursor += height;
+                }
+            }
+        }
+        surface.finish();
+        page.finish();
+    }
+    let bytes = document
+        .finish()
+        .map_err(|e| format!("PDF 生成失败：{e}"))?;
+    Ok((missing, bytes))
 }
 
 /// 正文转 XHTML（EPUB 是 XML，空元素必须自闭合），图片指向包内的 `images/`。
@@ -6466,16 +6810,20 @@ fn epub_target_path(text_path: &Path, output_dir: &str) -> PathBuf {
     Path::new(dir).join(file_name)
 }
 
-/// 同步图文小说时自动保留的阅读版格式，由设置项 `sync_image_format` 决定。
+/// 同步图文小说时自动保留的阅读版格式，由设置项 `sync_image_format` 决定
+/// （设置里只有 HTML / EPUB 两档；`Pdf` 是 v1.3.6 起详情「生成 PDF 版」按钮专用的）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReadingFormat {
     Html,
     Epub,
+    Pdf,
 }
 
 fn reading_format_of(value: &str) -> ReadingFormat {
     if value.trim().eq_ignore_ascii_case("epub") {
         ReadingFormat::Epub
+    } else if value.trim().eq_ignore_ascii_case("pdf") {
+        ReadingFormat::Pdf
     } else {
         ReadingFormat::Html
     }
@@ -6487,6 +6835,8 @@ impl ReadingFormat {
         match self {
             ReadingFormat::Html => ReadingFormat::Epub,
             ReadingFormat::Epub => ReadingFormat::Html,
+            // PDF 只是手动生成的产物，没有"兜底互相找"的入口，回 HTML 即可
+            ReadingFormat::Pdf => ReadingFormat::Html,
         }
     }
 
@@ -6495,6 +6845,7 @@ impl ReadingFormat {
         match self {
             ReadingFormat::Html => "html",
             ReadingFormat::Epub => "epub",
+            ReadingFormat::Pdf => "pdf",
         }
     }
 
@@ -6503,6 +6854,7 @@ impl ReadingFormat {
         match self {
             ReadingFormat::Html => "HTML",
             ReadingFormat::Epub => "EPUB",
+            ReadingFormat::Pdf => "PDF",
         }
     }
 }
@@ -6513,6 +6865,7 @@ fn reading_output_path(text_path: &Path, format: ReadingFormat, output_dir: &str
     match format {
         ReadingFormat::Html => novel_html_path(text_path),
         ReadingFormat::Epub => epub_target_path(text_path, output_dir),
+        ReadingFormat::Pdf => text_path.with_extension("pdf"),
     }
 }
 
@@ -6598,6 +6951,27 @@ fn write_reading_output(
                 fs::create_dir_all(parent).map_err(|e| format!("无法创建 EPUB 目录：{e}"))?;
             }
             write_bytes_atomic(&target, &epub)?;
+        }
+        ReadingFormat::Pdf => {
+            let images_dir = novel_images_dir(text_path);
+            let cover = if cover_path.is_file() {
+                cover_path.to_string_lossy().to_string()
+            } else {
+                String::new()
+            };
+            let (_, bytes) = render_novel_pdf(
+                meta.title,
+                meta.author_name,
+                meta.release_date,
+                content,
+                slots,
+                &images_dir,
+                &cover,
+            )?;
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("无法创建 PDF 目录：{e}"))?;
+            }
+            write_bytes_atomic(&target, &bytes)?;
         }
     }
     Ok(target)
@@ -7331,7 +7705,7 @@ fn pixiv_sync_impl(
                 &image_quality,
             );
             let images_dir = novel_images_dir(&text_path);
-            let (image_saved, _) = download_novel_images(&client, &slots, &images_dir);
+            let (image_saved, _) = download_novel_images(&client, &slots, &images_dir, &mut |_, _| {});
             let text_body = rewrite_novel_txt(&work.content, &slots);
             let text_temp = text_path.with_extension("txt.part");
             let cover_temp = cover_path.with_extension("jpg.part");
@@ -10692,6 +11066,9 @@ fn bind_series_bundle(work_ids: Vec<i64>, path: String) -> Result<String, String
         )
         .map_err(|e| e.to_string())?;
         refresh_reading_image_count(&tx, *work_id);
+        // v1.3.6：合集里**每一篇**都按实际补「带图版」标记 —— 以前只给单作品绑定补了标，
+        // 合集里就只有第一篇有标记（用户报「只有第一个作品自动设为带图版」）
+        mark_has_images_if_illustrated(&tx, *work_id, &target);
     }
     tx.commit().map_err(|e| e.to_string())?;
     // 这批的字数当场补上（v1.2.82）：换了路径 ⇒ 触发器把 word_count 标回 -1，
@@ -10851,6 +11228,8 @@ fn bind_work_preview(work_id: i64, path: String) -> Result<String, String> {
     )
     .map_err(|e| e.to_string())?;
     refresh_reading_image_count(&conn, work_id);
+    // v1.3.6：绑成「纯 txt」时把旧阅读版的带图标记清掉（和完整版绑定同款处理）
+    clear_image_flags_for_plain_txt(&conn, work_id, &target);
     Ok(target.to_string_lossy().to_string())
 }
 
@@ -10961,6 +11340,8 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, S
     )
     .map_err(|e| e.to_string())?;
     refresh_reading_image_count(&conn, work_id);
+    // v1.3.6：绑成「纯 txt」时先把旧阅读版留下的带图标记清掉，再按实际补标
+    clear_image_flags_for_plain_txt(&conn, work_id, &target);
     // v1.2.100：这份文件确实带配图就顺手标成「带图版」（用户要求）——
     // 放在字数/图片数都算完之后，`image_count` 才是刚更新的值
     mark_has_images_if_illustrated(&conn, work_id, &target);
@@ -11181,6 +11562,8 @@ fn distribute_file(
         )
         .map_err(|e| e.to_string())?;
         refresh_reading_image_count(conn, *work_id);
+        // v1.3.6：自动归组也算「绑完整版」，带图就补标带图版（和单作品绑定一个口径）
+        mark_has_images_if_illustrated(conn, *work_id, path);
         return Ok(Distributed {
             bound_count: 1,
             skipped_count,
@@ -11211,6 +11594,7 @@ fn distribute_file(
         )
         .map_err(|e| e.to_string())?;
         refresh_reading_image_count(conn, *work_id);
+        mark_has_images_if_illustrated(conn, *work_id, path);
     }
     Ok(Distributed {
         bound_count: resolved.len(),
@@ -11884,17 +12268,26 @@ fn ensure_novel_cover(client: &Client, assets: &NovelAssets) -> String {
         .unwrap_or_default()
 }
 
-/// 「重新下载 TXT 版并绑定」：从 Pixiv 重抓正文，把纯文本落回作品所在目录，
+/// 「生成 TXT 版」：从 Pixiv 重抓正文，把纯文本落回作品所在目录，
 /// 并**把作品绑定到这份 txt 上**（v0.3.60 刚加时只落文件、不动绑定，v0.3.63 按用户要求改成绑定）——
-/// 与「重新下载 HTML / EPUB 版并绑定」走同一套 `bind_work_to_reading`，作品原来在哪一侧就还留在哪一侧，
+/// 与「生成 HTML / EPUB / PDF 版」走同一套 `bind_work_to_reading`，作品原来在哪一侧就还留在哪一侧，
 /// 以后「打开作品」打开的就是这份 txt。
 /// 正文里的插图写成 `[插图 N：{正文名}_images/001.jpg]` 这种指引，和同步下来的预览版同款。
 /// 绑定文件本身就是 `.txt` 就直接覆盖它；是 `.epub` / `.htm` 那种就在旁边生成同名 `.txt`。
 ///
 /// v1.3.1 起**一部作品只留一个文件**：换成 txt 之后，原来那份阅读版（epub / html）
-/// 与这次下载的 `_images/` 配图目录都送进回收站 —— 想看带图的用「重新下载 EPUB / HTML 版」，
+/// 与 `_images/` 配图目录都送进回收站 —— 想看带图的用「生成 EPUB / HTML / PDF 版」，
 /// 那才是图的归宿。纯文本这条路的产物就是 `{正文名}.txt` 一个。
-fn redownload_novel_txt_impl(work_id: i64) -> Result<String, String> {
+///
+/// v1.3.6：**不再下载配图**。图会立刻被回收（见上），下载纯属白花流量和时间；只保留一次
+/// 轻量的"解析插图位置"（拿文件名/扩展名写进正文的 `[插图 N：…]` 指引）。换绑后的
+/// `image_count` / `has_images` 由 `bind_work_to_reading` 里的 `clear_image_flags_for_plain_txt`
+/// 统一清掉 —— 修掉「epub 转 txt 后角标还在」。
+fn redownload_novel_txt_impl(
+    work_id: i64,
+    progress: &mut dyn FnMut(usize, usize, String),
+) -> Result<String, String> {
+    progress(0, 2, "正在从 Pixiv 抓取正文…".into());
     let conn = db()?;
     let (novel_id, purchased_path, preview_path): (String, String, String) = conn
         .query_row(
@@ -11945,28 +12338,19 @@ fn redownload_novel_txt_impl(work_id: i64) -> Result<String, String> {
         return Err("Pixiv 返回的正文是空的，处理不了。".into());
     }
     let embedded = body.get("textEmbeddedImages").cloned().unwrap_or(Value::Null);
+    // 只解析插图位置（**不下载图片本体**）：txt 里的 `[插图 N：…]` 指引靠它写出来
     let slots = plan_novel_images(&client, &embedded, &content, &text_path, &quality);
     let images_dir = novel_images_dir(&text_path);
-    // 图片已有的会跳过，所以反复点也只是补缺
-    let (saved, _failed) = download_novel_images(&client, &slots, &images_dir);
+    progress(1, 2, "正在写入 TXT 版…".into());
     write_text_atomic(&text_path, &rewrite_novel_txt(&content, &slots))?;
     // v1.3.1：一部作品只留一个绑定文件 —— 换成 txt 之后，原来那份阅读版（epub / html）
     // 送进回收站（不能删刚写好的这份 txt，所以先比一下路径）。
     if path_key(&bound) != path_key(&text_path.to_string_lossy()) {
         let _ = recycle_to_bin(Path::new(&bound));
     }
-    // 这次下载的中间产物也一样：`_images/` 是给阅读版打图用的，txt 本身显示不了图，
-    // 留着就是散图。以后要再生成阅读版会重新下（`download_novel_images` 会补缺）。
+    // 历史残留的 `_images/` 也一并清掉（v1.3.6 起这条路不会再产出它；存在即旧数据）。
     let _ = recycle_to_bin(&images_dir);
     bind_work_to_reading(&conn, work_id, &text_path.to_string_lossy())?;
-    if !slots.is_empty() {
-        // 刚下下来的配图数最准，盖掉绑定后重算出来的结果：卡片上的带图徽标要跟正文里的插图对得上
-        conn.execute(
-            "UPDATE works SET image_count=?1, has_images=1 WHERE id=?2",
-            params![saved as i64, work_id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
     Ok(text_path.to_string_lossy().to_string())
 }
 
@@ -12226,12 +12610,18 @@ async fn cleanup_redundant_previews(apply: bool) -> Result<PreviewCleanupSummary
         .map_err(|e| e.to_string())?
 }
 
-/// 单篇「重新下载 TXT 版并绑定」：抓一份 Pixiv 原版正文、落成 txt，并把作品绑到它上面。
+/// 单篇「生成 TXT 版」：抓一份 Pixiv 原版正文、落成 txt，并把作品绑到它上面。
+/// v1.3.6 起全程发进度事件（右下角浮层用）；**不再下载配图**。
 #[tauri::command]
-async fn redownload_novel_txt(work_id: i64) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || redownload_novel_txt_impl(work_id))
-        .await
-        .map_err(|e| e.to_string())?
+async fn redownload_novel_txt(app: AppHandle, work_id: i64) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut progress = |current: usize, total: usize, title: String| {
+            emit_reading_progress(&app, total, current, title, false);
+        };
+        redownload_novel_txt_impl(work_id, &mut progress)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------------------
@@ -12274,6 +12664,7 @@ fn is_reading_version_path(path: &str) -> bool {
             ext.eq_ignore_ascii_case("epub")
                 || ext.eq_ignore_ascii_case("html")
                 || ext.eq_ignore_ascii_case("htm")
+                || ext.eq_ignore_ascii_case("pdf")
         })
         .unwrap_or(false)
 }
@@ -12573,7 +12964,7 @@ fn backfill_novel_images_for_work(work_id: i64) -> Result<usize, String> {
     let format = resolve_reading_format("")?;
     // v1.3.1：转换全程交给 `download_reading_version_impl` —— 它写完自包含的阅读版后，
     // 会把 `_images/` 配图目录与中转 txt 一并送回收站，并把作品绑到阅读版上。
-    download_reading_version_impl(work_id, format)?;
+    download_reading_version_impl(work_id, format, &mut |_, _, _| {})?;
     let conn = db()?;
     let count: i64 = conn
         .query_row("SELECT image_count FROM works WHERE id=?1", [work_id], |row| {
@@ -12598,10 +12989,15 @@ fn backfill_novel_images_for_work(work_id: i64) -> Result<usize, String> {
 fn download_reading_version_impl(
     work_id: i64,
     format: ReadingFormat,
+    progress: &mut dyn FnMut(usize, usize, String),
 ) -> Result<WorkReadingResult, String> {
+    progress(0, 3, "正在从 Pixiv 抓取作品详情…".to_string());
     let (assets, client) = prepare_novel_assets(work_id)?;
     let images_dir = novel_images_dir(&assets.text_path);
-    let (saved, failed) = download_novel_images(&client, &assets.slots, &images_dir);
+    let mut on_image = |done: usize, total: usize| {
+        progress(1, 3, format!("正在下载配图 {done}/{total}…"));
+    };
+    let (saved, failed) = download_novel_images(&client, &assets.slots, &images_dir, &mut on_image);
     if !assets.slots.is_empty() {
         // 占位符只能改写真正的 txt：作品可能已经绑定在 `.epub` / `.html` 上，
         // 直接 write 那个路径会把电子书本体覆盖成纯文本（v0.3.46 留下的隐患）。
@@ -12626,6 +13022,7 @@ fn download_reading_version_impl(
             .map_err(|e| e.to_string())?;
     }
     let cover_file = ensure_novel_cover(&client, &assets);
+    progress(2, 3, format!("正在生成 {} 版…", format.label()));
     let (output_path, missing_count, size_bytes) = match format {
         ReadingFormat::Html => {
             let html = render_novel_html(
@@ -12685,6 +13082,25 @@ fn download_reading_version_impl(
             }
             write_bytes_atomic(&path, &epub)?;
             (path, missing_count, epub.len() as u64)
+        }
+        ReadingFormat::Pdf => {
+            let cover_path = if cover_file.is_empty() {
+                String::new()
+            } else {
+                assets.cover_path.to_string_lossy().to_string()
+            };
+            let (pdf_missing, bytes) = render_novel_pdf(
+                &assets.title,
+                &assets.author_name,
+                &assets.release_date,
+                &assets.content,
+                &assets.slots,
+                &images_dir,
+                &cover_path,
+            )?;
+            let path = assets.text_path.with_extension("pdf");
+            write_bytes_atomic(&path, &bytes)?;
+            (path, pdf_missing, bytes.len() as u64)
         }
     };
     let output_path = output_path.to_string_lossy().to_string();
@@ -12819,6 +13235,8 @@ fn bind_work_to_reading(conn: &Connection, work_id: i64, reading_path: &str) -> 
         .map_err(|e| e.to_string())?;
     }
     refresh_reading_image_count(conn, work_id);
+    // v1.3.6：换成「纯 txt」的绑定顺手清掉旧阅读版留下的带图标记（角标残留 bug）
+    clear_image_flags_for_plain_txt(conn, work_id, Path::new(reading_path));
     Ok(())
 }
 
@@ -12922,16 +13340,22 @@ fn resolve_reading_format(value: &str) -> Result<ReadingFormat, String> {
     Ok(reading_format_of(value))
 }
 
-/// 单篇「重新下载 HTML / EPUB 版并绑定」：格式由菜单按钮显式指定。
+/// 单篇「生成 HTML / EPUB / PDF 版并绑定」：格式由菜单按钮显式指定，全程发进度事件。
 #[tauri::command]
 async fn download_reading_version(
+    app: AppHandle,
     work_id: i64,
     format: String,
 ) -> Result<WorkReadingResult, String> {
     let format = reading_format_of(&format);
-    tauri::async_runtime::spawn_blocking(move || download_reading_version_impl(work_id, format))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut progress = |current: usize, total: usize, title: String| {
+            emit_reading_progress(&app, total, current, title, false);
+        };
+        download_reading_version_impl(work_id, format, &mut progress)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 批量「重新下载阅读版并绑定」：逐篇串行、全程发进度事件，篇与篇之间留一点间隔。
@@ -12984,7 +13408,7 @@ fn run_reading_batch(
             format!("正在生成 {} 版：{label}", format.label()),
             false,
         );
-        match download_reading_version_impl(*work_id, format) {
+        match download_reading_version_impl(*work_id, format, &mut |_, _, _| {}) {
             Ok(outcome) => {
                 result.exported_count += 1;
                 result.image_count += outcome.saved_count;
@@ -17438,7 +17862,8 @@ mod tests {
         path_key,
         pixiv_novel_id_from_url, pixiv_published_at, read_settings, setting,
         populate_work_display_info, reading_already_bound, reading_format_of,
-        reading_output_path, refresh_reading_image_count, render_novel_html,
+        reading_output_path, refresh_reading_image_count, render_novel_html, render_novel_pdf,
+        clear_image_flags_for_plain_txt, find_pdf_font,
         render_novel_xhtml, resolve_cover_path, rewrite_novel_txt,
         sanitize_file_name,
         select_argument,
@@ -17500,6 +17925,8 @@ mod tests {
         text_word_count, is_text_body_path, TEXT_BODY_EXTENSIONS,
         file_word_count, epub_file_word_count, count_non_whitespace, extension_of,
         migrate_epub_word_counts, migrate_docx_word_counts,
+        pixiv_client, fetch_pixiv_novel_detail, json_string, plan_novel_images,
+        download_novel_images,
         apply_author_status, check_pixiv_author_impl, classify_author_status,
         title_indicates_images, unique_target_path, write_reading_output,
         text_has_raw_novel_image_tokens, detail_has_embedded_images,
@@ -17513,6 +17940,7 @@ mod tests {
         DATA_FOLDER_STEM, resolve_data_dir_in,
         COOKIE_PROBE_CONNECT_TIMEOUT, COOKIE_PROBE_TOTAL_TIMEOUT, pixiv_probe_client,
     };
+    use serde_json::Value;
     use chrono::{DateTime, NaiveDate, Utc};
     use rusqlite::Connection;
     use serde_json::json;
@@ -19738,9 +20166,12 @@ mod tests {
         assert_eq!(reading_format_of(" epub "), ReadingFormat::Epub);
         // 认不出来的值一律当 html，避免设置被写脏后没有阅读版可用
         assert_eq!(reading_format_of(""), ReadingFormat::Html);
-        assert_eq!(reading_format_of("pdf"), ReadingFormat::Html);
+        // v1.3.6：pdf 现在是显式格式（详情「生成 PDF 版」按钮传它）
+        assert_eq!(reading_format_of("pdf"), ReadingFormat::Pdf);
+        assert_eq!(reading_format_of("PDF"), ReadingFormat::Pdf);
         assert_eq!(ReadingFormat::Html.other(), ReadingFormat::Epub);
         assert_eq!(ReadingFormat::Epub.other(), ReadingFormat::Html);
+        assert_eq!(ReadingFormat::Pdf.other(), ReadingFormat::Html);
 
         let text = Path::new("D:/已购/标题-26410188.txt");
         assert_eq!(
@@ -19755,6 +20186,216 @@ mod tests {
             reading_output_path(text, ReadingFormat::Epub, "D:/导出"),
             PathBuf::from("D:/导出/标题-26410188.epub")
         );
+        assert_eq!(
+            reading_output_path(text, ReadingFormat::Pdf, ""),
+            PathBuf::from("D:/已购/标题-26410188.pdf")
+        );
+    }
+
+    /// v1.3.6：绑成「纯 txt」（旁边没有 `_images`）时清掉带图标记与图片数；
+    /// 有 `_images` 的图文 txt、以及非 txt 都不动。
+    #[test]
+    fn plain_txt_binding_clears_image_flags() {
+        let root = std::env::temp_dir().join(format!("clear-image-flags-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE works (
+               id INTEGER PRIMARY KEY,
+               image_count INTEGER NOT NULL DEFAULT 0,
+               has_images INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, image_count, has_images) VALUES (1, 12, 1), (2, 12, 1), (3, 12, 1)",
+            [],
+        )
+        .unwrap();
+        let flags = |id: i64| -> (i64, i64) {
+            conn.query_row(
+                "SELECT image_count, has_images FROM works WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        // ① 纯 txt（旁边没有 `_images` 目录）⇒ 清
+        let plain = root.join("纯文本.txt");
+        fs::write(&plain, "正文").unwrap();
+        assert!(clear_image_flags_for_plain_txt(&conn, 1, &plain));
+        assert_eq!(flags(1), (0, 0));
+        // 已经清零再清一次：不算"清过"
+        assert!(!clear_image_flags_for_plain_txt(&conn, 1, &plain));
+
+        // ② 图文 txt（旁边有 `{主名}_images` 目录）⇒ 不动
+        let with_dir = root.join("图文.txt");
+        fs::write(&with_dir, "正文").unwrap();
+        fs::create_dir_all(root.join("图文_images")).unwrap();
+        assert!(!clear_image_flags_for_plain_txt(&conn, 2, &with_dir));
+        assert_eq!(flags(2), (12, 1));
+
+        // ③ 非 txt（epub）⇒ 不动
+        let epub = root.join("书.epub");
+        fs::write(&epub, "x").unwrap();
+        assert!(!clear_image_flags_for_plain_txt(&conn, 3, &epub));
+        assert_eq!(flags(3), (12, 1));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.3.6：PDF 生成冒烟 —— 出中文正文的 PDF，检查文件头、体积与缺图计数。
+    /// 机器上没有可用中文字体时直接跳过（不误报）。
+    #[test]
+    fn pdf_reading_version_smoke() {
+        if find_pdf_font().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("pdf-render-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let slots = vec![
+            NovelImageSlot {
+                token: "[pixivimage:1]".to_string(),
+                order: 1,
+                file_name: "001.jpg".to_string(),
+                relative: "样例_images/001.jpg".to_string(),
+                url: String::new(),
+                external: false,
+            },
+            NovelImageSlot {
+                token: "[pixivimage:2]".to_string(),
+                order: 2,
+                file_name: "002.jpg".to_string(),
+                relative: "样例_images/002.jpg".to_string(),
+                url: String::new(),
+                external: false,
+            },
+        ];
+        let content = "第一段正文，长一点好触发换行：这是测试文本，这是测试文本，这是测试文本。\n[pixivimage:1]\n第二段正文。[pixivimage:2]";
+        let (missing, bytes) = render_novel_pdf(
+            "测试标题",
+            "测试作者",
+            "2026-10-14",
+            content,
+            &slots,
+            &root,
+            "",
+        )
+        .unwrap();
+        assert_eq!(missing, 2, "两张图都不在盘上，应当计 missing");
+        assert!(bytes.starts_with(b"%PDF-"), "应当是合法的 PDF 头");
+        assert!(bytes.len() > 2000, "不该是个空壳，实际 {} 字节", bytes.len());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// v1.3.6 真机探针（默认 ignore，手动跑）：用环境变量给的真库路径（**只读**取 Pixiv Cookie）
+    /// 抓一篇真实图文作品，走一遍"详情 → 插画 URL 解析 → 下载配图 → 渲染 PDF"。
+    ///
+    /// 默认只试**前两张**配图（诊断快）；设 `PIXIV_PROBE_FULL=1` 才全量下载。
+    /// 2026-10-14 首跑结论：正文 / 排版 / 分页 / 字体子集全通（35 页 303 KB）；
+    /// 当天本机 `i.pximg.net` 被代理解析到 fake-ip 段后连不通（curl 也超时）——配图缺失
+    /// 属网络环境，不是代码问题（软件里同样逻辑：拿不到的图计入 missing，照常出文件）。
+    ///
+    /// 跑法（Git Bash）：
+    ///   PIXIV_PROBE_DB=.../data/library.db PIXIV_PROBE_OUT=.../probe/out \
+    ///     cargo test --lib -- --ignored real_pixiv_pdf_probe --nocapture
+    #[test]
+    #[ignore]
+    fn real_pixiv_pdf_probe() {
+        let Ok(db_path) = std::env::var("PIXIV_PROBE_DB") else {
+            eprintln!("跳过：未设置 PIXIV_PROBE_DB（真库路径）");
+            return;
+        };
+        let out_dir = std::env::var("PIXIV_PROBE_OUT")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+        let novel_id =
+            std::env::var("PIXIV_PROBE_NOVEL").unwrap_or_else(|_| "27262111".to_string());
+        let conn = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("打开真库（只读）失败");
+        let cookie: String = conn
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='pixiv_cookie'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        drop(conn);
+        assert!(!cookie.trim().is_empty(), "真库里没有 Pixiv Cookie");
+        let cookie = normalize_pixiv_cookie(&cookie).unwrap();
+        let client = pixiv_client(Some(cookie)).unwrap();
+
+        let detail = fetch_pixiv_novel_detail(&client, &novel_id).expect("抓详情失败");
+        let body = detail.get("body").unwrap_or(&Value::Null);
+        let title = json_string(body, "title");
+        let author = json_string(body, "userName");
+        let content = json_string(body, "content");
+        assert!(!content.is_empty(), "正文为空");
+        let embedded = body.get("textEmbeddedImages").cloned().unwrap_or(Value::Null);
+
+        let root = std::env::temp_dir().join(format!("real-pdf-probe-{novel_id}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let text_path = root.join(format!("{novel_id}.txt"));
+        let quality = "1200".to_string();
+        let slots = plan_novel_images(&client, &embedded, &content, &text_path, &quality);
+        println!("标题：{title}");
+        println!("作者：{author}");
+        println!(
+            "插画引用：{} 张（第一张 external={}）",
+            slots.len(),
+            slots.first().map(|slot| slot.external).unwrap_or(false)
+        );
+        if let Some(first) = slots.first() {
+            println!("第一张 URL：{}", first.url);
+            match client
+                .get(&first.url)
+                .header(reqwest::header::REFERER, "https://www.pixiv.net/")
+                .send()
+            {
+                Ok(response) => println!("图片探测：HTTP {}", response.status()),
+                Err(error) => println!("图片探测失败：{error}"),
+            }
+        }
+
+        let images_dir = novel_images_dir(&text_path);
+        let mut progress = |done: usize, total: usize| {
+            println!("配图 {done}/{total}");
+        };
+        // 诊断模式：只试前两张（全量 17 张失败过一次、耗时太长）
+        let probe_count = std::env::var("PIXIV_PROBE_FULL").is_ok();
+        let targets = if probe_count {
+            &slots[..]
+        } else {
+            &slots[..slots.len().min(2)]
+        };
+        let (saved, failed) =
+            download_novel_images(&client, targets, &images_dir, &mut progress);
+        println!("配图下载：成功 {saved}、失败 {failed}");
+
+        let (missing, bytes) =
+            render_novel_pdf(&title, &author, "", &content, &slots, &images_dir, "")
+                .expect("渲染 PDF 失败");
+        let out = PathBuf::from(&out_dir).join(format!("real-{novel_id}.pdf"));
+        if let Some(parent) = out.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&out, &bytes).unwrap();
+        println!("缺图：{missing}");
+        println!(
+            "PDF：{} 字节（{:.1} KB）",
+            bytes.len(),
+            bytes.len() as f64 / 1024.0
+        );
+        println!("输出：{}", out.display());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

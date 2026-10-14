@@ -993,6 +993,8 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .detail-author-home { width: auto; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; color: #7a5db0; background: #f5f0fc; border-color: #e7dbf7; }
 .detail-author-home:hover { color: #5f3fa0; background: #ece0fa; border-color: #cdb4ee; }
 .detail-link-pill { padding: 1px 7px; color: #7a5db0; background: #fff; border: 1px solid #e7dbf7; border-radius: 999px; font-size: 11px; font-weight: 750; line-height: 1.6; }
+.detail-work-link { width: auto; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; }
+.detail-work-link .detail-link-pill { color: #176bd3; border-color: #cfe3fb; }
 
 /* 导入预览里那段"这些行没被认出来"的说明（v1.2.81） */
 .import-note { margin: 10px 0 6px; color: #7a6248; font-size: 12px; line-height: 1.6; }

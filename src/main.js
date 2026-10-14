@@ -942,7 +942,9 @@ async function invoke(command, args = {}) {
   // 「本地文件功能请在 Tauri 程序中使用」的报错上 —— 详情页的「打开」按钮点了会弹红条）
   if (command === "open_local_path") return;
   if (command === "redownload_novel_txt") {
-    // 真机是从 Pixiv 重抓正文写成 txt，这里只回一个像样的路径让界面能跑通
+    // 真机是从 Pixiv 重抓正文写成 txt，这里只回一个像样的路径让界面能跑通；
+    // __mockSlowReadingVersion 拖一下时间，好让无头脚本看清进度浮层
+    if (window.__mockSlowReadingVersion) await new Promise((resolve) => setTimeout(resolve, window.__mockSlowReadingVersion));
     const work = previewWorks.find((item) => item.id === args.workId);
     return `D:\\400 个人\\小说\\已购版\\希儿\\${(work?.title || "示例作品").slice(0, 12)}.txt`;
   }
@@ -952,7 +954,8 @@ async function invoke(command, args = {}) {
     return scan;
   }
   if (command === "download_reading_version") {
-    const format = args.format === "epub" ? "epub" : "html";
+    if (window.__mockSlowReadingVersion) await new Promise((resolve) => setTimeout(resolve, window.__mockSlowReadingVersion));
+    const format = args.format === "epub" ? "epub" : args.format === "pdf" ? "pdf" : "html";
     const work = previewWorks.find((item) => item.id === args.workId);
     const outputPath = `D:\\已购\\希儿.${format}`;
     if (work) {
@@ -960,7 +963,7 @@ async function invoke(command, args = {}) {
       work.hasImages = true;
       if (work.purchasedPath) work.purchasedPath = outputPath; else work.previewPath = outputPath;
     }
-    return { format, outputPath, totalCount: 4, savedCount: 4, failedCount: 0, missingCount: 0, sizeBytes: format === "epub" ? 3355443 : 0 };
+    return { format, outputPath, totalCount: 4, savedCount: 4, failedCount: 0, missingCount: 0, sizeBytes: format === "html" ? 0 : 3355443 };
   }
   if (command === "download_reading_versions") {
     // format 传空串＝跟随设置，这里也照着设置里选的走，方便浏览器里试用
@@ -3832,7 +3835,7 @@ async function detailToggleImages(workId) {
 /** 详情里的「重新下载 HTML / EPUB / TXT 版并绑定」。跑的是原来菜单里那三个按钮的老逻辑。 */
 async function detailDownload(workId, format) {
   if (format === "txt") { await redownloadNovelTxt(workId); return; }
-  await downloadReadingVersion(workId, format === "epub" ? "epub" : "html");
+  await downloadReadingVersion(workId, format === "epub" ? "epub" : format === "pdf" ? "pdf" : "html");
 }
 
 /** 详情里的删除作品。详情可以从任意页面打开，所以用 detailWork 找（列表里没有也靠快照兜住）。 */
@@ -3943,7 +3946,7 @@ function workDetailBody() {
         <p class="detail-author">${authorName ? `<button class="work-author is-link" data-action="detail-open-author" data-author-id="${work.authorId}">${escapeHtml(authorName)}</button>` : "未知作者"}${meta.map((item) => `<span class="detail-sep">·</span><span>${escapeHtml(item)}</span>`).join("")}</p>
         <div class="detail-quick">
           <button class="primary-button" data-action="detail-open-work" data-work-id="${work.id}">${icon("arrow", 18)}<span>打开${work.purchasedPath ? "完整版" : "预览版"}</span></button>
-          ${pixivUrl ? `<button class="detail-pixiv-button" data-action="detail-open-pixiv" data-url="${escapeHtml(pixivUrl)}" title="在浏览器里打开 Pixiv 原页" aria-label="在浏览器里打开 Pixiv 原页">${icon("link", 18)}</button>` : ""}
+          ${pixivUrl ? `<button class="detail-pixiv-button detail-work-link" data-action="detail-open-pixiv" data-url="${escapeHtml(pixivUrl)}" title="在浏览器里打开 Pixiv 原页" aria-label="在浏览器里打开 Pixiv 原页">${icon("link", 18)}<span class="detail-link-pill">作品</span></button>` : ""}
         ${authorHome ? `<button class="detail-pixiv-button detail-author-home" data-action="open-external-url" data-url="${escapeHtml(authorHome)}" title="在浏览器里打开作者主页：${escapeHtml(authorHome)}" aria-label="在浏览器里打开作者主页">${icon("link", 18)}<span class="detail-link-pill">作者</span></button>` : ""}
         </div>
       </div>
@@ -4011,10 +4014,18 @@ function workDetailBody() {
       ${work.pixivNovelId ? `<p class="detail-plain">作品 ID：${escapeHtml(work.pixivNovelId)}</p>
       <div class="detail-actions">
         <button class="quiet-button" data-action="detail-open-pixiv" data-url="${escapeHtml(pixivUrl)}">${icon("link", 16)}在浏览器里打开原页</button>
-        <button class="quiet-button" data-action="detail-download" data-work-id="${work.id}" data-format="html">${icon("file", 16)}重新下载 HTML 版并绑定</button>
-        <button class="quiet-button" data-action="detail-download" data-work-id="${work.id}" data-format="epub">${icon("file", 16)}重新下载 EPUB 版并绑定</button>
-        <button class="quiet-button" data-action="detail-download" data-work-id="${work.id}" data-format="txt">${icon("file", 16)}重新下载 TXT 版并绑定</button>
       </div>` : '<p class="match-note">这篇没有记录 Pixiv 作品 ID。</p>'}
+    </section>
+
+    <section class="detail-block">
+      <h4>重新抓取</h4>
+      ${work.pixivNovelId ? `<p class="detail-plain">从 Pixiv 重新抓取正文与配图，生成一份新的版本文件并绑定（旧的绑定文件会送进回收站）。生成期间右下角有进度。</p>
+      <div class="detail-actions">
+        <button class="quiet-button" data-action="detail-download" data-work-id="${work.id}" data-format="txt">${icon("file", 16)}生成 TXT 版</button>
+        <button class="quiet-button" data-action="detail-download" data-work-id="${work.id}" data-format="html">${icon("file", 16)}生成 HTML 版</button>
+        <button class="quiet-button" data-action="detail-download" data-work-id="${work.id}" data-format="epub">${icon("file", 16)}生成 EPUB 版</button>
+        <button class="quiet-button" data-action="detail-download" data-work-id="${work.id}" data-format="pdf">${icon("file", 16)}生成 PDF 版</button>
+      </div>` : '<p class="match-note">这篇没有记录 Pixiv 作品 ID，没法重新抓取。</p>'}
     </section>`;
 }
 
@@ -8098,26 +8109,58 @@ async function listenReadingProgress(handler) {
   }
 }
 
-// 「重新下载 HTML / EPUB 版并绑定」：抓最新正文 → 补配图（已有的跳过）→ 生成指定格式的
+// 「生成 HTML / EPUB / PDF 版」：抓最新正文 → 补配图（已有的跳过）→ 生成指定格式的
 // 阅读版（与正文同目录同名）→ 把作品绑定到它。格式由按钮决定，不看设置
 // （预览版 / 完整版属性不变，只是「打开作品」从此打开这份阅读版）。
+// v1.3.6：右下角带进度浮层（抓取 → 配图 x/N → 生成），走 `reading-download-progress`。
 async function downloadReadingVersion(workId, format) {
-  closeModal();
-  const label = format === "epub" ? "EPUB" : "HTML";
-  toast(`正在重新下载 ${label} 版（第一次会顺带把配图下到本地）…`, "info");
-  try {
-    const result = await invoke("download_reading_version", { workId, format });
-    // 统一走详情那套收尾：作品详情能从作者库 / 系列 / 所有作品 / 收藏夹 / 浏览历史 /
-    // 待补工作台任一处打开，只挑一路刷新会让别的页面停在旧值
-    // （用户报的「重新下载 EPUB 版并绑定后封面带图版图标不刷新」就是它）
-    await refreshAfterDetailChange();
-    const missing = result.missingCount ? `，${result.missingCount} 张配图没拿到` : "";
-    const size = result.sizeBytes ? `：${formatMegabytes(result.sizeBytes)}` : "";
-    const noImages = result.totalCount ? "" : "（这篇正文里没有配图）";
-    toast(`已重新下载 ${label} 版并绑定${size}，含配图 ${result.savedCount} 张${missing}${noImages}`, missing ? "info" : "success");
-  } catch (error) {
-    toast(String(error), "error");
+  const label = format === "epub" ? "EPUB" : format === "pdf" ? "PDF" : "HTML";
+  // 右下角浮层是共用的，别把正在跑的同步任务（或另一篇的生成）顶掉
+  if (state.syncTask && state.syncTask.kind !== "reading") {
+    toast("同步任务正在进行，请等它结束或先终止", "info");
+    return;
   }
+  closeModal();
+  state.syncTask = {
+    kind: "reading",
+    label: `正在生成 ${label} 版`,
+    title: "正在准备…",
+    current: 0,
+    total: 3,
+    cancelAction: "hide-images-progress",
+    cancelText: "隐藏进度",
+  };
+  render();
+  const unlisten = await listenReadingProgress((event) => {
+    const { total = 0, current = 0, title = "", done = false } = event.payload || {};
+    // 收尾那一条不做 UI 更新，浮层由 invoke 返回后统一收起
+    if (done || !state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    state.syncTask.title = title;
+    updateSyncFloater();
+  });
+  let result;
+  try {
+    result = await invoke("download_reading_version", { workId, format });
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(String(error), "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  render();
+  // 统一走详情那套收尾：作品详情能从作者库 / 系列 / 所有作品 / 收藏夹 / 浏览历史 /
+  // 待补工作台任一处打开，只挑一路刷新会让别的页面停在旧值
+  // （用户报的「重新下载 EPUB 版并绑定后封面带图版图标不刷新」就是它）
+  await refreshAfterDetailChange();
+  const missing = result.missingCount ? `，${result.missingCount} 张配图没拿到` : "";
+  const size = result.sizeBytes ? `：${formatMegabytes(result.sizeBytes)}` : "";
+  const noImages = result.totalCount ? "" : "（这篇正文里没有配图）";
+  toast(`已生成 ${label} 版并绑定${size}，含配图 ${result.savedCount} 张${missing}${noImages}`, missing ? "info" : "success");
 }
 
 function formatMegabytes(bytes) {
@@ -8442,22 +8485,51 @@ async function restoreBackupFile(path) {
 }
 
 /**
- * 作品卡三个点菜单里的「重新下载 TXT 版并绑定」：从 Pixiv 重抓正文，在作品所在目录落一份 txt，
- * 并把作品绑到这份 txt 上（跟 HTML / EPUB 两个下载入口同一路子，作品原来在哪一侧就还留在哪一侧）。
+ * 详情「生成 TXT 版」：从 Pixiv 重抓正文，在作品所在目录落一份 txt，
+ * 并把作品绑到这份 txt 上（跟 HTML / EPUB / PDF 三个入口同一路子，作品原来在哪一侧就还留在哪一侧）。
  * v1.3.1 起旧的那份阅读版会进回收站 —— 一部作品只留一个绑定文件。
+ * v1.3.6 起右下角带进度浮层；不再下载配图（图会被回收，下了白下）。
  */
 async function redownloadNovelTxt(workId) {
-  const work = findWork(workId);
-  closeModal();
-  toast(`正在从 Pixiv 重新下载《${work?.title || "这篇作品"}》的 TXT 版并绑定 …`, "info");
-  try {
-    const path = await invoke("redownload_novel_txt", { workId });
-    // 和 HTML / EPUB 那两条一样走统一收尾，别只照顾作者作品库那一页
-    await refreshAfterDetailChange();
-    toast(`TXT 版已下载并绑定：${path}`, "success");
-  } catch (error) {
-    toast(String(error), "error");
+  if (state.syncTask && state.syncTask.kind !== "reading") {
+    toast("同步任务正在进行，请等它结束或先终止", "info");
+    return;
   }
+  closeModal();
+  state.syncTask = {
+    kind: "reading",
+    label: "正在生成 TXT 版",
+    title: "正在准备…",
+    current: 0,
+    total: 2,
+    cancelAction: "hide-images-progress",
+    cancelText: "隐藏进度",
+  };
+  render();
+  const unlisten = await listenReadingProgress((event) => {
+    const { total = 0, current = 0, title = "", done = false } = event.payload || {};
+    if (done || !state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    state.syncTask.title = title;
+    updateSyncFloater();
+  });
+  let path;
+  try {
+    path = await invoke("redownload_novel_txt", { workId });
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(String(error), "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  render();
+  // 和 HTML / EPUB / PDF 那几条一样走统一收尾，别只照顾作者作品库那一页
+  await refreshAfterDetailChange();
+  toast(`已生成 TXT 版并绑定：${path}`, "success");
 }
 
 /**
