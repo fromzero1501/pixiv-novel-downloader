@@ -7887,8 +7887,9 @@ async function runSynopsisBackfill(recheck) {
  * v1.2.25 那版只是把图下到正文旁边、在正文里留一行 `[插图 N：…]` 指引 —— 纯文本里
  * 根本看不见图（用户 2026-10-04 报的「光补图没用」）。v1.2.26 改成：
  * **把带图作品转成带图阅读版（按设置里的 EPUB / HTML 格式）并绑定**，打开就是带图电子书；
- * EPUB 生成后旁边那份冗余的 `{正文名}_images` 配图目录会送进回收站（EPUB 把图打进包里了；
- * HTML 阅读版要靠这份目录显示图，那种情况不清）。
+ * v1.3.1 起阅读版一律**自包含**（EPUB 把图打进包、HTML 把图内嵌成 base64），
+ * 生成后旁边那份 `{正文名}_images` 配图目录、以及作为中转的正文 txt 都会送进回收站 ——
+ * 一篇作品最终只留一个文件。
  *
  * 判据全在后端，转过的作品不会再进来，再点一次就是「没有需要处理的」。
  */
@@ -7906,10 +7907,10 @@ async function backfillNovelImages() {
   }
   const parts = [];
   if (pending) parts.push(`${pending} 篇作品的正文里有插图、但还只绑着 txt`);
-  if (orphans) parts.push(`${orphans} 篇 EPUB 作品旁边还留着多余的配图目录`);
+  if (orphans) parts.push(`${orphans} 篇阅读版作品旁边还留着多余的配图目录`);
   confirmAction(
     "补齐正文插图",
-    `${parts.join("；")}。会把带图作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定 —— 图直接打进电子书里，打开就能看；EPUB 生成后那一份「正文名_images」配图目录会送进回收站（不是硬删，随时能捞回来）。一篇接一篇请求、间隔跟设置里的抓取间隔一致（防触发 Pixiv 风控），右下角浮层显示进度，随时可以终止。`,
+    `${parts.join("；")}。会把带图作品按设置里的阅读版格式（EPUB / HTML）重新生成并绑定 —— 图直接打进电子书里，打开就能看；生成后那份「正文名_images」配图目录和作为中转的正文 txt 会送进回收站（不是硬删，随时能捞回来），一篇作品只留一个文件。一篇接一篇请求、间隔跟设置里的抓取间隔一致（防触发 Pixiv 风控），右下角浮层显示进度，随时可以终止。`,
     "开始处理",
     () => runNovelImageBackfill(),
   );
@@ -8376,6 +8377,7 @@ async function restoreBackupFile(path) {
 /**
  * 作品卡三个点菜单里的「重新下载 TXT 版并绑定」：从 Pixiv 重抓正文，在作品所在目录落一份 txt，
  * 并把作品绑到这份 txt 上（跟 HTML / EPUB 两个下载入口同一路子，作品原来在哪一侧就还留在哪一侧）。
+ * v1.3.1 起旧的那份阅读版会进回收站 —— 一部作品只留一个绑定文件。
  */
 async function redownloadNovelTxt(workId) {
   const work = findWork(workId);

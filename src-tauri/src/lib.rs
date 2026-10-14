@@ -4247,26 +4247,6 @@ fn is_images_asset_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 同步自己生成的附属产物：配图文件夹（`{标题}_images`）与图文阅读版（HTML / EPUB）。
-/// 不能当成「作品的本地文件」参与相似度匹配，否则会被误判成另一个版本。
-///
-/// **只在扫「预览版文件夹」时用**（`sync_preview_entries` 那几处）—— 那里出现的
-/// html/epub 一定是同步刚落下来的阅读版。
-///
-/// **待归档文件夹（自动匹配）不能用它**：用户放在那里的 epub / HTML 是手头正经的
-/// 完整版（能当作品文件的只有文本、电子书和 HTML，见 `is_image_like_asset`），
-/// 用这个判据会把它们整批滤掉。那边改用 `is_images_asset_dir`，见 `collect_files_recursively`。
-fn is_generated_asset(path: &Path) -> bool {
-    is_images_asset_dir(path)
-        || path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| {
-                extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("epub")
-            })
-            .unwrap_or(false)
-}
-
 /// 阅读版里到底有几张图。只有 `epub` / `html` 数得出来，其它格式返回 `None`。
 /// 口径与「已下载配图数」一致：不含封面那一张。
 fn count_reading_images(path: &Path, cover_name: &str) -> Option<usize> {
@@ -4488,7 +4468,10 @@ fn sync_preview_entries(
     {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if is_generated_asset(&path) {
+        // v1.3.1：同步只留阅读版，预览目录里躺着的**就是这份 epub / html** ——
+        // 不能再按「同步生成的附属产物」跳过它们了，否则同步会认不出自己上次下的作品，
+        // 每次都当新作品重下一遍。只跳过配图目录（`_images`）。
+        if is_images_asset_dir(&path) {
             continue;
         }
         let is_cover = path
@@ -4502,7 +4485,12 @@ fn sync_preview_entries(
             || path
                 .extension()
                 .and_then(|extension| extension.to_str())
-                .map(|extension| extension.eq_ignore_ascii_case("txt"))
+                .map(|extension| {
+                    extension.eq_ignore_ascii_case("txt")
+                        || extension.eq_ignore_ascii_case("epub")
+                        || extension.eq_ignore_ascii_case("html")
+                        || extension.eq_ignore_ascii_case("htm")
+                })
                 .unwrap_or(false);
         if !is_cover && !is_preview {
             continue;
@@ -5140,6 +5128,59 @@ fn escape_novel_html(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// 标准 base64 编码（含补位）。v1.3.1 起 HTML 阅读版要把图**内嵌**进文件，
+/// 这样 `{正文名}_images/` 就能在生成后删掉，磁盘上只留一个自包含的 html。
+/// 不引 base64 crate —— 就这一个用途，手写三十行比多编一个依赖划算。
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(triple >> 18) as usize & 0x3f] as char);
+        out.push(TABLE[(triple >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(triple >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[triple as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// 按文件头认出图片 MIME；认不出的一律当 jpeg（Pixiv 的图基本都是 jpg）。
+fn image_mime_of(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        "image/jpeg"
+    }
+}
+
+/// 把磁盘上一张图读成 `data:image/...;base64,...`；读不到就返回 None（正文里那块图省略）。
+fn image_data_uri(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "data:{};base64,{}",
+        image_mime_of(&bytes),
+        base64_encode(&bytes)
+    ))
+}
+
 /// 正文里剩下的 Pixiv 标记，HTML 版渲染成真正的排版。
 enum NovelSegment {
     Text(String),
@@ -5218,8 +5259,15 @@ struct NovelHtmlMeta<'a> {
 }
 
 /// 生成图文版 HTML：封面 + 标题头 + 正文（配图、注音、章节、分页都渲染出来）。
-/// 图片走同目录相对路径，所以整个文件夹拷走也能照常显示。
-fn render_novel_html(content: &str, slots: &[NovelImageSlot], meta: &NovelHtmlMeta<'_>) -> String {
+/// v1.3.1 起图片与封面一律**内嵌成 base64**（`data:` URI），html 自包含；
+/// 生成完就能把 `{正文名}_images/` 删掉，磁盘上只剩这一个文件。
+/// 代价是 html 会大三分之一左右（base64 是 4/3 编码），换来的是"一个文件走天下"。
+fn render_novel_html(
+    content: &str,
+    slots: &[NovelImageSlot],
+    images_dir: &Path,
+    meta: &NovelHtmlMeta<'_>,
+) -> String {
     let mut work = content.to_string();
     for slot in slots {
         let label = if slot.external { "引用插画" } else { "插图" };
@@ -5269,23 +5317,34 @@ fn render_novel_html(content: &str, slots: &[NovelImageSlot], meta: &NovelHtmlMe
                 let Some(slot) = slots.iter().find(|slot| slot.order == order) else {
                     continue;
                 };
+                // 内嵌：读盘上那张图编成 data URI。读不到（图缺失）就整块省略，
+                // 不留一个裂图框 —— 反正下文还有 `[插图 N]` 的图注。
+                let Some(uri) = image_data_uri(&images_dir.join(&slot.file_name)) else {
+                    continue;
+                };
                 flush(&mut body, &mut paragraph);
                 let caption = if external { "引用插画" } else { "插图" };
                 body.push_str(&format!(
-                    "<figure><img src=\"{}\" alt=\"{caption} {order}\" loading=\"lazy\"><figcaption>{caption} {order}</figcaption></figure>\n",
-                    escape_novel_html(&slot.relative)
+                    "<figure><img src=\"{uri}\" alt=\"{caption} {order}\" loading=\"lazy\"><figcaption>{caption} {order}</figcaption></figure>\n"
                 ));
             }
         }
     }
     flush(&mut body, &mut paragraph);
-    let cover = if meta.cover_file.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "<img class=\"cover\" src=\"{}\" alt=\"封面\">",
-            escape_novel_html(meta.cover_file)
-        )
+    // 封面也内嵌（v1.3.1）：从配图目录的上一级取同名 `{正文名}.jpg`。
+    // 找不到就不放封面，不引外部路径。
+    let cover = {
+        let cover_path = images_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(meta.cover_file);
+        if meta.cover_file.is_empty() {
+            String::new()
+        } else {
+            image_data_uri(&cover_path)
+                .map(|uri| format!("<img class=\"cover\" src=\"{uri}\" alt=\"封面\">"))
+                .unwrap_or_default()
+        }
     };
     let tags = meta
         .tags
@@ -6053,11 +6112,130 @@ fn anthology_text_file(bound: &Path) -> Option<PathBuf> {
         .and_then(|extension| extension.to_str())
         .map(|extension| extension.to_ascii_lowercase())
         .unwrap_or_default();
-    if matches!(extension.as_str(), "txt" | "md" | "html" | "htm" | "xhtml") {
+    if matches!(
+        extension.as_str(),
+        "txt" | "md" | "html" | "htm" | "xhtml" | "epub"
+    ) {
         return Some(bound.to_path_buf());
     }
     let beside = bound.with_extension("txt");
     beside.is_file().then_some(beside)
+}
+
+/// v1.3.1：从 EPUB 阅读版里直接抽出**正文 + 图片**，给「合成一本 EPUB」用。
+///
+/// 背景：v1.3.1 起同步只留阅读版（epub / html），不再留 txt，也不再留 `{正文名}_images/`
+/// 散图目录 —— 图和正文都进 epub 了。所以合集取素材必须改成**从 epub 里拿**，
+/// 否则删了 txt / `_images/` 之后，整批作品会在合集里被跳过。
+///
+/// 正文里的 `<img>` 会被换成 `[插图 N：文件名]` 标记（和同步落下的 txt 同款），
+/// 这样上层的 `render_novel_xhtml` 就能照常定位插图 —— 图与文的相对位置因此不丢。
+/// 图片按 zip 里的原始字节返回，合集打包时原样写进去（不解码、不重编码）。
+fn anthology_epub_parts(path: &Path) -> Option<(String, Vec<NovelImageSlot>, Vec<(String, Vec<u8>)>)> {
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut text_names: Vec<String> = Vec::new();
+    let mut image_names: Vec<String> = Vec::new();
+    for index in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(index) {
+            let name = entry.name().to_string();
+            if name.to_ascii_lowercase().contains("__macosx") {
+                continue;
+            }
+            if is_epub_text_entry(&name) {
+                text_names.push(name);
+            } else if is_image_like_asset(Path::new(&name)) {
+                image_names.push(name);
+            }
+        }
+    }
+    // 正文顺序按 zip 里的自然顺序（打包时就是阅读顺序）；图片按名字排，稳定即可。
+    text_names.sort();
+    image_names.sort();
+    // 先给每张图定好槽位（文件名 → order），再把正文里的 `<img>` 换成标记。
+    let mut slots: Vec<NovelImageSlot> = Vec::new();
+    let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut order_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for name in &image_names {
+        let Ok(mut entry) = archive.by_name(name) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if entry.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+            continue;
+        }
+        let file_name = Path::new(name)
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| name.clone());
+        let order = slots.len() + 1;
+        order_of.insert(file_name.clone(), order);
+        slots.push(NovelImageSlot {
+            token: String::new(),
+            order,
+            file_name: file_name.clone(),
+            relative: file_name.clone(),
+            url: String::new(),
+            external: false,
+        });
+        images.push((file_name, bytes));
+    }
+    let mut text = String::new();
+    for name in &text_names {
+        let Ok(mut entry) = archive.by_name(name) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if entry.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        let source = decode_text_bytes(&bytes);
+        if name.to_ascii_lowercase().ends_with(".txt") {
+            text.push_str(&source);
+            text.push('\n');
+            continue;
+        }
+        // 把 <img ...> 换成 `[插图 N：文件名]`；其余标签交给 document_text 剥掉。
+        let marked = replace_img_tags_with_markers(&source, &order_of);
+        text.push_str(&document_text(&marked));
+        text.push('\n');
+    }
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some((text, slots, images))
+}
+
+/// 把 xhtml 里的 `<img src="…/001.jpg">` 换成 `[插图 N：001.jpg]` —— N 是该图在
+/// 槽位表里的序号。认不出来的（图没进槽位表）整块删掉，免得正文里留个破图位。
+fn replace_img_tags_with_markers(
+    source: &str,
+    order_of: &std::collections::HashMap<String, usize>,
+) -> String {
+    let mut out = String::with_capacity(source.len());
+    let lowered = source.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(offset) = lowered[cursor..].find("<img") {
+        let start = cursor + offset;
+        out.push_str(&source[cursor..start]);
+        let Some(gt) = lowered[start..].find('>') else {
+            return out; // 没闭合就当后面全是标签，整段丢掉
+        };
+        let tag = &source[start..start + gt + 1];
+        let src = xml_attr(tag, "src").unwrap_or_default();
+        let file_name = src
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&src)
+            .trim()
+            .to_string();
+        if let Some(order) = order_of.get(&file_name) {
+            out.push_str(&format!("[插图 {order}：{file_name}]"));
+        }
+        cursor = start + gt + 1;
+    }
+    out.push_str(&source[cursor..]);
+    out
 }
 
 /// 把本地正文里 `[插图 N：xxx_images/003.jpg]` 这类标记编成配图槽位。
@@ -6238,9 +6416,11 @@ fn write_reading_output(
     let target = reading_output_path(text_path, format, output_dir);
     match format {
         ReadingFormat::Html => {
+            let images_dir = novel_images_dir(text_path);
             let html = render_novel_html(
                 content,
                 slots,
+                &images_dir,
                 &NovelHtmlMeta {
                     title: meta.title,
                     author_name: meta.author_name,
@@ -7048,16 +7228,25 @@ fn pixiv_sync_impl(
                     },
                 )
             });
-            if reading_result.is_err() {
-                let _ = fs::remove_file(&text_temp);
-                let _ = fs::remove_file(&cover_temp);
-                result.failed_count += 1;
-                continue;
-            }
+            let reading_path = match reading_result {
+                Ok(path) => path,
+                Err(_) => {
+                    let _ = fs::remove_file(&text_temp);
+                    let _ = fs::remove_file(&cover_temp);
+                    result.failed_count += 1;
+                    continue;
+                }
+            };
+            // v1.3.1：作品只绑一个文件 —— 绑到刚写好的阅读版上，然后把中转产物
+            // （正文 txt、`_images/` 配图目录）送回收站。图和正文都已经进阅读版了。
+            // 注意顺序：先确认阅读版在盘上（`discard_sync_intermediates` 内部会查），
+            // 再删 txt，免得阅读版落空时把作品抹掉。
+            discard_sync_intermediates(&text_path, &reading_path);
+            let reading_value = reading_path.to_string_lossy().to_string();
             let (preview_value, purchased_value) = if work.is_preview {
-                (text_path.to_string_lossy().to_string(), String::new())
+                (reading_value.clone(), String::new())
             } else {
-                (String::new(), text_path.to_string_lossy().to_string())
+                (String::new(), reading_value.clone())
             };
             // 配图真的下下来了就以它为准：正文里 `[pixivimage:...]` 引用的插画很常见，
             // 光看标题里有没有「插画 / 图文」会漏掉一大批带图版
@@ -9673,7 +9862,9 @@ fn scan_preview_existing(author_id: i64) -> Result<ScanPreviewResult, String> {
     let mut ambiguous = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if is_generated_asset(&path) {
+        // v1.3.1：预览目录里现在放的就是 epub / html 阅读版，不能再按
+        // 「同步生成的附属产物」跳过 —— 只跳过配图目录。
+        if is_images_asset_dir(&path) {
             continue;
         }
         let key = stem(&path);
@@ -9719,7 +9910,13 @@ fn scan_preview_existing(author_id: i64) -> Result<ScanPreviewResult, String> {
                 || path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .map(|ext| ext.eq_ignore_ascii_case("txt"))
+                    .map(|ext| {
+                        // v1.3.1：作品现在绑的就是 epub / html 阅读版，扫描关联时得认它们。
+                        ext.eq_ignore_ascii_case("txt")
+                            || ext.eq_ignore_ascii_case("epub")
+                            || ext.eq_ignore_ascii_case("html")
+                            || ext.eq_ignore_ascii_case("htm")
+                    })
                     .unwrap_or(false)
             {
                 conn.execute(
@@ -9792,7 +9989,8 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if is_generated_asset(&path) {
+        // v1.3.1：同 `sync_preview_entries` —— 预览目录里现在是 epub / html，只跳过配图目录。
+        if is_images_asset_dir(&path) {
             continue;
         }
         let is_cover = path
@@ -9804,7 +10002,12 @@ fn scan_preview(author_id: i64) -> Result<ScanPreviewResult, String> {
             || path
                 .extension()
                 .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("txt"))
+                .map(|ext| {
+                    ext.eq_ignore_ascii_case("txt")
+                        || ext.eq_ignore_ascii_case("epub")
+                        || ext.eq_ignore_ascii_case("html")
+                        || ext.eq_ignore_ascii_case("htm")
+                })
                 .unwrap_or(false);
         if !is_cover && !is_preview {
             continue;
@@ -11543,12 +11746,16 @@ fn ensure_novel_cover(client: &Client, assets: &NovelAssets) -> String {
         .unwrap_or_default()
 }
 
-/// 「重新下载 TXT 版并绑定」：从 Pixiv 重抓正文与配图，把纯文本落回作品所在目录，
+/// 「重新下载 TXT 版并绑定」：从 Pixiv 重抓正文，把纯文本落回作品所在目录，
 /// 并**把作品绑定到这份 txt 上**（v0.3.60 刚加时只落文件、不动绑定，v0.3.63 按用户要求改成绑定）——
 /// 与「重新下载 HTML / EPUB 版并绑定」走同一套 `bind_work_to_reading`，作品原来在哪一侧就还留在哪一侧，
 /// 以后「打开作品」打开的就是这份 txt。
 /// 正文里的插图写成 `[插图 N：{正文名}_images/001.jpg]` 这种指引，和同步下来的预览版同款。
 /// 绑定文件本身就是 `.txt` 就直接覆盖它；是 `.epub` / `.htm` 那种就在旁边生成同名 `.txt`。
+///
+/// v1.3.1 起**一部作品只留一个文件**：换成 txt 之后，原来那份阅读版（epub / html）
+/// 与这次下载的 `_images/` 配图目录都送进回收站 —— 想看带图的用「重新下载 EPUB / HTML 版」，
+/// 那才是图的归宿。纯文本这条路的产物就是 `{正文名}.txt` 一个。
 fn redownload_novel_txt_impl(work_id: i64) -> Result<String, String> {
     let conn = db()?;
     let (novel_id, purchased_path, preview_path): (String, String, String) = conn
@@ -11605,6 +11812,14 @@ fn redownload_novel_txt_impl(work_id: i64) -> Result<String, String> {
     // 图片已有的会跳过，所以反复点也只是补缺
     let (saved, _failed) = download_novel_images(&client, &slots, &images_dir);
     write_text_atomic(&text_path, &rewrite_novel_txt(&content, &slots))?;
+    // v1.3.1：一部作品只留一个绑定文件 —— 换成 txt 之后，原来那份阅读版（epub / html）
+    // 送进回收站（不能删刚写好的这份 txt，所以先比一下路径）。
+    if path_key(&bound) != path_key(&text_path.to_string_lossy()) {
+        let _ = recycle_to_bin(Path::new(&bound));
+    }
+    // 这次下载的中间产物也一样：`_images/` 是给阅读版打图用的，txt 本身显示不了图，
+    // 留着就是散图。以后要再生成阅读版会重新下（`download_novel_images` 会补缺）。
+    let _ = recycle_to_bin(&images_dir);
     bind_work_to_reading(&conn, work_id, &text_path.to_string_lossy())?;
     if !slots.is_empty() {
         // 刚下下来的配图数最准，盖掉绑定后重算出来的结果：卡片上的带图徽标要跟正文里的插图对得上
@@ -12035,9 +12250,15 @@ fn collect_orphan_image_folders(conn: &Connection) -> Vec<(i64, String, PathBuf)
                 purchased_path
             };
             let path = Path::new(&bound);
+            // v1.3.1：EPUB 与 HTML 阅读版**都是自包含**的（EPUB 把图打进包、HTML 把图
+            // 内嵌成 base64），所以两种格式旁边残留的 `_images/` 都算孤儿目录，可以清。
             if !path
                 .extension()
-                .map(|ext| ext.eq_ignore_ascii_case("epub"))
+                .map(|ext| {
+                    ext.eq_ignore_ascii_case("epub")
+                        || ext.eq_ignore_ascii_case("html")
+                        || ext.eq_ignore_ascii_case("htm")
+                })
                 .unwrap_or(false)
                 || !path.is_file()
             {
@@ -12212,8 +12433,8 @@ fn backfill_novel_images_impl(app: &AppHandle) -> Result<NovelImageBackfillResul
 /// 一次详情请求。返回这篇落库后的配图张数（用来报数）。
 fn backfill_novel_images_for_work(work_id: i64) -> Result<usize, String> {
     let format = resolve_reading_format("")?;
-    // 阅读版与正文同名同目录，`_images` 也按同样的 stem 命名 —— 转换前后指向同一个目录
-    let images_dir = novel_images_dir(Path::new(&bound_path_of(work_id)));
+    // v1.3.1：转换全程交给 `download_reading_version_impl` —— 它写完自包含的阅读版后，
+    // 会把 `_images/` 配图目录与中转 txt 一并送回收站，并把作品绑到阅读版上。
     download_reading_version_impl(work_id, format)?;
     let conn = db()?;
     let count: i64 = conn
@@ -12228,11 +12449,6 @@ fn backfill_novel_images_for_work(work_id: i64) -> Result<usize, String> {
             "UPDATE works SET has_images=1 WHERE id=?1 AND has_images<>1",
             [work_id],
         );
-    }
-    // EPUB 把图打进包里了，这份目录就是冗余 —— 送回收站（不是硬删，随时能捞回来）。
-    // HTML 阅读版的 `<img>` 指着目录里的文件，那种情况绝不能清。
-    if matches!(format, ReadingFormat::Epub) && images_dir.is_dir() {
-        let _ = recycle_to_bin(&images_dir);
     }
     Ok(count.max(0) as usize)
 }
@@ -12277,6 +12493,7 @@ fn download_reading_version_impl(
             let html = render_novel_html(
                 &assets.content,
                 &assets.slots,
+                &images_dir,
                 &NovelHtmlMeta {
                     title: &assets.title,
                     author_name: &assets.author_name,
@@ -12333,7 +12550,26 @@ fn download_reading_version_impl(
         }
     };
     let output_path = output_path.to_string_lossy().to_string();
-    bind_work_to_reading(&db()?, work_id, &output_path)?;
+    // v1.3.1：一部作品只留一个绑定文件 —— 换格式重新生成时，把**旧的那份**送回收站，
+    // 再绑到新的上面。另外把这次用到的中转产物（`_images/` 配图目录、以及旧正文 txt）一并清掉。
+    {
+        let conn = db()?;
+        let previous: String = conn
+            .query_row(
+                "SELECT CASE WHEN ifnull(purchased_path,'')<>'' THEN purchased_path ELSE ifnull(preview_path,'') END FROM works WHERE id=?1",
+                [work_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        let previous = previous.trim().to_string();
+        if !previous.is_empty() && path_key(&previous) != path_key(&output_path) {
+            let _ = recycle_to_bin(Path::new(&previous));
+        }
+        // 配图目录与正文 txt 同样不再需要：图已进阅读版，正文的母版在 Pixiv 上。
+        let text_path = assets.text_path.clone();
+        discard_sync_intermediates(&text_path, Path::new(&output_path));
+        bind_work_to_reading(&conn, work_id, &output_path)?;
+    }
     Ok(WorkReadingResult {
         format: format.as_str().to_string(),
         output_path,
@@ -12446,6 +12682,30 @@ fn bind_work_to_reading(conn: &Connection, work_id: i64, reading_path: &str) -> 
     }
     refresh_reading_image_count(conn, work_id);
     Ok(())
+}
+
+/// v1.3.1：一部作品只留**一个绑定文件**。阅读版写好后，把这次同步落下的中转产物
+/// （正文 txt、`{正文名}_images/` 配图目录）送进回收站 —— 图和正文都已经进阅读版里了。
+///
+/// **只在阅读版真的落盘之后调**。阅读版是 html 时同理：v1.3.1 起 html 的配图与封面
+/// 都是 base64 内嵌，不再外链 `_images/`，所以那份目录同样可以删。
+///
+/// 删之前先确认阅读版文件在盘上 —— 万一阅读版没写成，先把 txt 删了就等于把这篇作品抹了。
+fn discard_sync_intermediates(text_path: &Path, reading_path: &Path) {
+    if !reading_path.is_file() {
+        return;
+    }
+    // 正文 txt：只有它不是阅读版本身时才删（阅读版格式理论上不会是 txt，防一手）。
+    if text_path.is_file()
+        && !path_key(&text_path.to_string_lossy()).eq(&path_key(&reading_path.to_string_lossy()))
+    {
+        let _ = recycle_to_bin(text_path);
+    }
+    // `{正文名}_images/` 配图目录：图已经进阅读版了，留着就是散图。
+    let images_dir = novel_images_dir(text_path);
+    if images_dir.is_dir() {
+        let _ = recycle_to_bin(&images_dir);
+    }
 }
 
 #[derive(Serialize)]
@@ -14203,25 +14463,56 @@ fn export_anthology_epub_impl(
             skipped.push(work_title);
             continue;
         };
-        let Some(raw) = read_text_file(&text_path) else {
-            skipped.push(work_title);
-            continue;
-        };
-        if raw.trim().is_empty() {
-            skipped.push(work_title);
-            continue;
-        }
         let extension = text_path
             .extension()
             .and_then(|extension| extension.to_str())
             .map(|extension| extension.to_ascii_lowercase())
             .unwrap_or_default();
-        let content = if matches!(extension.as_str(), "html" | "htm" | "xhtml") {
-            html_to_text(&raw)
+        // v1.3.1：绑在 epub 上时直接**从 epub 里取正文 + 图**（同步只留阅读版，
+        // 没有 txt 也没有 `_images/` 散图了）。其余格式（txt / html）走原来的读盘路。
+        let (content, slots, images) = if extension == "epub" {
+            let Some((text, slots, pictures)) = anthology_epub_parts(&text_path) else {
+                skipped.push(work_title);
+                continue;
+            };
+            if text.trim().is_empty() {
+                skipped.push(work_title);
+                continue;
+            }
+            // 打包名加章节前缀，避免不同作品的 `001.jpg` 在合集里撞名。
+            let chapter = chapters.len();
+            let images: Vec<(String, Vec<u8>)> = pictures
+                .iter()
+                .enumerate()
+                .map(|(index, (file_name, bytes))| {
+                    let ext = Path::new(file_name)
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("jpg");
+                    (
+                        format!("c{:02}_{:03}.{ext}", chapter + 1, index + 1),
+                        bytes.clone(),
+                    )
+                })
+                .collect();
+            (text, slots, images)
         } else {
-            raw
+            let Some(raw) = read_text_file(&text_path) else {
+                skipped.push(work_title);
+                continue;
+            };
+            if raw.trim().is_empty() {
+                skipped.push(work_title);
+                continue;
+            }
+            let content = if matches!(extension.as_str(), "html" | "htm" | "xhtml") {
+                html_to_text(&raw)
+            } else {
+                raw
+            };
+            let (slots, images) = anthology_image_slots(&content, &text_path, chapters.len());
+            (content, slots, images)
         };
-        let (slots, images) = anthology_image_slots(&content, &text_path, chapters.len());
         let body = render_novel_xhtml(&content, &slots);
         let words = content
             .chars()
@@ -16892,7 +17183,7 @@ mod tests {
         compress_series_orders,
         direct_target_path, distribute_file, epub_target_path, existing_sync_target, file_name,
         follow_cover_path, preview_is_redundant, recycle_to_bin,
-        has_invalid_date_range, insert_local_work, is_generated_asset,
+        has_invalid_date_range, insert_local_work,
         is_images_asset_dir,
         is_image_like_asset,
         is_within_date_range, matched_sync_preview, move_cover_along, move_path, name_key,
@@ -16917,6 +17208,8 @@ mod tests {
         attach_import_cover, epub_first_image, xml_attr,
         binding_target_path, mark_has_images_if_illustrated, move_path_overwriting,
         move_sibling_assets_along,
+        base64_encode, image_mime_of, image_data_uri,
+        discard_sync_intermediates, anthology_epub_parts, replace_img_tags_with_markers,
         sort_works_by_content_size,
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
         probe_latest_version, probe_update_asset, update_asset_names, update_client,
@@ -18486,18 +18779,14 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 判据分工：`is_images_asset_dir` 只认配图文件夹（自动匹配用），
-    /// `is_generated_asset` 才顺带认阅读版文件（只该用在预览目录那三处）。
+    /// `is_images_asset_dir` 只认配图文件夹 —— 自动匹配与预览目录扫描都用它。
+    /// （v1.3.1 起不再有「阅读版是同步附属产物」这套判据：阅读版就是作品本体。）
     #[test]
-    fn only_the_preview_scan_treats_reading_formats_as_generated_assets() {
+    fn only_image_folders_count_as_generated_assets() {
         assert!(is_images_asset_dir(Path::new("D:/待分组/希儿_images")));
         assert!(!is_images_asset_dir(Path::new("D:/待分组/希儿.epub")));
         assert!(!is_images_asset_dir(Path::new("D:/待分组/希儿.html")));
         assert!(!is_images_asset_dir(Path::new("D:/待分组/希儿.txt")));
-        // 旧判据保持不变：预览目录里出现的 epub / html 仍然是同步产物
-        assert!(is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.epub")));
-        assert!(is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.html")));
-        assert!(!is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.txt")));
     }
 
     #[test]
@@ -18833,18 +19122,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_assets_are_kept_out_of_work_matching() {
-        assert!(is_generated_asset(Path::new(
-            "D:/preview/2025-10-05 希儿_images"
-        )));
-        assert!(is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.html")));
-        assert!(is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.epub")));
-        assert!(!is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.txt")));
-        assert!(!is_generated_asset(Path::new("D:/preview/2025-10-05 希儿.jpg")));
-        assert!(!is_generated_asset(Path::new("D:/preview/番外 合集")));
-    }
-
-    #[test]
     fn novel_image_refs_follow_text_order_and_drop_duplicates() {
         let content =
             "开头[uploadedimage:20454900]中间[pixivimage:998877]结尾[uploadedimage:20454900]";
@@ -18918,9 +19195,17 @@ mod tests {
             url: "https://i.pximg.net/x.jpg".into(),
             external: false,
         }];
+        // v1.3.1 起图内嵌成 data URI，得让盘上真有这张图（和封面）才渲染得出来。
+        let root = std::env::temp_dir().join(format!("novel-html-embed-{}", std::process::id()));
+        let images_dir = root.join("标题_images");
+        fs::create_dir_all(&images_dir).unwrap();
+        // 最小合法 JPEG 头（FFD8）就够 image_mime_of 认得出来。
+        fs::write(images_dir.join("001.jpg"), [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10]).unwrap();
+        fs::write(root.join("标题.jpg"), [0xFFu8, 0xD8, 0xFF, 0xE0]).unwrap();
         let html = render_novel_html(
             content,
             &slots,
+            &images_dir,
             &NovelHtmlMeta {
                 title: "标题",
                 author_name: "作者",
@@ -18933,16 +19218,96 @@ mod tests {
         );
         assert!(html.contains("<h2>第一章</h2>"));
         assert!(html.contains("<ruby>汉字<rt>读音</rt></ruby>"));
-        assert!(html.contains("src=\"标题_images/001.jpg\""));
+        // 图与封面都内嵌：不再出现外部相对路径，改出现 data URI。
+        assert!(html.contains("src=\"data:image/jpeg;base64,"));
+        assert!(!html.contains("src=\"标题_images/001.jpg\""));
         assert!(html.contains("class=\"page\""));
         assert!(html.contains("配图 1 张"));
         assert!(!html.contains("uploadedimage"));
         assert!(!html.contains("[newpage]"));
+        let _ = fs::remove_dir_all(&root);
         // 简介折起来放，标签剥掉
         assert!(html.contains("<details class=\"synopsis\"><summary>作品简介</summary>"));
         assert!(html.contains("<p>简介重点</p>"));
         assert!(html.contains("<p>第二行</p>"));
         assert!(!html.contains("</b>"), "简介里的标签应该被剥掉");
+    }
+
+    #[test]
+    fn base64_encoding_matches_the_standard_alphabet() {
+        // RFC 4648 的经典测试向量：三个变体正好覆盖 3/2/1 字节补位。
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn image_data_uri_recognizes_png_and_defaults_to_jpeg() {
+        // PNG 头 → image/png
+        let mut png = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(b"payload");
+        assert!(image_mime_of(&png) == "image/png");
+        // 认不出来的（就当 jpg）
+        assert!(image_mime_of(&[0xFF, 0xD8, 0xFF, 0xE0]) == "image/jpeg");
+
+        let root = std::env::temp_dir().join(format!("data-uri-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("a.png");
+        fs::write(&file, &png).unwrap();
+        let uri = image_data_uri(&file).unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"), "实际：{uri}");
+        // 读不到的文件返回 None，不 panic、不产空 URI
+        assert!(image_data_uri(&root.join("缺.png")).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn anthology_epub_parts_extracts_text_images_and_marker_positions() {
+        // 造一本最小的 epub：一张图 + 一页 xhtml（图夹在两段文字中间）。
+        let root = std::env::temp_dir().join(format!("anth-parts-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let book = root.join("书.epub");
+        let mut archive = Vec::new();
+        let mut items = Vec::new();
+        zip_push(&mut archive, &mut items, "mimetype", b"application/epub+zip");
+        zip_push(&mut archive, &mut items, "OEBPS/images/001.jpg", b"jpeg-bytes");
+        zip_push(
+            &mut archive,
+            &mut items,
+            "OEBPS/text/novel.xhtml",
+            "<html><body><p>前一段</p><img src=\"../images/001.jpg\"/><p>后一段</p></body></html>"
+                .as_bytes(),
+        );
+        zip_finish(&mut archive, &mut items);
+        fs::write(&book, &archive).unwrap();
+
+        let (text, slots, images) = anthology_epub_parts(&book).unwrap();
+        // 图进槽位表 + 字节表
+        assert_eq!(slots.len(), 1);
+        assert_eq!(images.len(), 1);
+        assert_eq!(slots[0].order, 1);
+        // `<img>` 被换成 `[插图 1：…]` 标记，所以文字与图的位置关系不丢
+        assert!(text.contains("前一段"), "实际：{text}");
+        assert!(text.contains("[插图 1："), "实际：{text}");
+        assert!(text.contains("后一段"), "实际：{text}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replace_img_tags_keeps_known_images_and_drops_unknown_ones() {
+        let mut order_of = std::collections::HashMap::new();
+        order_of.insert("001.jpg".to_string(), 1usize);
+        let source = "<p>甲<img src=\"../images/001.jpg\" alt=\"x\"/></p><p>乙<img src=\"gone.png\"/></p>";
+        let marked = replace_img_tags_with_markers(source, &order_of);
+        assert!(marked.contains("[插图 1：001.jpg]"));
+        // 不在槽位表里的图整块删掉，不留破图位
+        assert!(!marked.contains("gone.png"));
+        assert!(marked.contains("甲"));
+        assert!(marked.contains("乙"));
     }
 
     #[test]
@@ -19141,7 +19506,9 @@ mod tests {
         assert_eq!(html, root.join("标题-26410188.html"));
         let html_text = fs::read_to_string(&html).unwrap();
         assert!(html_text.contains("<ruby>汉字<rt>读音</rt></ruby>"));
-        assert!(html_text.contains("标题-26410188_images/001.jpg"));
+        // v1.3.1：html 阅读版的图**内嵌**成 base64，不再外链 `_images/`
+        assert!(html_text.contains("src=\"data:image/jpeg;base64,"));
+        assert!(!html_text.contains("标题-26410188_images/001.jpg"));
         assert!(html_text.contains("<details class=\"synopsis\">"), "HTML 阅读版应该带简介");
         assert!(html_text.contains("作者写的一段简介 &amp; 一点补充"));
 
@@ -19857,6 +20224,8 @@ mod tests {
         let html = render_novel_html(
             "开头文字[uploadedimage:20454750]结尾文字",
             &slots,
+            // 这里只验文字分段，图目录给个不存在的即可（找不到就跳过）。
+            Path::new("D:/不存在的配图目录/标题_images"),
             &NovelHtmlMeta {
                 title: "标题",
                 author_name: "作者",
@@ -20025,8 +20394,8 @@ mod tests {
         for expected in ["我的小说_images", "我的小说.html", "我的小说.epub", "我的小说.jpg"] {
             assert!(names.contains(&expected.to_string()), "缺少 {expected}");
         }
-        // 配图目录必须能被 is_generated_asset 认出来，否则会被当成「另一个版本」参与匹配
-        assert!(is_generated_asset(Path::new(
+        // 配图目录必须能被 is_images_asset_dir 认出来，否则会被当成「另一个版本」参与匹配
+        assert!(is_images_asset_dir(Path::new(
             r"E:\预览版\作者\我的小说_images"
         )));
     }
