@@ -886,6 +886,8 @@ async function invoke(command, args = {}) {
   }
   if (command === "delete_work") { const index = previewWorks.findIndex((item) => item.id === args.workId); if (index >= 0) previewWorks.splice(index, 1); return; }
   if (command === "delete_works") { for (const workId of args.workIds) { const index = previewWorks.findIndex((item) => item.id === workId); if (index >= 0) previewWorks.splice(index, 1); } return; }
+  // v1.3.2：彻底删除 —— 浏览器预览里没有真文件系统，只把记录摘掉、报个数
+  if (command === "delete_work_with_files") { const index = previewWorks.findIndex((item) => item.id === args.workId); if (index >= 0) previewWorks.splice(index, 1); return { recycled: 2, skippedShared: 0, failed: 0 }; }
   if (command === "set_author_order") {
     const byId = new Map(previewAuthors.map((author) => [author.id, author]));
     const ordered = args.authorIds.map((id) => byId.get(id)).filter(Boolean);
@@ -3363,7 +3365,8 @@ async function openWorkDetail(workId) {
 
 /** 详情弹窗底部：左边删除（危险动作放角落），右边关闭 */
 function detailFooter() {
-  return `<button class="danger-button" data-action="detail-delete" data-work-id="${state.workDetailId}">${icon("more", 17)}删除作品</button><span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>`;
+  // v1.3.2：「删除作品」旁加「彻底删除作品」—— 后者连磁盘文件一起清（送回收站）
+  return `<button class="danger-button" data-action="detail-delete" data-work-id="${state.workDetailId}">${icon("more", 17)}删除作品</button><button class="danger-button" data-action="detail-delete-files" data-work-id="${state.workDetailId}">${icon("trash", 17)}彻底删除作品</button><span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">关闭</button>`;
 }
 
 /**
@@ -3830,6 +3833,44 @@ function detailDeleteWork(workId) {
     state.detailWorkSnapshot = null;
     await refreshAfterDetailChange();
     toast("作品记录已删除，原始文件未受影响", "success");
+  });
+}
+
+/**
+ * 详情里的**彻底删除**（v1.3.2）：记录和磁盘文件一起清。
+ *
+ * 后端把绑定的正文（完整版 / 预览版那份）、封面、以及正文旁的同名附属物
+ * （`{主名}_images/` 配图目录、同名 html / epub / jpg）送进 **Windows 回收站**
+ * —— 不是物理删除，能在系统回收站里还原；正被别的作品绑着的（合集共享）自动保留。
+ * 绑定正文送回收站失败时后端中止且**不删记录**（可以再点一次重试）。
+ */
+function detailDeleteWorkWithFiles(workId) {
+  const work = findWork(workId) || state.detailWorkSnapshot;
+  if (!work) return;
+  const names = [];
+  const bound = work.purchasedPath || work.previewPath || "";
+  if (bound) names.push(String(bound).split(/[\\/]/).pop());
+  if (work.coverPath) names.push(String(work.coverPath).split(/[\\/]/).pop());
+  // ⚠️ confirmAction 会对整段文案做一次转义，这里一律传**原文**（别再自己 escape，会双重转义）
+  const detail = names.length
+    ? `送进回收站的文件：${names.join("、")}。`
+    : "这篇没有绑定本地文件，只会删除记录。";
+  confirmAction("确认彻底删除作品", `将删除“${work.title}”的记录，并把它绑定的文件与封面送进回收站（可在系统回收站还原，不是物理删除）。${detail}`, "彻底删除", async () => {
+    let result;
+    try {
+      result = await invoke("delete_work_with_files", { workId });
+    } catch (error) {
+      toast(String(error), "error");
+      return;
+    }
+    closeModal();
+    state.workDetailId = null;
+    state.detailWorkSnapshot = null;
+    await refreshAfterDetailChange();
+    const bits = [`${result?.recycled || 0} 个文件已送进回收站`];
+    if (result?.skippedShared) bits.push(`${result.skippedShared} 个文件还绑着其他作品、已保留`);
+    if (result?.failed) bits.push(`${result.failed} 个文件没能删除`);
+    toast(`已彻底删除“${work.title}”：${bits.join("；")}`, result?.skippedShared || result?.failed ? "info" : "success");
   });
 }
 
@@ -6154,6 +6195,7 @@ async function bindEvents() {
       if (action === "detail-toggle-images") await detailToggleImages(Number(workId));
       if (action === "detail-download") await detailDownload(Number(workId), element.dataset.format);
       if (action === "detail-delete") detailDeleteWork(Number(workId));
+      if (action === "detail-delete-files") detailDeleteWorkWithFiles(Number(workId));
       // 「我的收藏」上栏要列收藏作者，顺手把作者表刷新一次，别拿启动时那份旧的（v1.2.32）
       if (action === "go-collections") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "collections"; state.seriesView = null; state.seriesItems = []; state.activeCollection = null; state.activeAuthorCollection = null; state.collectionQuery = ""; await refreshCollections(); await refreshAuthorCollections(); await refreshAuthors(); render(); }
       if (action === "go-history") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "history"; state.seriesView = null; state.seriesItems = []; state.historyQuery = ""; await refreshHistory(); render(); }
@@ -8435,6 +8477,38 @@ async function cleanupPreviewVersions() {
  * 预览不是"统计一下有几条重复"，而是**一条一行、带勾选框**：没匹配到本地作品的默认勾上，
  * 匹配到的默认不勾、并在右边写明撞上了哪一篇（连相似度）。勾中的才会真的新建。
  */
+/**
+ * 文件名超长时的「中间省略」（v1.3.2）：保开头 + 保结尾（扩展名不会丢），中间用 … 收掉。
+ *
+ * 按**视觉宽度**估算（汉字 / 全角按 2、其余按 1）—— 纯按字符数会让中文名显得太满、
+ * 拉丁长名被截太多。完整原文另有 `title` 悬停可看，所以截短只影响观感。
+ */
+function middleEllipsis(text, maxVisual = 74, headVisual = 52) {
+  const value = String(text);
+  const widthOf = (ch) => (ch.codePointAt(0) > 0x2e7f ? 2 : 1);
+  let total = 0;
+  for (const ch of value) total += widthOf(ch);
+  if (total <= maxVisual) return value;
+  const tailBudget = maxVisual - headVisual - 1; // -1 留给省略号
+  let head = "";
+  let used = 0;
+  for (const ch of value) {
+    const width = widthOf(ch);
+    if (used + width > headVisual) break;
+    head += ch;
+    used += width;
+  }
+  let tail = "";
+  used = 0;
+  for (const ch of [...value].reverse()) {
+    const width = widthOf(ch);
+    if (used + width > tailBudget) break;
+    tail = ch + tail;
+    used += width;
+  }
+  return `${head}…${tail}`;
+}
+
 async function submitImport() {
   // 防重入（两道闸）：拉文件夹 + 跑相似度都要一会儿，连点两下会叠出两层「预览新建结果」，
   // 而 closeModal 一次只关最上层 ⇒ 越关越多。这里第二道闸兜住"上一次还没回来"。
@@ -8498,12 +8572,15 @@ async function runImportPreview() {
     const label = item.sourcePath
       ? String(item.sourcePath).split(/[\\/]/).pop()
       : (item.releaseDate ? `${item.releaseDate} ${item.title}` : item.title);
-    return `<label class="import-row" data-index="${index}"><input type="checkbox" data-import-pick${checked}><span class="import-row-main"><strong>${escapeHtml(label)}</strong></span>${badge}</label>`;
+    // v1.3.2：长文件名**中间省略**（开头 + … + 结尾，扩展名不会丢）；完整原文放 title 悬停看
+    const shown = middleEllipsis(label);
+    return `<label class="import-row" data-index="${index}"><input type="checkbox" data-import-pick${checked}><span class="import-row-main"><strong title="${escapeHtml(label)}">${escapeHtml(shown)}</strong></span>${badge}</label>`;
   }).join("");
   const folderLine = folderPath ? `<p class="import-folder">${icon("folder", 15)}<span>${escapeHtml(folderPath)}</span></p>` : "";
   const body = `${folderLine}<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品够像，已经自动取消勾选。勾上的才会新建${usingFolder ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）" : ""}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
   closeModal();
-  showModal(modal("预览新建结果", body, `<button class="quiet-button" data-action="close-modal">取消</button><span class="footer-spacer"></span><button class="quiet-button" data-action="import-toggle-all" data-checked="true">全选</button><button class="quiet-button" data-action="import-toggle-all" data-checked="false">全不选</button><button class="primary-button" data-action="import-confirm">确认新建</button>`));
+  // v1.3.2：弹窗加宽到 960 档（和「选择要关联的作品」「选择要分组到的作品」一致）——文件名一长这里太挤
+  showModal(modal("预览新建结果", body, `<button class="quiet-button" data-action="close-modal">取消</button><span class="footer-spacer"></span><button class="quiet-button" data-action="import-toggle-all" data-checked="true">全选</button><button class="quiet-button" data-action="import-toggle-all" data-checked="false">全不选</button><button class="primary-button" data-action="import-confirm">确认新建</button>`, "is-wide"));
   // 「确认新建」的说明里要报数，选一个就更新一次
   const confirmButton = document.querySelector('[data-action="import-confirm"]');
   const syncCount = () => {

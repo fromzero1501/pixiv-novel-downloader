@@ -13135,6 +13135,110 @@ fn delete_works(work_ids: Vec<i64>) -> Result<(), String> {
     Ok(())
 }
 
+/// 「彻底删除作品」的结果：前端按这几个数报给用户。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PurgeWorkResult {
+    /// 真送进回收站的文件 / 目录数
+    recycled: usize,
+    /// 因「还绑着别的作品」（合集共享）而保留的条数
+    skipped_shared: usize,
+    /// 想删却没删掉的附属文件数（绑定正文失败是硬错误，走 Err，不在这里）
+    failed: usize,
+}
+
+/// 彻底删除：记录 + 磁盘文件一起清（v1.3.2）。
+///
+/// 清什么：**绑定的正文**（完整版 / 预览版那份）、封面、以及正文旁的同名附属物
+/// （`{主名}_images/` 配图目录、同名 html / epub / jpg）—— 全部送 **Windows 回收站**
+/// （不是物理删除，随时能还原，和全项目其它删除一致）。
+///
+/// 两个边界：
+/// · **共享保护**：任何一条路径若还被别的作品绑着（合集几篇指向同一个文件），一律保留，
+///   计入 `skipped_shared` —— 删一篇合集会毁掉其他篇；
+/// · **绑定正文送回收站失败 ⇒ 中止、不删记录**（保持可重试，和「清理多余预览版」一致）；
+///   封面 / 附属物个别失败不阻挡，计入 `failed` 报出来。
+#[tauri::command]
+fn delete_work_with_files(work_id: i64) -> Result<PurgeWorkResult, String> {
+    let conn = db()?;
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT COALESCE(purchased_path,''), COALESCE(preview_path,''), COALESCE(cover_path,'') FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((purchased, preview, cover)) = row else {
+        return Err("这篇作品的记录已经不在了".into());
+    };
+
+    // 收集清单：正文（primary）放最前 —— 它回收失败要当场中止，后面那些还没动过。
+    // 按 `path_key` 去重：同名封面与 `{主名}.jpg` 经常就是同一份。
+    fn push_target(
+        targets: &mut Vec<(PathBuf, bool)>,
+        seen: &mut HashSet<String>,
+        path: PathBuf,
+        primary: bool,
+    ) {
+        let key = path_key(&path.to_string_lossy());
+        if key.is_empty() || !seen.insert(key) {
+            return;
+        }
+        targets.push((path, primary));
+    }
+    let mut targets: Vec<(PathBuf, bool)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for value in [&purchased, &preview] {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        push_target(&mut targets, &mut seen, PathBuf::from(trimmed), true);
+    }
+    for value in [&purchased, &preview] {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        for asset in sibling_assets(Path::new(trimmed)) {
+            push_target(&mut targets, &mut seen, asset, false);
+        }
+    }
+    let cover = cover.trim();
+    if !cover.is_empty() {
+        push_target(&mut targets, &mut seen, PathBuf::from(cover), false);
+    }
+
+    let mut result = PurgeWorkResult {
+        recycled: 0,
+        skipped_shared: 0,
+        failed: 0,
+    };
+    for (path, primary) in &targets {
+        if !path.exists() {
+            continue;
+        }
+        if path_bound_to_another_work(&conn, path, work_id) {
+            result.skipped_shared += 1;
+            continue;
+        }
+        match recycle_to_bin(path) {
+            Ok(()) => result.recycled += 1,
+            Err(error) => {
+                if *primary {
+                    return Err(format!("绑定文件没能送进回收站，已中止（作品记录保留）：{error}"));
+                }
+                result.failed += 1;
+            }
+        }
+    }
+
+    conn.execute("DELETE FROM works WHERE id=?1", [work_id])
+        .map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
 // ============================ 收藏夹与浏览历史（v1.1.0） ============================
 
 /// 收藏夹名字：去掉首尾空白、不许空、给个长度上限（侧栏卡片放不下太长的）。
@@ -17059,6 +17163,7 @@ pub fn run() {
             mark_work_as_preview,
             delete_work,
             delete_works,
+            delete_work_with_files,
             toggle_has_images,
             list_collections,
             create_collection,

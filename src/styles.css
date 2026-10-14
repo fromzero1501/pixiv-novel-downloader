@@ -1004,7 +1004,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .import-row:hover { background: #eef5ff; }
 .import-row input[type="checkbox"] { flex: 0 0 auto; width: 15px; height: 15px; margin: 2px 0 0; accent-color: #216bc7; }
 .import-row-main { display: grid; flex: 1 1 auto; min-width: 0; gap: 2px; }
-.import-row-main strong { color: #2b4260; font-size: 13.5px; font-weight: 600; word-break: break-all; }
+.import-row-main strong { color: #2b4260; font-size: 13.5px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .import-folder { display: flex; align-items: flex-start; gap: 7px; margin: 0 0 12px; padding: 8px 10px; color: #536a85; background: #f5f8fc; border: 1px solid #e0e9f2; border-radius: 6px; font-size: 12.5px; }
 .import-folder svg { flex: 0 0 auto; margin-top: 1px; color: #7c93ab; }
 .import-folder span { min-width: 0; word-break: break-all; }
