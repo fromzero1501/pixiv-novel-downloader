@@ -8451,6 +8451,9 @@ async function runImportPreview() {
   const usingFolder = !folderPanel.classList.contains("is-hidden");
   // 文件夹方式给的是**完整路径**（后端要拿它把文件绑成完整版）
   let lines = [];
+  // 文件夹方式的目录：预览页顶部只显示一次（v1.2.99 用户要求 —— 每行都重复同一个
+  // 目录没有信息量，还把那行挤得看不全文件名）
+  let folderPath = "";
   if (usingPaste) {
     const form = new FormData(document.querySelector("#paste-import-form"));
     const prefix = form.get("prefix").trim();
@@ -8459,6 +8462,7 @@ async function runImportPreview() {
     const form = new FormData(document.querySelector("#folder-import-form"));
     const path = form.get("folderPath");
     if (!path) throw new Error("请先选择作品文件夹");
+    folderPath = String(path);
     const settings = await invoke("get_app_settings");
     const minimumSizeBytes = Number(settings.minimumTextCount || 0);
     lines = await invoke("read_import_folder", { path, minimumSizeBytes });
@@ -8485,10 +8489,15 @@ async function runImportPreview() {
     const badge = item.matchedWorkId
       ? `<span class="import-match" title="本地已有这篇作品">撞上：${escapeHtml(item.matchedTitle)}（${item.matchedScore}%）</span>`
       : (item.matchedScore ? `<span class="import-faint">本地没有相近的作品（最像的只有 ${item.matchedScore}%）</span>` : `<span class="import-faint">本地没有相近的作品</span>`);
-    const where = item.sourcePath ? `<span class="import-path">${escapeHtml(item.sourcePath)}</span>` : "";
-    return `<label class="import-row" data-index="${index}"><input type="checkbox" data-import-pick${checked}><span class="import-row-main"><strong>${escapeHtml(item.releaseDate ? `${item.releaseDate} ${item.title}` : item.title)}</strong>${where}</span>${badge}</label>`;
+    // 文件夹方式直接显示**文件名原文**（v1.2.99 用户要求）—— 带后缀，一眼看出哪篇是 txt、哪篇是 epub；
+    // 路径不在这儿重复了，顶部统一显示一次。粘贴 / Excel 没有源文件，只能显示解析出来的标题。
+    const label = item.sourcePath
+      ? String(item.sourcePath).split(/[\\/]/).pop()
+      : (item.releaseDate ? `${item.releaseDate} ${item.title}` : item.title);
+    return `<label class="import-row" data-index="${index}"><input type="checkbox" data-import-pick${checked}><span class="import-row-main"><strong>${escapeHtml(label)}</strong></span>${badge}</label>`;
   }).join("");
-  const body = `<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品够像，已经自动取消勾选。勾上的才会新建${usingFolder ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）" : ""}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
+  const folderLine = folderPath ? `<p class="import-folder">${icon("folder", 15)}<span>${escapeHtml(folderPath)}</span></p>` : "";
+  const body = `${folderLine}<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品够像，已经自动取消勾选。勾上的才会新建${usingFolder ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）" : ""}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
   closeModal();
   showModal(modal("预览新建结果", body, `<button class="quiet-button" data-action="close-modal">取消</button><span class="footer-spacer"></span><button class="quiet-button" data-action="import-toggle-all" data-checked="true">全选</button><button class="quiet-button" data-action="import-toggle-all" data-checked="false">全不选</button><button class="primary-button" data-action="import-confirm">确认新建</button>`));
   // 「确认新建」的说明里要报数，选一个就更新一次
@@ -8538,6 +8547,10 @@ function confirmImportPreview() {
     await refreshWorks();
     await refreshAuthors();
     render();
+    // v1.2.99：新建的作品字数是 -1（未算）。这里不补算的话要等**下次重启软件**
+    // 才会被后台补上 —— 刚导入的 epub 就会一直显示不出字数（用户 2026-10-14 报的）。
+    // 传 true：算完当场把字数补到卡片上，不用刷新。
+    if (result.created > 0) fillWordCountsInBackground(true);
     const bits = [`新建 ${result.created} 篇`];
     if (result.matched) bits.push(`${result.matched} 篇撞上已有作品、没建`);
     if (result.failed) bits.push(`${result.failed} 篇的文件没能绑成完整版`);

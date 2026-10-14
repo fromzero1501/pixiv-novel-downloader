@@ -15657,19 +15657,295 @@ fn commit_import(
     })
 }
 
-/// 从 EPUB 里取**第一张图**的原始字节与扩展名，取不到返回 `None`（v1.2.98）。
+/// 把 XML 注释整段抹掉（`<!-- ... -->`）。
+/// 手写解析不认注释，留着的话被注释掉的 `<item>` 会被当成真的读到。
+fn strip_xml_comments(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            // 注释没闭合：后面全当注释丢掉，宁可少读也不要读错
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 收集所有 `<name ...>` 开标签的原始文本（从 `<name` 到它自己的 `>`）。
 ///
-/// 按 zip 内的物理顺序走（和 `count_epub_images` 同一个遍历口径），跳过目录项与
-/// `META-INF/`（那里是 epub 自己的元数据，不是书里的图）。
+/// 不做正经 XML 解析 —— 只要能读属性就够，容错优先。标签名后必须跟空白 / `/` / `>`，
+/// 免得 `<item>` 的匹配把 `<items>` 也捞进来。
+fn xml_open_tags(xml: &str, name: &str) -> Vec<String> {
+    let needle = format!("<{name}");
+    let mut tags = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < xml.len() {
+        let Some(offset) = xml[cursor..].find(&needle) else {
+            break;
+        };
+        let start = cursor + offset;
+        let after = start + needle.len();
+        let boundary_ok = xml[after..]
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_whitespace() || ch == '/' || ch == '>');
+        if !boundary_ok {
+            cursor = after;
+            continue;
+        }
+        let end = xml[start..]
+            .find('>')
+            .map(|value| start + value + 1)
+            .unwrap_or(xml.len());
+        tags.push(xml[start..end].to_string());
+        cursor = end;
+    }
+    tags
+}
+
+/// 从一个开标签文本里读属性值（双引号、单引号都认，`=` 两边允许有空格）。
 ///
-/// ⚠️ **不解码、不重编码**，原样返回字节：项目里的 `image` crate 只编了 jpeg 特性，
-/// PNG / WebP 根本解不了；原样写还不会掉画质，顺带支持 svg 这种矢量图。
-fn epub_first_image(path: &Path) -> Option<(Vec<u8>, String)> {
+/// 属性名**必须**是独立的一个词：左边得是空白字符。否则 `xml_attr(tag, "src")`
+/// 会命中 `<img data-src="...">` 里的 `data-src`、`xml_attr(tag, "id")` 会命中
+/// `<itemref idref="c1">` 里的 `idref` —— 这两处都是真会踩到的。
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < tag.len() {
+        let Some(offset) = tag[cursor..].find(name) else {
+            return None;
+        };
+        let start = cursor + offset;
+        let mut index = start + name.len();
+        cursor = index;
+        if !tag[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_whitespace())
+        {
+            continue;
+        }
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'=' {
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let Some(&quote) = bytes.get(index) else {
+            return None;
+        };
+        if quote != b'"' && quote != b'\'' {
+            continue;
+        }
+        index += 1;
+        let value_start = index;
+        while index < bytes.len() && bytes[index] != quote {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        return Some(tag[value_start..index].to_string());
+    }
+    None
+}
+
+/// 把 epub 里的相对引用（OPF / 正文里的 href）解析成 zip 内的完整路径。
+/// `base_dir` 是引用者所在目录（zip 内路径，不带结尾 `/`）。
+fn resolve_zip_relative(base_dir: &str, href: &str) -> String {
+    // 只取路径那截：`#fragment`（指向章节内的锚点）和 `?query` 都不算文件名
+    let href = href.split(['#', '?']).next().unwrap_or("");
+    let mut parts: Vec<&str> = Vec::new();
+    if !href.starts_with('/') {
+        parts.extend(base_dir.split('/').filter(|segment| !segment.is_empty()));
+    }
+    for segment in href.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// zip 内某个路径所在目录（`OEBPS/text/a.xhtml` → `OEBPS/text`）。
+fn zip_dir_of(path: &str) -> String {
+    match path.rfind('/') {
+        Some(index) => path[..index].to_string(),
+        None => String::new(),
+    }
+}
+
+/// 在 zip 里按名字找一个条目，返回**它在 zip 里的真实名字**。
+/// 精确匹配不上时按忽略大小写再找一遍 —— OPF 里写的 href 大小写不保证跟打包时一致。
+fn zip_entry_name_matching<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    wanted: &str,
+) -> Option<String> {
+    let wanted = wanted.replace('\\', "/");
+    if archive.by_name(&wanted).is_ok() {
+        return Some(wanted);
+    }
+    let target = wanted.to_ascii_lowercase();
+    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    names
+        .into_iter()
+        .find(|name| name.replace('\\', "/").to_ascii_lowercase() == target)
+}
+
+/// 读 zip 里的一个文本条目（找不到 / 读不出都返回 None）。
+fn read_zip_entry_text<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    name: &str,
+) -> Option<String> {
     use std::io::Read;
-    let file = fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let real = zip_entry_name_matching(archive, name)?;
+    let mut entry = archive.by_name(&real).ok()?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// OPF 里声明的封面 href。三种写法都认（谁先命中用谁）：
+///   (a) EPUB 3 的 `<item ... properties="cover-image"/>`
+///   (b) EPUB 2 的 `<meta name="cover" content="ID"/>` ⇒ 再按 ID 去 manifest 找 href
+///   (c) guide 里的 `<reference type="cover" href="..."/>`
+fn declared_cover_href(opf: &str) -> Option<String> {
+    for tag in xml_open_tags(opf, "item") {
+        let is_cover = xml_attr(&tag, "properties")
+            .is_some_and(|value| value.split_whitespace().any(|word| word == "cover-image"));
+        if is_cover {
+            if let Some(href) = xml_attr(&tag, "href") {
+                return Some(href);
+            }
+        }
+    }
+    let cover_id = xml_open_tags(opf, "meta").iter().find_map(|tag| {
+        xml_attr(tag, "name")
+            .filter(|value| value.eq_ignore_ascii_case("cover"))
+            .and_then(|_| xml_attr(tag, "content"))
+    });
+    if let Some(id) = cover_id {
+        for tag in xml_open_tags(opf, "item") {
+            if xml_attr(&tag, "id").as_deref() == Some(id.as_str()) {
+                if let Some(href) = xml_attr(&tag, "href") {
+                    return Some(href);
+                }
+            }
+        }
+    }
+    for tag in xml_open_tags(opf, "reference") {
+        let is_cover = xml_attr(&tag, "type")
+            .is_some_and(|value| value.eq_ignore_ascii_case("cover"));
+        if is_cover {
+            if let Some(href) = xml_attr(&tag, "href") {
+                return Some(href);
+            }
+        }
+    }
+    None
+}
+
+/// 正文文档里**第一个**引用的图片地址（`<img src>` 或 SVG 里的 `<image xlink:href>`），
+/// 取出现位置最早的那个 —— 那才是读者翻开这本书先看到的那张。
+fn first_image_reference(document: &str) -> Option<String> {
+    let body = strip_xml_comments(document);
+    // `to_ascii_lowercase` 不改字节长度，所以下面的位置索引和 `body` 是对齐的
+    let lower = body.to_ascii_lowercase();
+    let mut best: Option<usize> = None;
+    for needle in ["<img", "<image"] {
+        if let Some(position) = lower.find(needle) {
+            if best.map_or(true, |current| position < current) {
+                best = Some(position);
+            }
+        }
+    }
+    let position = best?;
+    let end = lower[position..]
+        .find('>')
+        .map(|value| position + value)
+        .unwrap_or(lower.len());
+    let tag = &body[position..end];
+    xml_attr(tag, "src").or_else(|| xml_attr(tag, "xlink:href"))
+}
+
+/// 找出这本 epub 的**封面图**在 zip 里的路径。按**从准到松**三层：
+///   1. OPF 里声明的封面（`declared_cover_href` 那三种写法）
+///   2. **阅读顺序**的第一张图：spine 里第一个文档中第一个 `<img>` / `<image>`
+///   3. 都没有 ⇒ `None`（调用方会退回"zip 里第一张"）
+///
+/// ⚠️ 为什么不能直接按 zip 顺序取第一张（v1.2.98 就是这么干的，踩了）：
+/// **打包顺序跟书里的顺序无关**。用户实测那本按文件名字典序打包，
+/// `image-1.png`（21×21 的小图标）排在 `image-10.jpeg` 这些真插画前面 ——
+/// 封面被取成了那个小图标（2026-10-14 报的 bug）。
+fn epub_cover_entry_name<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<String> {
+    let container = read_zip_entry_text(archive, "META-INF/container.xml")?;
+    let container = strip_xml_comments(&container);
+    let opf_path = xml_open_tags(&container, "rootfile")
+        .iter()
+        .find_map(|tag| xml_attr(tag, "full-path"))?;
+    let opf_path = opf_path.replace('\\', "/");
+    let opf_dir = zip_dir_of(&opf_path);
+    let opf = read_zip_entry_text(archive, &opf_path)?;
+    let opf = strip_xml_comments(&opf);
+
+    // 第 1 层：OPF 里声明的封面。guide 那种写法有时指向**封面页**（xhtml）而不是图，
+    // 所以这里要确认解析出来的真是一张图，不是就往下走。
+    if let Some(href) = declared_cover_href(&opf) {
+        let candidate = resolve_zip_relative(&opf_dir, &href);
+        if is_image_file_name(&candidate) && zip_entry_name_matching(archive, &candidate).is_some() {
+            return Some(candidate);
+        }
+    }
+
+    // 第 2 层：按 spine 的阅读顺序，找第一个文档里第一个引用的图
+    let manifest = xml_open_tags(&opf, "item");
+    for idref in xml_open_tags(&opf, "itemref")
+        .iter()
+        .filter_map(|tag| xml_attr(tag, "idref"))
+    {
+        let href = manifest.iter().find_map(|tag| {
+            (xml_attr(tag, "id").as_deref() == Some(idref.as_str()))
+                .then(|| xml_attr(tag, "href"))
+                .flatten()
+        });
+        let Some(href) = href else {
+            continue;
+        };
+        let doc_path = resolve_zip_relative(&opf_dir, &href);
+        let Some(doc) = read_zip_entry_text(archive, &doc_path) else {
+            continue;
+        };
+        let Some(reference) = first_image_reference(&doc) else {
+            continue;
+        };
+        let candidate = resolve_zip_relative(&zip_dir_of(&doc_path), &reference);
+        if is_image_file_name(&candidate) && zip_entry_name_matching(archive, &candidate).is_some() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// 兜底：按 zip 内的**物理顺序**取第一张图。这条路不保证是书里的第一张
+/// （打包顺序常常只是文件名字典序），只在 OPF 那条路彻底走不通时才用。
+fn epub_any_image_entry_name<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<String> {
     for index in 0..archive.len() {
-        let Ok(mut entry) = archive.by_index(index) else {
+        let Ok(entry) = archive.by_index(index) else {
             continue;
         };
         if entry.is_dir() {
@@ -15679,21 +15955,39 @@ fn epub_first_image(path: &Path) -> Option<(Vec<u8>, String)> {
         if name.to_ascii_lowercase().starts_with("meta-inf/") {
             continue;
         }
-        if !is_image_file_name(&name) {
-            continue;
+        if is_image_file_name(&name) {
+            return Some(name);
         }
-        let extension = Path::new(&name)
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase())
-            .unwrap_or_default();
-        let mut bytes = Vec::new();
-        if entry.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
-            continue;
-        }
-        return Some((bytes, extension));
     }
     None
+}
+
+/// 从 EPUB 里取出**封面图**的原始字节与扩展名，取不到返回 `None`（v1.2.98 起）。
+///
+/// 先按「书里的顺序」找（`epub_cover_entry_name`），走不通才退回 zip 顺序。
+/// 跳过目录项与 `META-INF/`（那里是 epub 自己的元数据，不是书里的图）。
+///
+/// ⚠️ **不解码、不重编码**，原样返回字节：项目里的 `image` crate 只编了 jpeg 特性，
+/// PNG / WebP 根本解不了；原样写还不会掉画质，顺带支持 svg 这种矢量图。
+fn epub_first_image(path: &Path) -> Option<(Vec<u8>, String)> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let found = epub_cover_entry_name(&mut archive)
+        .or_else(|| epub_any_image_entry_name(&mut archive))?;
+    let real = zip_entry_name_matching(&mut archive, &found).unwrap_or(found);
+    let mut entry = archive.by_name(&real).ok()?;
+    let extension = Path::new(&real)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some((bytes, extension))
 }
 
 /// 把导入进来的 EPUB 首图，**存成这个作品的封面**。
@@ -16464,7 +16758,7 @@ mod tests {
         extended_path_for_api, strip_extended_prefix,
         should_import_folder_entry, should_skip_small_content, similarity_percent, similarity_with_title_limit,
         best_import_match, import_folder_extension_allowed, author_works_for_match, ImportCandidate, ImportSelection,
-        attach_import_cover, epub_first_image,
+        attach_import_cover, epub_first_image, xml_attr,
         sort_works_by_content_size,
         default_update_mirrors, join_mirror, parse_version, prefixed_urls,
         probe_latest_version, probe_update_asset, update_asset_names, update_client,
@@ -20718,6 +21012,140 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 按给定顺序写一本最小 epub（条目顺序＝zip 物理顺序，测试里要靠它复现"打包顺序"）。
+    fn write_test_epub(path: &Path, entries: &[(&str, Vec<u8>)]) {
+        let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, body) in entries {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(body).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    /// v1.2.99：取封面要**按书里的顺序**，不是 zip 的打包顺序。
+    ///
+    /// 这是用户实测那本的缩影：图片按**文件名字典序**打包（`image-1` 排在 `image-10`
+    /// 前面），而 `image-1.png` 只是正文里的小装饰图。旧实现（zip 第一张）会取到它 ——
+    /// 用户报的「取到红心一样的缩略图」就是这件事。
+    #[test]
+    fn epub_cover_follows_the_opf_not_the_zip_order() {
+        let root = std::env::temp_dir().join(format!("epub-cover-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let epub = root.join("同构样本.epub");
+        write_test_epub(
+            &epub,
+            &[
+                ("mimetype", b"application/epub+zip".to_vec()),
+                (
+                    "META-INF/container.xml",
+                    br#"<?xml version="1.0"?><container version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.to_vec(),
+                ),
+                (
+                    "OEBPS/content.opf",
+                    br#"<?xml version="1.0"?><package version="3.0"><metadata><meta name="cover" content="a17"/></metadata><manifest><item id="c1" href="chapter_001.xhtml" media-type="application/xhtml+xml"/><item id="a1" href="assets/image-1.png" media-type="image/png"/><item id="a2" href="assets/image-10.jpeg" media-type="image/jpeg"/><item id="a17" href="assets/image-3.jpeg" media-type="image/jpeg" properties="cover-image"/></manifest><guide><reference type="cover" href="assets/image-3.jpeg"/></guide><spine toc="ncx"><itemref idref="c1"/></spine></package>"#.to_vec(),
+                ),
+                (
+                    "OEBPS/chapter_001.xhtml",
+                    br#"<html><body><p>text</p><img src="assets/image-3.jpeg"/><img src="assets/image-1.png"/></body></html>"#.to_vec(),
+                ),
+                // 打包顺序故意让小图标排最前 —— 旧实现就是在这儿踩的
+                ("OEBPS/assets/image-1.png", b"small-icon".to_vec()),
+                ("OEBPS/assets/image-10.jpeg", b"big-illustration".to_vec()),
+                ("OEBPS/assets/image-3.jpeg", b"the-real-cover".to_vec()),
+            ],
+        );
+
+        let (bytes, extension) = epub_first_image(&epub).expect("该能取到封面");
+        assert_eq!(
+            bytes,
+            b"the-real-cover".to_vec(),
+            "要 OPF 声明的封面，不是 zip 里的第一张"
+        );
+        assert_eq!(extension, "jpeg");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 没有封面标记时，按**阅读顺序**取正文第一个引用的图（跳过后面的装饰图）。
+    #[test]
+    fn epub_cover_falls_back_to_the_first_image_in_reading_order() {
+        let root = std::env::temp_dir().join(format!("epub-order-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let epub = root.join("无封面标记.epub");
+        write_test_epub(
+            &epub,
+            &[
+                (
+                    "META-INF/container.xml",
+                    br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#.to_vec(),
+                ),
+                // 没有 cover 标记，也没有 guide
+                (
+                    "content.opf",
+                    br#"<package><manifest><item id="c1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/><item id="a1" href="images/icon.png" media-type="image/png"/><item id="a2" href="images/real.jpg" media-type="image/jpeg"/></manifest><spine><itemref idref="c1"/></spine></package>"#.to_vec(),
+                ),
+                // 正文第一张是 real.jpg，icon 在后面 ⇒ 要取 real.jpg
+                (
+                    "text/ch1.xhtml",
+                    br#"<html><body><img src="../images/real.jpg"/><p>x</p><img src="../images/icon.png"/></body></html>"#.to_vec(),
+                ),
+                ("images/icon.png", b"icon".to_vec()),
+                ("images/real.jpg", b"real-one".to_vec()),
+            ],
+        );
+
+        let (bytes, _) = epub_first_image(&epub).expect("该能取到封面");
+        assert_eq!(bytes, b"real-one".to_vec(), "要正文里第一个引用的图");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 连 `container.xml` / OPF 都没有（畸形 epub）⇒ 退回 zip 顺序，别整个失败。
+    #[test]
+    fn epub_cover_falls_back_to_zip_order_without_an_opf() {
+        let root = std::env::temp_dir().join(format!("epub-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let epub = root.join("没有元数据.epub");
+        write_test_epub(
+            &epub,
+            &[
+                ("first.jpg", b"zip-first".to_vec()),
+                ("second.jpg", b"zip-second".to_vec()),
+            ],
+        );
+
+        let (bytes, extension) = epub_first_image(&epub).expect("兜底也该取到一张");
+        assert_eq!(bytes, b"zip-first".to_vec());
+        assert_eq!(extension, "jpg");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 属性名必须是**整词**：`data-src` 不能当成 `src`，`idref` 不能当成 `id`。
+    /// 这两处都是真会踩到的 —— 踩了就会取错图 / 找错 manifest 项。
+    #[test]
+    fn xml_attr_requires_a_whole_attribute_name() {
+        let tag = r#"<img data-src="wrong.png" src="right.png"/>"#;
+        assert_eq!(xml_attr(tag, "src").as_deref(), Some("right.png"));
+        assert_eq!(xml_attr(tag, "data-src").as_deref(), Some("wrong.png"));
+
+        let itemref = r#"<itemref idref="c1"/>"#;
+        assert_eq!(xml_attr(itemref, "id"), None, "idref 不是 id");
+        assert_eq!(xml_attr(itemref, "idref").as_deref(), Some("c1"));
+
+        // 单引号、以及 `=` 两边带空格的写法都要认
+        let spaced = "<item id = 'a1' href='x.jpg'/>";
+        assert_eq!(xml_attr(spaced, "id").as_deref(), Some("a1"));
+        assert_eq!(xml_attr(spaced, "href").as_deref(), Some("x.jpg"));
+        // 属性不存在就是 None，别瞎猜
+        assert_eq!(xml_attr(spaced, "properties"), None);
     }
 
     /// v1.2.18 / v1.2.94：EPUB 假字数的两口子迁移。
