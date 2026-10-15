@@ -7369,12 +7369,18 @@ async function bindEvents() {
     settingsForm.addEventListener("submit", (event) => { event.preventDefault(); flushSettingsSave(settingsForm); });
     // 数字框只收数字（用户 2026-10-15）：`type="number"` 自己仍放行 e / E / + / - / .，
     // 中文输入法和粘贴还能塞进别的 —— 用户在「最小作品字数」上就敲进去过。
-    // 在**字符落进去之前**拦一道：键盘走 beforeinput，粘贴单独剥一遍。
+    //
+    // ⚠️⚠️ 这里**只能挂 keydown，绝不能挂 beforeinput**。用户 18:04 实测：挂了 beforeinput 之后
+    // 「设置里所有输入框」打字和删除都卡，而按上下键调数值完全不卡 —— 差别就在 beforeinput 是
+    // **可取消的输入事务事件**：绑了它，浏览器每次输入都得等 JS 走完才继续（WebView2 上这个代价
+    // 尤其明显，连普通文本框都跟着遭殃）；上下键不产生输入事务，压根不触发它，所以那会儿一点不卡。
+    // keydown 没有这个副作用，也照样能拦住字母和符号（只挡「可打印的单字符」，
+    // 退格 / 方向键 / Tab / 回车这些 key.length > 1 的照常放行）。
     const isNumberInput = (element) =>
       element?.tagName === "INPUT" && (element.type || "").toLowerCase() === "number";
-    settingsForm.addEventListener("beforeinput", (event) => {
+    settingsForm.addEventListener("keydown", (event) => {
       if (!isNumberInput(event.target)) return;
-      if (event.data && /\D/.test(event.data)) event.preventDefault();
+      if (event.key.length === 1 && /\D/.test(event.key)) event.preventDefault();
     });
     settingsForm.addEventListener("paste", (event) => {
       if (!isNumberInput(event.target)) return;
