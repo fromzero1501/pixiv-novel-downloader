@@ -916,7 +916,7 @@ async function invoke(command, args = {}) {
     return;
   }
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
-  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "html", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "书香", url: "https://sxsy45.com/search.php?mod=forum&searchid=83552&orderby=dateline&ascdesc=desc&searchsubmit=yes&kw=%E5%9B%BE" }, { name: "示例站", url: "https://example.com/search?q=" }], ...(window.__mockAppSettings || {}) };
+  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "epub", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "尚香书苑", url: "https://sxsy45.com/search.php?mod=forum&orderby=dateline&ascdesc=desc&searchsubmit=yes&srchtxt=" }], ...(window.__mockAppSettings || {}) };
   if (command === "save_app_settings") return args.settings;
   // 浏览器预览默认当作「已是最新版」；要看更新界面就把 window.__mockUpdateCheck 塞进来
   // 预览环境没有 Tauri 后端：给个默认「没填过 Cookie」，验证脚本可以塞 window.__mockCookieProbe 覆盖
@@ -9282,12 +9282,49 @@ async function probeAuthorStatus(authorId) {
   }
 }
 
+/**
+ * 同步前的 Cookie 体检（用户 2026-10-15 要求）：没填就在开跑之前提示，别让人白等一趟。
+ *
+ * **不拦死** —— 匿名也能拉到公开作品，所以留一个「仍然同步」的口子；
+ * 选了「去设置里填」就返回 false，调用方直接收工。
+ */
+async function ensurePixivCookie() {
+  if (String(state.settings?.pixivCookie || "").trim()) return true;
+  return await new Promise((resolve) => {
+    showModal(modal("还没填 Pixiv Cookie",
+      `<div class="cookie-warning">
+        <p>这一趟同步没拿到 Pixiv Cookie。填与不填的差别：</p>
+        <ul>
+          <li>不填：只能拉到公开作品，敏感（R-18）作品、完整作品列表都拿不到</li>
+          <li>填了：正常同步，和 Pixiv 上看到的对得上</li>
+        </ul>
+        <p>在设置里粘一次就行，旁边还有「测试 Cookie」可以先验一下有没有生效。</p>
+      </div>`,
+      `<button class="quiet-button" data-action="cookie-need-skip">仍然同步</button>
+       <button class="primary-button" data-action="cookie-need-settings">去设置里填</button>`));
+    document.querySelector('[data-action="cookie-need-skip"]')?.addEventListener("click", () => {
+      closeModal();
+      resolve(true);
+    });
+    document.querySelector('[data-action="cookie-need-settings"]')?.addEventListener("click", async () => {
+      closeModal();
+      // 单作者那条路的同步弹窗可能还在下面一层，一起收掉，免得叠成三层
+      closeModal();
+      await settingsModal();
+      resolve(false);
+    });
+  });
+}
+
 async function syncPixivWorks() {
   const form = document.querySelector("#pixiv-sync-form");
   if (!form) return;
   const { startDate = "", endDate = "", novelUrl = "" } = Object.fromEntries(new FormData(form).entries());
   const authorId = state.activeAuthor.id;
   const authorName = state.activeAuthor.name;
+  // 同步前的 Cookie 体检（放在 closeModal 之前：提示得叠在同步弹窗上面，
+  // 用户才看得出是「这一趟」缺东西）
+  if (!(await ensurePixivCookie())) return;
   // 填了单篇链接时不必（也没法）查作者主页 —— 这一趟同步的就是那一篇
   const probeAuthor = !isPixivNovelUrl(novelUrl);
   // 同步放后台跑：先关掉弹窗，主界面右下角显示进度，用户可以继续浏览其他内容
@@ -9375,6 +9412,8 @@ async function syncPixivWorks() {
 // 列表只抓一次：盘点段核对好的清单直接传给第二段，不会重扫。
 async function syncAllAuthors(targetsOverride) {
   if (state.syncTask) { toast("已有同步任务正在进行，请等待完成或先终止", "info"); return; }
+  // 同步前的 Cookie 体检（用户 2026-10-15 要求，见 ensurePixivCookie）
+  if (!(await ensurePixivCookie())) return;
   // 「散篇」作者不参与整库同步（用户要求）：它们只是下载时的落脚点，
   // 菜单里连卡都不显示，更不该去拉它们主页上的全部作品。
   // targetsOverride：设置里开了「新建作者 / 散篇转正时同步其所有作品」时，只同步刚建档 / 转正的那几位。
@@ -9780,7 +9819,7 @@ async function settingsModal() {
     <h3 class="settings-group-head"><span class="settings-group-no">5</span>下载与图文</h3>
     <div class="settings-fields is-single">
       <label>配图画质 <select name="imageQuality"><option value="1200" ${(settings.imageQuality || "1200") === "1200" ? "selected" : ""}>1200 宽（推荐，每张约 1 MB）</option><option value="original" ${settings.imageQuality === "original" ? "selected" : ""}>原始画质（作者上传的原图，可能每张几 MB）</option></select><small>图文小说同步时下载正文配图用这一档。原图更清晰，但一篇的配图可能要几十到上百 MB。</small></label>
-      <label>同步作品时图文小说自动保存为 <select name="syncImageFormat"><option value="html" ${(settings.syncImageFormat || "html") === "html" ? "selected" : ""}>HTML（浏览器直接打开）</option><option value="epub" ${settings.syncImageFormat === "epub" ? "selected" : ""}>EPUB（电子书阅读器）</option></select><small>同步图文小说时只保留这一种阅读版：HTML 双击就能用浏览器看，EPUB 适合推到手机 / 阅读器。不会两种都存。</small></label>
+      <label>同步作品时图文小说自动保存为 <select name="syncImageFormat"><option value="html" ${settings.syncImageFormat === "html" ? "selected" : ""}>HTML（浏览器直接打开）</option><option value="epub" ${(settings.syncImageFormat || "epub") === "epub" ? "selected" : ""}>EPUB（电子书阅读器）</option></select><small>同步图文小说时只保留这一种阅读版：HTML 双击就能用浏览器看，EPUB 适合推到手机 / 阅读器。不会两种都存。</small></label>
     </div>
   </section>
   <section class="settings-group is-search">

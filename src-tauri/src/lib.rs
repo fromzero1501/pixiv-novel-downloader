@@ -1785,17 +1785,29 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
                 "1200".to_string()
             }
         },
+        // 默认 EPUB（v1.3.20 用户要求）：只有**明确存过 html** 才用 html，
+        // 其余（没配过 / 旧库空值 / 存坏了）一律 epub。
+        // 注：一路用下来的老库多半已经存着 "html"（那是从前的默认值），
+        // 它们保持 html 不动 —— 想要 EPUB 得自己去设置里换一次。
         sync_image_format: {
             let value = setting(conn, "sync_image_format")?;
-            if value == "epub" {
-                "epub".to_string()
-            } else {
+            if value == "html" {
                 "html".to_string()
+            } else {
+                "epub".to_string()
             }
         },
-        // 存的是 JSON 文本；解析不出来（手改坏了或旧库空值）就当没配过
-        search_sites: serde_json::from_str::<Vec<SearchSite>>(&setting(conn, "search_sites")?)
-            .unwrap_or_default(),
+        // 存的是 JSON 文本；解析不出来（手改坏了或旧库空值）就当没配过。
+        // 完全没配过（空串）⇒ 出厂默认那个搜索站；用户在设置里清空存进去的是 "[]"，
+        // 走下面那支 ⇒ 不会被默认值顶回来。
+        search_sites: {
+            let raw = setting(conn, "search_sites")?;
+            if raw.trim().is_empty() {
+                default_search_sites()
+            } else {
+                serde_json::from_str::<Vec<SearchSite>>(&raw).unwrap_or_default()
+            }
+        },
         // 简介判定的两组关键词（v1.2.46）：没配过（空串）用内置默认，配过就用配的
         full_version_keywords: parse_keyword_list(
             &setting(conn, "full_version_keywords")?,
@@ -15825,6 +15837,17 @@ fn default_preview_version_keywords() -> Vec<String> {
     keywords
 }
 
+/// 出厂自带的搜索网站（v1.3.20 用户要求）。
+///
+/// 只在**完全没配过**（设置项是空串）时用上；用户在设置里把它删掉后存进去的是 `[]`，
+/// 不会被这里顶回来 —— 所以「删掉就是真的不要」。
+fn default_search_sites() -> Vec<SearchSite> {
+    vec![SearchSite {
+        name: "尚香书苑".to_string(),
+        url: "https://sxsy45.com/search.php?mod=forum&orderby=dateline&ascdesc=desc&searchsubmit=yes&srchtxt=".to_string(),
+    }]
+}
+
 fn default_update_mirrors() -> Vec<String> {
     vec![
         "https://ghproxy.net/".to_string(),
@@ -22312,8 +22335,15 @@ mod tests {
             "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .unwrap();
-        // 没配过（键不存在）时是空列表，右键菜单就不会多出搜索项
-        assert!(read_settings(&conn).unwrap().search_sites.is_empty());
+        // 没配过（键不存在）⇒ 出厂自带那个搜索站（v1.3.20 起内置「尚香书苑」）
+        let fresh = read_settings(&conn).unwrap().search_sites;
+        assert_eq!(fresh.len(), 1, "没配过时该有出厂默认那一条");
+        assert_eq!(fresh[0].name, "尚香书苑");
+        assert!(
+            fresh[0].url.ends_with("srchtxt="),
+            "搜索词的位置得留在最后一个 = 之后：{}",
+            fresh[0].url
+        );
         conn.execute(
             "INSERT INTO app_settings (key, value) VALUES ('search_sites', ?1)",
             [r#"[{"name":"书香","url":"https://a.com/search.php?kw="}]"#],
@@ -22323,13 +22353,36 @@ mod tests {
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].name, "书香");
         assert_eq!(sites[0].url, "https://a.com/search.php?kw=");
-        // 存的文本被改坏时不能连带整份设置都读不出来，退化成「没配过」
+        // 用户在设置里清空存进去的是 "[]" ⇒ 就是真的不要，不能被出厂默认顶回来
+        conn.execute("UPDATE app_settings SET value='[]' WHERE key='search_sites'", [])
+            .unwrap();
+        assert!(read_settings(&conn).unwrap().search_sites.is_empty());
+        // 存的文本被改坏时不能连带整份设置都读不出来，退化成空列表
+        // （注意：和「没配过」不同 —— 那说明用户确实配过，就不该塞回一个不是他配的站）
         conn.execute(
             "UPDATE app_settings SET value='{坏' WHERE key='search_sites'",
             [],
         )
         .unwrap();
         assert!(read_settings(&conn).unwrap().search_sites.is_empty());
+    }
+
+    /// 「同步作品时图文小说自动保存为」的默认值（v1.3.20 用户要求改成 EPUB）：
+    /// 没配过 → epub；明确存过 html 才用 html。
+    #[test]
+    fn sync_image_format_defaults_to_epub() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        assert_eq!(read_settings(&conn).unwrap().sync_image_format, "epub");
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('sync_image_format', 'html')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(read_settings(&conn).unwrap().sync_image_format, "html");
     }
 
     #[test]
