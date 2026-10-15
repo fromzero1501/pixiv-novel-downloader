@@ -10972,6 +10972,315 @@ fn relink_bundle_after_removal(conn: &Connection, leaving_work_id: i64) -> Resul
 
 /// 把文件绑成某篇作品的**预览版**（v1.2.83）：搬进 `preview_dir`、按作品标题改名，
 /// 和完整版那套一个规矩 —— 用户要的是"绑定都要把文件自动移到对应文件夹、同时改名"。
+/// 「设置作者」第一步的探路：这篇绑定的文件是不是**合集**（多篇共用同一个文件）。
+///
+/// 合集必须整包一起移动、一起改归到新作者 —— 单独挪一篇会把还留在旧作者名下的
+/// 那几篇的文件也一起拖走，所以前端要先问一句再动手。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkSharedFile {
+    shared: bool,
+    file_name: String,
+    /// 共用同一个文件的篇数（含本篇）
+    work_count: usize,
+    /// 其它篇的标题（最多 3 个，给提示文案用）
+    other_titles: Vec<String>,
+}
+
+#[tauri::command]
+fn work_shared_file(work_id: i64) -> Result<WorkSharedFile, String> {
+    shared_file_info(&db()?, work_id)
+}
+
+fn shared_file_info(conn: &Connection, work_id: i64) -> Result<WorkSharedFile, String> {
+    let (purchased, preview): (String, String) = conn
+        .query_row(
+            "SELECT purchased_path, preview_path FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "找不到这篇作品".to_string())?;
+    for path in [purchased, preview] {
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let mut statement = conn
+            .prepare(
+                "SELECT title FROM works WHERE (purchased_path=?1 OR preview_path=?1) AND id<>?2 ORDER BY id LIMIT 4",
+            )
+            .map_err(|e| e.to_string())?;
+        let others: Vec<String> = statement
+            .query_map(params![path.as_str(), work_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        drop(statement);
+        if others.is_empty() {
+            continue;
+        }
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM works WHERE purchased_path=?1 OR preview_path=?1",
+                [path.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        return Ok(WorkSharedFile {
+            shared: true,
+            file_name: file_name(Path::new(&path)),
+            work_count: total.max(1) as usize,
+            other_titles: others.into_iter().take(3).collect(),
+        });
+    }
+    Ok(WorkSharedFile {
+        shared: false,
+        file_name: String::new(),
+        work_count: 1,
+        other_titles: Vec::new(),
+    })
+}
+
+/// 「设置作者」的结果：改归之后的作者、三个绑定路径，以及搬动 / 留下的统计。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetWorkAuthorResult {
+    author_id: i64,
+    author_name: String,
+    purchased_path: String,
+    preview_path: String,
+    cover_path: String,
+    /// 实际搬动（合集时含整包重写路径）的文件数
+    moved: usize,
+    /// 目标目录没配 / 文件已不在 / 封面是合集共用的，留在原处的个数
+    kept: usize,
+    /// 这次一并过户的作品数（不是合集时为 1）
+    bundle_works: usize,
+}
+
+/// 把作品改归到另一位作者，并把它绑定的文件搬进那位作者的文件夹。
+///
+/// 规矩（v1.3.17）：
+/// - 正文（完整版 / 预览版）、封面都搬，文件名按作品标题规范化 —— 与「绑定」同一套；
+/// - 目标目录不存在就顺手建；目标作者没配对应目录、或文件已经不在 ⇒ 跳过并如实计数；
+/// - **合集**（多篇共用同一个文件）必须 `include_bundle = true`：整包一起搬、一起改归。
+///   没确认就报错，不给"只挪一篇"留口子。
+#[tauri::command]
+fn set_work_author(
+    work_id: i64,
+    author_id: i64,
+    include_bundle: bool,
+) -> Result<SetWorkAuthorResult, String> {
+    set_work_author_impl(&db()?, work_id, author_id, include_bundle)
+}
+
+/// 把一个绑定文件搬进目标目录并按标题改名；目标目录没配 / 文件不在 ⇒ Ok(None)（留在原处）。
+fn relocate_bound_file(
+    conn: &Connection,
+    title: &str,
+    work_id: i64,
+    old_path: &str,
+    target_dir: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let Some(dir) = target_dir else { return Ok(None) };
+    let source = Path::new(old_path);
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let extension = source.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let target = binding_target_path(conn, dir, title, extension, work_id);
+    if source != target {
+        move_path_overwriting(source, &target)?;
+        // 旧版 txt + 同名 _images 目录（v1.3.1 之前的中转产物）跟着搬
+        let _ = move_sibling_assets_along(source, dir);
+    }
+    Ok(Some(target.to_string_lossy().to_string()))
+}
+
+fn set_work_author_impl(
+    conn: &Connection,
+    work_id: i64,
+    author_id: i64,
+    include_bundle: bool,
+) -> Result<SetWorkAuthorResult, String> {
+    let (author_name, preview_dir, purchased_dir): (String, String, String) = conn
+        .query_row(
+            "SELECT name, preview_dir, purchased_dir FROM authors WHERE id=?1",
+            [author_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "找不到要归的那位作者".to_string())?;
+    let (title, purchased, preview, cover, current_author): (String, String, String, String, i64) =
+        conn.query_row(
+            "SELECT title, purchased_path, preview_path, cover_path, author_id FROM works WHERE id=?1",
+            [work_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "找不到这篇作品".to_string())?;
+    let mut result = SetWorkAuthorResult {
+        author_id,
+        author_name: author_name.clone(),
+        purchased_path: purchased.clone(),
+        preview_path: preview.clone(),
+        cover_path: cover.clone(),
+        moved: 0,
+        kept: 0,
+        bundle_works: 1,
+    };
+    if current_author == author_id {
+        return Ok(result);
+    }
+    // 目标目录：没配就当"这一类文件搬不了"；配了但文件夹不在，顺手建出来
+    let ensure_dir = |raw: &str| -> Option<PathBuf> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let dir = PathBuf::from(raw);
+        if fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        Some(dir)
+    };
+    let purchased_target = ensure_dir(&purchased_dir);
+    let preview_target = ensure_dir(&preview_dir);
+    let mut affected: Vec<i64> = vec![work_id];
+    for (old_path, dir, is_purchased) in [
+        (purchased.trim().to_string(), purchased_target.clone(), true),
+        (preview.trim().to_string(), preview_target.clone(), false),
+    ] {
+        if old_path.is_empty() {
+            continue;
+        }
+        if !Path::new(&old_path).is_file() {
+            result.kept += 1;
+            continue;
+        }
+        // 合集：共用同一个文件的其它作品要一起改归、一起搬
+        let mut statement = conn
+            .prepare("SELECT id FROM works WHERE purchased_path=?1 OR preview_path=?1 ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let members: Vec<i64> = statement
+            .query_map([old_path.as_str()], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        drop(statement);
+        if members.len() > 1 && !include_bundle {
+            return Err("这篇绑定的是合集文件，需要确认是否连合集内所有作品一起移动".into());
+        }
+        if members.len() > 1 {
+            affected = members.clone();
+        }
+        for id in &members {
+            conn.execute(
+                "UPDATE works SET author_id=?1 WHERE id=?2",
+                params![author_id, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        match relocate_bound_file(conn, &title, work_id, &old_path, dir.as_deref())? {
+            Some(new_path) => {
+                if new_path != old_path {
+                    result.moved += 1;
+                }
+                conn.execute(
+                    "UPDATE works SET purchased_path=?1 WHERE purchased_path=?2",
+                    params![new_path.as_str(), old_path.as_str()],
+                )
+                .map_err(|e| e.to_string())?;
+                conn.execute(
+                    "UPDATE works SET preview_path=?1 WHERE preview_path=?2",
+                    params![new_path.as_str(), old_path.as_str()],
+                )
+                .map_err(|e| e.to_string())?;
+                if is_purchased {
+                    result.purchased_path = new_path;
+                } else {
+                    result.preview_path = new_path;
+                }
+            }
+            None => result.kept += 1,
+        }
+    }
+    // 封面：跟正文同目录 —— 有完整版就放完整版目录，否则预览版目录（同「绑定」那套规矩）
+    if !cover.trim().is_empty() {
+        if !Path::new(cover.trim()).is_file() {
+            result.kept += 1;
+        } else {
+            // 封面也可能被多篇共用（合集封面）—— 共用就不动它，留在原处
+            let cover_shared: i64 = match conn.query_row(
+                "SELECT COUNT(*) FROM works WHERE cover_path=?1",
+                [cover.trim()],
+                |row| row.get(0),
+            ) {
+                Ok(count) => count,
+                Err(_) => 0,
+            };
+            let dir = if result.purchased_path.trim().is_empty() {
+                preview_target.as_deref()
+            } else {
+                purchased_target.as_deref()
+            };
+            if cover_shared > 1 {
+                result.kept += 1;
+            } else {
+                match relocate_bound_file(conn, &title, work_id, cover.trim(), dir)? {
+                    Some(new_path) => {
+                        if new_path != cover.trim() {
+                            result.moved += 1;
+                        }
+                        result.cover_path = new_path;
+                    }
+                    None => result.kept += 1,
+                }
+            }
+        }
+    }
+    result.bundle_works = affected.len();
+    // 路径变了 ⇒ 字数被触发器标回 -1，这里就地补上（合集成员一起）
+    for id in &affected {
+        refresh_reading_image_count(conn, *id);
+        let (purchased_path, preview_path): (String, String) = conn
+            .query_row(
+                "SELECT purchased_path, preview_path FROM works WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let path = if purchased_path.trim().is_empty() {
+            preview_path
+        } else {
+            purchased_path
+        };
+        if !path.trim().is_empty() {
+            if let Some(count) = file_word_count(Path::new(path.trim())) {
+                let _ = conn.execute(
+                    "UPDATE works SET word_count=?1 WHERE id=?2",
+                    params![count as i64, id],
+                );
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 fn bind_work_preview(work_id: i64, path: String) -> Result<String, String> {
     let conn = db()?;
@@ -17628,6 +17937,8 @@ pub fn run() {
             scan_preview,
             bind_work_moving_to_purchased,
             bind_work_preview,
+            work_shared_file,
+            set_work_author,
             bind_work_cover,
             bind_series_bundle,
             match_author_series,
@@ -17787,6 +18098,7 @@ mod tests {
         best_import_match, build_import_preview, import_folder_extension_allowed, author_works_for_match, ImportCandidate, ImportSelection,
         attach_import_cover, epub_first_image, xml_attr,
         binding_target_path, mark_has_images_if_illustrated, move_path_overwriting,
+        shared_file_info, set_work_author_impl,
         move_sibling_assets_along,
         base64_encode, image_mime_of, image_data_uri,
         discard_sync_intermediates, anthology_epub_parts, replace_img_tags_with_markers,
@@ -22190,6 +22502,101 @@ mod tests {
     /// 都要把全库的正文读一遍来数字数，真机 1350 篇 / 98 MB 要 1.4 秒。
     /// 现在算一次写进 `works.word_count`，列表只读这一列；算不出来的记 0（不会重算），
     /// 只有路径变了才由触发器标回 -1 重新排队。
+    #[test]
+    fn shared_file_info_flags_bundle_members() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, purchased_path) VALUES (1, 1, '甲', 'D:/x/合集.txt')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, purchased_path) VALUES (2, 1, '乙', 'D:/x/合集.txt')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, purchased_path) VALUES (3, 1, '丙', 'D:/x/单篇.txt')",
+            [],
+        )
+        .unwrap();
+        let bundle = shared_file_info(&conn, 1).unwrap();
+        assert!(bundle.shared);
+        assert_eq!(bundle.work_count, 2);
+        assert_eq!(bundle.other_titles, vec!["乙".to_string()]);
+        let single = shared_file_info(&conn, 3).unwrap();
+        assert!(!single.shared);
+        assert_eq!(single.work_count, 1);
+    }
+
+    #[test]
+    fn set_work_author_moves_file_and_refuses_splitting_a_bundle() {
+        let root = std::env::temp_dir().join(format!("set-work-author-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let old_dir = root.join("旧作者");
+        let new_dir = root.join("新作者");
+        fs::create_dir_all(&old_dir).unwrap();
+        let source = old_dir.join("散篇.txt");
+        fs::write(&source, "一二三四五").unwrap();
+        let old_text = source.to_string_lossy().to_string();
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute(
+            "INSERT INTO authors (id, name, preview_dir, purchased_dir) VALUES (1, '旧作者', ?1, ?1)",
+            [old_dir.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO authors (id, name, preview_dir, purchased_dir) VALUES (2, '新作者', ?1, ?1)",
+            [new_dir.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, purchased_path) VALUES (1, 1, '某篇', ?1)",
+            [old_text.as_str()],
+        )
+        .unwrap();
+
+        // 单篇：文件搬进新作者目录、路径与作者一起改
+        let result = set_work_author_impl(&conn, 1, 2, false).unwrap();
+        assert_eq!(result.author_id, 2);
+        assert_eq!(result.moved, 1);
+        let moved = new_dir.join("某篇.txt");
+        assert!(moved.is_file(), "文件应搬进新作者目录：{}", moved.display());
+        assert!(!source.exists(), "旧位置不该残留");
+        let (author_id, path): (i64, String) = conn
+            .query_row(
+                "SELECT author_id, purchased_path FROM works WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(author_id, 2);
+        assert_eq!(path, moved.to_string_lossy().to_string());
+
+        // 合集：不给 include_bundle 就得报错 —— 不给"只挪一篇"留口子
+        conn.execute("UPDATE works SET author_id=1 WHERE id=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, purchased_path) VALUES (2, 1, '同册另一篇', ?1)",
+            [moved.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        let err = set_work_author_impl(&conn, 1, 2, false).unwrap_err();
+        assert!(err.contains("合集"), "{}", err);
+        // 确认后整包一起过户
+        let all = set_work_author_impl(&conn, 1, 2, true).unwrap();
+        assert_eq!(all.bundle_works, 2);
+        let moved_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM works WHERE author_id=2", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(moved_count, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn word_count_is_cached_and_invalidated_when_the_path_changes() {
         let root = std::env::temp_dir().join(format!("word-count-cache-{}", std::process::id()));

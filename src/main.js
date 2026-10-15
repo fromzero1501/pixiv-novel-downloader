@@ -155,6 +155,9 @@ const state = {
   /** 收藏夹选择器弹窗：正在改归属的作品 id + 已勾选的夹子 id */
   pickerWorkId: null,
   pickerSelected: [],
+  authorPickerQuery: "",
+  authorPickerWorkId: null,
+  authorPickerBusy: false,
   /**
    * 「作者收藏夹」（v1.2.33）：和作品收藏夹**相互独立**的另一套夹子。
    * 作者卡上的星标＝这位作者在任意一个作者收藏夹里（`authors.starred` 是它的缓存位）。
@@ -1142,6 +1145,18 @@ async function invoke(command, args = {}) {
   if (command === "list_bundles") return [];
   if (command === "match_author_series") return [];
   if (command === "relocate_lost_files") return { roots: 0, lost: 0, matched: [], unmatched: 0, ambiguous: 0, applied: 0 };
+  if (command === "work_shared_file") {
+    // v1.3.17「设置作者」：默认没有合集；要验合集弹框就预置 window.__forceSharedFile
+    if (window.__forceSharedFile) return window.__forceSharedFile;
+    return { shared: false, fileName: "", workCount: 1, otherTitles: [] };
+  }
+  if (command === "set_work_author") {
+    window.__setWorkAuthorCalls = (window.__setWorkAuthorCalls || []).concat([{ workId: Number(args.workId), authorId: Number(args.authorId), includeBundle: Boolean(args.includeBundle) }]);
+    const target = previewWorks.find((item) => item.id === Number(args.workId));
+    const author = previewAuthors.find((item) => item.id === Number(args.authorId));
+    if (target && author) { target.authorId = author.id; target.authorName = author.name; }
+    return { authorId: Number(args.authorId), authorName: author ? author.name : "", purchasedPath: target ? (target.purchasedPath || "") : "", previewPath: target ? (target.previewPath || "") : "", coverPath: target ? (target.coverPath || "") : "", moved: 1, kept: 0, bundleWorks: args.includeBundle ? 8 : 1 };
+  }
   if (command === "sync_pixiv_novels") {
     if (typeof window.__syncMockResult === "function") return window.__syncMockResult(args);
     return { downloadedCount: 0, reusedPreviewCount: 0, skippedExistingCount: 0, skippedDateCount: 0, skippedSizeCount: 0, failedCount: 0, failedReasons: [], throttled: false, cancelled: false, lastSyncAt: new Date().toISOString(), candidates: [] };
@@ -3320,7 +3335,7 @@ function sortSelect(current, withAdded = false, withHits = false) {
   // 其它时候这个值既不在下拉里、也不生效 —— 选着它的期间离开正文搜索，下拉回落显示第一项，
   // 本次选择留在 state 里，下次正文搜索时它还会重新出现并保持勾选。
   const hits = withHits ? `<option value="hits_desc" ${current === "hits_desc" ? "selected" : ""}>命中从多到少</option>` : "";
-  return `<select class="sort-select" id="sort-select" aria-label="排序">${hits}${added}<option value="date_desc" ${current === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${current === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${current === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${current === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="images_desc" ${current === "images_desc" ? "selected" : ""}>图片从多到少</option><option value="rating_desc" ${current === "rating_desc" ? "selected" : ""}>评分从高到低</option></select>`;
+  return `<select class="sort-select" id="sort-select" aria-label="排序">${added}<option value="date_desc" ${current === "date_desc" ? "selected" : ""}>日期从新到旧</option><option value="date_asc" ${current === "date_asc" ? "selected" : ""}>日期从旧到新</option><option value="title_asc" ${current === "title_asc" ? "selected" : ""}>名称 A-Z</option><option value="words_desc" ${current === "words_desc" ? "selected" : ""}>字数从多到少</option><option value="images_desc" ${current === "images_desc" ? "selected" : ""}>图片从多到少</option><option value="rating_desc" ${current === "rating_desc" ? "selected" : ""}>评分从高到低</option>${hits}</select>`;
 }
 
 function renderWorks() {
@@ -4032,6 +4047,19 @@ function workDetailBody() {
     : '<p class="match-note">作者没写简介</p>';
   // 阅读版和正文指向同一个文件时就不必单列一行
   const showReadingRow = Boolean(readingPath) && readingPath !== work.purchasedPath && readingPath !== work.previewPath;
+  // 「设置作者」块（v1.3.17）：只给「新建作品」加进来的本地作品显示（没有 Pixiv ID 的那些）。
+  // 散篇 / Pixiv 同步来的不显示 —— 它们有现成的「散篇转正」和作者主页那条路。
+  const setAuthorBlock = !work.pixivNovelId ? `
+    <section class="detail-block">
+      <h4>设置作者</h4>
+      <p class="detail-plain">当前：${authorName ? escapeHtml(authorName) : "未知作者"}</p>
+      <div class="detail-author-set">
+        <input id="work-detail-author-input" type="text" maxlength="60" placeholder="输入作者名，回车即归到该作者（没有就新建）" autocomplete="off">
+        <button class="quiet-button" data-action="detail-set-author-name" data-work-id="${work.id}">${icon("check", 16)}直接设置作者</button>
+        <button class="quiet-button" data-action="detail-pick-author" data-work-id="${work.id}">${icon("user", 16)}加入已有作者</button>
+      </div>
+      <p class="match-note">归到别的作者后，这篇绑定的正文 / 封面会搬进那位作者的文件夹；合集必须整包一起搬。</p>
+    </section>` : "";
 
   return `
     <div class="detail-head">
@@ -4046,6 +4074,8 @@ function workDetailBody() {
         </div>
       </div>
     </div>
+
+    ${setAuthorBlock}
 
     <section class="detail-block">
       <h4>简介</h4>
@@ -4128,6 +4158,118 @@ function workDetailBody() {
  * 从详情弹窗开二次弹窗（收藏夹 / 标签 / 系列）时**不关详情弹窗** ——
  * 弹窗本来就能嵌套，关掉再开只会让人找不回来。
  */
+/** 「设置作者」· 文本框那条路（v1.3.17）：填的名字本地已有同名作者就直接归过去；
+ * 没有就新建一位（本地按「作者名(别名)」把预览 / 完整版目录建好）再归。 */
+async function assignWorkAuthorByName(workId) {
+  const input = document.querySelector("#work-detail-author-input");
+  const name = String(input?.value || "").trim();
+  if (!name) { toast("先输入作者名", "error"); input?.focus(); return; }
+  let author = (state.authors || []).find((item) => String(item.name || "").trim().toLowerCase() === name.toLowerCase());
+  let created = false;
+  if (!author) {
+    try {
+      author = await invoke("save_author", { author: { id: null, name, aliases: "", homepage: "", avatarPath: "", avatarManaged: false, notes: "", previewDir: "", purchasedDir: "", matchThreshold: 70 } });
+    } catch (error) { toast(String(error), "error"); return; }
+    created = true;
+  }
+  await assignWorkAuthor(workId, author.id, author.name || name, created);
+}
+
+/** 「设置作者」：改归之前先问一句 —— 这篇绑的是不是合集（多篇共用一个文件）。
+ * 合集必须整包一起移动、一起改归，不给「只挪一篇」留口子。 */
+async function assignWorkAuthor(workId, authorId, authorName, created = false) {
+  let shared = null;
+  try {
+    shared = await invoke("work_shared_file", { workId });
+  } catch (error) {
+    console.log("合集探测失败，按没有合集处理:", error);
+  }
+  if (shared && shared.shared) {
+    const others = Math.max(Number(shared.workCount || 1) - 1, 0);
+    confirmAction(
+      "合集作品",
+      `这篇绑定的是合集文件《${shared.fileName}》，里面还有 ${others} 篇。合集必须整包一起移动、一起设置作者，不能只处理这一篇。要把这 ${shared.workCount} 篇一并移动并归到「${authorName}」名下吗？`,
+      "一并移动",
+      async () => { await runSetWorkAuthor(workId, authorId, true, authorName, created); },
+      true,
+    );
+    return;
+  }
+  await runSetWorkAuthor(workId, authorId, false, authorName, created);
+}
+
+/** 「设置作者」的落地：调后端改归 + 搬文件，详情与当前列表一起刷新。 */
+async function runSetWorkAuthor(workId, authorId, includeBundle, authorName, created) {
+  try {
+    const result = await invoke("set_work_author", { workId, authorId, includeBundle: Boolean(includeBundle) });
+    await refreshAfterDetailChange();
+    const fresh = findWork(workId);
+    if (fresh) state.detailWorkSnapshot = fresh;
+    else if (state.detailWorkSnapshot) {
+      // 这篇可能被原列表（散篇页之类）筛掉了 —— 详情还开着，按后端回传补齐归属与路径
+      state.detailWorkSnapshot = {
+        ...state.detailWorkSnapshot,
+        authorId: result.authorId,
+        authorName: result.authorName,
+        purchasedPath: result.purchasedPath,
+        previewPath: result.previewPath,
+        coverPath: result.coverPath,
+      };
+    }
+    refreshDetailDom();
+    const parts = [created ? `已新建作者「${authorName}」` : `已归到「${authorName}」`];
+    if (Number(result.bundleWorks || 1) > 1) parts.push(`合集 ${result.bundleWorks} 篇一并移动`);
+    if (result.moved) parts.push(`搬了 ${result.moved} 个文件`);
+    if (result.kept) parts.push(`${result.kept} 个文件留在原处（目录没配或文件已不在）`);
+    toast(parts.join("，"), "success");
+  } catch (error) {
+    toast(String(error), "error");
+  }
+}
+
+/** 「加入已有作者」：带搜索的作者选择弹窗（散篇和当前作者不列）。
+ * 打开前两道闸：busy 标志 + 弹窗根节点，避免连点叠两层。 */
+async function openWorkAuthorPicker(workId) {
+  if (state.authorPickerBusy) return;
+  if (document.getElementById("work-author-picker")) return;
+  state.authorPickerBusy = true;
+  try {
+    if (!state.authors.length) await refreshAuthors();
+    state.authorPickerWorkId = workId;
+    state.authorPickerQuery = "";
+    showModal(modal("加入已有作者", `<div id="work-author-picker">${workAuthorPickerBody(workId)}</div>`, '<span class="footer-spacer"></span><button class="quiet-button" data-action="close-modal">取消</button>'));
+    const search = document.querySelector("#work-author-picker-search");
+    if (search) {
+      search.addEventListener("input", (event) => {
+        state.authorPickerQuery = event.target.value;
+        refreshWorkAuthorPickerDom(workId);
+      });
+    }
+  } finally {
+    state.authorPickerBusy = false;
+  }
+}
+
+function workAuthorPickerBody(workId) {
+  const work = detailWork() || findWork(workId);
+  const currentId = Number(work?.authorId || 0);
+  const query = String(state.authorPickerQuery || "").trim();
+  const list = (state.authors || []).filter((author) => !author.stray && Number(author.id) !== currentId && (!query || authorMatchesQuery(author, query)));
+  return `
+    <input id="work-author-picker-search" type="search" placeholder="搜作者名或别名" value="${escapeHtml(query)}" autocomplete="off">
+    <div class="picker-list">${list.length
+      ? list.map((author) => `<button class="picker-row" data-action="pick-author-for-work" data-author-id="${author.id}" data-work-id="${workId}"><span>${escapeHtml(author.name)}</span><small>${Number(author.workCount || 0)} 篇${author.aliases ? ` · ${escapeHtml(author.aliases)}` : ""}</small></button>`).join("")
+      : '<p class="match-note">没有匹配的作者。</p>'}</div>`;
+}
+
+function refreshWorkAuthorPickerDom(workId) {
+  const holder = document.querySelector("#work-author-picker");
+  if (!holder) return;
+  holder.innerHTML = workAuthorPickerBody(workId);
+  // 重绘出来的行是新的 DOM 节点，data-action 还没绑事件 —— 忘了这句，搜索后点谁都没反应
+  bindEvents();
+}
+
 async function openDetailPicker(workId) {
   state.pickerWorkId = workId;
   // 收藏夹列表平时只有进「我的收藏」页才拉；详情面板从任何页面都能开，先补齐免得弹窗里是空的
@@ -6275,6 +6417,14 @@ async function bindEvents() {
       if (action === "detail-rate") await setDetailMeta({ rating: Number(element.dataset.rating) });
       if (action === "detail-remove-tag") await removeDetailTag(Number(element.dataset.index));
       if (action === "detail-pick-collection") await openDetailPicker(Number(workId));
+      if (action === "detail-set-author-name") { await assignWorkAuthorByName(Number(workId)); return; }
+      if (action === "detail-pick-author") { await openWorkAuthorPicker(Number(workId)); return; }
+      if (action === "pick-author-for-work") {
+        const pickedAuthor = (state.authors || []).find((item) => Number(item.id) === Number(element.dataset.authorId));
+        closeModal();
+        if (pickedAuthor) await assignWorkAuthor(Number(workId), pickedAuthor.id, pickedAuthor.name || "这位作者");
+        return;
+      }
       if (action === "detail-open-path") await invoke("open_local_path", { path: element.dataset.path, parent: false });
       if (action === "detail-open-dir") {
         // 后端会带回一句"为什么没能选中文件"（比如路径超长），有就提示出来（v1.2.90）

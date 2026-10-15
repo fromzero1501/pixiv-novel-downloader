@@ -659,6 +659,13 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .detail-tag-add { margin-top: 10px; max-width: 320px; }
 .detail-tag-add input { width: 100%; color: #263c57; background: #fff; border: 1px solid #d6e1ed; border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; }
 .detail-tag-add input:focus { border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; }
+/* 「设置作者」块（v1.3.17）：文本框 + 两个按钮一行排开 */
+.detail-author-set { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.detail-author-set input { flex: 1 1 220px; min-width: 0; color: #263c57; background: #fff; border: 1px solid #d6e1ed; border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; }
+.detail-author-set input:focus { border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; }
+/* 「加入已有作者」弹窗顶上的搜索框 */
+#work-author-picker-search { width: 100%; margin-bottom: 9px; color: #263c57; background: #fff; border: 1px solid #d6e1ed; border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; }
+#work-author-picker-search:focus { border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; }
 .detail-plain { margin: 0 0 10px; color: #3d5570; font-size: 13px; overflow-wrap: anywhere; }
 .detail-paths { margin: 0; display: grid; gap: 10px; }
 .detail-path { display: flex; gap: 12px; align-items: flex-start; }
