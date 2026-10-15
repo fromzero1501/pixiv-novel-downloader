@@ -10137,19 +10137,26 @@ function characterChipsHtml(group) {
 
 /** 展开某个折叠的角色分组时，才把它的 chip 铺进去（铺完要重绑事件，元素是新造的）。 */
 function fillCharacterChips(details) {
-  const holder = details.querySelector(".char-chips");
-  if (!holder || holder.dataset.filled || holder.innerHTML.trim()) return;
+  if (details.dataset.filled) return;
   const group = (state.characters || []).find((entry) => entry.game === (details.dataset.game || ""));
   if (!group) return;
-  holder.dataset.filled = "true";
-  // v1.3.28：一次最多先铺 20 个 —— 632 个角色的库，展开一个大组就能把弹窗节点顶到四百多，
+  details.dataset.filled = "true";
+  // 角色片：一次最多先铺 20 个 —— 632 个角色的库，铺满一组就能把弹窗顶到几百节点，
   // 那正是用户实测「开始卡」的量级。剩下的让他用上面的搜索框找。
   const LIMIT = 20;
   const shown = group.characters.slice(0, LIMIT);
   const rest = group.characters.length - shown.length;
-  holder.innerHTML =
-    characterChipsHtml({ ...group, characters: shown }) +
-    (rest > 0 ? `<span class="char-more-note">还有 ${rest} 个 —— 用上面的搜索框找更快</span>` : "");
+  // v1.3.29：**分组管理那三件也在这里才插** —— 折叠态一个分组只占一行标题。
+  // `renameCharacterGame` 是从按钮往上找 `.char-group-tools` 取输入框的，放这儿不影响。
+  details.insertAdjacentHTML(
+    "beforeend",
+    `<div class="char-chips">${characterChipsHtml({ ...group, characters: shown })}${rest > 0 ? `<span class="char-more-note">还有 ${rest} 个 —— 用上面的搜索框找更快</span>` : ""}</div>
+    <div class="char-group-tools">
+      <input class="char-game-name" value="${escapeHtml(group.game)}" aria-label="分组名">
+      <button type="button" class="quiet-button" data-action="rename-character-game" data-game="${escapeHtml(group.game)}">重命名分组</button>
+      <button type="button" class="quiet-button danger-text-button" data-action="delete-character-game" data-game="${escapeHtml(group.game)}">删除整个分组</button>
+    </div>`,
+  );
   bindEvents();
 }
 
@@ -10236,14 +10243,12 @@ function characterListHtml(groups, keyword) {
     return groups
       .map((group) => {
         const enabledCount = group.characters.filter((entry) => entry.enabled).length;
+        // v1.3.29：**折叠态这一组只占一行标题** —— 连「分组名输入框 / 重命名 / 删除」这三件
+        // 也等展开时才插（见 fillCharacterChips）。用户实测「所有分组都折叠了还是卡」：
+        // 十七八个分组各带一个输入框加两个按钮，五十来个控件常驻在 DOM 里，
+        // 折叠着不显示也照样参与每次按键的样式计算。
         return `<details class="char-group" data-game="${escapeHtml(group.game)}">
       <summary><strong>${escapeHtml(group.game)}</strong><span class="char-count">${enabledCount}/${group.characters.length}</span></summary>
-      <div class="char-chips"></div>
-      <div class="char-group-tools">
-        <input class="char-game-name" value="${escapeHtml(group.game)}" aria-label="分组名">
-        <button type="button" class="quiet-button" data-action="rename-character-game" data-game="${escapeHtml(group.game)}">重命名分组</button>
-        <button type="button" class="quiet-button danger-text-button" data-action="delete-character-game" data-game="${escapeHtml(group.game)}">删除整个分组</button>
-      </div>
     </details>`;
       })
       .join("");
