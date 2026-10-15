@@ -4377,13 +4377,17 @@ function renderAuthorCollectionAuthors() {
 /**
  * 「我的收藏」页：上半「作者收藏夹」、下半「作品收藏夹」——**两套夹子相互独立**。
  *
- * 上栏特意不套 `.binding-bar`（那是下半收藏夹的摘要条，`check-collections-history`
- * 靠 `text(".binding-bar span")` 读它），换用 `.favorite-author-heading`。
+ * 上栏用的还是 `.favorite-author-heading` 这个 class（v1.3.31 起它的**样式**和下半的
+ * `.binding-bar` 长得一样了 —— 用户要求两边一致），**但别图省事把它也换成 `.binding-bar`**：
+ * 有四个无头脚本（check-collections-history / check-v1232 / check-v1233 / check-author-drag）
+ * 靠 `text(".binding-bar span")` 读**下半那行摘要**，上栏一套上去它们就取到错的那个了。
  */
 function renderCollections() {
   if (state.activeCollection) return renderCollectionWorks();
   if (state.activeAuthorCollection) return renderAuthorCollectionAuthors();
   const total = state.collections.reduce((sum, item) => sum + item.workCount, 0);
+  // v1.3.31：作者那半边也报个数（和作品那边「N 个收藏夹 · 共 M 篇作品」对齐）
+  const authorTotal = state.authorCollections.reduce((sum, item) => sum + (Number(item.authorCount) || 0), 0);
   const authorCards = state.authorCollections.map((collection) => authorCollectionCard(collection)).join("");
   const cards = state.collections.map((collection) => `
     <article class="collection-card" data-collection-id="${collection.id}" tabindex="0">
@@ -4399,9 +4403,10 @@ function renderCollections() {
       <div class="topbar-actions"><button class="quiet-button" data-action="create-author-collection">${icon("plus", 18)}<span>新建作者收藏夹</span></button><button class="primary-button" data-action="create-collection">${icon("plus", 18)}<span>新建收藏夹</span></button></div>
     </section>
     <section class="library-content">
-      <div class="favorite-author-heading"><strong>作者收藏夹</strong><span>${state.authorCollections.length ? `${state.authorCollections.length} 个 · 和下面的作品收藏夹相互独立` : "把收藏的作者收进夹子里，和下面的作品收藏夹互不影响"}</span></div>
+      <div class="favorite-author-heading"><div><strong>作者收藏夹</strong><span>${state.authorCollections.length ? `${state.authorCollections.length} 个 · 共 ${authorTotal} 位作者。和下面的作品收藏夹相互独立。` : "把收藏的作者收进夹子里"}</span></div></div>
       <div class="author-collection-grid">${authorCards || `<div class="empty-state works-empty"><h2>还没有作者收藏夹</h2><p>点右上角「新建作者收藏夹」，再到作者库点作者卡上的星标「收藏到…」。</p></div>`}</div>
-      <div class="binding-bar"><div><strong>收藏夹</strong><span>${state.collections.length ? `${state.collections.length} 个收藏夹 · 共 ${total} 篇作品。同一篇作品可以同时放进多个夹子。` : "还没有收藏夹"}</span></div></div>
+      <hr class="collection-separator">
+      <div class="binding-bar"><div><strong>作品收藏夹</strong><span>${state.collections.length ? `${state.collections.length} 个收藏夹 · 共 ${total} 篇作品。同一篇作品可以同时放进多个夹子。` : "还没有收藏夹"}</span></div></div>
       <div class="collection-grid">${cards || `<div class="empty-state works-empty"><h2>还没有收藏夹</h2><p>点右上角「新建收藏夹」建一个，再到作品卡上点心形图标把作品放进去。</p></div>`}</div>
     </section>`);
 }
@@ -6508,7 +6513,16 @@ async function bindEvents() {
       if (action === "detail-delete") detailDeleteWork(Number(workId));
       if (action === "detail-delete-files") detailDeleteWorkWithFiles(Number(workId));
       // 「我的收藏」上栏要列收藏作者，顺手把作者表刷新一次，别拿启动时那份旧的（v1.2.32）
-      if (action === "go-collections") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "collections"; state.seriesView = null; state.seriesItems = []; state.activeCollection = null; state.activeAuthorCollection = null; state.collectionQuery = ""; await refreshCollections(); await refreshAuthorCollections(); await refreshAuthors(); render(); }
+      if (action === "go-collections") {
+        state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "collections"; state.seriesView = null; state.seriesItems = []; state.activeCollection = null; state.activeAuthorCollection = null; state.collectionQuery = "";
+        // v1.3.31：进这页先保证「我的收藏」和作者那套的默认夹都存在。
+        // 两边的默认夹本来都是"收藏的时候才按需建"，于是从没收藏过的人进来看到的是两个空状态；
+        // 用户要求作者收藏夹也要有默认夹（和作品那套一样），这里一并兜住。
+        // 失败就算了 —— 按库里现有的渲染，不该因为这一步卡住整页。
+        await invoke("ensure_default_collection").catch(() => {});
+        await invoke("ensure_default_author_collection").catch(() => {});
+        await refreshCollections(); await refreshAuthorCollections(); await refreshAuthors(); render();
+      }
       if (action === "go-history") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "history"; state.seriesView = null; state.seriesItems = []; state.historyQuery = ""; await refreshHistory(); render(); }
       if (action === "go-watch-later") { state.authorReturnTo = null; state.activeAuthor = null; state.homeView = "watchLater"; state.seriesView = null; state.seriesItems = []; state.watchLaterQuery = ""; await refreshWatchLater(); render(); }
       // Pixiv 收藏：**每次点进来都重读一遍** —— 「本地库有没有」是后端现算的（用户要求）
@@ -6869,7 +6883,6 @@ async function bindEvents() {
       if (action === "toggle-author-select") toggleAuthorSelection(Number(authorId));
       if (action === "export-share-package") await exportSharePackage();
       if (action === "import-data-pick") await pickImportDataFile();
-      if (action === "import-data-pick-folder") await pickImportDataFolder();
       if (action === "copy-selected-full") await copySelectedToFull();
       if (action === "set-images-selected") await setSelectedHasImages();
       if (action === "delete-selected") await deleteSelectedWorks();
@@ -7825,20 +7838,17 @@ async function doImportData(path) {
   toast(parts.length ? `导入完成：${parts.join("，")}` : "导入完成：包里没有需要新增的作品", "success");
 }
 
-/** 导入区点一下：选文件（分享包 .zip 或整库备份 .db）。 */
+/** 导入区点一下：选作品的分享包 .zip。
+ *
+ * 整库备份走上面那个「导入设置和数据」按钮；**解压出来的文件夹请拖进来** ——
+ * 系统的文件选择框一次只能选"文件"或"文件夹"其中一种，用一个按钮兼顾不了（v1.3.31 用户定）。
+ */
 async function pickImportDataFile() {
   const path = await askOpenPath({
     multiple: false,
     directory: false,
-    filters: [{ name: "分享包 / 数据库备份", extensions: ["zip", "db"] }],
+    filters: [{ name: "作品分享包", extensions: ["zip"] }],
   });
-  if (!path) return;
-  await runImportData(path);
-}
-
-/** 导入区另一个入口：有人把包解压了才发过来，那就直接挑那个文件夹。 */
-async function pickImportDataFolder() {
-  const path = await askOpenPath({ multiple: false, directory: true });
   if (!path) return;
   await runImportData(path);
 }
@@ -9909,10 +9919,9 @@ async function settingsModal() {
       <button type="button" data-action="clear-skipped-novels">${icon("archive", 18)}清空「太小跳过」记录<span class="settings-action-hint">同步时小于「最小文件大小」的作品会被记下来、下次直接跳过（省请求、也少招限流）。把最小文件大小调小之后点这里，让它们重新参与同步</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出设置和数据<span class="settings-action-hint">把整个资料库存成一个 .db 文件（作品记录、绑定关系、设置全在里面），换电脑或出问题时可回滚</span></button>
-      <button type="button" data-action="import-data-pick">${icon("upload", 18)}导入数据<span class="settings-action-hint">吃三种：别人给的作品分享包（.zip）／解压好的分享包文件夹／你自己的整库备份（.db，覆盖式导入、需重启）。分享包只补作品，不带收藏、评分这些私人记录</span></button>
-      <button type="button" data-action="import-data-pick-folder">${icon("folder", 18)}导入已解压的分享包<span class="settings-action-hint">对方把包解压了才发过来时用这个，直接挑那个文件夹；文件会复制进来，原文件夹不动</span></button>
+      <button type="button" data-action="import-data-pick">${icon("upload", 18)}导入设置和数据<span class="settings-action-hint">只吃你自己用「导出设置和数据」存下来的那个 .db 文件（覆盖式导入、需重启）。别人的作品分享包不在这里导 —— 拖到下面那块去</span></button>
     </div>
-    <div class="bind-drop-zone is-wide" id="import-drop-zone" data-action="import-data-pick" title="把作品分享包（.zip）、解压出来的文件夹、或整库备份（.db）拖到这里；点一下也可以选文件">${icon("upload", 16)}<span>把作品分享包拖到这里（也可以点一下选文件）</span></div>
+    <div class="bind-drop-zone is-wide" id="import-drop-zone" data-action="import-data-pick" title="把作品分享包拖到这里：压缩包（.zip）或解压出来的文件夹都收，整库备份 .db 也收。点一下则是选压缩包">${icon("upload", 16)}<span>把作品分享包拖到这里 —— 压缩包、解压出来的文件夹都行（点一下是选压缩包）</span></div>
     </div>
   </section>  </section>
 </form>`, `<span class="settings-save-state" id="settings-save-state"></span>`, "is-wide"));

@@ -976,7 +976,13 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .bookmark-author-meta { color: #77899c; font-size: 12px; white-space: nowrap; }
 
 /* ============ v1.2.32：「我的收藏」上半栏 · 收藏作者 ============ */
-.favorite-author-heading { display: flex; align-items: baseline; gap: 11px; margin: 22px 0 14px; }
+/* 「我的收藏」页：作者收藏夹与作品收藏夹之间的分隔线（v1.3.31） */
+.collection-separator { margin: 26px 0 22px; border: 0; border-top: 1px solid #e0e9f2; }
+/* 作者收藏夹的标题行：外观**对齐**作品区的 .binding-bar（用户要求两边一致）。
+   ⚠️ class 必须分开，不能图省事直接把上栏也写成 .binding-bar —— 有四个无头脚本
+   靠 `text(".binding-bar span")` 读下半那行摘要，上栏套上去它们就取到错的那个。 */
+.favorite-author-heading { margin: 22px 0 26px; min-height: 58px; display: flex; align-items: center; padding: 10px 12px 10px 16px; background: #eef6ff; border: 1px solid #d7e8fa; border-radius: 8px; }
+.favorite-author-heading > div { display: flex; align-items: baseline; gap: 11px; flex-wrap: wrap; }
 .favorite-author-heading strong { color: #34618e; font-size: 14px; }
 .favorite-author-heading span { color: #6e87a1; font-size: 13px; }
 .favorite-author-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 12px; margin-bottom: 24px; }
