@@ -17504,13 +17504,19 @@ fn collect_import_folder_entries(
 
 // ==================== 作品分享包 · 导出（v1.3.18）====================
 
-/// 分享包清单里的一位作者。**只带身份信息**：头像、目录、备注、星标属于设置/私人数据，不进包。
+/// 分享包清单里的一位作者。**只带身份信息**：目录、备注、星标属于设置/私人数据，不进包。
+/// 头像是例外（v1.3.20 用户要求）：别人拿到包就该看见作者长什么样，不用再自己去
+/// Pixiv 抓一遍 —— 所以带一份，落在包里的 `作者头像/` 下。
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct SharePackageAuthor {
     name: String,
     aliases: String,
     homepage: String,
+    /// 头像在包里的相对路径（形如 `作者头像/某人.jpg`）；没头像就是空串。
+    /// `default` 是给旧包留的：v1.3.19 及更早的包没有这个字段，读的时候不能报错。
+    #[serde(default)]
+    avatar: String,
 }
 
 /// 分享包清单里的一篇作品。路径一律是**包内相对路径**。
@@ -17641,23 +17647,25 @@ fn export_works_package_impl(
     };
     // 清单条目 + 它在磁盘上的源路径（打包时直接用，不用回头查库）
     let mut sources: Vec<(String, String, PathBuf)> = Vec::new();
+    // 作者头像：包内相对路径 + 磁盘上的源文件（每位作者最多一条）
+    let mut avatar_sources: Vec<(String, String)> = Vec::new();
     let mut author_names: Vec<String> = Vec::new();
     let mut skipped = 0usize;
     let total = ids.len();
     for (index, work_id) in ids.iter().enumerate() {
-        let row: Option<(String, String, String, String, String, String, String, String, String, i64, String, i64, i64, i64, String, String, String, i64)> = conn
+        let row: Option<(String, String, String, String, String, String, String, String, String, i64, String, i64, i64, i64, String, String, String, i64, String)> = conn
             .query_row(
                 "SELECT a.name, a.aliases, a.homepage, w.title, w.release_date, w.tags, \
                         w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.synopsis, \
                         w.word_count, w.has_images, w.image_count, w.preview_path, w.purchased_path, w.cover_path, \
-                        w.id \
+                        w.id, a.avatar_path \
                  FROM works w JOIN authors a ON a.id = w.author_id WHERE w.id=?1",
                 [work_id],
                 |row| {
                     Ok((
                         row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
                         row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
-                        row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?,
+                        row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?,
                     ))
                 },
             )
@@ -17677,7 +17685,7 @@ fn export_works_package_impl(
         let (
             author_name, aliases, homepage, title, release_date, tags, pixiv_novel_id, series_id,
             series_title, series_order, synopsis, word_count, has_images, image_count, preview_path,
-            purchased_path, cover_path, _row_id,
+            purchased_path, cover_path, _row_id, avatar_path,
         ) = values;
         let purchased_ok = !purchased_path.trim().is_empty() && Path::new(&purchased_path).is_file();
         let preview_ok = !preview_path.trim().is_empty() && Path::new(&preview_path).is_file();
@@ -17713,10 +17721,25 @@ fn export_works_package_impl(
         };
         if !author_names.contains(&author_name) {
             author_names.push(author_name.to_string());
+            // 头像（v1.3.20）：硬盘上真有这个文件才带。软件从 Pixiv 抓下来的那份就在
+            // data/avatars/ 下，按作者名重命名后放进包里 —— 对方导入时直接用得上。
+            let avatar_entry = if !avatar_path.trim().is_empty() && Path::new(&avatar_path).is_file() {
+                let avatar_extension = Path::new(&avatar_path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("jpg")
+                    .to_string();
+                let entry = format!("作者头像/{folder}.{avatar_extension}");
+                avatar_sources.push((entry.clone(), avatar_path.clone()));
+                entry
+            } else {
+                String::new()
+            };
             manifest.authors.push(SharePackageAuthor {
                 name: author_name.clone(),
                 aliases: aliases,
                 homepage: homepage.clone(),
+                avatar: avatar_entry,
             });
         }
         manifest.works.push(SharePackageWork {
@@ -17771,6 +17794,16 @@ fn export_works_package_impl(
                 .map_err(|e| e.to_string())?;
             add_dir_to_zip(&mut zip, images_dir, &work.images, options)?;
         }
+    }
+    // 作者头像放最后（作品正文/封面在前，解压出来一眼看到的是作品）
+    for (entry, avatar_source) in avatar_sources.iter() {
+        if !Path::new(avatar_source).is_file() {
+            continue;
+        }
+        let bytes = fs::read(avatar_source)
+            .map_err(|e| format!("读取 {} 失败：{e}", avatar_source))?;
+        zip.start_file(entry.clone(), options).map_err(|e| e.to_string())?;
+        zip.write_all(&bytes).map_err(|e| e.to_string())?;
     }
     zip.finish().map_err(|e| e.to_string())?;
     Ok(ExportPackageResult {
@@ -17852,6 +17885,53 @@ fn upsert_share_author(conn: &Connection, author: &SharePackageAuthor) -> Result
     )
     .map_err(|e| e.to_string())?;
     Ok((conn.last_insert_rowid(), true))
+}
+
+/// 把分享包里的作者头像落到本机（v1.3.20）。
+///
+/// 规则：**本地已经有可用头像就不动** —— 那多半是他自己从 Pixiv 同步下来的、比包里的新；
+/// 只有本地空着（或指向的文件已经没了）才用包里的顶上。头像属于"看得见的身份信息"，
+/// 别人的旧头像盖掉自己刚同步的，比保留不动更让人意外。
+///
+/// 落盘位置和自动抓下来的头像同一个目录（`data/avatars/`），文件名加 `shared-` 前缀，
+/// 免得跟 `pixiv-author-{id}.jpg` 撞名；`avatar_managed` 照样置 1（＝软件管理的那类，
+/// 以后同步作者的资料时可以正常更新它）。
+fn apply_shared_avatar(
+    conn: &Connection,
+    author_id: i64,
+    author: &SharePackageAuthor,
+    root: &Path,
+) -> Result<(), String> {
+    let entry = author.avatar.trim();
+    if entry.is_empty() {
+        return Ok(());
+    }
+    let source = root.join(entry);
+    if !source.is_file() {
+        return Ok(());
+    }
+    let existing: String = conn
+        .query_row("SELECT avatar_path FROM authors WHERE id=?1", [author_id], |row| {
+            row.get(0)
+        })
+        .unwrap_or_default();
+    if !existing.trim().is_empty() && Path::new(&existing).is_file() {
+        return Ok(());
+    }
+    let dir = app_data_dir()?.join("avatars");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let extension = Path::new(entry)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("jpg");
+    let target = dir.join(format!("shared-author-{author_id}.{extension}"));
+    fs::copy(&source, &target).map_err(|e| format!("复制作者头像失败：{e}"))?;
+    conn.execute(
+        "UPDATE authors SET avatar_path=?1, avatar_managed=1 WHERE id=?2",
+        params![target.to_string_lossy().to_string(), author_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// 把分享包里的正文 / 封面 / 旧式配图目录落进目标作者目录，并回填 works 路径。
@@ -18012,6 +18092,8 @@ fn import_works_package_impl(
     let mut author_ids: Vec<(String, i64)> = Vec::new();
     for author in &manifest.authors {
         let (author_id, created) = upsert_share_author(conn, author)?;
+        // 头像（v1.3.20）：包里带了就落到本机（本地已经有可用头像的见下面的函数）
+        apply_shared_avatar(conn, author_id, author, &root)?;
         if created {
             result.authors_created += 1;
         }
@@ -23561,6 +23643,85 @@ mod tests {
             .unwrap();
         assert_eq!(kept, local_full.to_string_lossy(), "已是完整版的不能被顶替");
         assert!(local_full.is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 作者头像要跟着分享包走（v1.3.20 用户要求）：
+    /// 源库作者有一张头像 → 包里得真带文件、清单里得记着路径；
+    /// 导入到空库后头像要落到本机、`avatar_path` 指得到、`avatar_managed` 置 1。
+    #[test]
+    fn share_package_carries_the_author_avatar() {
+        use std::io::Read as _;
+        let root = std::env::temp_dir().join(format!("share-pkg-avatar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src_full = root.join("src/已购");
+        fs::create_dir_all(&src_full).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        // 头像内容无所谓（这里只搬运、不解码），给几个字节就行
+        let avatar = root.join("源头像.jpg");
+        fs::write(&avatar, b"fake-jpeg-bytes").unwrap();
+        conn.execute(
+            "INSERT INTO authors (id, name, avatar_path, avatar_managed) VALUES (1, '带头像的作者', ?1, 1)",
+            [avatar.to_string_lossy()],
+        )
+        .unwrap();
+        let book = src_full.join("某篇.txt");
+        fs::write(&book, "一二三四").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, pixiv_novel_id, purchased_path) VALUES (1, 1, '某篇', '999', ?1)",
+            [book.to_string_lossy()],
+        )
+        .unwrap();
+        let zip_path = root.join("分享包.zip");
+        export_works_package_impl(&conn, &[1], &[], &zip_path, None).unwrap();
+
+        // ① 包里真带了头像文件，清单里也记了包内路径
+        let handle = fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(handle).unwrap();
+        let mut names: Vec<String> = Vec::new();
+        for index in 0..archive.len() {
+            names.push(archive.by_index(index).unwrap().name().to_string());
+        }
+        assert!(
+            names.iter().any(|name| name.starts_with("作者头像/")),
+            "包里该有作者头像：{names:?}"
+        );
+        let mut text = String::new();
+        archive
+            .by_name("作品清单.json")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("作者头像/"), "清单里该记着头像的包内路径：{text}");
+        drop(archive);
+
+        // ② 导入到空库：作者新建，头像落到本机并且指向得到
+        let dst = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&dst);
+        dst.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        for (key, dir) in [("default_purchased_dir", "dst/已购"), ("default_preview_dir", "dst/预览")] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+            dst.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, root.join(dir).to_string_lossy()],
+            )
+            .unwrap();
+        }
+        import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap();
+        let (avatar_path, managed): (String, i64) = dst
+            .query_row(
+                "SELECT avatar_path, avatar_managed FROM authors WHERE name='带头像的作者'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!avatar_path.trim().is_empty(), "导入后该有头像路径");
+        assert!(Path::new(&avatar_path).is_file(), "头像文件该真在：{avatar_path}");
+        assert_eq!(managed, 1, "导入的头像按「软件管理」那类记");
         let _ = fs::remove_dir_all(&root);
     }
 
