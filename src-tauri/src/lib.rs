@@ -761,6 +761,33 @@ fn migrate_epub_word_counts(conn: &Connection) -> Result<(), String> {
 /// 让启动那轮 `refresh_word_counts` 重新算一遍 —— 否则它们永远停在 0，用户看不到新功能。
 ///
 /// 只跑一次（`app_settings` 里一个 flag 守）。
+/// 设置项默认值的一次性迁移（v1.3.22）。
+///
+/// 为什么必须迁移、光改默认值不够：**「保存设置」会把界面上的全部字段一起写库** ——
+/// 用户只要保存过一次设置（哪怕只是填个 Cookie），`sync_image_format` 就被固化成界面
+/// 当时的值（老版本的默认 html）、`search_sites` 也被固化成空列表；
+/// 于是「没配过才兜默认」的逻辑对他永远不生效，改成 EPUB / 内置搜索站都白改。
+/// 所以升级时主动纠一次，之后照旧以库里的值为准（用户自己再改也不会被顶回来）。
+fn migrate_setting_defaults(conn: &Connection) -> Result<(), String> {
+    if setting(conn, "setting_defaults_v1322")? == "1" {
+        return Ok(());
+    }
+    // 图文保存格式：老默认是 html，只要还没被换成别的就迁到新默认 EPUB。
+    // 迁移之后想用 HTML 可以自己选 —— 那时标记已经在，不会再被动。
+    if setting(conn, "sync_image_format")? != "epub" {
+        put_setting(conn, "sync_image_format", "epub")?;
+    }
+    // 搜索网站：空着就摆上出厂那条
+    let raw = setting(conn, "search_sites")?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        let sites = serde_json::to_string(&default_search_sites()).map_err(|e| e.to_string())?;
+        put_setting(conn, "search_sites", &sites)?;
+    }
+    put_setting(conn, "setting_defaults_v1322", "1")?;
+    Ok(())
+}
+
 fn migrate_docx_word_counts(conn: &Connection) -> Result<(), String> {
     if setting(conn, "docx_word_counts_reset")? == "1" {
         return Ok(());
@@ -1088,6 +1115,9 @@ fn db() -> Result<Connection, String> {
     // 让启动那轮后台补算重新算一遍（否则它们永远停在 0，用户看不到新功能）。
     // 必须排在上面那条 v1.2.18 的迁移之后，两条各管各的、都只跑一次。
     let _ = migrate_epub_word_counts(&conn);
+    // 设置项默认值（v1.3.22）：把「老默认被保存动作固化」的图文格式 / 搜索网站纠一次。
+    // 必须在这里（启动初始化）跑：要赶在用户打开设置之前，否则他看到的还是固化的旧值。
+    let _ = migrate_setting_defaults(&conn);
     // DOCX 从 v1.3.5 起同理（解包读 document.xml）—— 老库里停在 0 的 DOCX 也标回未算。
     let _ = migrate_docx_word_counts(&conn);
     // 常见角色名表：用于「按角色匹配」的自动匹配 / 关联完整版文件。
@@ -18890,7 +18920,7 @@ mod tests {
         // v1.2.30：收藏表新字段 + 散篇
         bookmark_tags_json, bookmark_tags_list,
         list_bookmark_author_options_impl, stray_summary_impl,
-        migrate_word_counts_for_non_text_files,
+        migrate_word_counts_for_non_text_files, migrate_setting_defaults,
         add_works_to_collections_impl, update_works_tags_impl,
         set_works_rating_impl, set_works_need_full_state_impl,
         remove_works_from_collections_impl, search_match_clause, list_missing_full_impl,
@@ -22383,6 +22413,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_settings(&conn).unwrap().sync_image_format, "html");
+    }
+
+    /// 设置默认值的一次性迁移（v1.3.22）。
+    ///
+    /// 背景：**「保存设置」会把界面上的全部字段一起写库** —— 用户只要保存过一次
+    /// （哪怕只是填个 Cookie），`sync_image_format` 就被固化成老默认 `html`、
+    /// `search_sites` 被固化成 `[]`，此后「没配过才兜默认」永远不生效。
+    /// 所以升级时要主动纠一次；纠完打了标记，用户再自己改成 html / 清空就不许顶回来。
+    #[test]
+    fn setting_defaults_migrate_once_and_respect_later_choices() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        // 老库的样子：保存过设置，两项都被固化
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('sync_image_format', 'html')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('search_sites', '[]')",
+            [],
+        )
+        .unwrap();
+        migrate_setting_defaults(&conn).unwrap();
+        assert_eq!(read_settings(&conn).unwrap().sync_image_format, "epub");
+        let sites = read_settings(&conn).unwrap().search_sites;
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].name, "尚香书苑");
+
+        // 迁移之后再自己改回去 —— 标记已经在，不能被顶回来
+        conn.execute("UPDATE app_settings SET value='html' WHERE key='sync_image_format'", [])
+            .unwrap();
+        conn.execute("UPDATE app_settings SET value='[]' WHERE key='search_sites'", [])
+            .unwrap();
+        migrate_setting_defaults(&conn).unwrap();
+        assert_eq!(read_settings(&conn).unwrap().sync_image_format, "html");
+        assert!(read_settings(&conn).unwrap().search_sites.is_empty());
     }
 
     #[test]
