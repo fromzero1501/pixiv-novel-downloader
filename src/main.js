@@ -53,6 +53,12 @@ const state = {
   sort: "date_desc",
   bulkMode: false,
   selectedWorkIds: new Set(),
+  /**
+   * 作者库的批量选择（v1.3.18）：勾选作者＝导出他名下全部作品。
+   * 和作品库那份各自独立 —— 两个页面不会同时在屏幕上，混用只会互相串。
+   */
+  authorBulkMode: false,
+  selectedAuthorIds: new Set(),
   pendingConfirmation: null,
   // 「新建作品」预览里勾中的候选（v1.2.92）：预览 → 确认框 → 落库，中间要把它带着走
   pendingImport: null,
@@ -587,6 +593,18 @@ async function invoke(command, args = {}) {
       elapsedMs: 8,
       truncated: matched.length > limit,
     };
+  }
+  // 作品分享包（v1.3.18）：预览里没有真文件系统，回一份形状正确的假回执 ——
+  // 前端要处理的「进度浮层 → toast → 打开目录」这条链照样验得到。
+  if (command === "export_works_package") {
+    const pickedWorks = (args.workIds || []).length;
+    const pickedAuthors = (args.authorIds || []).length;
+    return { path: `D:\\预览\\作品分享包-${pickedWorks + pickedAuthors}.zip`, works: pickedWorks || pickedAuthors * 3, authors: pickedAuthors, skipped: 0 };
+  }
+  if (command === "import_data") {
+    const given = String(args.path || "");
+    const isLibrary = /\.db$/i.test(given);
+    return { kind: isLibrary ? "library" : "package", authorsCreated: 1, worksAdded: 2, worksUpgraded: 1, worksSkipped: 1, path: given, restartedNeeded: isLibrary };
   }
   // 系列序号故意留一个空号（1、3，缺 2），好让「缺篇检测」在预览里也验得到。
   // v1.2.96：系列改成**内存可变**（新建 / 重命名 / 删除要能在预览里看得出效果）
@@ -1167,6 +1185,11 @@ async function invoke(command, args = {}) {
   if (command === "cancel_pixiv_sync") return undefined;
   if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.isNew = false; if (work.readState === 0) work.readState = 1; } return; }
   if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
+  // 系统对话框（v1.3.18）：真机走真对话框；预览里没有，读验证脚本塞进来的假路径
+  // （`window.__previewOpenPath` / `__previewSavePath`，不塞就返回 null ＝ 用户点了取消）。
+  // 以前这里没有桩 —— 预览里点这类按钮会一路走到函数末尾那个 throw。
+  if (command === "plugin:dialog|open") return window.__previewOpenPath ?? null;
+  if (command === "plugin:dialog|save") return window.__previewSavePath ?? null;
   if (command === "open_search_site") {
     // 和 Rust 侧同一条规则：最后一个 = 后面的内容清掉，填进编码后的搜索词
     const index = String(args.url || "").lastIndexOf("=");
@@ -1337,6 +1360,16 @@ const PREVIEW_ASSET_FALLBACK = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///y
 async function askSavePath(options) {
   if (window.__TAURI_INTERNALS__) return save(options);
   return window.__previewSavePath ?? null;
+}
+
+/**
+ * 要一个「打开哪个文件 / 文件夹」。和 `askSavePath` 同一套路：**浏览器预览里没有系统
+ * 对话框**，`open()` 会直接抛 —— 而它在导入流程的第一步，一抛就什么都验不到。
+ * 预览里读 `window.__previewOpenPath`（脚本塞个假路径进去，不塞就返回 null ＝ 用户点了取消）。
+ */
+async function askOpenPath(options) {
+  if (window.__TAURI_INTERNALS__) return open(options);
+  return window.__previewOpenPath ?? null;
 }
 
 function asset(path) {
@@ -2417,7 +2450,7 @@ function renderAuthors() {
         ${state.missingAuthorIds.has(author.id) ? `<span class="author-missing-badge" title="Pixiv 上找不到这个作者主页（多半已销号或封号）。下次同步若能读到作品列表，会自动摘掉这个标记。">已销号或封号</span>` : ""}
       </div>
       <div class="author-card-body">
-        <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2><div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="收藏到…（作者收藏夹）" data-action="pick-author-collections" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>
+        <div class="author-card-title-row"><h2>${escapeHtml(author.name)}</h2>${state.authorBulkMode ? `<button class="selection-badge" title="${state.selectedAuthorIds.has(author.id) ? "取消选择" : "选择这位作者"}" data-action="toggle-author-select" data-author-id="${author.id}">${state.selectedAuthorIds.has(author.id) ? icon("check", 16) : ""}</button>` : `<div class="author-card-actions"><button class="icon-button card-drag" title="长按拖动，调整作者顺序" aria-label="长按拖动调整顺序">${icon("grip", 17)}</button><button class="icon-button card-star${author.starred ? " is-on" : ""}" title="收藏到…（作者收藏夹）" data-action="pick-author-collections" data-author-id="${author.id}">${icon(author.starred ? "starFilled" : "star", 17)}</button><button class="icon-button card-edit" title="编辑作者" data-action="edit-author" data-author-id="${author.id}">${icon("more", 18)}</button></div></div>`}
         ${authorAliasList(author.aliases)}
         <dl class="author-stats"><div><dt>作品</dt><dd>${author.workCount}</dd></div><div><dt>完整版</dt><dd>${author.purchasedCount}</dd></div><div><dt>带图版</dt><dd>${author.imagesCount || 0}</dd></div><div><dt>收藏</dt><dd>${author.favoriteCount}</dd></div></dl>
         <p class="author-sync-note" title="${author.pixivLastSyncAt ? escapeHtml(author.pixivLastSyncAt) : "还没有同步记录"}">Pixiv ${escapeHtml(syncLabel(author.pixivLastSyncAt))}</p>
@@ -2429,12 +2462,15 @@ function renderAuthors() {
     <section class="topbar">
       <div><p class="section-kicker">私人作品档案</p><h1>作者库</h1></div>
       <div class="topbar-actions">
+        ${state.authorBulkMode
+          ? `<button class="quiet-button" data-action="author-bulk-mode">退出批量选择</button>`
+          : `<button class="icon-text-button" data-action="author-bulk-mode" title="进批量选择：勾选作者后，可以把他们名下的作品一起导出">${icon("more", 18)}<span>批量操作</span></button>
         <button class="icon-text-button" data-action="auto-group">${icon("upload", 18)}<span>完整版自动匹配</span></button>
         <button class="icon-text-button" data-action="auto-group-by-author">${icon("folder", 18)}<span>指定作者自动匹配</span></button>
         <button class="icon-text-button" data-action="sync-all-authors">${icon("sync", 18)}<span>同步所有作者</span></button>
         <button class="icon-text-button" data-action="import-bookmark-authors">${icon("heart", 18)}<span>从pixiv收藏新增作者</span></button>
         <button class="icon-text-button" data-action="add-stray">${icon("download", 18)}<span>添加散篇</span></button>
-        <button class="primary-button" data-action="new-author">${icon("plus", 18)}<span>新增作者</span></button>
+        <button class="primary-button" data-action="new-author">${icon("plus", 18)}<span>新增作者</span></button>`}
       </div>
     </section>
     <section class="authors-content">
@@ -2442,6 +2478,7 @@ function renderAuthors() {
         <label class="search-field"><span>${icon("search", 19)}</span><input id="author-search" type="search" placeholder="搜索作者" value="${escapeHtml(state.authorQuery)}" autocomplete="off"></label>
         <button class="icon-text-button star-filter${state.authorsStarredOnly ? " is-active" : ""}" data-action="authors-starred-only" title="只显示已经收藏的作者">${icon(state.authorsStarredOnly ? "starFilled" : "star", 17)}<span>作者收藏</span></button>
       </div>
+      ${state.authorBulkMode ? authorBulkBar(authors) : ""}
       <div class="section-row"><p>${authors.length ? `共 ${authors.length} 位作者${state.authorsStarredOnly ? "（只看收藏作者）" : ""}` : ""}</p></div>
       <div class="author-grid">${cards || (state.authors.length ? renderNoMatchedAuthors() : renderEmptyAuthors())}${query || state.authorsStarredOnly ? "" : strayCard()}</div>
     </section>`);
@@ -3859,11 +3896,12 @@ function dropZoneAt(position) {
   const hit = document.elementFromPoint(x, y);
   // 详情里的「拖动到此绑定完整版」和系列页的「拖动绑定合集文件」都是拖放区（v1.2.68）
   // 详情页三个绑定区 + 系列页那个合集区（v1.2.83 起详情页有三个）
-  return hit && hit.closest ? hit.closest("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone") : null;
+  // 设置页那块导入区（v1.3.18）也是拖放区，但它收文件夹，见 handleDropToBind 里的分流
+  return hit && hit.closest ? hit.closest("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone, #import-drop-zone") : null;
 }
 
 function highlightDropZone(zone) {
-  document.querySelectorAll("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone").forEach((el) => {
+  document.querySelectorAll("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone, #import-drop-zone").forEach((el) => {
     el.classList.toggle("is-drop-active", el === zone);
   });
 }
@@ -3875,6 +3913,13 @@ async function handleDropToBind(payload) {
   if (!zone) return;
   const paths = Array.isArray(payload?.paths) ? payload.paths : [];
   if (!paths.length) return;
+  // 设置页那块导入区单独分流（v1.3.18）：文件和**文件夹**都收（有人会把分享包解压了再拖过来），
+  // 也不套用下面「只能一个 / 必须是文件」那两条 —— 那是绑定，这是另一件事。
+  if (zone.id === "import-drop-zone") {
+    if (paths.length > 1) toast("一次只导入一个分享包，这次只用了第一个", "info");
+    await runImportData(paths[0]);
+    return;
+  }
   if (paths.length > 1) toast("一次只能绑一个文件，这次只用了第一个", "info");
   const path = paths[0];
   // ⚠️ 目录要自己拦：后端的 bind_work 只拒绝「封面图 / 配图文件夹」，普通文件夹会被直接绑上。
@@ -6816,6 +6861,13 @@ async function bindEvents() {
       if (action === "toggle-select") toggleWorkSelection(Number(workId));
       if (action === "bulk-mode") toggleBulkMode();
       if (action === "select-all") toggleSelectAll();
+      // 作者库批量选择（v1.3.18）+ 分享包导出 / 导入
+      if (action === "author-bulk-mode") toggleAuthorBulkMode();
+      if (action === "author-select-all") toggleSelectAllAuthors();
+      if (action === "toggle-author-select") toggleAuthorSelection(Number(authorId));
+      if (action === "export-share-package") await exportSharePackage();
+      if (action === "import-data-pick") await pickImportDataFile();
+      if (action === "import-data-pick-folder") await pickImportDataFolder();
       if (action === "copy-selected-full") await copySelectedToFull();
       if (action === "set-images-selected") await setSelectedHasImages();
       if (action === "delete-selected") await deleteSelectedWorks();
@@ -7527,6 +7579,181 @@ function toggleBulkMode() {
   render();
 }
 
+/** 作者库的批量条（v1.3.18）：和作品库那条同一个形状，只是口径从「已选 N 篇」换成「已选 N 位」。 */
+function authorBulkBar(authors) {
+  const count = state.selectedAuthorIds.size;
+  const disabled = count ? "" : "disabled";
+  const allSelected = authors.length > 0 && authors.every((author) => state.selectedAuthorIds.has(author.id));
+  return `<section class="bulk-bar" aria-label="作者批量操作">
+      <div class="bulk-bar-group is-lead">
+        <strong class="bulk-count">已选 ${count} 位</strong>
+        <button class="quiet-button" data-action="author-select-all" ${authors.length ? "" : "disabled"}>${allSelected ? "取消全选" : "全选本页"}</button>
+        <button class="quiet-button" data-action="author-bulk-mode">退出批量</button>
+      </div>
+      <div class="bulk-bar-group"><span class="bulk-bar-label">导出</span><button class="bulk-button" data-action="export-share-package" title="把勾选作者名下的全部作品打成一个 zip（含正文与封面，不含收藏 / 评分 / 笔记这些私人记录）" ${disabled}>导出分享包</button></div>
+    </section>`;
+}
+
+/** 进 / 出作者库的批量选择。两头都清一次选择 —— 留着上次的勾选只会让人莫名导出多出来的作者。 */
+function toggleAuthorBulkMode() {
+  state.authorBulkMode = !state.authorBulkMode;
+  state.selectedAuthorIds.clear();
+  render();
+}
+
+function toggleAuthorSelection(authorId) {
+  if (state.selectedAuthorIds.has(authorId)) state.selectedAuthorIds.delete(authorId);
+  else state.selectedAuthorIds.add(authorId);
+  render();
+}
+
+/** 「全选本页」只勾当前可见的作者（搜索 / 只看收藏都算），和作品库那条同规矩。 */
+function toggleSelectAllAuthors() {
+  const query = state.authorQuery.trim().toLowerCase();
+  const authors = state.authors.filter((author) => !author.stray && (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
+  const allSelected = authors.length > 0 && authors.every((author) => state.selectedAuthorIds.has(author.id));
+  if (allSelected) state.selectedAuthorIds.clear();
+  else authors.forEach((author) => state.selectedAuthorIds.add(author.id));
+  render();
+}
+
+/**
+ * 导出作品分享包（v1.3.18）：作品库勾作品 / 作者库勾作者两个入口共用这一条。
+ *
+ * 进度走右下角那套浮层（和同步、批量下载共用一个位置）—— 后端边写包边发
+ * `export-package-progress`，前端只更新浮层，不重绘主界面。
+ * 落盘位置由后端定（exe 旁边），存完自动打开那个目录。
+ */
+async function exportSharePackage() {
+  const workIds = [...state.selectedWorkIds];
+  const authorIds = [...state.selectedAuthorIds];
+  if (!workIds.length && !authorIds.length) {
+    toast("先勾选要导出的作品或作者", "info");
+    return;
+  }
+  // 浮层是共用的，别把正在跑的同步顶掉
+  if (state.syncTask) {
+    toast("有任务正在进行，请等它结束或先终止", "info");
+    return;
+  }
+  state.syncTask = {
+    kind: "share",
+    label: "正在导出分享包",
+    title: "正在准备…",
+    current: 0,
+    total: workIds.length + authorIds.length,
+    cancelAction: "hide-share-progress",
+    cancelText: "隐藏进度",
+  };
+  render();
+  const unlisten = await listenExportPackageProgress((event) => {
+    const { total = 0, current = 0, title = "" } = event.payload || {};
+    if (!state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    state.syncTask.title = title;
+    updateSyncFloater();
+  });
+  let result;
+  try {
+    result = await invoke("export_works_package", { workIds, authorIds });
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(`导出失败：${error}`, "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  // 导出完就退出批量、清空勾选：不留一屏还亮着的勾，也免得不小心又导一遍
+  state.bulkMode = false;
+  state.authorBulkMode = false;
+  state.selectedWorkIds.clear();
+  state.selectedAuthorIds.clear();
+  render();
+  const skippedNote = result.skipped ? `，${result.skipped} 篇没有绑定文件、没东西可带` : "";
+  toast(`已导出 ${result.works} 篇作品（${result.authors} 位作者）${skippedNote}：${result.path}`, skippedNote ? "info" : "success");
+  // 存完把所在目录打开（拿不到就当没这回事，别让提示盖住成功）
+  try {
+    await invoke("open_local_path", { path: result.path, parent: true });
+  } catch {
+    /* 打开目录失败不影响导出结果 */
+  }
+}
+
+/** 订阅导出进度。浏览器预览里没有 Tauri 事件系统，订阅失败就退化成「没有进度条」。 */
+async function listenExportPackageProgress(handler) {
+  try {
+    return await listen("export-package-progress", handler);
+  } catch {
+    return () => {};
+  }
+}
+
+/**
+ * 导入数据（v1.3.18）：一个入口吃三种 —— 分享包 zip / 已解压的分享包文件夹 / 整库备份 .db。
+ * 分类、判重、目录校验全在后端；前端只负责挑路径 + 把结果翻成人话。
+ */
+async function runImportData(path) {
+  if (!path) return;
+  // 整库备份是「覆盖」：先让用户点头再动手。分享包是合并，不用问。
+  if (/\.db$/i.test(path)) {
+    confirmAction(
+      "确认导入整库备份",
+      "这是整库备份文件，导入会用它的内容覆盖当前资料库（作品记录、绑定关系、设置都会被替换）。硬盘上的作品文件不动。",
+      "覆盖导入",
+      async () => { await doImportData(path); },
+    );
+    return;
+  }
+  await doImportData(path);
+}
+
+async function doImportData(path) {
+  let result;
+  try {
+    result = await invoke("import_data", { path });
+  } catch (error) {
+    toast(`导入失败：${error}`, "error");
+    return;
+  }
+  if (result.kind === "library") {
+    state.activeAuthor = null;
+    state.homeView = "authors";
+    render();
+    toast("整库备份已导入，重启软件后生效", "success");
+    return;
+  }
+  await refreshAuthors();
+  await refreshWorks().catch(() => {});
+  render();
+  const parts = [];
+  if (result.authorsCreated) parts.push(`新增作者 ${result.authorsCreated} 位`);
+  if (result.worksAdded) parts.push(`新增作品 ${result.worksAdded} 篇`);
+  if (result.worksUpgraded) parts.push(`升级为完整版 ${result.worksUpgraded} 篇`);
+  if (result.worksSkipped) parts.push(`跳过 ${result.worksSkipped} 篇`);
+  toast(parts.length ? `导入完成：${parts.join("，")}` : "导入完成：包里没有需要新增的作品", "success");
+}
+
+/** 导入区点一下：选文件（分享包 .zip 或整库备份 .db）。 */
+async function pickImportDataFile() {
+  const path = await askOpenPath({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "分享包 / 数据库备份", extensions: ["zip", "db"] }],
+  });
+  if (!path) return;
+  await runImportData(path);
+}
+
+/** 导入区另一个入口：有人把包解压了才发过来，那就直接挑那个文件夹。 */
+async function pickImportDataFolder() {
+  const path = await askOpenPath({ multiple: false, directory: true });
+  if (!path) return;
+  await runImportData(path);
+}
+
 /**
  * 批量操作条（v1.2.1）。
  * 原来是把十几个长得一模一样的按钮一股脑塞进顶栏、每个后面还挂个「（N）」，
@@ -7556,7 +7783,7 @@ function bulkBar(works) {
       ${group("版本", `<button class="bulk-button" data-action="copy-selected-full" ${disabled}>设为完整版</button><button class="bulk-button" data-action="set-images-selected" ${disabled}>设为带图版</button>`)}
       ${group("整理", `<button class="bulk-button" data-action="bulk-read-state" data-read-state="2" ${disabled}>设已读</button><button class="bulk-button" data-action="bulk-read-state" data-read-state="0" ${disabled}>设未读</button><button class="bulk-button" data-action="bulk-rating-modal" ${disabled}>设评分</button><button class="bulk-button" data-action="bulk-add-collection" ${disabled}>加入收藏夹</button><button class="bulk-button" data-action="bulk-remove-collection" ${disabled}>移出收藏夹</button><button class="bulk-button" data-action="bulk-tag-modal" ${disabled}>改标签</button>`)}
       ${group("文件", `<button class="bulk-button" data-action="backfill-images" title="按设置里选的格式，给勾选的作品重新下载阅读版并绑定" ${disabled}>补下配图</button><button class="bulk-button" data-action="download-selected-reading" data-format="epub" ${disabled}>重新下载 EPUB 版</button>`)}
-      ${group("输出", `<button class="bulk-button" data-action="export-selected" ${disabled}>导出清单</button>`)}
+      ${group("输出", `<button class="bulk-button" data-action="export-selected" ${disabled}>导出清单</button><button class="bulk-button" data-action="export-share-package" title="把勾选的作品打成一个 zip（含正文与封面，不含收藏 / 评分 / 笔记这些私人记录）" ${disabled}>导出分享包</button>`)}
       <div class="bulk-bar-group is-danger"><button class="danger-button" data-action="delete-selected" ${disabled}>删除作品</button><button class="danger-button" data-action="delete-selected-files" ${disabled}>彻底删除</button></div>
     </section>`;
 }
@@ -9549,9 +9776,11 @@ async function settingsModal() {
       <button type="button" data-action="relocate-lost-files">${icon("sync", 18)}重新定位丢失的文件<span class="settings-action-hint">换盘 / 搬过目录之后用：到您设置过的所有目录里按文件名找同名文件，找到唯一一个就重新绑上（先给预览，再动手）</span></button>
       <button type="button" data-action="clear-skipped-novels">${icon("archive", 18)}清空「太小跳过」记录<span class="settings-action-hint">同步时小于「最小文件大小」的作品会被记下来、下次直接跳过（省请求、也少招限流）。把最小文件大小调小之后点这里，让它们重新参与同步</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
-      <button type="button" data-action="export-backup">${icon("database", 18)}导出数据库备份<span class="settings-action-hint">保存一份数据库文件，出问题时可回滚</span></button>
-      <button type="button" data-action="restore-backup">${icon("upload", 18)}从备份恢复<span class="settings-action-hint">用备份文件覆盖当前数据库，需重启</span></button>
+      <button type="button" data-action="export-backup">${icon("database", 18)}导出设置和数据<span class="settings-action-hint">把整个资料库存成一个 .db 文件（作品记录、绑定关系、设置全在里面），换电脑或出问题时可回滚</span></button>
+      <button type="button" data-action="import-data-pick">${icon("upload", 18)}导入数据<span class="settings-action-hint">吃三种：别人给的作品分享包（.zip）／解压好的分享包文件夹／你自己的整库备份（.db，覆盖式导入、需重启）。分享包只补作品，不带收藏、评分这些私人记录</span></button>
+      <button type="button" data-action="import-data-pick-folder">${icon("folder", 18)}导入已解压的分享包<span class="settings-action-hint">对方把包解压了才发过来时用这个，直接挑那个文件夹；文件会复制进来，原文件夹不动</span></button>
     </div>
+    <div class="bind-drop-zone is-wide" id="import-drop-zone" data-action="import-data-pick" title="把作品分享包（.zip）、解压出来的文件夹、或整库备份（.db）拖到这里；点一下也可以选文件">${icon("upload", 16)}<span>把作品分享包拖到这里（也可以点一下选文件）</span></div>
     </div>
   </section>  </section>
 </form>`, `<span class="settings-save-state" id="settings-save-state"></span>`, "is-wide"));
