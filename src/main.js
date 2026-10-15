@@ -7397,6 +7397,26 @@ async function bindEvents() {
       event.target.value = cleaned;
       event.target.dispatchEvent(new Event("input", { bubbles: true }));
     });
+    // 点字段名 / 说明文字 / 空白，不再抢输入框焦点（v1.3.26）。
+    //
+    // 设置页每个字段都是**整个 label 把输入框和说明文字一起包住**，按 HTML 标准，
+    // 点 label 内任何位置都等于点它关联的控件 —— 于是「随手点一下输入框旁边想定位光标」
+    // 会把焦点挪过去，**顺带触发一次自动保存**（前一个框失焦）。
+    // 用户 18:20 连问的「为什么点附近也会选中输入框」「我输入的时候怎么会有数据库操作」
+    // 都是它：他以为只在打字，其实那些误点一直在背后触发写库。
+    //
+    // 只放行两类点击：
+    //  · 直接点在控件上（输入框 / 下拉 / 按钮）；
+    //  · 勾选框和单选框 —— 点它旁边的文字就能勾，这是习惯用法，保留。
+    settingsForm.addEventListener("click", (event) => {
+      const label = event.target?.closest?.("label");
+      if (!label) return;
+      if (event.target.closest("input, textarea, select, button")) return;
+      const control = label.querySelector("input, select, textarea");
+      const type = (control?.type || "").toLowerCase();
+      if (type === "checkbox" || type === "radio") return;
+      event.preventDefault();
+    });
   }
 
   // 作者别名输入框：回车就地把别名加进去（不能重开弹窗，否则会丢掉表单里其它未保存的修改）
