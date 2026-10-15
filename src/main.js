@@ -7010,14 +7010,6 @@ async function bindEvents() {
       if (action === "pick-auto-group-dir") await pickPath("autoGroupDir", true);
       if (action === "auto-group") pickMatchMode({ action: "auto-group", authorId: null, authorName: "" }, "完整版自动匹配", "先选择用哪种方式把文件匹配到作品上，然后再开始匹配。");
       if (action === "auto-group-by-author") autoGroupAuthorPicker();
-      if (action === "expand-character-editor") {
-        const box = document.querySelector("#character-editor");
-        if (box) {
-          box.dataset.expanded = "true";   // 同一元素上再渲染（增删角色后）保持展开
-          await renderCharacterEditor();
-          bindEvents();
-        }
-      }
       if (action === "add-search-site") addSearchSiteRow();
       if (action === "remove-search-site") {
         element.closest(".search-site-item")?.remove();
@@ -10201,16 +10193,10 @@ async function renderCharacterEditor() {
     box.innerHTML = `<p class="read-only-note">还没有角色名，先在下面新建一个游戏分组。</p>`;
     return;
   }
-  // v1.3.27：**默认不铺角色列表**。
-  // 用户 2026-10-15 用 picker 版定位到「设置里只有第 4 组（匹配与关联）打字卡，其他组都不卡」，
-  // 而角色编辑器就在第 4 组 —— 632 个角色。v1.3.23 只做到「折叠的分组不铺 chip」，
-  // 但**第一个分组默认展开**，那 45 个角色的名字片仍然铺在弹窗里，照样拖慢每次输入的样式重算。
-  // 折叠态只放一个按钮（几乎零节点）；点开才真渲染（见 expand-character-editor）。
+  // v1.3.30：这里**不再有「管理常见角色名（N 个）」那个中间按钮** ——
+  // 用户实测（v1.3.29）确认展开态本身不卡，那就没必要先拿一个按钮拦一道（用户要求"像之前就行了"）。
+  // 真正管用的是下面这套懒加载：分组默认全折叠、展开一组才铺（≤20 个）、搜索框跨分组平铺。
   box.dataset.total = String(total);
-  if (!box.dataset.expanded) {
-    box.innerHTML = `<button type="button" class="quiet-button" data-action="expand-character-editor">${icon("settings", 16)}管理常见角色名（${total} 个）</button><small class="read-only-note">点开时才加载 —— 角色多的时候这一块会拖慢设置面板的输入。</small>`;
-    return;
-  }
   // v1.3.28 重新设计（用户：「展开常用角色后还是会卡，需要重新设计」）：
   // 原则是**任何一次铺进 DOM 的角色元素都控制在几十个以内** —— 632 个角色全铺出来，
   // 设置面板每次按键的样式重算都要过那几百个节点，那正是卡感的来源。
