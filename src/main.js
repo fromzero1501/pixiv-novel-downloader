@@ -10082,6 +10082,48 @@ async function loadCharacterIndex() {
   state.characterIndex = buildCharacterIndex(state.characters);
 }
 
+/** 一个角色分组里的 chip（停用的划掉但仍占位，方便随时恢复）。
+ *
+ * 抽出来是因为**折叠着的分组不预先铺** —— 展开时才调它（见 fillCharacterChips）。
+ * 用户 2026-10-15 报「设置里所有输入框都很卡」：他有 632 个角色，设置弹窗里
+ * 光角色就铺出 1400+ 节点，每次输入的样式重算都要过一遍这些节点。
+ */
+function characterChipsHtml(group) {
+  const chips = group.characters.map((entry) => {
+    // 有别名时把别名收进 title，不额外占位
+    const title = entry.aliases ? `别名：${entry.aliases}` : entry.name;
+    return `<span class="char-chip ${entry.enabled ? "" : "is-off"}" data-action="toggle-character" data-id="${entry.id}" title="${escapeHtml(title)}（点击${entry.enabled ? "停用" : "启用"}）">${escapeHtml(entry.name)}<button type="button" class="char-chip-remove" data-action="delete-character" data-id="${entry.id}" title="删除这个角色">×</button></span>`;
+  }).join("");
+  const empty = group.characters.length ? "" : `<span class="char-empty">还没有角色，用上面的"添加角色"往里加</span>`;
+  return chips + empty;
+}
+
+/** 展开某个折叠的角色分组时，才把它的 chip 铺进去（铺完要重绑事件，元素是新造的）。 */
+function fillCharacterChips(details) {
+  const holder = details.querySelector(".char-chips");
+  if (!holder || holder.dataset.filled || holder.innerHTML.trim()) return;
+  const group = (state.characters || []).find((entry) => entry.game === (details.dataset.game || ""));
+  if (!group) return;
+  holder.dataset.filled = "true";
+  holder.innerHTML = characterChipsHtml(group);
+  bindEvents();
+}
+
+/** 给角色编辑器的分组挂「展开才铺 chip」的监听。
+ *
+ * `toggle` 事件**不冒泡**，所以只能在捕获阶段挂一次（挂在容器上，不管重建多少回都管用）。
+ */
+function bindCharacterChipLazyFill() {
+  const box = document.querySelector("#character-editor");
+  if (!box || box.dataset.lazyBound) return;
+  box.dataset.lazyBound = "true";
+  box.addEventListener("toggle", (event) => {
+    const details = event.target;
+    if (!details?.matches?.("details.char-group") || !details.open) return;
+    fillCharacterChips(details);
+  }, true);
+}
+
 /** 「显示角色名」开关只切一个 body 类：CSS 靠它把角色名条常显，不用重绘整页。 */
 function applyCharacterNameDisplay() {
   document.body.classList.toggle("show-character-names", Boolean(state.showCharacterNames));
@@ -10111,16 +10153,13 @@ async function renderCharacterEditor() {
   box.dataset.total = String(total);
   box.innerHTML = groups.map((group, index) => {
     const enabledCount = group.characters.filter((entry) => entry.enabled).length;
-    const chips = group.characters.map((entry) => {
-      // 有别名时把别名收进 title，不额外占位；停用的划掉但仍占位，方便随时恢复
-      const title = entry.aliases ? `别名：${entry.aliases}` : entry.name;
-      return `<span class="char-chip ${entry.enabled ? "" : "is-off"}" data-action="toggle-character" data-id="${entry.id}" title="${escapeHtml(title)}（点击${entry.enabled ? "停用" : "启用"}）">${escapeHtml(entry.name)}<button type="button" class="char-chip-remove" data-action="delete-character" data-id="${entry.id}" title="删除这个角色">×</button></span>`;
-    }).join("");
-    const empty = group.characters.length ? "" : `<span class="char-empty">还没有角色，用上面的"添加角色"往里加</span>`;
-    // 第一个分组默认展开，让人一眼看到这堆是能点、能删的角色名
-    return `<details class="char-group" ${index === 0 ? "open" : ""}>
+    // 第一个分组默认展开，让人一眼看到这堆是能点、能删的角色名。
+    // **只有它马上铺 chips**，其余分组等展开时才铺（见 fillCharacterChips）——
+    // 角色多的人有几百上千条，全铺出来设置弹窗要上千节点，每次输入的样式重算都得过一遍。
+    const opened = index === 0;
+    return `<details class="char-group" data-game="${escapeHtml(group.game)}" ${opened ? "open" : ""}>
       <summary><strong>${escapeHtml(group.game)}</strong><span class="char-count">${enabledCount}/${group.characters.length}</span></summary>
-      <div class="char-chips">${chips}${empty}</div>
+      <div class="char-chips">${opened ? characterChipsHtml(group) : ""}</div>
       <div class="char-group-tools">
         <input class="char-game-name" value="${escapeHtml(group.game)}" aria-label="分组名">
         <button type="button" class="quiet-button" data-action="rename-character-game" data-game="${escapeHtml(group.game)}">重命名分组</button>
@@ -10130,6 +10169,8 @@ async function renderCharacterEditor() {
   }).join("");
   // 新生成的 chip / 分组按钮需要重新挂事件（元素是新造的，dataset.bound 会重新生效）
   bindEvents();
+  // 折叠着的分组等展开再铺 chip（v1.3.23）
+  bindCharacterChipLazyFill();
 }
 function bindCharacterEditorInputs() {
   const bind = (selector, run) => {

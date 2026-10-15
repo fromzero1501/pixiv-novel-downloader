@@ -507,7 +507,9 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .link-button { margin-left: 4px; padding: 0; color: #176bd3; background: transparent; border: 0; font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
 .link-button:hover { color: #0f4fa8; }
 /* 设置页脚的保存状态：保存按钮没了，得让用户看得见「改动自己存了」 */
-.settings-save-state { font-size: 12px; font-weight: 600; color: #8098b0; }
+/* 这行字会在「改动待保存…」和「已自动保存 17:23:45（N 个搜索网站）」之间反复变长变短，
+   不锁住就会带着页脚（进而整个弹窗）重排 —— 设置里打字发卡的一个来源（v1.3.23）。 */
+            .settings-save-state { font-size: 12px; font-weight: 600; color: #8098b0; white-space: nowrap; min-width: 210px; text-align: right; }
 .settings-save-state.is-done { color: #27755c; }
 .settings-save-state.is-error { color: #b44155; }
 .search-site-tools { margin-top: 7px; }
