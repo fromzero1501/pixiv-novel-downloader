@@ -17502,6 +17502,664 @@ fn collect_import_folder_entries(
     }
 }
 
+// ==================== 作品分享包 · 导出（v1.3.18）====================
+
+/// 分享包清单里的一位作者。**只带身份信息**：头像、目录、备注、星标属于设置/私人数据，不进包。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SharePackageAuthor {
+    name: String,
+    aliases: String,
+    homepage: String,
+}
+
+/// 分享包清单里的一篇作品。路径一律是**包内相对路径**。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SharePackageWork {
+    title: String,
+    release_date: String,
+    tags: String,
+    pixiv_novel_id: String,
+    series_id: String,
+    series_title: String,
+    series_order: i64,
+    synopsis: String,
+    word_count: i64,
+    has_images: i64,
+    image_count: i64,
+    /// 所属作者名（导入时映射到本地作者；对不上的这篇跳过）
+    author: String,
+    /// 这份正文原本是完整版（purchased）还是预览版（preview）—— 导入时按它落进对应目录
+    slot: String,
+    file: String,
+    cover: String,
+    images: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SharePackageManifest {
+    kind: String,
+    version: u32,
+    exported_at: String,
+    note: String,
+    authors: Vec<SharePackageAuthor>,
+    works: Vec<SharePackageWork>,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExportPackageResult {
+    path: String,
+    works: usize,
+    authors: usize,
+    /// 没有任何绑定文件、没东西可带而跳过的篇数
+    skipped: usize,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportPackageProgress {
+    current: usize,
+    total: usize,
+    title: String,
+}
+
+/// 分享包落在哪儿：exe 所在目录（用户双击 exe 的那个文件夹）；取不到就退回数据目录。
+fn share_package_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+    {
+        if dir.is_dir() {
+            return Ok(dir);
+        }
+    }
+    Ok(app_data_dir()?)
+}
+
+fn zip_file_options() -> zip::write::SimpleFileOptions {
+    zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated)
+}
+
+/// 把作品旁边的 `<作品名>_images/` 配图目录整块写进 zip（v1.3.1 之前的中转产物）。
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<fs::File>,
+    dir: &Path,
+    prefix: &str,
+    options: zip::write::SimpleFileOptions,
+) -> Result<(), String> {
+    let Ok(entries) = fs::read_dir(dir) else { return Ok(()) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name() else { continue };
+        let target = format!("{prefix}/{}", name.to_string_lossy());
+        if path.is_dir() {
+            zip.add_directory(format!("{target}/"), options)
+                .map_err(|e| e.to_string())?;
+            add_dir_to_zip(zip, &path, &target, options)?;
+        } else {
+            let bytes = fs::read(&path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+            zip.start_file(target, options).map_err(|e| e.to_string())?;
+            zip.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn export_works_package_impl(
+    conn: &Connection,
+    work_ids: &[i64],
+    author_ids: &[i64],
+    dest: &Path,
+    app: Option<tauri::AppHandle>,
+) -> Result<ExportPackageResult, String> {
+    // 作者 id 展开成作品 id（作者库那条入口：勾选作者 = 导出他名下所有作品）
+    let mut ids: Vec<i64> = work_ids.to_vec();
+    for author_id in author_ids {
+        let mut statement = conn
+            .prepare("SELECT id FROM works WHERE author_id=?1 ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([author_id], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        ids.extend(rows.filter_map(Result::ok));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err("没有可导出的作品：先勾选作品或作者".into());
+    }
+    let mut manifest = SharePackageManifest {
+        kind: "collection-library/share-package".to_string(),
+        version: 1,
+        exported_at: Utc::now().to_rfc3339(),
+        note: "这是作品分享包：书目信息 + 作品文件。导入它不需要联网；收藏、评分、笔记这类私人记录不在包里。".to_string(),
+        authors: Vec::new(),
+        works: Vec::new(),
+    };
+    // 清单条目 + 它在磁盘上的源路径（打包时直接用，不用回头查库）
+    let mut sources: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut author_names: Vec<String> = Vec::new();
+    let mut skipped = 0usize;
+    let total = ids.len();
+    for (index, work_id) in ids.iter().enumerate() {
+        let row: Option<(String, String, String, String, String, String, String, String, String, i64, String, i64, i64, i64, String, String, String, i64)> = conn
+            .query_row(
+                "SELECT a.name, a.aliases, a.homepage, w.title, w.release_date, w.tags, \
+                        w.pixiv_novel_id, w.series_id, w.series_title, w.series_order, w.synopsis, \
+                        w.word_count, w.has_images, w.image_count, w.preview_path, w.purchased_path, w.cover_path, \
+                        w.id \
+                 FROM works w JOIN authors a ON a.id = w.author_id WHERE w.id=?1",
+                [work_id],
+                |row| {
+                    Ok((
+                        row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
+                        row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+                        row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let title_for_progress = row.as_ref().map(|values| values.3.clone()).unwrap_or_default();
+        if let Some(app) = &app {
+            let _ = app.emit(
+                "export-package-progress",
+                ExportPackageProgress { current: index + 1, total, title: title_for_progress },
+            );
+        }
+        let Some(values) = row else {
+            skipped += 1;
+            continue;
+        };
+        let (
+            author_name, aliases, homepage, title, release_date, tags, pixiv_novel_id, series_id,
+            series_title, series_order, synopsis, word_count, has_images, image_count, preview_path,
+            purchased_path, cover_path, _row_id,
+        ) = values;
+        let purchased_ok = !purchased_path.trim().is_empty() && Path::new(&purchased_path).is_file();
+        let preview_ok = !preview_path.trim().is_empty() && Path::new(&preview_path).is_file();
+        let cover_ok = !cover_path.trim().is_empty() && Path::new(&cover_path).is_file();
+        // 一个文件都没有的篇目：分享包是给人「拿走就能读」的，没东西可带就别占位
+        if !purchased_ok && !preview_ok && !cover_ok {
+            skipped += 1;
+            continue;
+        }
+        let folder = sanitize_file_name(&author_folder_name(&author_name, &aliases));
+        let stem = sanitize_file_name(&title);
+        let (slot, body_path) = if purchased_ok {
+            ("purchased", purchased_path.clone())
+        } else {
+            ("preview", preview_path.clone())
+        };
+        let extension = Path::new(&body_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("txt")
+            .to_string();
+        let images_dir = novel_images_dir(Path::new(&body_path));
+        let has_images_dir = images_dir.is_dir();
+        let cover_entry = if cover_ok {
+            let cover_extension = Path::new(&cover_path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("jpg")
+                .to_string();
+            format!("文件/{folder}/{stem}.{cover_extension}")
+        } else {
+            String::new()
+        };
+        if !author_names.contains(&author_name) {
+            author_names.push(author_name.to_string());
+            manifest.authors.push(SharePackageAuthor {
+                name: author_name.clone(),
+                aliases: aliases,
+                homepage: homepage.clone(),
+            });
+        }
+        manifest.works.push(SharePackageWork {
+            title: title,
+            release_date,
+            tags,
+            pixiv_novel_id,
+            series_id,
+            series_title,
+            series_order,
+            synopsis,
+            word_count,
+            has_images,
+            image_count,
+            author: author_name.to_string(),
+            slot: slot.to_string(),
+            file: format!("文件/{folder}/{stem}.{extension}"),
+            cover: cover_entry,
+            images: if has_images_dir { format!("文件/{folder}/{stem}_images") } else { String::new() },
+        });
+        sources.push((body_path, cover_path, images_dir));
+    }
+    if manifest.works.is_empty() {
+        return Err("这些作品都没有绑定文件，导出分享包没有内容".into());
+    }
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = fs::File::create(dest).map_err(|e| format!("创建分享包失败：{e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip_file_options();
+    zip.start_file("作品清单.json", options)
+        .map_err(|e| e.to_string())?;
+    let manifest_text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+    zip.write_all(manifest_text.as_bytes())
+        .map_err(|e| e.to_string())?;
+    for (work, (body_path, cover_path, images_dir)) in manifest.works.iter().zip(sources.iter()) {
+        if !work.file.is_empty() && Path::new(body_path).is_file() {
+            let bytes = fs::read(body_path).map_err(|e| format!("读取 {} 失败：{e}", body_path))?;
+            zip.start_file(work.file.clone(), options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+        if !work.cover.is_empty() && Path::new(cover_path).is_file() {
+            let bytes = fs::read(cover_path).map_err(|e| format!("读取 {} 失败：{e}", cover_path))?;
+            zip.start_file(work.cover.clone(), options)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
+        if !work.images.is_empty() && images_dir.is_dir() {
+            zip.add_directory(format!("{}/", work.images), options)
+                .map_err(|e| e.to_string())?;
+            add_dir_to_zip(&mut zip, images_dir, &work.images, options)?;
+        }
+    }
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(ExportPackageResult {
+        path: dest.to_string_lossy().to_string(),
+        works: manifest.works.len(),
+        authors: manifest.authors.len(),
+        skipped,
+    })
+}
+
+/// 导出作品分享包：勾选作品 / 勾选作者（导出其全部作品）都走这里。
+/// 落盘固定在软件目录（exe 旁边），文件名带时间戳；同名自动加序号。
+#[tauri::command]
+async fn export_works_package(
+    work_ids: Vec<i64>,
+    author_ids: Vec<i64>,
+    app: tauri::AppHandle,
+) -> Result<ExportPackageResult, String> {
+    let dir = share_package_dir()?;
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let dest = unique_target_path(&dir, &format!("作品分享包-{stamp}"), "zip");
+    tauri::async_runtime::spawn_blocking(move || {
+        export_works_package_impl(&db()?, &work_ids, &author_ids, &dest, Some(app))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ==================== 作品分享包 · 导入（v1.3.18）====================
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ImportDataResult {
+    /// "package" = 作品分享包（合并、0 请求）；"library" = 整库备份（覆盖、需重启）
+    kind: String,
+    authors_created: usize,
+    works_added: usize,
+    /// 本地只有预览版、被包里的完整版顶替掉的篇数
+    works_upgraded: usize,
+    works_skipped: usize,
+    path: String,
+    restarted_needed: bool,
+}
+
+fn is_zip_file(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else { return false };
+    let mut head = [0u8; 2];
+    matches!(file.read_exact(&mut head), Ok(())) && head == *b"PK"
+}
+
+/// 分享包里的作者：主页优先，其次名字；都没命中就新建（**只写名字/别名/主页**，目录另说）。
+fn upsert_share_author(conn: &Connection, author: &SharePackageAuthor) -> Result<(i64, bool), String> {
+    let name = author.name.trim().to_string();
+    if name.is_empty() {
+        return Err("分享包里有一条作者没有名字".into());
+    }
+    let homepage = author.homepage.trim().to_string();
+    if !homepage.is_empty() {
+        let found: Option<i64> = conn
+            .query_row("SELECT id FROM authors WHERE homepage=?1", [homepage.as_str()], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(id) = found {
+            return Ok((id, false));
+        }
+    }
+    let found: Option<i64> = conn
+        .query_row("SELECT id FROM authors WHERE name=?1", [name.as_str()], |row| row.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(id) = found {
+        return Ok((id, false));
+    }
+    conn.execute(
+        "INSERT INTO authors (name, aliases, homepage) VALUES (?1, ?2, ?3)",
+        params![name, author.aliases.trim(), homepage],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((conn.last_insert_rowid(), true))
+}
+
+/// 把分享包里的正文 / 封面 / 旧式配图目录落进目标作者目录，并回填 works 路径。
+///
+/// `move_files`：true = 从解包目录**搬走**（那个目录是临时的）；false = **复制**，
+/// 源文件留在原地（对方拖进来的是他自己解压的文件夹，不能给搬空）。
+fn bind_share_assets(
+    conn: &Connection,
+    work_id: i64,
+    title: &str,
+    slot: &str,
+    body: &Path,
+    cover: Option<&Path>,
+    images: Option<&Path>,
+    move_files: bool,
+) -> Result<(), String> {
+    let (preview_dir, purchased_dir): (String, String) = conn
+        .query_row(
+            "SELECT ifnull(a.preview_dir,''), ifnull(a.purchased_dir,'') \
+             FROM works w JOIN authors a ON a.id=w.author_id WHERE w.id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let full = slot == "purchased";
+    let raw = if full { purchased_dir } else { preview_dir };
+    if raw.trim().is_empty() {
+        return Err(format!(
+            "「{title}」要落进{}目录，但这位作者的还没建出来",
+            if full { "完整版" } else { "预览版" }
+        ));
+    }
+    let dir = PathBuf::from(raw.trim());
+    fs::create_dir_all(&dir).map_err(|e| format!("创建文件夹失败：{e}"))?;
+    let place = |source: &Path, target: &Path| -> Result<(), String> {
+        if source == target {
+            return Ok(());
+        }
+        if move_files {
+            move_path_overwriting(source, target)
+        } else {
+            fs::copy(source, target).map(|_| ()).map_err(|e| format!("复制 {} 失败：{e}", source.display()))
+        }
+    };
+    let extension = body
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("txt");
+    let target = binding_target_path(conn, &dir, title, extension, work_id);
+    place(body, &target)?;
+    let mut cover_value = String::new();
+    if let Some(cover) = cover {
+        let cover_extension = cover
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("jpg");
+        let cover_target = binding_target_path(conn, &dir, title, cover_extension, work_id);
+        place(cover, &cover_target)?;
+        cover_value = cover_target.to_string_lossy().to_string();
+    }
+    if let Some(images) = images {
+        if images.is_dir() {
+            let stem = target
+                .file_stem()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let images_target = dir.join(format!("{stem}_images"));
+            if !images_target.exists() {
+                if move_files {
+                    let _ = move_path(images, &images_target);
+                } else {
+                    copy_directory(images, &images_target)?;
+                }
+            }
+        }
+    }
+    if full {
+        conn.execute(
+            "UPDATE works SET purchased_path=?1, cover_path=?2 WHERE id=?3",
+            params![target.to_string_lossy(), cover_value, work_id],
+        )
+        .map_err(|e| e.to_string())?;
+        // 拿到完整版后旧预览版自动清掉（送回收站）、封面跟过来 —— 复用现成那套
+        clear_redundant_preview_for_bound_work(conn, work_id, &target);
+    } else {
+        conn.execute(
+            "UPDATE works SET preview_path=?1, cover_path=?2 WHERE id=?3",
+            params![target.to_string_lossy(), cover_value, work_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // 路径变了触发器会把字数标回 -1，这里就地补上
+    if let Some(count) = file_word_count(&target) {
+        let _ = conn.execute(
+            "UPDATE works SET word_count=?1 WHERE id=?2",
+            params![count as i64, work_id],
+        );
+    }
+    refresh_reading_image_count(conn, work_id);
+    Ok(())
+}
+
+/// 导入作品分享包。`source` 可以是压缩包，也可以是**已经解压好的文件夹**。
+///
+/// 顺序是用户定的：**先校验两个默认目录**（缺任一就报错、什么都不做）→ 读清单 → 作者 upsert
+/// 并按「默认目录 + 作者名(别名)」建目录 → 逐篇按版本判重：本地没有就新建；本地只有预览版而
+/// 包里是完整版就覆盖升级；其余（本地已是完整版、包里只是预览版）一律跳过。
+fn import_works_package_impl(
+    conn: &Connection,
+    source: &Path,
+    extract_root: &Path,
+    move_files: bool,
+    cleanup: bool,
+) -> Result<ImportDataResult, String> {
+    let settings = read_settings(conn)?;
+    if settings.default_preview_dir.trim().is_empty() || settings.default_purchased_dir.trim().is_empty() {
+        return Err(
+            "请先到设置里填好「默认预览版文件夹」和「默认完整版文件夹」，再导入作品分享包。".into(),
+        );
+    }
+    let from_folder = source.is_dir();
+    let root = if from_folder {
+        source.to_path_buf()
+    } else {
+        let _ = fs::remove_dir_all(extract_root);
+        fs::create_dir_all(extract_root).map_err(|e| format!("准备导入目录失败：{e}"))?;
+        // 解包用系统 tar（和更新包那条 extract_program_from_zip 同一套做法）：
+        // 不给 zip crate 加读路径，省一份依赖、也省一份体积。
+        let status = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(source)
+            .arg("-C")
+            .arg(extract_root)
+            .status()
+            .map_err(|e| format!("系统里没有解压工具，请手动解压后再导入文件夹：{e}"))?;
+        if !status.success() {
+            let _ = fs::remove_dir_all(extract_root);
+            return Err("解压分享包失败（文件可能已损坏）".into());
+        }
+        extract_root.to_path_buf()
+    };
+    let manifest: SharePackageManifest = match fs::read(root.join("作品清单.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("读不懂作品清单.json：{e}"))?,
+        Err(error) => {
+            if cleanup {
+                let _ = fs::remove_dir_all(extract_root);
+            }
+            return Err(format!("这里没有 作品清单.json：{error}"));
+        }
+    };
+    if manifest.kind != "collection-library/share-package" {
+        if cleanup {
+            let _ = fs::remove_dir_all(extract_root);
+        }
+        return Err("这不是作品分享包（清单类型对不上）".into());
+    }
+    let mut result = ImportDataResult { kind: "package".to_string(), ..Default::default() };
+    let mut author_ids: Vec<(String, i64)> = Vec::new();
+    for author in &manifest.authors {
+        let (author_id, created) = upsert_share_author(conn, author)?;
+        if created {
+            result.authors_created += 1;
+        }
+        // 目录还没绑就按「默认目录 + 作者名(别名)」现场建一份（与保存作者时同一套规则）
+        apply_default_dirs(conn, author_id)?;
+        author_ids.push((author.name.trim().to_string(), author_id));
+    }
+    for work in &manifest.works {
+        let Some(author_id) = author_ids
+            .iter()
+            .find(|(name, _)| name == work.author.trim())
+            .map(|(_, id)| *id)
+        else {
+            result.works_skipped += 1;
+            continue;
+        };
+        let body = root.join(&work.file);
+        let has_body = !work.file.trim().is_empty() && body.is_file();
+        let cover = {
+            let path = root.join(&work.cover);
+            (!work.cover.trim().is_empty() && path.is_file()).then_some(path)
+        };
+        let images = {
+            let path = root.join(&work.images);
+            (!work.images.trim().is_empty() && path.is_dir()).then_some(path)
+        };
+        let pixiv_id = work.pixiv_novel_id.trim();
+        let existing: Option<i64> = if !pixiv_id.is_empty() {
+            conn.query_row(
+                "SELECT id FROM works WHERE pixiv_novel_id=?1 LIMIT 1",
+                [pixiv_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        } else {
+            conn.query_row(
+                "SELECT id FROM works WHERE author_id=?1 AND title=?2 LIMIT 1",
+                params![author_id, work.title],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        };
+        match existing {
+            None => {
+                let work_id = insert_local_work(conn, author_id, &work.title, &work.release_date)
+                    .map_err(|e| e.to_string())?;
+                if !pixiv_id.is_empty() {
+                    let _ = conn.execute(
+                        "UPDATE works SET pixiv_novel_id=?1 WHERE id=?2",
+                        params![pixiv_id, work_id],
+                    );
+                }
+                // 私人字段（收藏 / 评分 / 笔记 / 阅读状态 / NEW）一律留默认 —— 分享包不带那些
+                let _ = conn.execute(
+                    "UPDATE works SET tags=?1, series_id=?2, series_title=?3, series_order=?4, \
+                            synopsis=?5, has_images=?6, image_count=?7 WHERE id=?8",
+                    params![
+                        work.tags, work.series_id, work.series_title, work.series_order, work.synopsis,
+                        work.has_images, work.image_count, work_id,
+                    ],
+                );
+                if has_body {
+                    bind_share_assets(
+                        conn,
+                        work_id,
+                        &work.title,
+                        &work.slot,
+                        &body,
+                        cover.as_deref(),
+                        images.as_deref(),
+                        move_files,
+                    )?;
+                }
+                result.works_added += 1;
+            }
+            Some(work_id) => {
+                let local_full: String = conn
+                    .query_row(
+                        "SELECT ifnull(purchased_path,'') FROM works WHERE id=?1",
+                        [work_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let already_full =
+                    !local_full.trim().is_empty() && Path::new(&local_full).is_file();
+                // 本地已是完整版 → 跳过（不降级）；包里只是预览版 → 也跳过
+                if already_full || work.slot != "purchased" || !has_body {
+                    result.works_skipped += 1;
+                    continue;
+                }
+                bind_share_assets(
+                    conn,
+                    work_id,
+                    &work.title,
+                    "purchased",
+                    &body,
+                    cover.as_deref(),
+                    images.as_deref(),
+                    move_files,
+                )?;
+                result.works_upgraded += 1;
+            }
+        }
+    }
+    if cleanup {
+        let _ = fs::remove_dir_all(extract_root);
+    }
+    Ok(result)
+}
+
+/// 导入数据：一个入口吃三种 —— 解压好的文件夹 / 作品分享包 zip（合并、0 请求）/ 整库备份 .db（覆盖、需重启）。
+#[tauri::command]
+async fn import_data(path: String) -> Result<ImportDataResult, String> {
+    let given = PathBuf::from(path.trim().to_string());
+    if given.is_dir() {
+        let source = given.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            // 就地导入：文件复制到作者目录，源文件留在原地（那个文件夹是用户自己解压的）
+            import_works_package_impl(&db()?, &source, &source, false, false)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if !given.is_file() {
+        return Err("请选择有效的分享包、已解压的文件夹，或数据库备份文件".into());
+    }
+    if is_zip_file(&given) {
+        let extract_root =
+            app_data_dir()?.join(format!("import-tmp-{}", Local::now().format("%Y%m%d%H%M%S")));
+        return tauri::async_runtime::spawn_blocking(move || {
+            import_works_package_impl(&db()?, &given, &extract_root, true, true)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    // 整库备份：覆盖（保持旧行为，需重启）
+    let target = app_data_dir()?.join("library.db");
+    fs::copy(&given, &target).map_err(|e| format!("恢复备份失败：{e}"))?;
+    Ok(ImportDataResult {
+        kind: "library".to_string(),
+        path: given.to_string_lossy().to_string(),
+        restarted_needed: true,
+        ..Default::default()
+    })
+}
+
 #[tauri::command]
 fn export_backup(path: String) -> Result<(), String> {
     let source = app_data_dir()?.join("library.db");
@@ -18041,6 +18699,8 @@ pub fn run() {
             check_pixiv_cookie,
             update_work_tags,
             export_backup,
+            export_works_package,
+            import_data,
             restore_backup,
             // v1.2.7：待补完整版工作台 / 批量补充 / 自动备份
             // v1.2.8：字数后台补算
@@ -18099,6 +18759,7 @@ mod tests {
         attach_import_cover, epub_first_image, xml_attr,
         binding_target_path, mark_has_images_if_illustrated, move_path_overwriting,
         shared_file_info, set_work_author_impl,
+        export_works_package_impl, import_works_package_impl, SharePackageManifest, author_folder_name,
         move_sibling_assets_along,
         base64_encode, image_mime_of, image_data_uri,
         discard_sync_intermediates, anthology_epub_parts, replace_img_tags_with_markers,
@@ -22594,6 +23255,312 @@ mod tests {
             })
             .unwrap();
         assert_eq!(moved_count, 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn share_package_round_trip_moves_files_into_author_dirs() {
+        use std::io::Read as _;
+        let root = std::env::temp_dir().join(format!("share-pkg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src_full = root.join("src/已购");
+        let src_preview = root.join("src/预览");
+        let dst_full = root.join("dst/已购");
+        let dst_preview = root.join("dst/预览");
+        for dir in [&src_full, &src_preview, &dst_full, &dst_preview] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        // 源库：一位作者，一篇完整版（带封面）、一篇预览版（带旧式 _images 目录）
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute(
+            "INSERT INTO authors (id, name, aliases, homepage) VALUES (1, '测试作者', '别名甲', 'https://www.pixiv.net/users/9')",
+            [],
+        )
+        .unwrap();
+        let book = src_full.join("第一本.txt");
+        fs::write(&book, "一二三四五六七八九十").unwrap();
+        let book_cover = src_full.join("第一本.jpg");
+        fs::write(&book_cover, [1u8, 2, 3]).unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, release_date, tags, pixiv_novel_id, synopsis, word_count, purchased_path, cover_path) \
+             VALUES (1, 1, '第一本', '2025-01-02', '标签A', '111', '简介一', 10, ?1, ?2)",
+            rusqlite::params![book.to_string_lossy(), book_cover.to_string_lossy()],
+        )
+        .unwrap();
+        let text = src_preview.join("第二篇.txt");
+        fs::write(&text, "一二三四五").unwrap();
+        fs::create_dir_all(src_preview.join("第二篇_images")).unwrap();
+        fs::write(src_preview.join("第二篇_images/1.png"), [0u8, 1]).unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, release_date, pixiv_novel_id, preview_path, favorite, rating, note, read_state) \
+             VALUES (2, 1, '第二篇', '2025-02-03', '222', ?1, 1, 5, '我的私人笔记', 2)",
+            [text.to_string_lossy()],
+        )
+        .unwrap();
+
+        let zip_path = root.join("分享包.zip");
+        let exported = export_works_package_impl(&conn, &[1, 2], &[], &zip_path, None).unwrap();
+        assert_eq!(exported.works, 2);
+        assert_eq!(exported.authors, 1);
+        // 清单里没有私人记录（结构体里就没那些字段，这里再确认一次内容）
+        let manifest_text = {
+            use std::io::Read as _;
+            let handle = fs::File::open(&zip_path).unwrap();
+            let mut archive = zip::ZipArchive::new(handle).unwrap();
+            let mut buffer = Vec::new();
+            archive
+                .by_name("作品清单.json")
+                .unwrap()
+                .read_to_end(&mut buffer)
+                .unwrap();
+            String::from_utf8_lossy(&buffer).to_string()
+        };
+        assert!(!manifest_text.contains("我的私人笔记"), "私人记录不该进包");
+        let manifest: SharePackageManifest = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(manifest.kind, "collection-library/share-package");
+        assert_eq!(manifest.works.len(), 2);
+        assert_eq!(manifest.authors[0].name, "测试作者");
+        assert_eq!(manifest.works[0].author, "测试作者");
+        assert!(manifest.works[0].file.starts_with("文件/"), "{}", manifest.works[0].file);
+
+        // 对方：一个空库 + 两个默认目录
+        let dst = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&dst);
+        dst.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_purchased_dir', ?1)",
+            [dst_full.to_string_lossy()],
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_preview_dir', ?1)",
+            [dst_preview.to_string_lossy()],
+        )
+        .unwrap();
+        let imported =
+            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap();
+        assert_eq!(imported.kind, "package");
+        assert_eq!(imported.authors_created, 1);
+        assert_eq!(imported.works_added, 2);
+        let folder = author_folder_name("测试作者", "别名甲");
+        // 完整版落进「默认已购/作者文件夹」，封面跟着
+        assert!(dst_full.join(&folder).join("第一本.txt").is_file());
+        assert!(dst_full.join(&folder).join("第一本.jpg").is_file());
+        // 预览版落进「默认预览/作者文件夹」，旧式配图目录整块搬过去
+        assert!(dst_preview.join(&folder).join("第二篇.txt").is_file());
+        assert!(dst_preview
+            .join(&folder)
+            .join("第二篇_images")
+            .join("1.png")
+            .is_file());
+        // 书目字段写进去了；私人字段一律是默认值
+        let (tags, favorite, rating, note, word): (String, i64, i64, String, i64) = dst
+            .query_row(
+                "SELECT tags, favorite, rating, note, word_count FROM works WHERE pixiv_novel_id='111'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(tags, "标签A");
+        assert_eq!(favorite, 0, "分享包不该带收藏");
+        assert_eq!(rating, 0);
+        assert_eq!(note, "");
+        assert!(word > 0, "搬完文件后字数应就地补上");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_share_folder_copies_files_and_keeps_source() {
+        let root = std::env::temp_dir().join(format!("share-folder-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src_full = root.join("src/已购");
+        let dst_full = root.join("dst/已购");
+        let dst_preview = root.join("dst/预览");
+        for dir in [&src_full, &dst_full, &dst_preview] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute("INSERT INTO authors (id, name) VALUES (1, '文件夹作者')", [])
+            .unwrap();
+        let book = src_full.join("某篇.txt");
+        fs::write(&book, "一二三四五六七八九").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, pixiv_novel_id, purchased_path) VALUES (1, 1, '某篇', '555', ?1)",
+            [book.to_string_lossy()],
+        )
+        .unwrap();
+        let zip_path = root.join("分享包.zip");
+        export_works_package_impl(&conn, &[1], &[], &zip_path, None).unwrap();
+        // 模拟对方自己解压出来的文件夹
+        let unpacked = root.join("解压出来的");
+        {
+            let handle = fs::File::open(&zip_path).unwrap();
+            let mut archive = zip::ZipArchive::new(handle).unwrap();
+            archive.extract(&unpacked).unwrap();
+        }
+        let dst = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&dst);
+        dst.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_purchased_dir', ?1)",
+            [dst_full.to_string_lossy()],
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_preview_dir', ?1)",
+            [dst_preview.to_string_lossy()],
+        )
+        .unwrap();
+        let imported =
+            import_works_package_impl(&dst, &unpacked, &unpacked, false, false).unwrap();
+        assert_eq!(imported.works_added, 1);
+        let folder = author_folder_name("文件夹作者", "");
+        let landed = dst_full.join(&folder).join("某篇.txt");
+        assert!(landed.is_file(), "文件应复制进作者目录");
+        assert!(book.is_file(), "源文件要留在原地 —— 那是用户自己解压的文件夹");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_share_package_needs_both_default_dirs() {
+        let root = std::env::temp_dir().join(format!("share-pkg-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src_full = root.join("src/已购");
+        fs::create_dir_all(&src_full).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute("INSERT INTO authors (id, name) VALUES (1, '某作者')", [])
+            .unwrap();
+        let book = src_full.join("某篇.txt");
+        fs::write(&book, "一二三四").unwrap();
+        conn.execute(
+            "INSERT INTO works (id, author_id, title, pixiv_novel_id, purchased_path) VALUES (1, 1, '某篇', '999', ?1)",
+            [book.to_string_lossy()],
+        )
+        .unwrap();
+        let zip_path = root.join("分享包.zip");
+        export_works_package_impl(&conn, &[1], &[], &zip_path, None).unwrap();
+
+        // 对方：默认目录一个都没填
+        let dst = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&dst);
+        dst.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        let error =
+            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap_err();
+        assert!(error.contains("默认"), "{}", error);
+        let count: i64 = dst
+            .query_row("SELECT COUNT(*) FROM works", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "校验没过就不该动任何数据");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_share_package_upgrades_preview_and_skips_full() {
+        let root = std::env::temp_dir().join(format!("share-pkg-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src_full = root.join("src/已购");
+        let dst_full = root.join("dst/已购");
+        let dst_preview = root.join("dst/预览");
+        for dir in [&src_full, &dst_full, &dst_preview] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        // 源库：两篇完整版
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute(
+            "INSERT INTO authors (id, name, homepage) VALUES (1, '同一作者', 'https://www.pixiv.net/users/7')",
+            [],
+        )
+        .unwrap();
+        for (work_id, title, pixiv) in [(1i64, "甲篇", "111"), (2, "乙篇", "222")] {
+            let file = src_full.join(format!("{title}.txt"));
+            fs::write(&file, "一二三四五六").unwrap();
+            conn.execute(
+                "INSERT INTO works (id, author_id, title, pixiv_novel_id, purchased_path) VALUES (?1, 1, ?2, ?3, ?4)",
+                rusqlite::params![work_id, title, pixiv, file.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        let zip_path = root.join("分享包.zip");
+        export_works_package_impl(&conn, &[1, 2], &[], &zip_path, None).unwrap();
+
+        // 对方：同一位作者；甲篇只有预览版，乙篇已经是完整版
+        let dst = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&dst);
+        dst.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_purchased_dir', ?1)",
+            [dst_full.to_string_lossy()],
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_preview_dir', ?1)",
+            [dst_preview.to_string_lossy()],
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO authors (id, name, homepage) VALUES (1, '同一作者', 'https://www.pixiv.net/users/7')",
+            [],
+        )
+        .unwrap();
+        let local_preview = dst_preview.join("甲篇.txt");
+        fs::write(&local_preview, "旧预览版").unwrap();
+        dst.execute(
+            "INSERT INTO works (id, author_id, title, pixiv_novel_id, preview_path) VALUES (1, 1, '甲篇', '111', ?1)",
+            [local_preview.to_string_lossy()],
+        )
+        .unwrap();
+        let local_full = dst_full.join("乙篇.txt");
+        fs::write(&local_full, "本地已有完整版").unwrap();
+        dst.execute(
+            "INSERT INTO works (id, author_id, title, pixiv_novel_id, purchased_path) VALUES (2, 1, '乙篇', '222', ?1)",
+            [local_full.to_string_lossy()],
+        )
+        .unwrap();
+
+        let imported =
+            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap();
+        assert_eq!(imported.authors_created, 0, "同一位作者不该重复建");
+        assert_eq!(imported.works_added, 0);
+        assert_eq!(imported.works_upgraded, 1, "本地只有预览版的那篇应被完整版顶替");
+        assert_eq!(imported.works_skipped, 1, "本地已是完整版的应跳过");
+        let folder = author_folder_name("同一作者", "");
+        // 甲篇：完整版落进已购目录、旧预览版不再指向盘上文件
+        let (purchased, preview): (String, String) = dst
+            .query_row(
+                "SELECT ifnull(purchased_path,''), ifnull(preview_path,'') FROM works WHERE pixiv_novel_id='111'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(!purchased.trim().is_empty() && Path::new(&purchased).is_file(), "{purchased}");
+        assert!(
+            preview.trim().is_empty() || !Path::new(&preview).exists(),
+            "旧预览版应被清掉：{preview}"
+        );
+        // 乙篇：本地那份完整版原样不动
+        let kept: String = dst
+            .query_row("SELECT purchased_path FROM works WHERE pixiv_novel_id='222'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, local_full.to_string_lossy(), "已是完整版的不能被顶替");
+        assert!(local_full.is_file());
         let _ = fs::remove_dir_all(&root);
     }
 

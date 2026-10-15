@@ -1,0 +1,27 @@
+# 测试二进制专用 manifest：让 Windows 加载 common-controls v6 的 comctl32。
+#
+# 背景：本项目的单测里，import_works_package_impl 首次把 windows crate 的
+# Win32_UI_Shell（送回收站 SHFileOperationW）拉进测试二进制，于是链接器静态
+# 导入 comctl32!TaskDialogIndirect。System32 那份是 v5，没有这个导出 ⇒ 测试
+# 二进制启动即 STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)。
+# 真正的 Tauri exe 有 tauri-build 生成的 manifest（声明 v6），所以软件本身没事。
+# 测试目标不经过 tauri-build，于是缺这份声明。这里给测试目标补上。
+
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="collection-library.tests"
+      version="1.0.0.0"
+      processorArchitecture="*"/>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="*"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"/>
+    </dependentAssembly>
+  </dependency>
+</assembly>
