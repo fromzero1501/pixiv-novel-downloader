@@ -510,6 +510,12 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 /* 这行字会在「改动待保存…」和「已自动保存 17:23:45（N 个搜索网站）」之间反复变长变短，
    不锁住就会带着页脚（进而整个弹窗）重排 —— 设置里打字发卡的一个来源（v1.3.23）。 */
             .settings-save-state { font-size: 12px; font-weight: 600; color: #8098b0; white-space: nowrap; min-width: 210px; text-align: right; }
+/* 角色编辑器重新设计（v1.3.28）：搜索框 + 分组标题，任何一次铺进 DOM 的角色元素都控制在几十个以内 */
+.char-editor-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.character-filter { flex: 1 1 auto; min-width: 0; padding: 7px 10px; color: #263c57; background: #fff; border: 1px solid #d6e1ed; border-radius: 6px; font-size: 13px; }
+.character-filter:focus { border-color: #4b91e9; box-shadow: 0 0 0 3px #dcecff; outline: none; }
+.char-editor-head .char-total { flex: 0 0 auto; color: #8098b0; font-size: 12px; }
+.char-more-note { margin: 8px 0 0; color: #8098b0; font-size: 12px; }
 .settings-save-state.is-done { color: #27755c; }
 .settings-save-state.is-error { color: #b44155; }
 .search-site-tools { margin-top: 7px; }

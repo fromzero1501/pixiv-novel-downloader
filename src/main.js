@@ -10130,11 +10130,7 @@ async function loadCharacterIndex() {
  * 光角色就铺出 1400+ 节点，每次输入的样式重算都要过一遍这些节点。
  */
 function characterChipsHtml(group) {
-  const chips = group.characters.map((entry) => {
-    // 有别名时把别名收进 title，不额外占位
-    const title = entry.aliases ? `别名：${entry.aliases}` : entry.name;
-    return `<span class="char-chip ${entry.enabled ? "" : "is-off"}" data-action="toggle-character" data-id="${entry.id}" title="${escapeHtml(title)}（点击${entry.enabled ? "停用" : "启用"}）">${escapeHtml(entry.name)}<button type="button" class="char-chip-remove" data-action="delete-character" data-id="${entry.id}" title="删除这个角色">×</button></span>`;
-  }).join("");
+  const chips = group.characters.map((entry) => characterChipHtml(entry)).join("");
   const empty = group.characters.length ? "" : `<span class="char-empty">还没有角色，用上面的"添加角色"往里加</span>`;
   return chips + empty;
 }
@@ -10146,7 +10142,14 @@ function fillCharacterChips(details) {
   const group = (state.characters || []).find((entry) => entry.game === (details.dataset.game || ""));
   if (!group) return;
   holder.dataset.filled = "true";
-  holder.innerHTML = characterChipsHtml(group);
+  // v1.3.28：一次最多先铺 20 个 —— 632 个角色的库，展开一个大组就能把弹窗节点顶到四百多，
+  // 那正是用户实测「开始卡」的量级。剩下的让他用上面的搜索框找。
+  const LIMIT = 20;
+  const shown = group.characters.slice(0, LIMIT);
+  const rest = group.characters.length - shown.length;
+  holder.innerHTML =
+    characterChipsHtml({ ...group, characters: shown }) +
+    (rest > 0 ? `<span class="char-more-note">还有 ${rest} 个 —— 用上面的搜索框找更快</span>` : "");
   bindEvents();
 }
 
@@ -10201,26 +10204,99 @@ async function renderCharacterEditor() {
     box.innerHTML = `<button type="button" class="quiet-button" data-action="expand-character-editor">${icon("settings", 16)}管理常见角色名（${total} 个）</button><small class="read-only-note">点开时才加载 —— 角色多的时候这一块会拖慢设置面板的输入。</small>`;
     return;
   }
-  box.innerHTML = groups.map((group, index) => {
-    const enabledCount = group.characters.filter((entry) => entry.enabled).length;
-    // 第一个分组默认展开，让人一眼看到这堆是能点、能删的角色名。
-    // **只有它马上铺 chips**，其余分组等展开时才铺（见 fillCharacterChips）——
-    // 角色多的人有几百上千条，全铺出来设置弹窗要上千节点，每次输入的样式重算都得过一遍。
-    const opened = index === 0;
-    return `<details class="char-group" data-game="${escapeHtml(group.game)}" ${opened ? "open" : ""}>
+  // v1.3.28 重新设计（用户：「展开常用角色后还是会卡，需要重新设计」）：
+  // 原则是**任何一次铺进 DOM 的角色元素都控制在几十个以内** —— 632 个角色全铺出来，
+  // 设置面板每次按键的样式重算都要过那几百个节点，那正是卡感的来源。
+  //  · 分组全部默认折叠（原来第一个默认展开，一进去就是 45 个）；
+  //  · 给一个搜索框：输关键词跨分组平铺匹配（最多 50 条），632 个里找人不用翻；
+  //  · 展开某个分组时最多先铺 20 个（见 fillCharacterChips）。
+  box.innerHTML = `<div class="char-editor-head">
+      <input id="character-filter" class="character-filter" type="search" placeholder="搜游戏名 / 角色名…" autocomplete="off" value="${escapeHtml(box.dataset.filter || "")}">
+      <span class="char-total">共 ${total} 个</span>
+    </div>
+    <div id="character-list">${characterListHtml(groups, box.dataset.filter || "")}</div>`;
+  // 新生成的 chip / 分组按钮需要重新挂事件（元素是新造的，dataset.bound 会重新生效）
+  bindEvents();
+  // 折叠着的分组等展开再铺 chip（v1.3.23）
+  bindCharacterChipLazyFill();
+  // 搜索框（v1.3.28）
+  bindCharacterFilter(groups);
+}
+
+/**
+ * 角色列表主体（v1.3.28）—— 两种形态：
+ *  · 没输关键词：只列**分组标题**（全部折叠，几十个节点），点开某一组才铺它里面的角色；
+ *  · 输了关键词：跨分组平铺匹配到的角色（**最多 50 条**），省得在 632 个里翻。
+ *
+ * 之所以不是"一次铺完"，见上面 `renderCharacterEditor` 里的说明。
+ */
+function characterListHtml(groups, keyword) {
+  const needle = String(keyword || "").trim().toLowerCase();
+  if (!needle) {
+    return groups
+      .map((group) => {
+        const enabledCount = group.characters.filter((entry) => entry.enabled).length;
+        return `<details class="char-group" data-game="${escapeHtml(group.game)}">
       <summary><strong>${escapeHtml(group.game)}</strong><span class="char-count">${enabledCount}/${group.characters.length}</span></summary>
-      <div class="char-chips">${opened ? characterChipsHtml(group) : ""}</div>
+      <div class="char-chips"></div>
       <div class="char-group-tools">
         <input class="char-game-name" value="${escapeHtml(group.game)}" aria-label="分组名">
         <button type="button" class="quiet-button" data-action="rename-character-game" data-game="${escapeHtml(group.game)}">重命名分组</button>
         <button type="button" class="quiet-button danger-text-button" data-action="delete-character-game" data-game="${escapeHtml(group.game)}">删除整个分组</button>
       </div>
     </details>`;
-  }).join("");
-  // 新生成的 chip / 分组按钮需要重新挂事件（元素是新造的，dataset.bound 会重新生效）
-  bindEvents();
-  // 折叠着的分组等展开再铺 chip（v1.3.23）
-  bindCharacterChipLazyFill();
+      })
+      .join("");
+  }
+  const hits = [];
+  for (const group of groups) {
+    const gameHit = group.game.toLowerCase().includes(needle);
+    for (const entry of group.characters) {
+      const aliasHit = String(entry.aliases || "").toLowerCase().includes(needle);
+      if (gameHit || entry.name.toLowerCase().includes(needle) || aliasHit) {
+        hits.push({ game: group.game, entry });
+      }
+    }
+  }
+  if (!hits.length) {
+    return `<p class="read-only-note">没有匹配「${escapeHtml(keyword)}」的角色。</p>`;
+  }
+  const LIMIT = 50;
+  const shown = hits.slice(0, LIMIT);
+  const note =
+    hits.length > LIMIT
+      ? `匹配 ${hits.length} 个，先显示前 ${LIMIT} 个 —— 再输几个字缩小范围`
+      : `匹配 ${hits.length} 个`;
+  return `<div class="char-chips">${shown.map(({ game, entry }) => characterChipHtml(entry, game)).join("")}</div><p class="char-more-note">${note}</p>`;
+}
+
+/** 一个角色名「片」（点它停用/启用，右边小叉删除）。搜索结果里带上所属游戏名当提示。 */
+function characterChipHtml(entry, game = "") {
+  const title = entry.aliases ? `别名：${entry.aliases}` : entry.name;
+  const prefix = game ? `${game} · ` : "";
+  return `<span class="char-chip ${entry.enabled ? "" : "is-off"}" data-action="toggle-character" data-id="${entry.id}" title="${escapeHtml(prefix + title)}（点击${entry.enabled ? "停用" : "启用"}）">${escapeHtml(entry.name)}<button type="button" class="char-chip-remove" data-action="delete-character" data-id="${entry.id}" title="删除这个角色">×</button></span>`;
+}
+
+/**
+ * 角色搜索框（v1.3.28）：只重画 `#character-list`，**搜索框本身不动**（动了光标会跳），
+ * 再套一层防抖 —— 免得边打字边重画列表。
+ */
+function bindCharacterFilter(groups) {
+  const input = document.querySelector("#character-filter");
+  if (!input || input.dataset.filterBound) return;   // ⚠️ 别占用 dataset.bound（那是 [data-action] 专用标记）
+  input.dataset.filterBound = "true";
+  let timer = 0;
+  input.addEventListener("input", () => {
+    window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      const box = document.querySelector("#character-editor");
+      const list = document.querySelector("#character-list");
+      if (!box || !list) return;
+      box.dataset.filter = input.value;
+      list.innerHTML = characterListHtml(groups, input.value);
+      bindEvents();
+    }, 250);
+  });
 }
 function bindCharacterEditorInputs() {
   const bind = (selector, run) => {
