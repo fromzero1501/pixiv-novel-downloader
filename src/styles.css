@@ -419,7 +419,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 
 /* ===== 设置分组（v0.3.53）===== */
 /* 设置项变多以后按用途分块：每块一张卡片、左侧一条类别色带，块内字段可按列排布 */
-.settings-form { display: grid; gap: 14px; }
+.settings-form { display: grid; gap: 22px; }
 .settings-group { --accent: #176bd3; --tint: #f5f9ff; --line: #dbe7f4; min-width: 0; padding: 15px 17px 16px 18px; background: #fdfefe; border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 9px; }
 .settings-group.is-account { --accent: #1595e8; --tint: #eff7ff; --line: #cfe5f9; }
 .settings-group.is-storage { --accent: #2f8f8f; --tint: #eff9f8; --line: #cde7e5; }
