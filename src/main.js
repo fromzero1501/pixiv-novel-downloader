@@ -7010,6 +7010,14 @@ async function bindEvents() {
       if (action === "pick-auto-group-dir") await pickPath("autoGroupDir", true);
       if (action === "auto-group") pickMatchMode({ action: "auto-group", authorId: null, authorName: "" }, "完整版自动匹配", "先选择用哪种方式把文件匹配到作品上，然后再开始匹配。");
       if (action === "auto-group-by-author") autoGroupAuthorPicker();
+      if (action === "expand-character-editor") {
+        const box = document.querySelector("#character-editor");
+        if (box) {
+          box.dataset.expanded = "true";   // 同一元素上再渲染（增删角色后）保持展开
+          await renderCharacterEditor();
+          bindEvents();
+        }
+      }
       if (action === "add-search-site") addSearchSiteRow();
       if (action === "remove-search-site") {
         element.closest(".search-site-item")?.remove();
@@ -10183,7 +10191,16 @@ async function renderCharacterEditor() {
     box.innerHTML = `<p class="read-only-note">还没有角色名，先在下面新建一个游戏分组。</p>`;
     return;
   }
+  // v1.3.27：**默认不铺角色列表**。
+  // 用户 2026-10-15 用 picker 版定位到「设置里只有第 4 组（匹配与关联）打字卡，其他组都不卡」，
+  // 而角色编辑器就在第 4 组 —— 632 个角色。v1.3.23 只做到「折叠的分组不铺 chip」，
+  // 但**第一个分组默认展开**，那 45 个角色的名字片仍然铺在弹窗里，照样拖慢每次输入的样式重算。
+  // 折叠态只放一个按钮（几乎零节点）；点开才真渲染（见 expand-character-editor）。
   box.dataset.total = String(total);
+  if (!box.dataset.expanded) {
+    box.innerHTML = `<button type="button" class="quiet-button" data-action="expand-character-editor">${icon("settings", 16)}管理常见角色名（${total} 个）</button><small class="read-only-note">点开时才加载 —— 角色多的时候这一块会拖慢设置面板的输入。</small>`;
+    return;
+  }
   box.innerHTML = groups.map((group, index) => {
     const enabledCount = group.characters.filter((entry) => entry.enabled).length;
     // 第一个分组默认展开，让人一眼看到这堆是能点、能删的角色名。
