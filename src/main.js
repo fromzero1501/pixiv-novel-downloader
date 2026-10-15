@@ -9924,7 +9924,7 @@ async function settingsModal() {
     <div class="bind-drop-zone is-wide" id="import-drop-zone" data-action="import-data-pick" title="把作品分享包拖到这里：压缩包（.zip）或解压出来的文件夹都收，整库备份 .db 也收。点一下则是选压缩包">${icon("upload", 16)}<span>把作品分享包拖到这里 —— 压缩包、解压出来的文件夹都行（点一下是选压缩包）</span></div>
     </div>
   </section>  </section>
-</form>`, `<span class="settings-save-state" id="settings-save-state"></span>`, "is-wide"));
+</form>`, `<span class="settings-save-state" id="settings-save-state"></span>`, "is-wide is-settings"));
   bindCharacterEditorInputs();
   await renderCharacterEditor();
   renderSearchSiteEditor(settings.searchSites || []);
