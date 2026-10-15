@@ -940,7 +940,9 @@ async function invoke(command, args = {}) {
   if (command === "cleanup_old_portable_builds") return { removed: [], failed: [] };
   if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh.monlor.com/", "https://ghfile.geekertao.top/", "https://gh-proxy.net/"];
   if (command === "refresh_reading_image_counts") return { scannedCount: 0, updatedCount: 0 };
-  if (command === "read_pixiv_cookie_file") return "";
+  // 预览里"读文件"给一份像样的假 Cookie：真机读到的是一整行，回空串的话
+  // 「导入 Cookie 文件」这条链在无头校验里验不出东西（框被清空，看着像没生效）
+  if (command === "read_pixiv_cookie_file") return "PHPSESSID=12345678_preview_cookie;";
   if (command === "sync_pixiv_author_profile") {
     // 无头脚本要验"同步失败且没填名字就拦住保存"：塞 window.__mockSyncProfileError 让它抛
     if (window.__mockSyncProfileError) throw new Error(String(window.__mockSyncProfileError));
@@ -6999,11 +7001,8 @@ async function bindEvents() {
       }
       if (action === "reset-update-mirrors") {
         const list = await invoke("default_update_mirror_list");
-        const box = document.querySelector('#settings-form [name="updateMirrors"]');
-        if (box) {
-          box.value = (list || []).join("\n");
-          scheduleSettingsSave(document.querySelector("#settings-form"));
-        }
+        // 同一类改法，统一走助手（顺手补上原来漏标的 dirty）
+        applySettingsValue(document.querySelector('#settings-form [name="updateMirrors"]'), (list || []).join("\n"));
       }
       if (action === "pick-pixiv-cookie") await importPixivCookie();
       if (action === "pick-default-preview") await pickPath("defaultPreviewDir", true);
@@ -7368,6 +7367,26 @@ async function bindEvents() {
     settingsForm.addEventListener("change", () => scheduleSettingsSave(settingsForm));
     // 表单里已经没有提交按钮，万一按回车触发隐式提交，就当一次「立刻保存」处理
     settingsForm.addEventListener("submit", (event) => { event.preventDefault(); flushSettingsSave(settingsForm); });
+    // 数字框只收数字（用户 2026-10-15）：`type="number"` 自己仍放行 e / E / + / - / .，
+    // 中文输入法和粘贴还能塞进别的 —— 用户在「最小作品字数」上就敲进去过。
+    // 在**字符落进去之前**拦一道：键盘走 beforeinput，粘贴单独剥一遍。
+    const isNumberInput = (element) =>
+      element?.tagName === "INPUT" && (element.type || "").toLowerCase() === "number";
+    settingsForm.addEventListener("beforeinput", (event) => {
+      if (!isNumberInput(event.target)) return;
+      if (event.data && /\D/.test(event.data)) event.preventDefault();
+    });
+    settingsForm.addEventListener("paste", (event) => {
+      if (!isNumberInput(event.target)) return;
+      const raw = String(event.clipboardData?.getData("text") || "");
+      const cleaned = raw.replace(/\D/g, "");
+      if (cleaned === raw) return;
+      event.preventDefault();
+      // number 框没有光标位置可言（selectionStart 恒为 null），粘贴就整体顶掉；
+      // 派发 input 是让上面那条通用监听照常记 dirty 并触发自动保存
+      event.target.value = cleaned;
+      event.target.dispatchEvent(new Event("input", { bubbles: true }));
+    });
   }
 
   // 作者别名输入框：回车就地把别名加进去（不能重开弹窗，否则会丢掉表单里其它未保存的修改）
@@ -7389,9 +7408,32 @@ async function bindEvents() {
   bindMarqueeSelection();
 }
 
+/**
+ * 程序化给设置表单里的控件赋值，并**手动惊动一次自动保存**（v1.3.18）。
+ *
+ * 自动保存（`input` / `focusout` / `change` 三处监听）只认键盘、鼠标产生的事件，
+ * 而「选择目录」「导入 Cookie 文件」「恢复默认镜像」这类是把 value 直接写进去的 ——
+ * 不补这一步，用户看着框里已经有值了，关掉设置却什么都没存。
+ * 用户 2026-10-15 报的「预览版 / 完整版文件夹没有自动保存」就是这个：早期入口
+ * （恢复默认镜像）记得自己催一下，后来加的几处全漏了 —— 所以统一走这里，别再各写各的。
+ *
+ * 只惊动设置表单里的控件：作者弹窗、导入弹窗里那些同名控件不在表单内，照旧不碰。
+ * 返回是否真的惊动了（表单外的控件返回 false）。
+ */
+function applySettingsValue(input, value) {
+  if (!input) return false;
+  input.value = value;
+  const form = input.closest("#settings-form");
+  if (!form) return false;
+  state.settingsDirty = true;
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+
 async function pickPath(field, directory, extensions) {
   const path = await open({ directory, multiple: false, filters: extensions ? [{ name: "文件", extensions }] : undefined });
-  if (path) document.querySelector(`[name="${field}"]`).value = path;
+  if (!path) return;
+  applySettingsValue(document.querySelector(`[name="${field}"]`), path);
 }
 
 async function syncAuthorProfile() {
@@ -7636,6 +7678,23 @@ async function exportSharePackage() {
     toast("有任务正在进行，请等它结束或先终止", "info");
     return;
   }
+  // 二次确认（用户 2026-10-15 要求）：导出会写文件、还会自动开资源管理器，误点一下就有动静。
+  // 要导多少先算好写进文案，让人点之前心里有数。
+  const what = workIds.length ? `${workIds.length} 篇作品` : `${authorIds.length} 位作者名下的全部作品`;
+  confirmAction(
+    "确认导出分享包",
+    `将导出${what}，打包成一个 zip 存到软件所在的文件夹（同名自动加序号），完成后自动打开那个目录。分享包只带正文和封面，不带收藏、评分、笔记这些私人记录。`,
+    "导出",
+    () => runExportSharePackage(workIds, authorIds),
+  );
+}
+
+/**
+ * 真正干活的那半（确认之后才到这儿）。
+ * 进来时两份 id 列表已经定死 —— 确认框开着的时候列表被遮住翻不了，
+ * 不会出现「确认的和实际导出的是两批」。
+ */
+async function runExportSharePackage(workIds, authorIds) {
   state.syncTask = {
     kind: "share",
     label: "正在导出分享包",
@@ -9564,7 +9623,8 @@ function removeAuthorAlias(index) {
 async function importPixivCookie() {
   const path = await open({ multiple: false, directory: false, filters: [{ name: "Cookie", extensions: ["json", "txt"] }] });
   if (!path) return;
-  document.querySelector('[name="pixivCookie"]').value = await invoke("read_pixiv_cookie_file", { path });
+  // 读出来的 Cookie 直接填进框里 —— 和选目录同一类，得自己惊动自动保存（v1.3.18 补）
+  applySettingsValue(document.querySelector('[name="pixivCookie"]'), await invoke("read_pixiv_cookie_file", { path }));
 }
 
 /** 设置表单 → 提交给后端的对象；校验不过就抛错（自动保存时把错误写到页脚，不弹 toast 打断输入） */
