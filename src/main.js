@@ -7347,8 +7347,12 @@ async function bindEvents() {
       return !["checkbox", "radio", "file", "color", "range"].includes((element.type || "text").toLowerCase());
     };
     settingsForm.addEventListener("input", (event) => {
-      // 又在改网址了：上一条「已自动清洗」的说明已经过期，先撤掉
-      event.target?.closest?.(".search-site-item")?.querySelector(".search-site-hint")?.remove();
+      // 又在改网址了：上一条「已自动清洗」的说明已经过期，先撤掉。
+      // 先用 classList 挡一道再 closest —— 这条监听每个输入框的每次按键都会跑，
+      // 而绝大多数按键跟搜索网站根本没关系（v1.3.25）。
+      if (event.target?.classList?.contains("search-site-url")) {
+        event.target.closest(".search-site-item")?.querySelector(".search-site-hint")?.remove();
+      }
       state.settingsDirty = true;
       setSettingsSaveState("改动待保存…", "busy");
       // 勾选 / 下拉这类没有"正在编辑"的状态：立即保存；文本类等失焦（见下面的 focusout）
@@ -9737,8 +9741,11 @@ async function persistSettings(form) {
 function setSettingsSaveState(text, kind = "idle") {
   const node = document.querySelector("#settings-save-state");
   if (!node) return;
-  node.textContent = text;
-  node.className = `settings-save-state is-${kind}`;
+  // 这行在**每次按键**时都会被调到，而 className 赋值即使和原来一模一样也会触发一次样式重算 ——
+  // 先比一下再改，打字这一路就只剩一次字符串比较（v1.3.25）。
+  const nextClass = `settings-save-state is-${kind}`;
+  if (node.textContent !== text) node.textContent = text;
+  if (node.className !== nextClass) node.className = nextClass;
 }
 
 /** 改动后防抖保存：边打字边写库太吵，停手半秒再落盘 */

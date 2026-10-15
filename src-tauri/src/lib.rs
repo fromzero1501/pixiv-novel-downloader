@@ -825,11 +825,33 @@ fn migrate_docx_word_counts(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// 建表 / ALTER 补齐这一整套的版本号，落在 SQLite 自己的 `PRAGMA user_version` 上。
+///
+/// 为什么要有它：`db()` 是**每次写库都会调用**的（自动保存、同步、批量操作…），
+/// 而它原来每次都要跑 15 条 `CREATE TABLE` + 25 条 `ALTER TABLE` + 内置角色合并 ——
+/// 用户 2026-10-15 报「设置里打字还有点卡」：停手半秒触发一次自动保存，后端就要重跑一遍这套 DDL。
+/// 现在拿库文件自己的 user_version 当门禁：跑过一次就跳过。跟着库走 ⇒ 换库自动重建，
+/// 跨进程也对（进程内的静态标记做不到这点）。
+///
+/// ⚠️ **以后只要改了 `db()` 里的建表 / ALTER 语句，就把这个数字加 1** —— 否则老库不会补上新列。
+const SCHEMA_VERSION: i64 = 1;
+
 fn db() -> Result<Connection, String> {
     let path = app_data_dir()?.join("library.db");
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|e| e.to_string())?;
+    // 内置角色合并**留在门禁外面**：它自己按内容指纹把关（内置表没换过时只花一次查询），
+    // 必须保证「发新版补了内置角色」时能立刻合进老库 —— 要是跟建表一起被跳过就永远补不上了。
+    let _ = ensure_builtin_characters(&conn);
+    // 建表 / ALTER 补齐（下面那一大段）只在该库还没建过时跑一遍，见 SCHEMA_VERSION。
+    // 这是 db() 里唯一每次都做的事：一次 PRAGMA 查询，开销可以忽略。
+    let schema_ready: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    if schema_ready >= SCHEMA_VERSION {
+        return Ok(conn);
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS authors (
           id INTEGER PRIMARY KEY,
@@ -1190,10 +1212,9 @@ fn db() -> Result<Connection, String> {
             }
         }
     }
-    // 内置角色表按「账本 + 差集」合并增量（见 merge_builtin_characters）：
-    // 内置表里新加的角色会补进老库，用户改过的行一个字段都不动。
-    // 门禁是内容指纹 —— 内置表没换过时，这里只花一次查询。
-    let _ = ensure_builtin_characters(&conn);
+    // 上面全跑通了才落版本号：中途任何一步失败（`?` 提前返回）都不会写，
+    // 下次拿连接会老老实实再跑一遍 —— 不会出现「建了一半却记成已建完」。
+    let _ = conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"));
     Ok(conn)
 }
 
