@@ -557,28 +557,52 @@ async function invoke(command, args = {}) {
     // 预览里没有真的本地正文文件可扫，拿 synopsis 当「正文」占位 ——
     // 命中的篇目、片段截取、计数、截断标记这些**前端要处理的东西**都能照验。
     const needle = String(args.query || "").trim();
+    // v1.3.33：和后端同一口径 —— 按空白切词、取交集（每个词都得出现）、不区分大小写
+    const terms = needle.split(/\s+/).filter(Boolean);
     const matched = [];
     let scannedCount = 0;
-    if (needle) {
+    if (terms.length) {
       for (const work of previewWorkPool()) {
         const text = String(work.synopsis || "");
         if (!text) continue;
         scannedCount += 1;
+        const lowered = text.toLowerCase();
         const snippets = [];
         let hitCount = 0;
-        let from = 0;
-        for (;;) {
-          const at = text.indexOf(needle, from);
-          if (at < 0) break;
-          hitCount += 1;
-          if (snippets.length < 3) {
+        // 每个词各自出现几次，片段轮流取（和后端一致：一篇最多 3 段）
+        const queues = [];
+        let missed = false;
+        for (const term of terms) {
+          const word = term.toLowerCase();
+          const starts = [];
+          let from = 0;
+          for (;;) {
+            const at = lowered.indexOf(word, from);
+            if (at < 0) break;
+            starts.push(at);
+            from = at + word.length;
+          }
+          if (!starts.length) { missed = true; break; }
+          hitCount += starts.length;
+          queues.push({ starts, length: term.length });
+        }
+        if (missed) continue;
+        for (let depth = 0; snippets.length < 3; depth += 1) {
+          let taken = false;
+          for (const queue of queues) {
+            if (snippets.length >= 3) break;
+            const at = queue.starts[depth];
+            if (at === undefined) continue;
+            taken = true;
+            // 高亮取原文那几个字母（length 按字符算，中英文都对）
+            const length = queue.length;
             snippets.push({
               before: text.slice(Math.max(0, at - 36), at).replace(/\s+/g, " ").trim(),
-              hit: needle,
-              after: text.slice(at + needle.length, at + needle.length + 36).replace(/\s+/g, " ").trim(),
+              hit: text.slice(at, at + length),
+              after: text.slice(at + length, at + length + 36).replace(/\s+/g, " ").trim(),
             });
           }
-          from = at + needle.length;
+          if (!taken) break;
         }
         if (hitCount) matched.push({ workId: work.id, hitCount, snippets });
       }
@@ -2811,8 +2835,9 @@ function searchPlaceholder() {
   if (state.searchField === "series") return "搜索系列名";
   if (state.searchField === "title_synopsis") return "搜索标题或简介";
   if (state.searchField === "title_synopsis_tags") return "搜索标题、简介或标签";
-  // 正文这一档要扫盘，不能边打边搜 —— 提示里说清楚要按回车
-  if (state.searchField === "body") return "搜索正文，按回车";
+  // 正文这一档要扫盘，不能边打边搜 —— 提示里说清楚要按回车；
+  // 空格分隔多个词 = 正文要同时包含（v1.3.33），也一并提示
+  if (state.searchField === "body") return "搜索正文，按回车；多个词用空格隔开 = 同时包含";
   return "搜索作品名称";
 }
 
@@ -3256,12 +3281,20 @@ function bodySearchContext(query) {
   };
 }
 
+/// 正文搜索词按空白拆开（v1.3.33）：多个词 = 正文要**同时包含**全部词。
+/// 后端已按这个口径判定，这里只负责把话说明白（"同时包含「A」「B」"）。
+function bodySearchTerms(needle) {
+  return String(needle || "").trim().split(/\s+/).filter(Boolean);
+}
+
 /// 正文结果上方那一段：扫描中给进度提示，扫完给命中统计（含「当前筛选下 N 篇」）
 function bodySearchHeader(ctx, shownCount) {
   if (!ctx) return "";
   if (ctx.running) return `<div class="text-search-progress">${icon("sync", 18)}<span>正在扫全库正文…（读本地文件，不联网）</span></div>`;
   if (!ctx.meta) return "";
+  const terms = bodySearchTerms(ctx.needle);
   const notes = [];
+  if (terms.length > 1) notes.push(`要同时包含：${terms.map((term) => `「${term}」`).join("")}`);
   if (ctx.meta.truncated) notes.push(`命中太多，只列了前 ${ctx.hitCount} 篇`);
   if (ctx.meta.missingCount) notes.push(`${ctx.meta.missingCount} 篇没有可读的正文（没绑阅读版、或者文件不在原处），已跳过`);
   const filteredNote = ctx.hitCount && shownCount !== ctx.hitCount ? `（当前筛选下 ${shownCount} 篇）` : "";
@@ -3271,7 +3304,14 @@ function bodySearchHeader(ctx, shownCount) {
 /// 正文结果为空时的提示（扫描中 / 出错时不出，交给格子的默认空态或干脆留白）
 function bodySearchEmpty(ctx, shownCount) {
   if (!ctx || shownCount || ctx.running || !ctx.meta) return "";
-  if (!ctx.hitCount) return `<div class="empty-state works-empty"><h2>正文里没搜到「${escapeHtml(ctx.needle)}」</h2><p>换个词试试；如果是想找某个设定，把范围调成「标题 + 简介」可能更合适。</p></div>`;
+  const terms = bodySearchTerms(ctx.needle);
+  if (!ctx.hitCount) {
+    // 多词搜不到时最容易误以为是"没搜到" —— 其实可能是"没同时出现在一篇里"，把话说清楚
+    if (terms.length > 1) {
+      return `<div class="empty-state works-empty"><h2>没有一篇正文同时包含 ${terms.map((term) => `「${escapeHtml(term)}」`).join("")}</h2><p>空格表示「同时包含」；想找只提到其中一个词的作品，就单独搜那一个词。</p></div>`;
+    }
+    return `<div class="empty-state works-empty"><h2>正文里没搜到「${escapeHtml(ctx.needle)}」</h2><p>换个词试试；如果是想找某个设定，把范围调成「标题 + 简介」可能更合适。</p></div>`;
+  }
   return `<div class="empty-state works-empty"><h2>正文命中 ${ctx.hitCount} 篇，但当前筛选下没有</h2><p>把筛选放宽一点再看看。</p></div>`;
 }
 

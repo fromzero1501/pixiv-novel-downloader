@@ -3051,15 +3051,80 @@ struct TextSearchResult {
     truncated: bool,
 }
 
-/// 一段正文里出现多少处，外加头几处的前后文。
-/// 计数要把整段扫完（不然报的数是假的），但片段只留前三段。
+/// 把搜索词切成若干个词（v1.3.33 用户要求：`A B` = 正文里**同时**包含 A 和 B）。
+///
+/// 只按空白切（中英文空格、全角空格、制表符都算），丢掉空项。
+/// **不做中文分词** —— 中文没有词边界，硬切只会搜出一堆不是人想要的。
+/// 词序无关，重复出现的词只算一次（"书 书" 和 "书" 一样）。
+fn text_search_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for piece in query.split_whitespace() {
+        if terms.iter().any(|term| term == piece) {
+            continue;
+        }
+        terms.push(piece.to_string());
+    }
+    terms
+}
+
+/// 一段正文里命中多少处，外加头几段前后文。
+///
+/// 单词（只有 1 个词）：整段就是原来的一个子串，行为不变。
+/// 多词：**每个词都得出现**才算命中（交集），命中数按各词出现次数之和算；
+/// 片段名额在词之间轮流分（每篇最多 3 段），免得一个高频词把 3 段全占了、
+/// 用户看不到别的词到底命中在哪儿。有一个词没出现 → 返回 (0, 空)。
+///
+/// 大小写（v1.3.33）：统一按小写比对，`Alice` 能搜到 `alice` / `ALICE`。
+/// 比对走两份小写副本（正文一份、词一份），偏移量按**字节**对齐 ——
+/// 小写转换只改 ASCII 字母的字节值、长度不变，所以小写副本里的偏移
+/// 直接能切原文；中文一个字三字节照样按字节边界切，不会切出半个字。
 fn text_search_matches(text: &str, query: &str) -> (usize, Vec<TextSnippet>) {
+    text_search_matches_lowered(text, &text.to_lowercase(), query)
+}
+
+/// `text_search_matches` 的本体：`lowered` 是 `text` 的小写副本（扫描一遍库时
+/// 由调用方提前算好、两种用途共用，省掉重复转换）。
+fn text_search_matches_lowered(
+    text: &str,
+    lowered: &str,
+    query: &str,
+) -> (usize, Vec<TextSnippet>) {
+    let terms = text_search_terms(query);
+    if terms.is_empty() {
+        return (0, Vec::new());
+    }
     let mut count = 0usize;
+    // 每个词留一份待取的命中起点，片段名额在词之间轮流分
+    let mut pending: Vec<std::vec::IntoIter<(usize, usize)>> = Vec::new();
+    for term in &terms {
+        let needle = term.to_lowercase();
+        let mut starts: Vec<(usize, usize)> = Vec::new();
+        for (start, matched) in lowered.match_indices(&needle) {
+            // 小写只改 ASCII 字母的字节值、不改长度，所以偏移和长度都能直接切原文
+            starts.push((start, matched.len()));
+        }
+        // 多词取交集：任何一个词一处都没有，这篇整篇不算命中
+        if starts.is_empty() {
+            return (0, Vec::new());
+        }
+        count += starts.len();
+        pending.push(starts.into_iter());
+    }
     let mut snippets = Vec::new();
-    for (start, matched) in text.match_indices(query) {
-        count += 1;
-        if snippets.len() < TEXT_SEARCH_MAX_SNIPPETS {
-            snippets.push(text_snippet_at(text, start, start + matched.len()));
+    'outer: loop {
+        let mut taken = false;
+        for starts in pending.iter_mut() {
+            let Some((start, len)) = starts.next() else {
+                continue;
+            };
+            taken = true;
+            snippets.push(text_snippet_at(text, start, start + len));
+            if snippets.len() >= TEXT_SEARCH_MAX_SNIPPETS {
+                break 'outer;
+            }
+        }
+        if !taken {
+            break;
         }
     }
     (count, snippets)
@@ -3300,7 +3365,8 @@ fn search_full_text_over(
     limit: Option<usize>,
 ) -> Result<TextSearchResult, String> {
     let needle = query.trim();
-    if needle.is_empty() {
+    // 只剩空白（或全是空格分隔符）就当没填 —— 别让一次全库扫描白跑
+    if text_search_terms(needle).is_empty() {
         return Err("先输入要搜的内容".into());
     }
     let cap = limit.unwrap_or(TEXT_SEARCH_MAX_HITS).clamp(1, TEXT_SEARCH_MAX_HITS);
@@ -3348,7 +3414,10 @@ fn search_full_text_over(
                             continue;
                         }
                         scanned += 1;
-                        let (count, snippets) = text_search_matches(&document, needle);
+                        // 小写只做一次，交集判断和抠片段共用（v1.3.33）
+                        let lowered_document = document.to_lowercase();
+                        let (count, snippets) =
+                            text_search_matches_lowered(&document, &lowered_document, needle);
                         if count > 0 {
                             hits.push((*work_id, count, snippets));
                         }
@@ -18948,7 +19017,7 @@ mod tests {
         list_series_impl, refresh_word_counts_impl, WORD_COUNT_TRIGGER_DDL,
         anthology_image_slots, clean_filter_view_name, FILTER_VIEW_MAX_NAME,
         document_text, is_epub_text_entry, single_line, strip_element_block,
-        search_full_text_over, text_search_document, text_search_matches,
+        search_full_text_over, text_search_document, text_search_matches, text_search_terms,
         TEXT_SEARCH_CONTEXT_CHARS, TEXT_SEARCH_MAX_SNIPPETS,
         mark_work_in_progress, read_state_label, split_tags, READ_DONE, READ_IN_PROGRESS,
         READ_UNREAD,
@@ -24790,6 +24859,62 @@ mod tests {
         assert_eq!(count, 50);
         assert_eq!(snippets.len(), TEXT_SEARCH_MAX_SNIPPETS);
         assert_eq!(single_line("  换行\n和  空格 "), "换行 和 空格");
+    }
+
+    /// v1.3.33：搜索词按空白切，重复词只算一次（"书 书" 等于 "书"）
+    #[test]
+    fn text_search_terms_split_on_whitespace() {
+        assert_eq!(text_search_terms("  书  "), vec!["书".to_string()]);
+        assert_eq!(
+            text_search_terms("书  魔法\t少女"),
+            vec!["书".to_string(), "魔法".to_string(), "少女".to_string()]
+        );
+        // 全角空格也是空白
+        assert_eq!(
+            text_search_terms("书\u{3000}魔法"),
+            vec!["书".to_string(), "魔法".to_string()]
+        );
+        assert_eq!(text_search_terms("书 书 书"), vec!["书".to_string()]);
+        assert!(text_search_terms("   ").is_empty());
+    }
+
+    /// v1.3.33：正文搜索不区分大小写 —— 词用小写打、正文里大写也照样命中，
+    /// 而且片段里高亮的是**原文**那几个字母，不是小写后的。
+    #[test]
+    fn text_search_ignores_ascii_case() {
+        let text = "她说 Alice 来了，ALICE 又走了。";
+        let (count, snippets) = text_search_matches(text, "alice");
+        assert_eq!(count, 2);
+        assert_eq!(snippets[0].hit, "Alice");
+        assert_eq!(snippets[1].hit, "ALICE");
+        // 反过来：大写词搜小写正文
+        assert_eq!(text_search_matches("alice", "ALICE").0, 1);
+    }
+
+    /// v1.3.33：多个词是**交集** —— 整篇正文得同时含所有词才算命中，
+    /// 命中数按各词出现次数之和算，片段在词之间轮流分。
+    #[test]
+    fn text_search_multi_terms_require_all_of_them() {
+        // 两个词都在：「魔法」2 处 + 「少女」2 处
+        let both = "前半段写着魔法，后半段写着少女。魔法少女。";
+        let (count, snippets) = text_search_matches(both, "魔法 少女");
+        assert_eq!(count, 4, "各词命中数相加");
+        // 片段轮着给：第一个来自「魔法」、第二个来自「少女」
+        assert!(snippets.len() >= 2);
+        assert!(snippets[0].hit.contains("魔法"), "{:?}", snippets[0].hit);
+        assert!(snippets[1].hit.contains("少女"), "{:?}", snippets[1].hit);
+
+        // 少一个词 → 整篇不命中（这正是「A B」与「A 或 B」的区别）
+        assert_eq!(text_search_matches("只有魔法", "魔法 少女").0, 0);
+        assert_eq!(text_search_matches("只有少女", "魔法 少女").0, 0);
+
+        // 词序无关
+        assert_eq!(
+            text_search_matches(both, "少女 魔法").0,
+            text_search_matches(both, "魔法 少女").0
+        );
+        // 大小写对各词同样生效
+        assert_eq!(text_search_matches("Magic Girl", "magic GIRL").0, 2);
     }
 
     #[test]
