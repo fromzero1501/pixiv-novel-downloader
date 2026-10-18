@@ -11,10 +11,13 @@ const APP_VERSION = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "0.0
 /** 「所有作品」瀑布流一屏先画多少张，之后滚到底再追加这么多 */
 const ALL_WORKS_PAGE = 60;
 /**
- * 正文搜索一次最多要几篇命中（跟后端 TEXT_SEARCH_MAX_HITS 对齐）。
- * 搜「的」这种字会命中九成作品，全画出来既没意义又卡 —— 后端也是按这个数截断的。
+ * 正文搜索一次最多要几篇命中（v1.3.34 起**不再限制**，传 null）。
+ *
+ * 原来是 200，和后端那个硬上限成对出现：命中多了就只给前 200 篇。现在后端不截断、
+ * 前端靠分批渲染（每批 `ALL_WORKS_PAGE` 张）顶住渲染压力，所以这里传 null = 全要。
+ * 留着这个常量是给「以后想临时限一下」的调用点用，默认不要动它。
  */
-const TEXT_SEARCH_HIT_LIMIT = 200;
+const TEXT_SEARCH_HIT_LIMIT = null;
 /**
  * 正文搜索的历史词存哪儿、最多留几条（v1.2.15）。**必须定义在 `state` 之前** ——
  * `state.textSearchHistory` 初始化时就要用它，而 `const` 有暂时性死区：
@@ -104,6 +107,18 @@ const state = {
   allWorksShown: ALL_WORKS_PAGE,
   /** 防抖用：正在追加下一页时不要再触发一次 */
   allWorksLoadingMore: false,
+  /**
+   * 作者作品库 / 收藏夹的分批渲染（v1.3.34）。
+   *
+   * 原来只有「所有作品」是分批的，这两页一次铺完 —— 收藏夹一般不大，作者库也就几百篇，
+   * 所以一直没出事。但**正文搜索现在不再截断 200 篇**，作者作品库在正文结果态下可能
+   * 一下要画上千张带片段的卡片，所以两页也接上同一套分批。
+   * 任何一次重新查询（改搜索 / 筛选 / 排序 / 换词）都复位到第一屏。
+   */
+  worksShown: ALL_WORKS_PAGE,
+  worksLoadingMore: false,
+  collectionWorksShown: ALL_WORKS_PAGE,
+  collectionWorksLoadingMore: false,
   /**
    * 正文搜索（v1.2.11；v1.3.14 起没有独立页面 —— 在哪个列表页搜就在哪儿出结果）。
    * 后端不建索引、每次现扫本地文件；结果放这里，由列表页结合当前筛选就地渲染。
@@ -608,14 +623,16 @@ async function invoke(command, args = {}) {
       }
     }
     matched.sort((left, right) => right.hitCount - left.hitCount || left.workId - right.workId);
-    const limit = Number(args.limit) || 200;
+    // v1.3.34：真后端不再按 200 截断，这里也得跟着放开 —— 否则预览里永远只看到 200 篇，
+    // 分批渲染根本验不出来。传正数 limit 才截断。
+    const limit = Number(args.limit) > 0 ? Number(args.limit) : 0;
     return {
-      hits: matched.slice(0, limit),
+      hits: limit ? matched.slice(0, limit) : matched,
       scannedCount,
       missing: [],
       missingCount: 0,
       elapsedMs: 8,
-      truncated: matched.length > limit,
+      truncated: Boolean(limit) && matched.length > limit,
     };
   }
   // 作品分享包（v1.3.18）：预览里没有真文件系统，回一份形状正确的假回执 ——
@@ -1508,6 +1525,8 @@ async function refreshWorks() {
     collectionId: state.collectionFilter,
     sort: state.sort,
   });
+  // 重新查过一遍就退回第一屏（v1.3.34 这页也分批了，换筛选还留着「已展开 600 张」很怪）
+  resetListPager("works");
 }
 
 async function refreshAllWorks() {
@@ -1527,22 +1546,72 @@ async function refreshAllWorks() {
 }
 
 /**
- * 「所有作品」瀑布流：滚到底再画下一批。
+ * 分批渲染的**通用**三件套（v1.3.34 起三页共用：「所有作品」/ 作者作品库 / 收藏夹）。
  *
- * 用 IntersectionObserver 而不是滚轮事件，是因为列表本身就在窗口里滚、没有独立滚动容器；
- * 哨兵元素进了视野就说明到底了。追加之后会重画整个列表，哨兵是新节点，
- * `bindEvents()` 会重新挂上去 —— 如果那时哨兵仍在视野里（一屏放不下这么多张），
+ * 原来只有「所有作品」是分批的，逻辑写死在那一个地方；正文搜索去掉 200 篇截断之后，
+ * 任何一页都可能要画上千张带片段的卡片，所以抽成通用的一套。
+ * 每页只需要给出「哪个 state 键记已画多少」「这页最终要画几篇」。
+ */
+const LIST_PAGERS = {
+  allWorks: { key: "allWorksShown", loadingKey: "allWorksLoadingMore" },
+  works: { key: "worksShown", loadingKey: "worksLoadingMore" },
+  collectionWorks: { key: "collectionWorksShown", loadingKey: "collectionWorksLoadingMore" },
+};
+
+/** 这页第一屏画几张（至少一批，避免出现「已显示 0 / 300」） */
+function shownCountFor(pager, total) {
+  const { key } = LIST_PAGERS[pager];
+  return Math.min(total, Math.max(ALL_WORKS_PAGE, Number(state[key]) || ALL_WORKS_PAGE));
+}
+
+/** 重新查询后回到第一屏 —— 换了筛选还留着「已展开 600 张」很怪 */
+function resetListPager(pager) {
+  state[LIST_PAGERS[pager].key] = ALL_WORKS_PAGE;
+}
+
+/** 列表底部的「已显示 x / y 篇」+「再加载 N 篇」+ 哨兵；一页塞得下就不显示 */
+function loadMoreFooter(pager, shownCount, total) {
+  if (!total) return "";
+  const remaining = total - shownCount;
+  const action = pager === "collectionWorks"
+    ? "load-more-collection-works"
+    : pager === "works" ? "load-more-works" : "load-more-all-works";
+  // 哨兵上标着这是哪个列表 —— 三页共用一个观察器，别把批错加到别的页上
+  return `<div class="load-more-foot">
+        <span class="load-more-count">已显示 <strong>${shownCount}</strong> / ${total} 篇</span>
+        ${remaining > 0 ? `<button class="quiet-button" data-action="${action}">再加载 ${Math.min(ALL_WORKS_PAGE, remaining)} 篇</button>` : `<span class="load-more-done">到底了</span>`}
+      </div>
+      ${remaining > 0 ? `<div data-role="load-more-sentinel" data-pager="${pager}" class="load-more-sentinel" aria-hidden="true"></div>` : ""}`;
+}
+
+/**
+ * 追加下一批。用 IntersectionObserver 而不是滚轮事件，是因为列表本身就在窗口里滚、
+ * 没有独立滚动容器；哨兵元素进了视野就说明到底了。追加之后会重画整个列表，
+ * 哨兵是新节点，`bindEvents()` 会重新挂上去 —— 如果那时哨兵仍在视野里（一屏放不下这么多张），
  * 会立刻再触发一次，于是连续滚到底就是平滑的无限加载。
  * 另外留一个「加载更多」按钮兜底：万一浏览器不支持/观察器没挂上，还能手点。
  */
 async function loadMoreAllWorks() {
-  if (state.homeView !== "allWorks" || state.activeAuthor) return;
-  if (state.allWorksLoadingMore) return;
-  if (state.allWorksShown >= visibleAllWorksCount()) return;
-  state.allWorksLoadingMore = true;
-  state.allWorksShown += ALL_WORKS_PAGE;
+  await loadMorePage("allWorks", state.homeView === "allWorks" && !state.activeAuthor, visibleAllWorksCount());
+}
+
+async function loadMoreWorksPage() {
+  await loadMorePage("works", Boolean(state.activeAuthor), visibleWorksCount());
+}
+
+async function loadMoreCollectionWorks() {
+  await loadMorePage("collectionWorks", Boolean(state.activeCollection), visibleCollectionWorksCount());
+}
+
+async function loadMorePage(pager, active, total) {
+  if (!active) return;
+  const { key, loadingKey } = LIST_PAGERS[pager];
+  if (state[loadingKey]) return;
+  if ((Number(state[key]) || 0) >= total) return;
+  state[loadingKey] = true;
+  state[key] = shownCountFor(pager, total) + ALL_WORKS_PAGE;
   render();
-  state.allWorksLoadingMore = false;
+  state[loadingKey] = false;
 }
 
 /** 「所有作品」当前筛选条件下总共还剩多少张要画（筛选口径和 renderAllWorks 完全一致） */
@@ -1550,8 +1619,22 @@ function visibleAllWorksCount() {
   return collapseSerialWorks(state.allWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters).length;
 }
 
+/** 作者作品库最终要画几篇（口径和 renderWorks 一致：正文命中 → 序列折叠 → 各种筛选） */
+function visibleWorksCount() {
+  const body = bodySearchContext(state.workQuery);
+  const filtered = collapseSerialWorks(state.works).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+  return (body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered).length;
+}
+
+/** 收藏夹最终要画几篇（口径和 renderCollectionWorks 一致） */
+function visibleCollectionWorksCount() {
+  const body = bodySearchContext(state.collectionQuery);
+  const filtered = collapseSerialWorks(state.collectionWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
+  return (body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered).length;
+}
+
 function ensureLoadMoreObserver() {
-  const sentinel = document.querySelector('[data-role="all-works-sentinel"]');
+  const sentinel = document.querySelector('[data-role="load-more-sentinel"]');
   if (!sentinel) {
     loadMoreObserver?.disconnect();
     loadMoreObserver = null;
@@ -1559,7 +1642,15 @@ function ensureLoadMoreObserver() {
   }
   if (!loadMoreObserver) {
     loadMoreObserver = new IntersectionObserver(
-      (entries) => { if (entries.some((entry) => entry.isIntersecting)) loadMoreAllWorks(); },
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        if (document.querySelector('[data-role="load-more-sentinel"]') !== sentinel) return;
+        // 哨兵上标着是哪个列表 —— 同一个观察器服务三页，别把批错加到别的页上
+        const pager = sentinel.dataset.pager || "allWorks";
+        if (pager === "works") loadMoreWorksPage();
+        else if (pager === "collectionWorks") loadMoreCollectionWorks();
+        else loadMoreAllWorks();
+      },
       // 提前 600px 就开始取下一批，滚到底时基本已经接上了
       { rootMargin: "600px 0px" },
     );
@@ -1643,6 +1734,8 @@ async function refreshCollectionWorks() {
     alsoInCollectionId: state.collectionFilter,
     sort: state.collectionSort,
   });
+  // 重新查过一遍就退回第一屏（v1.3.34）
+  resetListPager("collectionWorks");
 }
 
 /**
@@ -3295,7 +3388,8 @@ function bodySearchHeader(ctx, shownCount) {
   const terms = bodySearchTerms(ctx.needle);
   const notes = [];
   if (terms.length > 1) notes.push(`要同时包含：${terms.map((term) => `「${term}」`).join("")}`);
-  if (ctx.meta.truncated) notes.push(`命中太多，只列了前 ${ctx.hitCount} 篇`);
+  // v1.3.34：后端不再截断 200 篇，命中多少都全返回（分批渲染在这页做）。
+  // 这句留着只当兜底 —— 万一以后又给后端加回上限，这里还能如实说明，不至于让人以为没命中。
   if (ctx.meta.missingCount) notes.push(`${ctx.meta.missingCount} 篇没有可读的正文（没绑阅读版、或者文件不在原处），已跳过`);
   const filteredNote = ctx.hitCount && shownCount !== ctx.hitCount ? `（当前筛选下 ${shownCount} 篇）` : "";
   return `<div class="text-search-heading"><h2>正文里命中 <em>${ctx.hitCount}</em> 篇${filteredNote}</h2><span class="text-search-stats">扫过 ${ctx.meta.scannedCount} 篇正文 · 用时 ${ctx.meta.elapsedMs} 毫秒</span></div>${notes.length ? `<div class="read-only-note">${notes.map((note) => escapeHtml(note)).join("　")}</div>` : ""}`;
@@ -3422,7 +3516,9 @@ function renderWorks() {
   const body = bodySearchContext(state.workQuery);
   const filtered = collapseSerialWorks(state.works).filter(matchesReadFilter).filter(matchesAdvancedFilters);
   const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
-  const cards = works.map((work) => `
+  // 分批渲染（v1.3.34）：正文搜索不再截断 200 篇，这页可能一下命中上千篇
+  const shownWorks = works.slice(0, shownCountFor("works", works.length));
+  const cards = shownWorks.map((work) => `
     <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
       <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
@@ -3454,6 +3550,7 @@ function renderWorks() {
       <div class="binding-bar"><div><strong>本地文件</strong><span>${author.previewDir ? "预览版目录已绑定" : "尚未绑定预览版目录"} · ${author.purchasedDir ? "完整版目录已绑定" : "尚未绑定完整版目录"}</span><em class="sync-status">Pixiv ${syncLabel(author.pixivLastSyncAt)}</em></div><div><button class="quiet-button" data-action="scan-preview">${icon("folder", 17)}关联预览版文件</button><button class="quiet-button" data-action="scan-purchased">${icon("upload", 17)}关联完整版文件</button></div></div>
       ${bodySearchHeader(body, works.length)}
       <div class="works-grid">${cards || bodySearchEmpty(body, works.length) || (body ? "" : renderEmptyWorks())}</div>
+      ${loadMoreFooter("works", shownWorks.length, works.length)}
     </section>`);
 }
 
@@ -3481,14 +3578,8 @@ function renderAllWorks() {
       </div>
       <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}${bodySearchSnippet(body, work.id)}</div>
     </article>`).join("");
-  const remaining = visible.length - shown.length;
-  const footer = visible.length
-    ? `<div class="load-more-foot">
-        <span class="load-more-count">已显示 <strong>${shown.length}</strong> / ${visible.length} 篇</span>
-        ${remaining > 0 ? `<button class="quiet-button" data-action="load-more-all-works">再加载 ${Math.min(ALL_WORKS_PAGE, remaining)} 篇</button>` : `<span class="load-more-done">到底了</span>`}
-      </div>
-      ${remaining > 0 ? '<div data-role="all-works-sentinel" class="load-more-sentinel" aria-hidden="true"></div>' : ""}`
-    : "";
+  // 底部「已显示 x / y」交给通用分页脚（v1.3.34 起三页共用一套）
+  const footer = loadMoreFooter("allWorks", shown.length, visible.length);
   return renderShell(`
     <section class="topbar work-topbar"><div><p class="section-kicker">全部作者</p><div class="all-works-title"><h1>所有作品</h1><span class="works-total">${totalLabel}</span></div></div><div class="topbar-actions"><button class="icon-text-button" data-action="export-all">${icon("download", 18)}<span>导出清单</span></button></div></section>
     <section class="library-content">
@@ -4456,7 +4547,9 @@ function renderCollectionWorks() {
   const body = bodySearchContext(state.collectionQuery);
   const filtered = collapseSerialWorks(state.collectionWorks).filter(matchesReadFilter).filter(matchesAdvancedFilters);
   const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
-  const cards = works.map((work) => linkedWorkCard(work, bodySearchSnippet(body, work.id))).join("");
+  // 分批渲染（v1.3.34）：正文搜索可能把整个夹子都命中
+  const shownWorks = works.slice(0, shownCountFor("collectionWorks", works.length));
+  const cards = shownWorks.map((work) => linkedWorkCard(work, bodySearchSnippet(body, work.id))).join("");
   return renderShell(`
     <section class="topbar work-topbar">
       <div class="crumb-heading"><button class="back-button" title="返回收藏夹列表" data-action="back-to-collections">${icon("back", 20)}</button><div><p class="section-kicker">收藏夹</p><h1>${escapeHtml(collection.name)}</h1></div></div>
@@ -4476,6 +4569,7 @@ function renderCollectionWorks() {
       ${filterPanel()}
       ${bodySearchHeader(body, works.length)}
       <div class="works-grid">${cards || bodySearchEmpty(body, works.length) || (body ? "" : `<div class="empty-state works-empty"><h2>${state.collectionQuery || state.status !== "all" || state.imagesFilter !== "all" ? "没有符合条件的作品" : "这个收藏夹还是空的"}</h2><p>在任意作品卡上点心形图标，就能把它收进来。</p></div>`)}</div>
+      ${loadMoreFooter("collectionWorks", shownWorks.length, works.length)}
     </section>`);
 }
 
@@ -6614,6 +6708,9 @@ async function bindEvents() {
       }
       if (action === "clear-filters") { state.readFilter = []; state.ratingFilter = []; state.wordsFilter = []; state.collectionFilter = 0; state.imagesFilter = "all"; state.status = "all"; await refreshActiveList(); render(); }
       if (action === "load-more-all-works") await loadMoreAllWorks();
+      // v1.3.34：作者作品库 / 收藏夹也分批了
+      if (action === "load-more-works") await loadMoreWorksPage();
+      if (action === "load-more-collection-works") await loadMoreCollectionWorks();
       // 待补完整版工作台
       if (action === "open-missing-author") { state.missingFullAuthorId = Number(element.dataset.authorId) || null; state.missingFullFilter = "todo"; render(); }
       if (action === "back-to-missing-authors") { state.missingFullAuthorId = null; render(); }
@@ -10959,6 +11056,8 @@ const VIEW_STATE_EXTRA_FIELDS = [
   ["missingFullFilter", "todo"],
   ["filterPanelOpen", false],
   ["allWorksShown", ALL_WORKS_PAGE],
+  ["worksShown", ALL_WORKS_PAGE],
+  ["collectionWorksShown", ALL_WORKS_PAGE],
   ["pixivBookmarksQuery", ""],
   ["pixivBookmarksFilter", "all"],
 ];
@@ -11129,12 +11228,19 @@ function topVisibleCardAnchor() {
 function expandShownForAnchor(bucket) {
   const anchor = scrollAnchors[bucket];
   if (!anchor || anchor.kind !== "work") return;
-  // 只有「所有作品」是分批的：作者作品库 / 收藏夹 / 散篇都是一次画完
-  if (state.activeAuthor || state.homeView !== "allWorks") return;
-  const index = state.allWorks.findIndex((work) => Number(work.id) === anchor.id);
+  // 分批的列表有三页（v1.3.34）：所有作品 / 作者作品库 / 收藏夹。
+  // 锚点可能落在很后面，得先把那一批扩出来，否则卡片压根不在 DOM 里、滚不过去。
+  let list = null;
+  let pager = "";
+  if (state.activeAuthor) { list = state.works; pager = "works"; }
+  else if (state.homeView === "allWorks") { list = state.allWorks; pager = "allWorks"; }
+  else if (state.homeView === "collections" && state.activeCollection) { list = state.collectionWorks; pager = "collectionWorks"; }
+  if (!list || !pager) return;
+  const index = list.findIndex((work) => Number(work.id) === anchor.id);
   if (index < 0) return;
   const need = Math.ceil((index + 1) / ALL_WORKS_PAGE) * ALL_WORKS_PAGE;
-  if (state.allWorksShown < need) state.allWorksShown = need;
+  const key = LIST_PAGERS[pager].key;
+  if ((Number(state[key]) || 0) < need) state[key] = need;
 }
 
 /** 把视口滚到锚点那张卡上；找不到（被删 / 被筛掉）就退回老的「按像素」恢复 */
@@ -11189,8 +11295,10 @@ async function restoreViewState() {
   Object.assign(scrollTops, saved.scrollTops && typeof saved.scrollTops === "object" ? saved.scrollTops : {});
   Object.assign(scrollAnchors, saved.scrollAnchors && typeof saved.scrollAnchors === "object" ? saved.scrollAnchors : {});
   state.authorReturnTo = saved.authorReturnTo === "allWorks" ? "allWorks" : null;
-  // 瀑布流深度跟着回到离开时那样，否则滚动位置落在一片空白上
-  if (!(state.allWorksShown >= ALL_WORKS_PAGE)) state.allWorksShown = ALL_WORKS_PAGE;
+  // 瀑布流深度跟着回到离开时那样，否则滚动位置落在一片空白上（v1.3.34 起三页都分批）
+  ["allWorksShown", "worksShown", "collectionWorksShown"].forEach((key) => {
+    if (!(Number(state[key]) >= ALL_WORKS_PAGE)) state[key] = ALL_WORKS_PAGE;
+  });
 
   // 先把页面回到最朴素的作者库，下面按记下来的页面逐条还原
   state.homeView = "authors";

@@ -3013,8 +3013,6 @@ fn search_match_clause(
 const TEXT_SEARCH_CONTEXT_CHARS: usize = 36;
 /// 每篇最多给几段。卡片上留三段就到顶了。
 const TEXT_SEARCH_MAX_SNIPPETS: usize = 3;
-/// 命中篇目上限。搜「的」这种字会命中九成作品，全返回既没意义又拖慢渲染。
-const TEXT_SEARCH_MAX_HITS: usize = 200;
 /// 连正文都没找到的作品只报总数 + 前几个名字，列全了没地方放。
 const TEXT_SEARCH_LISTED_MISSING: usize = 12;
 
@@ -3369,7 +3367,9 @@ fn search_full_text_over(
     if text_search_terms(needle).is_empty() {
         return Err("先输入要搜的内容".into());
     }
-    let cap = limit.unwrap_or(TEXT_SEARCH_MAX_HITS).clamp(1, TEXT_SEARCH_MAX_HITS);
+    // v1.3.34：不再按 200 篇截断，命中多少全返回（分批渲染在前端做）。
+    // `limit` 还留着：传了正数才截断，单测和「只想要前 N 篇」的调用点照样能用。
+    let cap = limit.filter(|value| *value > 0);
     let started = std::time::Instant::now();
 
     // 整库一百来兆正文，单线程也就零点几秒 —— 但读文件大半时间在等 IO，
@@ -3438,8 +3438,11 @@ fn search_full_text_over(
 
     // 命中多的排前面，同样多的按 work_id 稳定排 —— 免得每次搜出来顺序都不一样
     collected.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-    let truncated = collected.len() > cap;
-    collected.truncate(cap);
+    // cap 为 None = 不截断（v1.3.34 起的常态）；只有显式传了正数才截
+    let truncated = matches!(cap, Some(limit) if collected.len() > limit);
+    if let Some(limit) = cap {
+        collected.truncate(limit);
+    }
     let missing_count = missing.len();
     missing.sort();
     missing.truncate(TEXT_SEARCH_LISTED_MISSING);
@@ -24978,6 +24981,38 @@ mod tests {
         fs::create_dir_all(&folder).unwrap();
         fs::write(folder.join("正文.txt"), "目录里的关键句子").unwrap();
         assert!(text_search_document(&folder).unwrap().contains("目录里的关键句子"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// v1.3.34：正文搜索**不再按 200 篇截断** —— 命中多少就返回多少，
+    /// 分批渲染交给前端（每批 60 张）。渲染压力不该变成「看不到第 201 篇后」的功能缺失。
+    #[test]
+    fn full_text_search_returns_every_hit_when_unlimited() {
+        let root = text_search_fixture("no-cap");
+        // 250 篇都提到同一个词，已经超过原来那个 200 的坎
+        let mut rows = Vec::new();
+        for index in 0..250i64 {
+            let file = root.join(format!("第{index}篇.txt"));
+            fs::write(&file, format!("这篇里有关键句子，编号 {index}")).unwrap();
+            rows.push((
+                index + 1,
+                format!("第{index}篇"),
+                file.to_string_lossy().into_owned(),
+                String::new(),
+            ));
+        }
+
+        // 不传上限：250 篇全回来，且没有截断标记
+        let all = search_full_text_over(&rows, "关键句子", None).unwrap();
+        assert_eq!(all.scanned_count, 250);
+        assert_eq!(all.hits.len(), 250, "超过 200 篇也要全返回");
+        assert!(!all.truncated, "不再有上限，就不该报截断");
+
+        // 显式传正数上限仍然有效（单测和"只想要前 N 篇"的调用点用得上）
+        let capped = search_full_text_over(&rows, "关键句子", Some(10)).unwrap();
+        assert_eq!(capped.hits.len(), 10);
+        assert!(capped.truncated);
 
         let _ = fs::remove_dir_all(&root);
     }
