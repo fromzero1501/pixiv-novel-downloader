@@ -889,7 +889,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .text-hit-snippets { margin-top: 10px; display: grid; gap: 6px; }
 .text-snippet { margin: 0; color: #506888; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 .text-snippet mark { background: #fff1b3; color: #6b4a00; padding: 0 2px; border-radius: 3px; font-weight: 700; }
-.text-hit-count { color: #7c90a8; font-size: 12px; }
+.text-hit-count { color: #7c90a8; font-size: 12px; overflow-wrap: anywhere; }
 
 /* ---------------------------------------------------------------------------
  * 键盘快捷键说明弹窗（v1.2.12）：按 ? 弹出来的那份

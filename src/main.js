@@ -573,7 +573,11 @@ async function invoke(command, args = {}) {
     // 命中的篇目、片段截取、计数、截断标记这些**前端要处理的东西**都能照验。
     const needle = String(args.query || "").trim();
     // v1.3.33：和后端同一口径 —— 按空白切词、取交集（每个词都得出现）、不区分大小写
-    const terms = needle.split(/\s+/).filter(Boolean);
+    // v1.3.35：词表也去重（顺序保留首次出现），这样每篇的 termCounts 能和它一一对齐
+    const terms = [];
+    for (const piece of needle.split(/\s+/)) {
+      if (piece && !terms.includes(piece)) terms.push(piece);
+    }
     const matched = [];
     let scannedCount = 0;
     if (terms.length) {
@@ -584,7 +588,8 @@ async function invoke(command, args = {}) {
         const lowered = text.toLowerCase();
         const snippets = [];
         let hitCount = 0;
-        // 每个词各自出现几次，片段轮流取（和后端一致：一篇最多 3 段）
+        // 每个词各自出现几次（v1.3.35：卡片底部要分开报），片段轮流取（一篇最多 3 段）
+        const termCounts = [];
         const queues = [];
         let missed = false;
         for (const term of terms) {
@@ -599,6 +604,7 @@ async function invoke(command, args = {}) {
           }
           if (!starts.length) { missed = true; break; }
           hitCount += starts.length;
+          termCounts.push(starts.length);
           queues.push({ starts, length: term.length });
         }
         if (missed) continue;
@@ -619,7 +625,7 @@ async function invoke(command, args = {}) {
           }
           if (!taken) break;
         }
-        if (hitCount) matched.push({ workId: work.id, hitCount, snippets });
+        if (hitCount) matched.push({ workId: work.id, hitCount, termCounts, snippets });
       }
     }
     matched.sort((left, right) => right.hitCount - left.hitCount || left.workId - right.workId);
@@ -3365,8 +3371,12 @@ function syncTextSearchHistoryPanel() {
 function bodySearchContext(query) {
   const needle = String(query || "").trim();
   if (state.searchField !== "body" || !needle || state.textSearchQuery !== needle) return null;
+  // 词表优先用后端返回的那份：它已按空白去重，且和每篇的 termCounts 同一个顺序。
+  // 老数据 / 假后端没给就照同一规则本地切一份 —— 只影响底部文案，不影响命中判定。
+  const backendTerms = state.textSearchMeta && Array.isArray(state.textSearchMeta.terms) ? state.textSearchMeta.terms : [];
   return {
     needle,
+    terms: backendTerms.length ? backendTerms : bodySearchTerms(needle),
     running: state.textSearchRunning,
     meta: state.textSearchMeta,
     hitMap: new Map((state.textSearchHits || []).map((hit) => [Number(hit.workId), hit])),
@@ -3413,15 +3423,23 @@ function bodySearchEmpty(ctx, shownCount) {
 function bodySearchSnippet(ctx, workId) {
   if (!ctx) return "";
   const hit = ctx.hitMap.get(Number(workId));
-  return hit ? textHitSnippets(hit) : "";
+  return hit ? textHitSnippets(hit, ctx.terms) : "";
 }
 
-/** 正文命中的片段：命中处前后各截一段，中间那几个字高亮 */
-function textHitSnippets(hit) {
+/**
+ * 正文命中的片段：命中处前后各截一段，中间那几个字高亮。
+ * 多词时底部把**每个词各命中多少处**一并写清楚（v1.3.35）——
+ * 顺序照后端给的词表；计数对不上（老数据 / 假后端没给）就只报总数，不硬凑。
+ */
+function textHitSnippets(hit, terms = []) {
   const rows = (hit.snippets || [])
     .map((snippet) => `<p class="text-snippet">${snippet.before ? `<span>…${escapeHtml(snippet.before)}</span>` : ""}<mark>${escapeHtml(snippet.hit)}</mark>${snippet.after ? `<span>${escapeHtml(snippet.after)}…</span>` : ""}</p>`)
     .join("");
-  return `<div class="text-hit-snippets">${rows}<span class="text-hit-count">正文里命中 ${hit.hitCount} 处</span></div>`;
+  const counts = Array.isArray(hit.termCounts) ? hit.termCounts : [];
+  const detail = terms.length > 1 && counts.length === terms.length
+    ? ` · ${terms.map((term, index) => `「${escapeHtml(term)}」${counts[index]} 处`).join("、")}`
+    : "";
+  return `<div class="text-hit-snippets">${rows}<span class="text-hit-count">正文里命中 ${hit.hitCount} 处${detail}</span></div>`;
 }
 
 /**

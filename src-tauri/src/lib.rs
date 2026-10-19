@@ -3031,7 +3031,10 @@ struct TextSnippet {
 #[serde(rename_all = "camelCase")]
 struct TextSearchHit {
     work_id: i64,
+    /// 各词命中数之和（排序、卡片上的总数都用它）
     hit_count: usize,
+    /// 每个词各命中多少处，顺序与结果顶层的 `terms` 一一对应（v1.3.35）
+    term_counts: Vec<usize>,
     snippets: Vec<TextSnippet>,
 }
 
@@ -3039,6 +3042,9 @@ struct TextSearchHit {
 #[serde(rename_all = "camelCase")]
 struct TextSearchResult {
     hits: Vec<TextSearchHit>,
+    /// 本次实际用的词：按空白切、去重、保留首次出现顺序。
+    /// 前端拿它和每篇的 `term_counts` 对齐 —— 单词搜索也有一项（v1.3.35）。
+    terms: Vec<String>,
     /// 真扫过正文的作品数
     scanned_count: usize,
     /// 没找到正文的作品（没绑阅读版 / 文件丢了），只列前几个
@@ -3065,19 +3071,30 @@ fn text_search_terms(query: &str) -> Vec<String> {
     terms
 }
 
-/// 一段正文里命中多少处，外加头几段前后文。
+/// 一段正文里**每个词各**命中多少处，外加头几段前后文。
+///
+/// 返回的计数数组与 `text_search_terms(query)` **同序**（单词就是长度 1 的数组），
+/// 前端拿它和结果顶层的 `terms` 一一对齐，才能把「哪个词命中几处」说清楚（v1.3.35）。
 ///
 /// 单词（只有 1 个词）：整段就是原来的一个子串，行为不变。
-/// 多词：**每个词都得出现**才算命中（交集），命中数按各词出现次数之和算；
+/// 多词：**每个词都得出现**才算命中（交集），各词计数分开算；
 /// 片段名额在词之间轮流分（每篇最多 3 段），免得一个高频词把 3 段全占了、
-/// 用户看不到别的词到底命中在哪儿。有一个词没出现 → 返回 (0, 空)。
+/// 用户看不到别的词到底命中在哪儿。有一个词没出现 → 计数全是 0、没有片段。
 ///
 /// 大小写（v1.3.33）：统一按小写比对，`Alice` 能搜到 `alice` / `ALICE`。
 /// 比对走两份小写副本（正文一份、词一份），偏移量按**字节**对齐 ——
 /// 小写转换只改 ASCII 字母的字节值、长度不变，所以小写副本里的偏移
 /// 直接能切原文；中文一个字三字节照样按字节边界切，不会切出半个字。
+#[cfg(test)]
 fn text_search_matches(text: &str, query: &str) -> (usize, Vec<TextSnippet>) {
-    text_search_matches_lowered(text, &text.to_lowercase(), query)
+    let (counts, snippets) = text_search_matches_lowered(text, &text.to_lowercase(), query);
+    (text_hit_total(&counts), snippets)
+}
+
+/// 各词命中数相加 = 这篇一共命中多少处。
+/// 排序用的总数、卡片上那个「命中 N 处」都走这一个口径，两处不会算出两个数。
+fn text_hit_total(counts: &[usize]) -> usize {
+    counts.iter().sum()
 }
 
 /// `text_search_matches` 的本体：`lowered` 是 `text` 的小写副本（扫描一遍库时
@@ -3086,13 +3103,13 @@ fn text_search_matches_lowered(
     text: &str,
     lowered: &str,
     query: &str,
-) -> (usize, Vec<TextSnippet>) {
+) -> (Vec<usize>, Vec<TextSnippet>) {
     let terms = text_search_terms(query);
     if terms.is_empty() {
-        return (0, Vec::new());
+        return (Vec::new(), Vec::new());
     }
-    let mut count = 0usize;
-    // 每个词留一份待取的命中起点，片段名额在词之间轮流分
+    // 每个词一份计数（与 terms 同序）+ 一份待取的命中起点，片段名额在词之间轮流分
+    let mut counts: Vec<usize> = Vec::with_capacity(terms.len());
     let mut pending: Vec<std::vec::IntoIter<(usize, usize)>> = Vec::new();
     for term in &terms {
         let needle = term.to_lowercase();
@@ -3103,9 +3120,9 @@ fn text_search_matches_lowered(
         }
         // 多词取交集：任何一个词一处都没有，这篇整篇不算命中
         if starts.is_empty() {
-            return (0, Vec::new());
+            return (vec![0; terms.len()], Vec::new());
         }
-        count += starts.len();
+        counts.push(starts.len());
         pending.push(starts.into_iter());
     }
     let mut snippets = Vec::new();
@@ -3125,7 +3142,7 @@ fn text_search_matches_lowered(
             break;
         }
     }
-    (count, snippets)
+    (counts, snippets)
 }
 
 /// 抠出命中处前后各 N 个**字符**。
@@ -3380,7 +3397,7 @@ fn search_full_text_over(
         .clamp(1, 6);
     let chunk = rows.len().div_ceil(workers).max(1);
 
-    let mut collected: Vec<(i64, usize, Vec<TextSnippet>)> = Vec::new();
+    let mut collected: Vec<(i64, Vec<usize>, Vec<TextSnippet>)> = Vec::new();
     let mut scanned_count = 0usize;
     let mut missing: Vec<String> = Vec::new();
 
@@ -3389,7 +3406,7 @@ fn search_full_text_over(
             .chunks(chunk)
             .map(|slice| {
                 scope.spawn(move || {
-                    let mut hits: Vec<(i64, usize, Vec<TextSnippet>)> = Vec::new();
+                    let mut hits: Vec<(i64, Vec<usize>, Vec<TextSnippet>)> = Vec::new();
                     let mut scanned = 0usize;
                     let mut missing: Vec<String> = Vec::new();
                     for (work_id, title, purchased, preview) in slice {
@@ -3416,10 +3433,11 @@ fn search_full_text_over(
                         scanned += 1;
                         // 小写只做一次，交集判断和抠片段共用（v1.3.33）
                         let lowered_document = document.to_lowercase();
-                        let (count, snippets) =
+                        let (term_counts, snippets) =
                             text_search_matches_lowered(&document, &lowered_document, needle);
-                        if count > 0 {
-                            hits.push((*work_id, count, snippets));
+                        // 交集下要么每个词都有、要么全 0，所以总数 > 0 就代表整篇命中
+                        if text_hit_total(&term_counts) > 0 {
+                            hits.push((*work_id, term_counts, snippets));
                         }
                     }
                     (hits, scanned, missing)
@@ -3437,7 +3455,11 @@ fn search_full_text_over(
     });
 
     // 命中多的排前面，同样多的按 work_id 稳定排 —— 免得每次搜出来顺序都不一样
-    collected.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    collected.sort_by(|left, right| {
+        text_hit_total(&right.1)
+            .cmp(&text_hit_total(&left.1))
+            .then(left.0.cmp(&right.0))
+    });
     // cap 为 None = 不截断（v1.3.34 起的常态）；只有显式传了正数才截
     let truncated = matches!(cap, Some(limit) if collected.len() > limit);
     if let Some(limit) = cap {
@@ -3450,12 +3472,14 @@ fn search_full_text_over(
     Ok(TextSearchResult {
         hits: collected
             .into_iter()
-            .map(|(work_id, hit_count, snippets)| TextSearchHit {
+            .map(|(work_id, term_counts, snippets)| TextSearchHit {
                 work_id,
-                hit_count,
+                hit_count: text_hit_total(&term_counts),
+                term_counts,
                 snippets,
             })
             .collect(),
+        terms: text_search_terms(needle),
         scanned_count,
         missing,
         missing_count,
@@ -19021,6 +19045,7 @@ mod tests {
         anthology_image_slots, clean_filter_view_name, FILTER_VIEW_MAX_NAME,
         document_text, is_epub_text_entry, single_line, strip_element_block,
         search_full_text_over, text_search_document, text_search_matches, text_search_terms,
+        text_search_matches_lowered, text_hit_total,
         TEXT_SEARCH_CONTEXT_CHARS, TEXT_SEARCH_MAX_SNIPPETS,
         mark_work_in_progress, read_state_label, split_tags, READ_DONE, READ_IN_PROGRESS,
         READ_UNREAD,
@@ -24920,6 +24945,34 @@ mod tests {
         assert_eq!(text_search_matches("Magic Girl", "magic GIRL").0, 2);
     }
 
+    /// v1.3.35：多词时每篇要报出**每个词各**命中多少处（卡片底部那行分开写），
+    /// 计数顺序与 `text_search_terms` 一致 —— 前端就是靠这个顺序和词表对齐的。
+    #[test]
+    fn text_search_counts_each_term_separately() {
+        let text = "魔法少女。魔法少女。魔法。";
+        // 「魔法」3 处、「少女」2 处；词表顺序是「少女」在前
+        let (counts, snippets) =
+            text_search_matches_lowered(text, &text.to_lowercase(), "少女 魔法");
+        assert_eq!(counts, vec![2, 3], "顺序跟词表走，不是按次数排");
+        assert_eq!(text_hit_total(&counts), 5);
+        assert!(!snippets.is_empty());
+
+        // 单词也有自己那一项
+        let (single, _) = text_search_matches_lowered(text, &text.to_lowercase(), "少女");
+        assert_eq!(single, vec![2]);
+
+        // 交集不成立 → 每一项都归零、不给片段（前端据此整篇不收）
+        let narrow = "只有魔法".to_string();
+        let (empty, snippets) =
+            text_search_matches_lowered(&narrow, &narrow.to_lowercase(), "魔法 少女");
+        assert_eq!(empty, vec![0, 0]);
+        assert!(snippets.is_empty());
+
+        // 重复词只算一次，不会凭空多出一项
+        let (deduped, _) = text_search_matches_lowered(text, &text.to_lowercase(), "魔法 魔法");
+        assert_eq!(deduped, vec![3]);
+    }
+
     #[test]
     fn epub_text_entries_take_content_files_only() {
         assert!(is_epub_text_entry("OEBPS/chapter001.xhtml"));
@@ -25054,6 +25107,9 @@ mod tests {
         assert_eq!(result.hits[0].work_id, 1);
         assert_eq!(result.hits[0].hit_count, 2);
         assert_eq!(result.hits[0].snippets[0].hit, "关键句子");
+        // v1.3.35：结果带上词表，每篇带上各词计数（单词时就是长度 1 的数组）
+        assert_eq!(result.terms, vec!["关键句子".to_string()]);
+        assert_eq!(result.hits[0].term_counts, vec![2]);
         assert!(!result.truncated);
         // 文件不在原处的作品要点名报出来，不能静默跳过
         assert_eq!(result.missing_count, 1);
