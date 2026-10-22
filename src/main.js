@@ -2820,13 +2820,6 @@ function workWatchLaterButton(work) {
   return `<button class="watch-later-toggle ${added ? "is-added" : ""}" title="${added ? "移出稍后再看" : "加入稍后再看"}" data-action="toggle-watch-later" data-work-id="${work.id}">${icon(added ? "bookmarkFilled" : "bookmark", 14)}<span>${added ? "已在稍后再看" : "稍后再看"}</span></button>`;
 }
 
-/** 卡片上的评分：没打过分就不显示，免得一排空星星白占地方。 */
-function workRatingMark(work) {
-  const rating = Number(work.rating) || 0;
-  if (!rating) return "";
-  return `<span class="work-rating" title="我的评分：${rating} 星">${icon("starFilled", 13)}<span>${rating}</span></span>`;
-}
-
 /** 标签最多显示 3 个，其余收成「+N」——完整标签在详情弹窗里看（卡片以前被这一整行撑得很臃肿）。 */
 function workTags(work) {
   const tags = String(work.tags || "").split("|").map((tag) => tag.trim()).filter(Boolean);
@@ -3536,15 +3529,9 @@ function renderWorks() {
   const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
   // 分批渲染（v1.3.34）：正文搜索不再截断 200 篇，这页可能一下命中上千篇
   const shownWorks = works.slice(0, shownCountFor("works", works.length));
-  const cards = shownWorks.map((work) => `
-    <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
-        ${workBadges(work)}
-        ${workCharacterNames(work)}
-        ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
-      </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}${bodySearchSnippet(body, work.id)}</div>
-    </article>`).join("");
+  const cards = shownWorks
+    .map((work) => workCard(work, { selecting: state.bulkMode, extra: bodySearchSnippet(body, work.id) }))
+    .join("");
 
   return renderShell(`
     <section class="topbar work-topbar">
@@ -3586,16 +3573,9 @@ function renderAllWorks() {
   const totalLabel = body && body.running ? "共 … 篇" : `共 ${visible.length} 篇`;
   // 瀑布流：只画前 allWorksShown 张，剩下的滚到底再说（库里一千四百多篇，一次铺完很卡）
   const shown = visible.slice(0, Math.max(ALL_WORKS_PAGE, state.allWorksShown));
-  const cards = shown.map((work) => `
-    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}
-        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
-        ${workBadges(work)}
-        ${workCharacterNames(work)}
-        ${workReadToggle(work)}
-      </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}${bodySearchSnippet(body, work.id)}</div>
-    </article>`).join("");
+  const cards = shown
+    .map((work) => workCard(work, { showAuthor: true, series: "all", extra: bodySearchSnippet(body, work.id) }))
+    .join("");
   // 底部「已显示 x / y」交给通用分页脚（v1.3.34 起三页共用一套）
   const footer = loadMoreFooter("allWorks", shown.length, visible.length);
   return renderShell(`
@@ -3625,22 +3605,52 @@ function workMenuButton(work) {
 }
 
 /**
- * 跨作者的作品卡（收藏夹 / 浏览历史 / 正文搜索用）：作者名可以点，直接落到那位作者的作品库。
+ * **唯一的作品卡渲染入口**（v1.3.38）。
  *
- * `extra` 是可选的附加块（正文搜索拿来挂命中片段），插在标签下面。
- * ⚠️ 别把本函数直接交给 `map()` —— 第二个参数会当成 `extra` 传进来（就是数组下标），
- * 于是每张卡上会莫名多出一个数字。调用处一律写 `.map((work) => linkedWorkCard(work))`。
+ * 基准就是「作者作品库」那张卡：封面（NEW / 状态与收藏徽标 / 角色名 / 书签 / 已读 / 三点）
+ * → 日期 + 字数 → 评分星行（评分星 + 已读点 + 合集徽标）→ 标题 → 系列 → 标签。
+ * 其它页面**只声明差异**，不再各写一份 —— 以前散在这九处，某处补了新块别处就漏
+ *（v1.3.37「稍后再看没评分、没合集徽标」就是这么来的）。
+ *
+ * opts（全可选）：
+ *   showAuthor   要作者名那一行。跨作者的页面都要开：所有作品 / 收藏夹 / 稍后再看 / 散篇 / 待补 / Pixiv 收藏
+ *   selecting    批量选择模式：封面右下角换成勾选徽标
+ *   selectAction 勾选徽标的 data-action（默认 toggle-select；待补工作台用 missing-toggle-select）
+ *   leading      封面按钮组最前面追加的按钮（散篇的「散篇转正」）
+ *   indexPrefix  标题前缀（系列里的序号）
+ *   metaExtra    元信息行追加的 HTML（「Pixiv 已删」）
+ *   series       "local"（本作者系列，默认，作者作品库用）/ "all"（跨作者，带 authorId）/ false
+ *   extra        标签下面追加的整行 HTML（加入时间 / 正文命中片段 / 待补标记）
  */
-function linkedWorkCard(work, extra = "") {
+function workCard(work, opts = {}) {
+  const {
+    showAuthor = false,
+    selecting = false,
+    selectAction = "toggle-select",
+    leading = "",
+    indexPrefix = "",
+    metaExtra = "",
+    series = "local",
+    extra = "",
+  } = opts;
+  const selected = state.selectedWorkIds.has(work.id);
+  const seriesHtml = series === false ? "" : series === "all" ? allWorkSeries(work) : workSeries(work);
+  const corner = selecting
+    ? `<button class="selection-badge ${selected ? "is-selected" : ""}" title="${selected ? "取消选择" : "选择作品"}" data-action="${selectAction}" data-work-id="${work.id}">${selected ? icon("check", 16) : ""}</button>`
+    : `${leading}${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`;
+  const author = showAuthor
+    ? work.authorName
+      ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>`
+      : `<p class="work-author"></p>`
+    : "";
   return `
-    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}
-        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
+    <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${selecting ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
+      <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
         ${workBadges(work)}
         ${workCharacterNames(work)}
-        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
+        ${corner}
       </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}${extra}</div>
+      <div class="work-copy">${author}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${metaExtra}${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${indexPrefix}${escapeHtml(work.title)}</h2>${seriesHtml}${workTags(work)}${extra}</div>
     </article>`;
 }
 
@@ -4567,7 +4577,9 @@ function renderCollectionWorks() {
   const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
   // 分批渲染（v1.3.34）：正文搜索可能把整个夹子都命中
   const shownWorks = works.slice(0, shownCountFor("collectionWorks", works.length));
-  const cards = shownWorks.map((work) => linkedWorkCard(work, bodySearchSnippet(body, work.id))).join("");
+  const cards = shownWorks
+    .map((work) => workCard(work, { showAuthor: true, series: "all", extra: bodySearchSnippet(body, work.id) }))
+    .join("");
   return renderShell(`
     <section class="topbar work-topbar">
       <div class="crumb-heading"><button class="back-button" title="返回收藏夹列表" data-action="back-to-collections">${icon("back", 20)}</button><div><p class="section-kicker">收藏夹</p><h1>${escapeHtml(collection.name)}</h1></div></div>
@@ -4669,23 +4681,15 @@ function watchLaterTimeLabel(value) {
  * 按加入顺序倒序平铺就够清楚。想区分「哪些是自己加的、哪些是打开过的」时，看两页的差别就明白了。
  */
 function renderWatchLater() {
-  // 卡片就是【所有作品】那一套，一个元素都不少（v1.3.37 用户报「没合集图标、没评分」——
-  // 上一版复用的是收藏夹那条 `linkedWorkCard`，它没有 `workCardStars`，而那一块里同时装着
-  // 评分星、已读点和合集徽标，所以看着像是少了两样东西）。
-  // 在这套之上只加两样：封面上的书签（这页里等于「移出」）、标签下面那行加入时间。
-  const cards = state.watchLater.map((entry) => {
-    const work = entry.work;
-    return `
-    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}
-        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
-        ${workBadges(work)}
-        ${workCharacterNames(work)}
-        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
-      </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}<p class="watch-later-added">${watchLaterTimeLabel(entry.addedAt)}加入</p></div>
-    </article>`;
-  }).join("");
+  // 卡片走统一入口，基准是作者作品库那张卡（v1.3.38）；这页只多两样：
+  // 封面上的书签（在这页等于「移出」）、标签下面那行加入时间。
+  const cards = state.watchLater
+    .map((entry) => workCard(entry.work, {
+      showAuthor: true,
+      series: "all",
+      extra: `<p class="watch-later-added">${watchLaterTimeLabel(entry.addedAt)}加入</p>`,
+    }))
+    .join("");
   return renderShell(`
     <section class="topbar work-topbar">
       <div><p class="section-kicker">存着晚点看</p><h1>稍后再看</h1></div>
@@ -4863,16 +4867,13 @@ function bookmarkFetchedLabel() {
 function pixivBookmarkCard(item) {
   if (item.work) {
     const work = item.work;
-    return `
-    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}
-        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
-        ${workBadges(work)}
-        ${workCharacterNames(work)}
-        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
-      </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${item.isMasked ? '<span class="bookmark-flag" title="这篇在 Pixiv 上已经删除或设为非公开了，本地库里还留着这一份。">Pixiv 已删</span>' : ""}${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div><h2 title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}</div>
-    </article>`;
+    return workCard(work, {
+      showAuthor: true,
+      series: "all",
+      metaExtra: item.isMasked
+        ? '<span class="bookmark-flag" title="这篇在 Pixiv 上已经删除或设为非公开了，本地库里还留着这一份。">Pixiv 已删</span>'
+        : "",
+    });
   }
   const cover = item.coverPath
     ? `<img src="${asset(item.coverPath)}" alt="" loading="lazy" onerror="this.closest('.work-cover')?.classList.add('is-missing');this.remove()">`
@@ -4956,16 +4957,16 @@ function renderStray() {
   const body = bodySearchContext(state.workQuery);
   const filtered = strayVisibleWorks();
   const works = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
-  const cards = works.map((work) => `
-    <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.bulkMode ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}
-        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
-        ${workBadges(work)}
-        ${workCharacterNames(work)}
-        ${state.bulkMode ? `<button class="selection-badge ${state.selectedWorkIds.has(work.id) ? "is-selected" : ""}" title="${state.selectedWorkIds.has(work.id) ? "取消选择" : "选择作品"}" data-action="toggle-select" data-work-id="${work.id}">${state.selectedWorkIds.has(work.id) ? icon("check", 16) : ""}</button>` : `<button class="stray-promote-button" data-action="promote-stray-work" data-work-id="${work.id}" data-author-id="${work.authorId}" title="把「${escapeHtml(work.authorName || "这位作者")}」转成正式作者">${icon("star", 14)}<span>散篇转正</span></button>${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`}
-      </div>
-      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}${bodySearchSnippet(body, work.id)}</div>
-    </article>`).join("");
+  // 和其它页只有一处不同：封面按钮组最前面多一个「散篇转正」
+  const cards = works
+    .map((work) => workCard(work, {
+      showAuthor: true,
+      selecting: state.bulkMode,
+      series: "all",
+      leading: `<button class="stray-promote-button" data-action="promote-stray-work" data-work-id="${work.id}" data-author-id="${work.authorId}" title="把「${escapeHtml(work.authorName || "这位作者")}」转成正式作者">${icon("star", 14)}<span>散篇转正</span></button>`,
+      extra: bodySearchSnippet(body, work.id),
+    }))
+    .join("");
   const empty = state.straySummary.workCount
     ? '<div class="empty-state works-empty"><h2>没有匹配的作品</h2></div>'
     : '<div class="empty-state works-empty"><h2>散篇还是空的</h2><p>点右上角「添加散篇」，贴一个作品链接就能把它下进来。</p></div>';
@@ -5578,26 +5579,14 @@ function missingFullCard(work) {
   const value = Number(work.needFullState || 0);
   const mark = (state_, label) => `<button class="chip-button" data-action="mark-missing-full" data-work-id="${work.id}" data-state="${state_}">${label}</button>`;
   const marked = missingFullMarked(work.needFullMarkedAt);
-  // 批量标记模式下右下角让给勾选框（和作者作品库那套 selection-badge 用同一个样式）
-  const selected = state.selectedWorkIds.has(work.id);
-  const corner = state.missingFullBulk
-    ? `<button class="selection-badge ${selected ? "is-selected" : ""}" title="${selected ? "取消选择" : "选择作品"}" data-action="missing-toggle-select" data-work-id="${work.id}">${selected ? icon("check", 16) : ""}</button>`
-    : `${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}`;
-  return `
-    <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"} ${state.missingFullBulk ? "is-selecting" : ""}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}
-        ${workBadges(work)}
-        ${workCharacterNames(work)}
-        ${corner}
-      </div>
-      <div class="work-copy">
-        <button class="work-author is-link" title="打开「${escapeHtml(work.authorName || "")}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName || "")}</button>
-        <div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}${workReadDot(work)}${workRatingMark(work)}</div>
-        <h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>
-        ${workSeries(work)}${workTags(work)}
-        <div class="missing-mark"><span class="missing-state">${missingFullStateLabel(work)}</span>${marked ? `<span class="missing-time" title="${escapeHtml(marked.absolute)}">${escapeHtml(marked.label)}处理</span>` : ""}${value === 0 ? `${mark(1, "已找过·没有")}${mark(2, "不打算补")}` : `<button class="chip-button" data-action="mark-missing-full" data-work-id="${work.id}" data-state="0">恢复未处理</button>`}</div>
-      </div>
-    </article>`;
+  // 「标记」那一行挂在标签下面；批量标记模式下封面右下角换成勾选框（同一套 selection-badge）
+  const markRow = `<div class="missing-mark"><span class="missing-state">${missingFullStateLabel(work)}</span>${marked ? `<span class="missing-time" title="${escapeHtml(marked.absolute)}">${escapeHtml(marked.label)}处理</span>` : ""}${value === 0 ? `${mark(1, "已找过·没有")}${mark(2, "不打算补")}` : `<button class="chip-button" data-action="mark-missing-full" data-work-id="${work.id}" data-state="0">恢复未处理</button>`}</div>`;
+  return workCard(work, {
+    showAuthor: true,
+    selecting: state.missingFullBulk,
+    selectAction: "missing-toggle-select",
+    extra: markRow,
+  });
 }
 
 /**
@@ -5639,15 +5628,10 @@ function missingBulkBar(works) {
 }
 
 function renderSeriesWorkCards(works) {
-  return works.map((work, index) => `
-    <article class="work-card ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
-      <div class="work-cover">${workCover(work)}${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
-        ${workBadges(work)}
-        ${workCharacterNames(work)}
-        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
-      </div>
-      <div class="work-copy"><div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}"><span class="work-index">${work.seriesOrder || index + 1}.</span>${escapeHtml(work.title)}</h2>${workSeries(work)}${workTags(work)}</div>
-    </article>`).join("");
+  // 系列视图和其它页的差别只有标题前那个序号
+  return works
+    .map((work, index) => workCard(work, { indexPrefix: `<span class="work-index">${work.seriesOrder || index + 1}.</span>` }))
+    .join("");
 }
 
 /**
