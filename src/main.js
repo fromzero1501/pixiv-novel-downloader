@@ -4669,12 +4669,23 @@ function watchLaterTimeLabel(value) {
  * 按加入顺序倒序平铺就够清楚。想区分「哪些是自己加的、哪些是打开过的」时，看两页的差别就明白了。
  */
 function renderWatchLater() {
-  // 卡片样式和【所有作品】同一套（v1.3.36 用户要求）：封面 / 作者 / 日期 / 字数 / 标签都复用
-  // `linkedWorkCard`，只在标签下面多挂一行「什么时候加进来的」。
-  // 卡上那个书签按钮在这页等于「移出」—— 它本来就有 `toggle-watch-later` 的语义。
-  const cards = state.watchLater
-    .map((entry) => linkedWorkCard(entry.work, `<p class="watch-later-added">${watchLaterTimeLabel(entry.addedAt)}加入</p>`))
-    .join("");
+  // 卡片就是【所有作品】那一套，一个元素都不少（v1.3.37 用户报「没合集图标、没评分」——
+  // 上一版复用的是收藏夹那条 `linkedWorkCard`，它没有 `workCardStars`，而那一块里同时装着
+  // 评分星、已读点和合集徽标，所以看着像是少了两样东西）。
+  // 在这套之上只加两样：封面上的书签（这页里等于「移出」）、标签下面那行加入时间。
+  const cards = state.watchLater.map((entry) => {
+    const work = entry.work;
+    return `
+    <article class="work-card is-read-only ${work.purchasedPath ? "is-purchased" : "is-unpurchased"}" data-work-id="${work.id}" tabindex="0">
+      <div class="work-cover">${workCover(work)}
+        ${work.isNew ? '<span class="new-badge">NEW</span>' : ""}
+        ${workBadges(work)}
+        ${workCharacterNames(work)}
+        ${workWatchLaterButton(work)}${workReadToggle(work)}${workMenuButton(work)}
+      </div>
+      <div class="work-copy">${work.authorName ? `<button class="work-author is-link" title="打开「${escapeHtml(work.authorName)}」的作品库" data-action="open-author" data-author-id="${work.authorId}">${escapeHtml(work.authorName)}</button>` : `<p class="work-author"></p>`}<div class="work-meta"><p class="work-date">${dateLabel(work.releaseDate)}</p>${workContentMeta(work)}</div>${workCardStars(work)}<h2 class="work-open" title="${escapeHtml(work.title)}">${escapeHtml(work.title)}</h2>${allWorkSeries(work)}${workTags(work)}<p class="watch-later-added">${watchLaterTimeLabel(entry.addedAt)}加入</p></div>
+    </article>`;
+  }).join("");
   return renderShell(`
     <section class="topbar work-topbar">
       <div><p class="section-kicker">存着晚点看</p><h1>稍后再看</h1></div>
