@@ -1974,6 +1974,45 @@ fn author_folder_name(name: &str, aliases: &str) -> String {
     folder
 }
 
+/// 给某位作者挑一个能用的目录（v1.3.36）。
+///
+/// 判据从「目录存在就算冲突」改成「**目录被别的作者记录占着**才算冲突」：
+/// 目录本来就是按作者名造的，它存在多半是这位作者自己的（散篇时期建的、删过作者留下的、
+/// 或者用户手工放好文件等着导入）。旧规则直接失败，而自动建作者那条路又把错误吞了 ——
+/// 结果作者建出来了、目录字段空着，同步按钮永远是灰的（用户 2026-10-22 报的那位作者）。
+///
+/// 真撞车（同名作者，且那条记录正指着这个目录）时退一步，目录名后加 `-<作者id>`：
+/// 目的只有一个 —— 每位作者都得有个自己的目录，不能留成空壳。
+fn author_dir_available(
+    conn: &Connection,
+    author_id: i64,
+    base: &Path,
+    folder: &str,
+) -> Result<PathBuf, String> {
+    let taken = |path: &Path| -> Result<bool, String> {
+        let value = path.to_string_lossy().to_string();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM authors WHERE id <> ?1 AND (preview_dir = ?2 OR purchased_dir = ?2)",
+                params![author_id, value],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(count > 0)
+    };
+    let primary = base.join(folder);
+    if !primary.exists() || !taken(&primary)? {
+        return Ok(primary);
+    }
+    let fallback = base.join(format!("{folder}-{author_id}"));
+    if !fallback.exists() || !taken(&fallback)? {
+        return Ok(fallback);
+    }
+    Err(format!(
+        "「{folder}」这个目录已经被别的作者占着，没法给这位作者分配目录。给这位作者加个别名或改个名字再保存。"
+    ))
+}
+
 fn apply_default_dirs(conn: &Connection, author_id: i64) -> Result<(), String> {
     // v1.2.54：「自动创建作者目录」的开关撤了，行为**恒为自动创建**；
     // 作者弹窗里那两个目录输入也撤了，目录名一律按「作者名(别名…)」生成。
@@ -1986,25 +2025,18 @@ fn apply_default_dirs(conn: &Connection, author_id: i64) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     let folder = author_folder_name(&name, &aliases);
-    let clash = format!(
-        "「{folder}」这个目录已经存在（多半是别的作者占着）。给这位作者再加个别名、或者改个名字，让目录名不撞车，然后再保存一次。"
-    );
 
     let mut preview_dir = preview;
     if preview_dir.trim().is_empty() && !settings.default_preview_dir.trim().is_empty() {
-        let path = PathBuf::from(&settings.default_preview_dir).join(&folder);
-        if path.exists() {
-            return Err(clash);
-        }
+        let base = PathBuf::from(&settings.default_preview_dir);
+        let path = author_dir_available(conn, author_id, &base, &folder)?;
         fs::create_dir_all(&path).map_err(|e| e.to_string())?;
         preview_dir = path.to_string_lossy().to_string();
     }
     let mut purchased_dir = purchased;
     if purchased_dir.trim().is_empty() && !settings.default_purchased_dir.trim().is_empty() {
-        let path = PathBuf::from(&settings.default_purchased_dir).join(&folder);
-        if path.exists() {
-            return Err(clash);
-        }
+        let base = PathBuf::from(&settings.default_purchased_dir);
+        let path = author_dir_available(conn, author_id, &base, &folder)?;
         fs::create_dir_all(&path).map_err(|e| e.to_string())?;
         purchased_dir = path.to_string_lossy().to_string();
     }
@@ -2422,15 +2454,22 @@ fn save_author(author: AuthorInput) -> Result<AuthorSummary, String> {
             return Err(format!("作者主页已存在，名称为“{name}”"));
         }
     }
+    // 整段包一个事务（v1.3.36）：旧写法先写库、再算目录，算目录失败时库里已经多出一条
+    // 目录空的作者记录 —— 用户看到"报错了"，作者却留在列表里、同步按钮永远是灰的。
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let id = if let Some(id) = author.id {
-        conn.execute("UPDATE authors SET name=?1, homepage=?2, avatar_path=?3, avatar_managed=?4, notes=?5, preview_dir=?6, purchased_dir=?7, aliases=?8 WHERE id=?9", params![author.name.trim(), homepage, author.avatar_path, author.avatar_managed as i64, author.notes, author.preview_dir, author.purchased_dir, aliases, id]).map_err(|e| e.to_string())?;
+        // 传空串表示「这次别动这个字段」（v1.3.36）：作者表单里没有目录输入，前端一律传空，
+        // 旧写法会拿空串盖掉已有绑定 —— 改个备注就把目录丢了，同步按钮随即变灰。
+        tx.execute("UPDATE authors SET name=?1, homepage=?2, avatar_path=?3, avatar_managed=?4, notes=?5, preview_dir=CASE WHEN ?6='' THEN preview_dir ELSE ?6 END, purchased_dir=CASE WHEN ?7='' THEN purchased_dir ELSE ?7 END, aliases=?8 WHERE id=?9", params![author.name.trim(), homepage, author.avatar_path, author.avatar_managed as i64, author.notes, author.preview_dir, author.purchased_dir, aliases, id]).map_err(|e| e.to_string())?;
         id
     } else {
-        conn.execute("INSERT INTO authors (name, homepage, avatar_path, avatar_managed, notes, preview_dir, purchased_dir, aliases) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![author.name.trim(), homepage, author.avatar_path, author.avatar_managed as i64, author.notes, author.preview_dir, author.purchased_dir, aliases]).map_err(|e| e.to_string())?;
-        conn.last_insert_rowid()
+        tx.execute("INSERT INTO authors (name, homepage, avatar_path, avatar_managed, notes, preview_dir, purchased_dir, aliases) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![author.name.trim(), homepage, author.avatar_path, author.avatar_managed as i64, author.notes, author.preview_dir, author.purchased_dir, aliases]).map_err(|e| e.to_string())?;
+        tx.last_insert_rowid()
     };
-    apply_default_dirs(&conn, id)?;
-    read_author(&conn, id)
+    apply_default_dirs(&tx, id)?;
+    let saved = read_author(&tx, id)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -8612,7 +8651,10 @@ fn rename_author_dirs(
     old_purchased: &str,
 ) -> Result<(), String> {
     let folder = author_folder_name(new_name, aliases);
-    let mut pairs: Vec<(String, String, &str)> = vec![];
+    // 两阶段（v1.3.36）：先把目标全部算好、全部校验通过，再动磁盘。
+    // 旧写法边校验边改名 —— 预览版改完了、已购版撞车才 return Err，磁盘已经改了、库还停在旧路径，
+    // 用户看到的后果就是"目录名对不上库"，而且之后怎么保存都自愈不了。
+    let mut planned: Vec<(PathBuf, PathBuf, &str)> = vec![];
     for (old_dir, column) in [(old_preview, "preview_path"), (old_purchased, "purchased_path")] {
         let old = old_dir.trim();
         if old.is_empty() {
@@ -8631,8 +8673,16 @@ fn rename_author_dirs(
                 "「{folder}」这个名字的目录已经存在（多半是别的作者占着），没有自动改目录：{old}"
             ));
         }
-        fs::rename(old_path, &target).map_err(|e| format!("目录改名失败：{e}"))?;
-        pairs.push((target.to_string_lossy().to_string(), old.to_string(), column));
+        planned.push((old_path.to_path_buf(), target, column));
+    }
+    let mut pairs: Vec<(String, String, &str)> = vec![];
+    for (old_path, target, column) in planned {
+        fs::rename(&old_path, &target).map_err(|e| format!("目录改名失败：{e}"))?;
+        pairs.push((
+            target.to_string_lossy().to_string(),
+            old_path.to_string_lossy().to_string(),
+            column,
+        ));
     }
 
     for (new_dir, old_dir, column) in pairs {
@@ -8785,6 +8835,10 @@ fn sync_pixiv_author_profile_impl(
         }
     }
     if let Some(id) = resolved_author_id {
+        // 目录空着就顺手补上（v1.3.36）：散篇转正的作者走的就是这条「同步资料」的路，
+        // 而旧版本自动建目录失败时错误被吞了 —— 作者留下个空目录，同步按钮永远是灰的。
+        // 失败不拦着改名 / 头像同步（真撞车时保存那一步会明确报错）。
+        let _ = apply_default_dirs(&conn, id);
         let author = read_author(&conn, id)?;
         return Ok(PixivAuthorProfile {
             id: Some(author.id),
@@ -19012,6 +19066,7 @@ mod tests {
         binding_target_path, mark_has_images_if_illustrated, move_path_overwriting,
         shared_file_info, set_work_author_impl,
         export_works_package_impl, import_works_package_impl, SharePackageManifest, author_folder_name,
+        author_dir_available,
         move_sibling_assets_along,
         base64_encode, image_mime_of, image_data_uri,
         discard_sync_intermediates, anthology_epub_parts, replace_img_tags_with_markers,
@@ -19149,6 +19204,56 @@ mod tests {
         apply_author_status(&conn, 1, "retired");
         apply_author_status(&conn, 1, "unreachable");
         assert!(!missing(&conn).is_empty(), "连不上时已有标记要保持原样");
+    }
+
+    /// 作者目录怎么挑（v1.3.36）：**目录存在、但没有别的作者记录指着它** → 直接采用它。
+    ///
+    /// 这条是这次修复的核心。旧规则只要目录存在就报「多半是别的作者占着」，
+    /// 而目录本来就是按作者名造的，存在往往正是这位作者自己的（散篇时期建的、
+    /// 删过作者留下的、手工放了文件等着导入的）—— 于是建作者失败、目录字段空着，
+    /// 同步按钮永远是灰的。只有真被别人占着才该换名字。
+    #[test]
+    fn author_dir_is_reused_when_nobody_else_owns_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE authors (
+                 id INTEGER PRIMARY KEY,
+                 preview_dir TEXT NOT NULL DEFAULT '',
+                 purchased_dir TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO authors (id) VALUES (1), (2);",
+        )
+        .unwrap();
+        let base = std::env::temp_dir().join(format!("dirpick-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("甲")).unwrap();
+        fs::create_dir_all(base.join("甲-1")).unwrap();
+
+        // 目录在、库里没人认领 → 采用它
+        let picked = author_dir_available(&conn, 1, &base, "甲").unwrap();
+        assert_eq!(picked, base.join("甲"), "没人占的目录该直接采用，不该报冲突");
+
+        // 2 号作者的预览目录正是它 → 换带 id 的那个
+        conn.execute(
+            "UPDATE authors SET preview_dir=?1 WHERE id=2",
+            [base.join("甲").to_string_lossy().to_string()],
+        )
+        .unwrap();
+        let picked = author_dir_available(&conn, 1, &base, "甲").unwrap();
+        assert_eq!(picked, base.join("甲-1"), "被别的作者占着时该退到带自己 id 的目录");
+
+        // 自己指着它不算冲突（重新保存同一位作者必须还能落在原地）
+        conn.execute(
+            "UPDATE authors SET preview_dir=?1 WHERE id=1",
+            [base.join("甲").to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute("UPDATE authors SET preview_dir='' WHERE id=2", [])
+            .unwrap();
+        let picked = author_dir_available(&conn, 1, &base, "甲").unwrap();
+        assert_eq!(picked, base.join("甲"), "自己占着自己用，不该被挤走");
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// 作者主页里解析不出 uid：不发请求、也不动库里的标记。

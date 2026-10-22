@@ -4664,20 +4664,17 @@ function watchLaterTimeLabel(value) {
 }
 
 /**
- * 「稍后再看」清单。骨架和浏览历史一样（顶栏 + 搜索 + 列表），但**不按天分组** ——
- * 历史那边分的是「什么时候看的」，这里只有一个加入时间，按加入顺序倒序平铺就够清楚。
- * 想区分「哪些是自己加的、哪些是打开过的」时，看两页的差别就明白了。
+ * 「稍后再看」清单。顶栏 + 搜索 + 作品卡网格（v1.3.36 起和【所有作品】同一套卡片），
+ * **不按天分组** —— 历史那边分的是「什么时候看的」，这里只有一个加入时间，
+ * 按加入顺序倒序平铺就够清楚。想区分「哪些是自己加的、哪些是打开过的」时，看两页的差别就明白了。
  */
 function renderWatchLater() {
-  const items = state.watchLater.map((entry) => `
-    <article class="history-item" data-work-id="${entry.work.id}">
-      <button class="history-thumb" data-action="open-history-work" data-work-id="${entry.work.id}" title="打开《${escapeHtml(entry.work.title)}》">${entry.work.coverPath ? `<img src="${asset(entry.work.coverPath)}" alt="" loading="lazy" onerror="this.remove()">` : `<span>${icon("image", 20)}</span>`}</button>
-      <div class="history-copy">
-        <button class="history-title" data-action="open-history-work" data-work-id="${entry.work.id}" title="${escapeHtml(entry.work.title)}">${escapeHtml(entry.work.title)}</button>
-        <p class="history-meta">${entry.work.authorName ? `<button class="history-author" data-action="open-author" data-author-id="${entry.work.authorId}">${escapeHtml(entry.work.authorName)}</button>` : ""}<span>${watchLaterTimeLabel(entry.addedAt)}加入</span><span class="history-state ${entry.work.purchasedPath ? "is-full" : "is-preview"}">${entry.work.purchasedPath ? "完整版" : "预览版"}</span></p>
-      </div>
-      <button class="history-remove" title="移出稍后再看" data-action="remove-watch-later" data-work-id="${entry.work.id}">${icon("x", 16)}</button>
-    </article>`).join("");
+  // 卡片样式和【所有作品】同一套（v1.3.36 用户要求）：封面 / 作者 / 日期 / 字数 / 标签都复用
+  // `linkedWorkCard`，只在标签下面多挂一行「什么时候加进来的」。
+  // 卡上那个书签按钮在这页等于「移出」—— 它本来就有 `toggle-watch-later` 的语义。
+  const cards = state.watchLater
+    .map((entry) => linkedWorkCard(entry.work, `<p class="watch-later-added">${watchLaterTimeLabel(entry.addedAt)}加入</p>`))
+    .join("");
   return renderShell(`
     <section class="topbar work-topbar">
       <div><p class="section-kicker">存着晚点看</p><h1>稍后再看</h1></div>
@@ -4689,7 +4686,7 @@ function renderWatchLater() {
         ${characterNameToggle()}
       </div>
       <div class="read-only-note">在作品封面上点左下角的书签按钮就能加进来，按加入时间倒序排。它和「浏览历史」是两回事 —— 历史是打开过就自动记一笔，这里是你主动标了想晚点看。</div>
-      ${items || `<div class="empty-state works-empty"><h2>${state.watchLaterQuery ? "没有匹配的作品" : "还没有要稍后再看的作品"}</h2><p>鼠标移到作品封面上，点左下角的书签按钮就收进来。</p></div>`}
+      <div class="works-grid">${cards || `<div class="empty-state works-empty"><h2>${state.watchLaterQuery ? "没有匹配的作品" : "还没有要稍后再看的作品"}</h2><p>鼠标移到作品封面上，点左下角的书签按钮就收进来。</p></div>`}</div>
     </section>`);
 }
 
@@ -7441,10 +7438,14 @@ async function bindEvents() {
             console.log("自动重定位跳过:", error);
           }
         }
-        if (isNewAuthor) await moveAuthorsToEnd([saved.id]);
-        await refreshAuthors();
+        // 先把弹窗关掉、界面放开（v1.3.36 用户要求）：挪到最后和重拉作者列表都是全量 IPC
+        // （143 位作者连作品计数一起重查），排在关窗前面就是「点确认后弹窗卡几秒」。
         if (state.activeAuthor?.id === saved.id) state.activeAuthor = saved;
         closeModal();
+        render();
+        if (isNewAuthor) await moveAuthorsToEnd([saved.id]);
+        await refreshAuthors();
+        // refreshAuthors 之后目录字段才是最新的（自动建目录就发生在保存里），补一次重画
         render();
         // 设置里开了「新建作者时同步其所有作品」→ 新建完直接补一次整库同步
         if (isNewAuthor && (state.settings || {}).syncWorksOnNewAuthor) await syncAuthorsAfterCreate([saved.id]);

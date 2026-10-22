@@ -845,6 +845,7 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .watch-later-toggle:hover { color: #1b65bf; background: #fff; border-color: #a7c9ef; }
 .watch-later-toggle.is-added { opacity: 1; color: #fff; background: #2674d7; border-color: #2674d7; }
 .watch-later-toggle.is-added:hover { background: #1f66bd; border-color: #1f66bd; }
+.watch-later-added { margin: 6px 0 0; color: #7b8ea3; font-size: 12px; }
 .is-selecting .watch-later-toggle { display: none; }
 
 /* 系列缺篇提示。顶栏一个胶囊、总览卡片上一行小字，两处共用同一套配色 */
