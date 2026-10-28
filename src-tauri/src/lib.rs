@@ -10,8 +10,8 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter};
 
@@ -556,6 +556,28 @@ struct SyncPreviewEntry {
     path: PathBuf,
     name: String,
     is_preview: bool,
+}
+
+/// 批量同步第二段按「一篇一个任务」并发抓取时，同一作者的目录扫描会被反复调用。
+/// 扫描要读一遍预览版目录、还可能给每个 txt 数字数，不能每篇都扫。缓存 10 分钟，
+/// 批量开始前由前端清一次（`clear_pixiv_preview_cache`）。
+static SYNC_PREVIEW_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Arc<Vec<SyncPreviewEntry>>)>>> = OnceLock::new();
+
+fn cached_sync_preview_entries(dir: &Path, minimum_text_count: u64) -> Result<Arc<Vec<SyncPreviewEntry>>, String> {
+    let key = format!("{}|{}", dir.display(), minimum_text_count);
+    let cache = SYNC_PREVIEW_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some((stamp, entries)) = guard.get(&key) {
+            if stamp.elapsed() < Duration::from_secs(600) {
+                return Ok(entries.clone());
+            }
+        }
+        // 持锁扫描：并发任务同时打到同一作者时只扫一次，其余等这一趟。
+        let entries = Arc::new(sync_preview_entries(dir, minimum_text_count)?);
+        guard.insert(key, (Instant::now(), entries.clone()));
+        return Ok(entries);
+    }
+    Ok(Arc::new(sync_preview_entries(dir, minimum_text_count)?))
 }
 
 #[derive(Serialize)]
@@ -7447,8 +7469,13 @@ fn pixiv_sync_impl(
     scan_only: bool,
     candidates_override: Option<Vec<String>>,
     fetch_mode: Option<String>,
+    max_concurrency: Option<usize>,
+    reset_cancel: bool,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
+    if reset_cancel {
+        clear_pixiv_sync_cancel(author_id);
+    }
     let conn = db()?;
     let delay_threshold = setting(&conn, "pixiv_delay_threshold")?
         .parse::<usize>()
@@ -7488,10 +7515,13 @@ fn pixiv_sync_impl(
     // 读的是改名前的旧键 `minimum_file_size_bytes`，新设置管不到同步 —— 用户报「同步时突破了字数限制」）。
     let minimum_text_count = setting(&conn, "minimum_text_count")?.parse::<u64>().unwrap_or(0);
     // 只盘点（两段式第一段）不落盘、用不到「复用本地文件」的匹配表，跳过这趟目录扫描
-    let preview_entries = if scan_only {
-        Vec::new()
+    let single_candidate = candidates_override.as_ref().map(|items| items.len() == 1).unwrap_or(false);
+    let preview_entries: Arc<Vec<SyncPreviewEntry>> = if scan_only {
+        Arc::new(Vec::new())
+    } else if single_candidate {
+        cached_sync_preview_entries(&preview_dir, minimum_text_count)?
     } else {
-        sync_preview_entries(&preview_dir, minimum_text_count)?
+        Arc::new(sync_preview_entries(&preview_dir, minimum_text_count)?)
     };
     let single_novel_id = pixiv_novel_id_from_url(&novel_url)?;
     let is_single_sync = single_novel_id.is_some();
@@ -7742,6 +7772,9 @@ fn pixiv_sync_impl(
         }
     };
     let use_request_delay = took_sequential && delay_seconds > 0;
+    // 前端「固定 6 路」的全局作品队列：一次只带一篇候选、maxConcurrency=1，
+    // 这样六路任务各自抓一篇，总数由前端队列控制；单作者同步不传，仍是 6。
+    let detail_concurrency = max_concurrency.unwrap_or(6).clamp(1, 12);
     let mut details = Vec::with_capacity(candidates.len());
     // 连续失败退避：和「补抓简介」同一套思路（那边早就有了，同步这条一直缺）。
     // 没有它的时候，撞上风控会一路错到底 —— 用户看到的就是整片失败。
@@ -7827,8 +7860,7 @@ fn pixiv_sync_impl(
             );
         }
     } else {
-        const DETAIL_CONCURRENCY: usize = 6;
-        for (batch_index, batch) in candidates.chunks(DETAIL_CONCURRENCY).enumerate() {
+        for (batch_index, batch) in candidates.chunks(detail_concurrency).enumerate() {
             if pixiv_sync_cancelled(author_id) {
                 result.cancelled = true;
                 break;
@@ -7886,7 +7918,7 @@ fn pixiv_sync_impl(
                     break;
                 }
                 current_delay = throttled_delay_seconds(current_delay).min(SYNC_MAX_DELAY_SECONDS);
-                let current = ((batch_index + 1) * DETAIL_CONCURRENCY).min(candidates.len());
+                let current = ((batch_index + 1) * detail_concurrency).min(candidates.len());
                 let _ = app.emit(
                     "pixiv-sync-progress",
                     PixivSyncProgress {
@@ -7916,7 +7948,7 @@ fn pixiv_sync_impl(
                 result.throttled = true;
                 break;
             }
-            let current = ((batch_index + 1) * DETAIL_CONCURRENCY).min(candidates.len());
+            let current = ((batch_index + 1) * detail_concurrency).min(candidates.len());
             let _ = app.emit(
                 "pixiv-sync-progress",
                 PixivSyncProgress {
@@ -8089,9 +8121,9 @@ fn pixiv_sync_impl(
             text_count: body.get("textCount").and_then(Value::as_i64).unwrap_or(-1),
         });
     }
-    const COVER_CONCURRENCY: usize = 4;
+    let cover_concurrency = if detail_concurrency == 1 { 1 } else { 4 };
     let download_total = downloads.len();
-    for (batch_index, batch) in downloads.chunks(COVER_CONCURRENCY).enumerate() {
+    for (batch_index, batch) in downloads.chunks(cover_concurrency).enumerate() {
         if pixiv_sync_cancelled(author_id) {
             result.cancelled = true;
             break;
@@ -8231,7 +8263,7 @@ fn pixiv_sync_impl(
         }
             result.downloaded_count += 1;
         }
-        let current = ((batch_index + 1) * COVER_CONCURRENCY).min(download_total);
+        let current = ((batch_index + 1) * cover_concurrency).min(download_total);
         let _ = app.emit(
             "pixiv-sync-progress",
             PixivSyncProgress {
@@ -8347,9 +8379,14 @@ async fn sync_pixiv_novels(
     scan_only: Option<bool>,
     candidates: Option<Vec<String>>,
     fetch_mode: Option<String>,
+    max_concurrency: Option<usize>,
+    reset_cancel: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<PixivSyncResult, String> {
-    clear_pixiv_sync_cancel(author_id);
+    let reset_cancel = reset_cancel.unwrap_or(true);
+    if reset_cancel {
+        clear_pixiv_sync_cancel(author_id);
+    }
     // 累计游标的键：**单作者同步 / 点名下载**不传 batch_key，退回按 author_id 记，各自独立。
     // （v1.3.15 起「同步所有作者」不再走游标：前端盘点完汇总总数后一次定档，
     // 通过 fetch_mode 传进来；游标那套只留给没带 fetch_mode 的入口。）
@@ -8367,12 +8404,16 @@ async fn sync_pixiv_novels(
             scan_only,
             candidates,
             fetch_mode,
+            max_concurrency,
+            reset_cancel,
             app,
         )
     })
     .await
     .map_err(|e| e.to_string())?;
-    clear_pixiv_sync_cancel(author_id);
+    if reset_cancel {
+        clear_pixiv_sync_cancel(author_id);
+    }
     result
 }
 
@@ -8380,6 +8421,15 @@ async fn sync_pixiv_novels(
 #[tauri::command]
 fn reset_pixiv_sync_batch_cursor(batch_key: i64) {
     reset_pixiv_sync_batch(batch_key);
+}
+
+#[tauri::command]
+fn clear_pixiv_preview_cache() {
+    if let Some(cache) = SYNC_PREVIEW_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.clear();
+        }
+    }
 }
 
 #[tauri::command]
@@ -10077,7 +10127,7 @@ fn download_bookmark_novel_impl(
     drop(conn);
     let url = format!("https://www.pixiv.net/novel/show.php?id={novel_id}");
     // 「点名下载」只有一篇，不需要调流；游标键沿用作者 id 就行（不会被读）
-    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, author_id, false, None, None, app.clone())?;
+    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, author_id, false, None, None, None, true, app.clone())?;
     if result.downloaded_count == 0 {
         if result.throttled {
             return Err("被 Pixiv 限流了，停一会儿再试".into());
@@ -19433,6 +19483,7 @@ pub fn run() {
             read_import_file,
             read_import_folder,
             sync_pixiv_novels,
+            clear_pixiv_preview_cache,
             check_pixiv_author,
             cancel_pixiv_sync,
             // v1.2.95：批量同步的跨作者抓取累计游标（节流判断按整轮算）

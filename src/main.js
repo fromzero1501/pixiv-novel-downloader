@@ -1290,6 +1290,7 @@ async function invoke(command, args = {}) {
   if (command === "reset_pixiv_sync_batch_cursor") return undefined;
   // v1.3.15：两段式并行时「终止同步」会给多位在跑的作者发取消；预览里没有真任务，安静收下即可
   if (command === "cancel_pixiv_sync") return undefined;
+  if (command === "clear_pixiv_preview_cache") return true;
   if (command === "open_work") { const work = previewWorks.find((item) => item.id === args.workId); if (work) { work.isNew = false; if (work.readState === 0) work.readState = 1; } return; }
   if (command === "open_external_url") { window.open(args.url, "_blank", "noopener,noreferrer"); return; }
   // 系统对话框（v1.3.18）：真机走真对话框；预览里没有，读验证脚本塞进来的假路径
@@ -2173,14 +2174,13 @@ function syncBallParts(task) {
   let ratio;
   let tip;
   if (task.authors) {
-    // 两段式（v1.3.15）：盘点段把「已盘点」记进度，抓取段把「已收尾 + 在跑的零头」记进度；
-    // 两段各占半程（除 2×N），并行时多位在跑也一起算，进度只增不回跳。
-    const settled = task.authors.filter(syncRowSettled).length;
-    const scanned = task.authors.filter((item) => item.status !== "pending" && item.status !== "checking").length;
-    const active = task.authors.filter((item) => item.status === "running" || item.status === "checking");
-    const activeRatio = active.reduce((sum, item) => sum + (item.total > 0 ? Math.min(item.current / item.total, 1) : 0), 0);
-    ratio = task.authors.length ? (scanned + settled + activeRatio) / (2 * task.authors.length) : 0;
-    tip = [task.label || "处理中", task.phase === "fetch" ? `已完成 ${settled} / ${task.authors.length} 位作者` : `已盘点 ${scanned} / ${task.authors.length} 位作者`].join(" · ");
+    // v1.3.42：盘点段只按作者数，抓取段只按作品数 —— 两段各自是一条干净的进度，
+    // 不再把「作者收尾 + 篇数零头」混进同一个分母里。
+    const isFetch = task.phase === "fetch";
+    const current = isFetch ? (task.fetchDone || 0) : (task.scanDone || 0);
+    const total = isFetch ? (task.fetchTotal || 0) : (task.scanTotal || task.authors.length || 0);
+    ratio = total > 0 ? Math.min(current / total, 1) : 0;
+    tip = [task.label || "处理中", isFetch ? `已抓取 ${current} / ${total} 篇` : `已盘点 ${current} / ${total} 位作者`].join(" · ");
   } else {
     ratio = total > 0 ? current / total : 0;
     tip = [task.label || "处理中", total > 0 ? `${current}/${total}` : "", task.title || ""]
@@ -2219,16 +2219,9 @@ function advanceStageSpin(task, box) {
   let units;
   let phaseKey;
   if (task.authors) {
-    // 按作者分行的任务（含「新增作者自动同步」「转正自动同步」这种只有一行的）：
-    // 已盘点 / 已收尾的作者按它的篇数算满、正在跑的按已处理篇数算 —— 一格 = 一篇。
-    // 并行时可能同时有好几位在跑/在盘点（v1.3.15），一起算。
-    const active = task.authors.filter((item) => item.status === "running" || item.status === "checking");
-    units = task.authors.reduce((sum, item) => {
-      if (active.includes(item)) return sum + Math.max(0, Number(item.current) || 0);
-      const counted = syncRowSettled(item) || item.status === "scanned";
-      return sum + (counted ? Math.max(Number(item.total) || 0, 1) : 0);
-    }, 0);
-    phaseKey = String(active.map((item) => item.title).join("") || task.phase || "").replace(/\d+/g, "#");
+    // 盘点一格 = 一位作者，抓取一格 = 一篇作品。
+    units = task.phase === "fetch" ? (task.fetchDone || 0) : (task.scanDone || 0);
+    phaseKey = task.phase || "";
   } else {
     units = Math.floor(Math.max(0, Number(task.current) || 0));
     phaseKey = String(task.title || "").replace(/\d+/g, "#");
@@ -2315,29 +2308,42 @@ function failureReasonText(reasons, failedCount) {
   return list.length > 3 ? `${shown} 等 ${list.length} 条` : shown;
 }
 
+function syncActiveAdd(task, name) {
+  if (!task.activeCounts) task.activeCounts = {};
+  task.activeCounts[name] = (task.activeCounts[name] || 0) + 1;
+}
+
+function syncActiveRemove(task, name) {
+  if (!task.activeCounts) return;
+  const left = (task.activeCounts[name] || 0) - 1;
+  if (left > 0) task.activeCounts[name] = left;
+  else delete task.activeCounts[name];
+}
+
+function syncActiveText(task) {
+  const names = Object.keys(task.activeCounts || {});
+  const head = task.phase === "fetch" ? "正在抓取" : "正在盘点";
+  if (!names.length) return task.phase === "fetch" ? "准备开始抓取…" : "等待开始盘点…";
+  return `${head}：${names.slice(0, 4).join("、")}${names.length > 4 ? " 等" : ""}`;
+}
+
 function batchSyncFloater(task) {
-  const rows = task.authors.map((item) => {
-    const { value, max } = syncRowProgress(item);
-    return `<div class="sync-floater-row is-${item.status}" data-sync-author-id="${item.authorId}">
-      <div class="sync-floater-row-head">
-        <span class="sync-row-name" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
-        <span class="sync-row-count" data-sync-count>${syncCountText(item)}</span>
-      </div>
-      <progress data-sync-bar value="${value}" max="${max}"></progress>
-      <p class="sync-row-title" data-sync-title title="${escapeHtml(syncRowStatusText(item))}">${escapeHtml(syncRowStatusText(item))}</p>
-    </div>`;
-  }).join("");
-  const finished = task.authors.filter(syncRowSettled).length;
-  const scanned = task.authors.filter((item) => item.status !== "pending" && item.status !== "checking").length;
+  const isFetch = task.phase === "fetch";
+  const current = isFetch ? (task.fetchDone || 0) : (task.scanDone || 0);
+  const total = isFetch ? (task.fetchTotal || 0) : (task.scanTotal || task.authors.length || 0);
+  const max = Math.max(total, 1);
   return `<div class="sync-floater is-batch" id="sync-floater">
     <div class="sync-floater-head">
       <strong>${icon("sync", 16)}<span id="sync-progress-label">${escapeHtml(task.label)}</span></strong>
-      <span class="sync-floater-count" id="sync-progress-count">${task.phase === "fetch" ? finished : scanned} / ${task.authors.length}</span>
+      <span class="sync-floater-count" id="sync-progress-count">${current} / ${total}</span>
       <button class="sync-floater-fold" data-action="toggle-sync-floater">收起</button>
     </div>
-    <div class="sync-floater-rows">${rows}</div>
+    <div class="sync-floater-rows">
+      <progress id="sync-progress-bar" value="${Math.min(current, max)}" max="${max}"></progress>
+      <p class="sync-row-title" id="sync-progress-title" title="${escapeHtml(syncActiveText(task))}">${escapeHtml(syncActiveText(task))}</p>
+    </div>
     <div class="sync-floater-foot">
-      <p id="sync-progress-title">${task.phase === "fetch" ? "正在抓取新作品" : "正在盘点作者列表"}，可随时终止</p>
+      <p>${isFetch ? "按作品计数" : "按作者计数"}，可随时终止</p>
       <div class="sync-floater-foot-row">
         <button class="quiet-button" data-action="cancel-pixiv-sync" data-floater-foot ${task.cancelling ? "disabled" : ""}>${task.cancelling ? "正在终止…" : "终止同步"}</button>
       </div>
@@ -2366,24 +2372,23 @@ function updateSyncFloater() {
     foot.textContent = task.cancelling && !task.cancelAction ? "正在终止…" : task.cancelText || "终止同步";
   }
   if (task.authors) {
-    // 两段式（v1.3.15）：盘点段显示「已盘点 x / N」，抓取段显示「已完成 x / N」
-    const finished = task.authors.filter(syncRowSettled).length;
-    const scanned = task.authors.filter((item) => item.status !== "pending" && item.status !== "checking").length;
-    box.querySelector("#sync-progress-count").textContent = `${task.phase === "fetch" ? finished : scanned} / ${task.authors.length}`;
+    const isFetch = task.phase === "fetch";
+    const current = isFetch ? (task.fetchDone || 0) : (task.scanDone || 0);
+    const total = isFetch ? (task.fetchTotal || 0) : (task.scanTotal || task.authors.length || 0);
+    box.querySelector("#sync-progress-count").textContent = `${current} / ${total}`;
     box.querySelector("#sync-progress-label").textContent = task.label;
-    task.authors.forEach((item) => {
-      const line = box.querySelector(`[data-sync-author-id="${item.authorId}"]`);
-      if (!line) return;
-      line.className = `sync-floater-row is-${item.status}`;
-      const bar = line.querySelector("[data-sync-bar]");
-      const { value, max } = syncRowProgress(item);
-      bar.max = max;
-      bar.value = value;
-      line.querySelector("[data-sync-count]").textContent = syncCountText(item);
-      const status = line.querySelector("[data-sync-title]");
-      status.textContent = syncRowStatusText(item);
-      status.title = status.textContent;
-    });
+    const bar = box.querySelector("#sync-progress-bar");
+    if (bar) {
+      bar.max = Math.max(total, 1);
+      bar.value = Math.min(current, Math.max(total, 1));
+    }
+    const title = box.querySelector("#sync-progress-title");
+    if (title) {
+      title.textContent = syncActiveText(task);
+      title.title = title.textContent;
+    }
+    const footNote = box.querySelector(".sync-floater-foot p");
+    if (footNote) footNote.textContent = `${isFetch ? "按作品计数" : "按作者计数"}，可随时终止`;
     return;
   }
   const bar = box.querySelector("#sync-progress-bar");
@@ -6655,6 +6660,8 @@ async function bindEvents() {
       }
       const inAllWorks = state.homeView === "allWorks" && !state.activeAuthor;
       const queryKey = inAllWorks ? "allWorksQuery" : "workQuery";
+      // v1.3.41：非正文搜索（标题 / 标签 / 简介…）统一回到「加入时间由新到旧」
+      if (inAllWorks) state.allWorksSort = "added_desc";
       state[queryKey] = query;
       if (inAllWorks) await refreshAllWorks(); else await refreshWorks();
       if (state[queryKey] !== query) return;
@@ -6852,6 +6859,10 @@ async function bindEvents() {
   const searchField = app.querySelector("#search-field");
   if (searchField) searchField.onchange = async (event) => {
     state.searchField = event.target.value;
+    // 从「正文内容」切回其它搜索时，排序也要从「命中从多到少」退回「加入时间由新到旧」
+    if (state.homeView === "allWorks" && !state.activeAuthor && state.searchField !== "body") {
+      state.allWorksSort = "added_desc";
+    }
     // 收藏夹视图也吃这个范围（v1.2.7 起），它的数据源跟另外两个列表不是同一个
     if (state.homeView === "collections" && state.activeCollection) await refreshCollectionWorks();
     else if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks();
@@ -9982,34 +9993,55 @@ async function syncAllAuthors(targetsOverride) {
     phase: "scan",
     label: `正在盘点 ${targets.length} 位作者的作品列表`,
     cancelling: false,
+    scanTotal: targets.length,
+    scanDone: 0,
+    fetchTotal: 0,
+    fetchDone: 0,
+    activeCounts: {},
     authors: targets.map((author) => ({ authorId: author.id, name: author.name, status: "pending", current: 0, total: 0, title: "", note: "" })),
   };
   render();
-  const unlisten = await listen("pixiv-sync-progress", (event) => {
-    const { authorId = null, total = 0, current = 0, title = "" } = event.payload || {};
-    const authors = state.syncTask?.authors;
-    if (!authors) return;
-    // 按 authorId 精确落到对应作者那一行；万一没带 authorId 就退回当前正在跑的那位
-    const row = authors.find((item) => item.authorId === Number(authorId)) || authors.find((item) => item.status === "running");
-    if (!row || !(row.status === "running" || row.status === "checking")) return;
-    // 第一帧正文进度说明作者主页查通了，从「检查作者主页」切到正式同步
-    if (row.status === "checking") { row.status = "running"; row.note = ""; }
-    row.total = total;
-    row.current = current;
-    row.title = title;
-    updateSyncFloater();
-  });
+  const task = state.syncTask;
+  // 浏览器预览没有 Tauri 事件通道（listen 会直接抛错）。挂不上就继续跑：
+  // 并发分支本来就不依赖事件，串行分支只是少了逐篇进度，不影响结果。
+  let unlisten = () => {};
+  try {
+    unlisten = await listen("pixiv-sync-progress", (event) => {
+      // 抓取阶段的串行分支才用后端逐篇进度；并发分支按「一篇一个任务」计数，
+      // 每篇结束时前端自己 +1，不会被多路事件互相覆盖。
+      if (!state.syncTask || state.syncTask.phase !== "fetch" || state.syncTask.fetchMode !== "serial") return;
+      const { current = 0 } = event.payload || {};
+      const base = state.syncTask.fetchBase || 0;
+      const total = state.syncTask.fetchTotal || 0;
+      state.syncTask.fetchDone = Math.min(base + Math.max(0, Number(current) || 0), total);
+      updateSyncFloater();
+    });
+  } catch (error) {
+    console.log("预览里没有同步事件通道，按无事件模式继续:", error);
+  }
 
   let stopped = false;
   let doneAuthors = 0;
   let downloaded = 0;
+  let anyAdded = false;
+  let throttledHit = false;
   const scanResults = [];
   const failures = [];
   const missingAuthors = [];
+  const failedAuthors = new Map();
+  const addFailure = (text) => {
+    if (text && !failures.includes(text)) failures.push(text);
+  };
+  const authorDownloads = new Map();
+  const resultDownloadedForAuthor = (authorId) => authorDownloads.get(authorId) || 0;
+  const noteAuthorFailure = (author, count = 1, reason = "") => {
+    const item = failedAuthors.get(author.id) || { name: author.name, count: 0, reasons: new Set() };
+    item.count += count;
+    if (reason) item.reasons.add(reason);
+    failedAuthors.set(author.id, item);
+  };
 
-  // ── 第一段：并发盘点（4 个并发位逐位滚动）────────────────────────────
-  // 每位作者：探测主页 → 只盘点（后端抓列表、核对「新作品」，不下载）。
-  // 销号、出错单独标记，不拖累其他位；一位盘完立刻补下一位。
+  // ── 第一段：并发盘点（4 个并发位逐位滚动，进度按作者数）────────────────
   const SCAN_CONCURRENCY = 4;
   let scanCursor = 0;
   const scanWorker = async () => {
@@ -10019,119 +10051,193 @@ async function syncAllAuthors(targetsOverride) {
       if (index >= targets.length) return;
       const author = targets[index];
       const row = state.syncTask.authors.find((item) => item.authorId === author.id);
-      // 先标成「检查作者主页」：这一步真的会连一次作者主页（`check_pixiv_author`），
-      // 判到退会就直接落到 missing、跳过同步；真开始看作品了，进度事件再把它切回 running。
       if (row) { row.status = "checking"; row.note = ""; row.title = ""; row.current = 0; row.total = 0; }
+      syncActiveAdd(state.syncTask, author.name);
       updateSyncFloater();
       const probe = await probeAuthorStatus(author.id);
-      if (!state.syncTask || state.syncTask.cancelling) { stopped = true; return; }
+      if (!state.syncTask || state.syncTask.cancelling) {
+        syncActiveRemove(state.syncTask, author.name);
+        stopped = true;
+        return;
+      }
       if (probe.status === "retired") {
         if (row) { row.status = "missing"; row.note = "主页打不开（可能已销号或封号），已跳过同步"; }
         missingAuthors.push(author.name);
-        updateSyncFloater();
-        continue;
-      }
-      try {
-        // 只盘点：把核对好的「新作品」清单带回来，不抓详情、不落盘。
-        const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "", scanOnly: true });
-        const candidates = (result && result.candidates) || [];
-        scanResults.push({ author, candidates });
-        if (row) {
-          row.status = "scanned";
-          row.total = candidates.length;
-          row.note = candidates.length ? `待抓取 ${candidates.length} 篇` : "已是最新，无新作品";
+      } else {
+        try {
+          const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "", scanOnly: true });
+          const candidates = (result && result.candidates) || [];
+          scanResults.push({ author, candidates });
+          if (row) {
+            row.status = "scanned";
+            row.total = candidates.length;
+            row.note = candidates.length ? `待抓取 ${candidates.length} 篇` : "已是最新，无新作品";
+          }
+        } catch (error) {
+          noteAuthorFailure(author, 1, String(error));
+          if (row) { row.status = "failed"; row.note = String(error); }
         }
-      } catch (error) {
-        failures.push(`${author.name}（${error}）`);
-        if (row) { row.status = "failed"; row.note = String(error); }
       }
+      syncActiveRemove(state.syncTask, author.name);
+      state.syncTask.scanDone = Math.min((state.syncTask.scanDone || 0) + 1, targets.length);
       updateSyncFloater();
     }
   };
   try {
     await Promise.all(Array.from({ length: Math.min(SCAN_CONCURRENCY, targets.length) }, () => scanWorker()));
   } catch (error) {
-    // 盘点位各自已经处理了自己的失败；这里只兜意外，别让整轮卡在「同步任务进行中」
     console.log("盘点阶段异常:", error);
   }
   if (!state.syncTask || state.syncTask.cancelling) stopped = true;
 
-  // ── 第二段：汇总总数、一次定档，按作者顺序统一抓取 ───────────────────
+  // ── 第二段：汇总作品总数、一次定档，固定 6 路全局作品队列 ─────────────
   if (!stopped && state.syncTask) {
     const totalCandidates = scanResults.reduce((sum, item) => sum + item.candidates.length, 0);
-    // 节奏只看一次总数（设置里那句「同步作品超过 N 部时，每部间隔 M 秒」）：
-    // 超过了 ⇒ 逐篇抓、每篇间隔 M 秒；没超过 ⇒ 并发抓。开跑前定好，不再中途切换。
     const threshold = Number((state.settings || {}).pixivDelayThreshold || 150);
     const delaySeconds = Number((state.settings || {}).pixivDelaySeconds ?? 1);
     const fetchMode = totalCandidates > threshold ? "serial" : "concurrent";
     state.syncTask.phase = "fetch";
+    state.syncTask.fetchMode = fetchMode;
+    state.syncTask.fetchTotal = totalCandidates;
+    state.syncTask.fetchDone = 0;
+    state.syncTask.activeCounts = {};
     state.syncTask.label = totalCandidates
-      ? (fetchMode === "serial" ? `正在抓取新作品（共 ${totalCandidates} 篇 · 每篇间隔 ${delaySeconds} 秒）` : `正在抓取新作品（共 ${totalCandidates} 篇）`)
+      ? (fetchMode === "serial" ? `正在抓取新作品（共 ${totalCandidates} 篇 · 每篇间隔 ${delaySeconds} 秒）` : `正在抓取新作品（共 ${totalCandidates} 篇 · 固定 6 路）`)
       : "没有新作品，正在收尾";
     updateSyncFloater();
-    for (let index = 0; index < scanResults.length; index++) {
-      // 用户点了「终止同步」：当前请求结束后不再继续后面的作者
-      if (!state.syncTask || state.syncTask.cancelling) { stopped = true; break; }
-      const { author, candidates } = scanResults[index];
+
+    // 盘点时就没新作品的作者：走一次「空抓取」把上次同步时间补上（毫秒级、不会下载）。
+    for (const { author, candidates } of scanResults) {
+      if (stopped || !state.syncTask || state.syncTask.cancelling) break;
+      if (candidates.length) continue;
+      try { await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "", candidates: [], fetchMode }); } catch { /* 收尾失败不打扰 */ }
       const row = state.syncTask.authors.find((item) => item.authorId === author.id);
-      state.syncTask.authorId = author.id;
-      if (!candidates.length) {
-        // 盘点时就没新作品的作者：走一次「空抓取」把上次同步时间补上（毫秒级、不会下载），
-        // 失败也不打扰 —— 它本来就没东西要抓。
-        try { await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "", candidates: [], fetchMode }); } catch { /* 收尾失败不打扰 */ }
-        if (row) { row.status = "done"; row.note = row.note || "已是最新，无新作品"; }
-        doneAuthors += 1;
+      if (row) { row.status = "done"; row.note = row.note || "已是最新，无新作品"; }
+      doneAuthors += 1;
+      updateSyncFloater();
+    }
+
+    if (fetchMode === "serial" && !stopped) {
+      let fetchBase = 0;
+      for (const { author, candidates } of scanResults) {
+        if (!state.syncTask || state.syncTask.cancelling) { stopped = true; break; }
+        if (!candidates.length) continue;
+        const row = state.syncTask.authors.find((item) => item.authorId === author.id);
+        state.syncTask.authorId = author.id;
+        state.syncTask.fetchBase = fetchBase;
+        state.syncTask.fetchDone = fetchBase;
+        if (row) { row.status = "running"; row.note = ""; row.title = ""; row.current = 0; row.total = candidates.length; }
+        syncActiveAdd(state.syncTask, author.name);
         updateSyncFloater();
-        continue;
-      }
-      if (row) { row.status = "running"; row.note = ""; row.title = ""; row.current = 0; row.total = candidates.length; }
-      updateSyncFloater();
-      // 这一位本次新落库的作品数（新下载 + 复用本地），用来决定跑完要不要补算字数
-      let thisAuthorAdded = 0;
-      try {
-        // 带清单抓取：清单在盘点段已经核对好（列表只抓一次），这里按定好的节奏抓详情 + 落盘。
-        const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "", candidates, fetchMode });
-        downloaded += result.downloadedCount || 0;
-        thisAuthorAdded = (result.downloadedCount || 0) + (result.reusedPreviewCount || 0);
-        if (row) {
-          row.current = result.downloadedCount || 0;
-          if (result.cancelled) {
-            // 单独一个状态：终止不算「核对完成」，别让它顶着绿的过去
-            row.status = "cancelled";
-            row.note = "已终止";
-          } else if (result.throttled) {
-            // 后端识别出疑似限流、主动踩了刹车，这一位要单独标出来
-            row.status = "throttled";
-            row.note = "疑似被限流，已提前停止";
-          } else if (result.failedCount) {
-            row.status = "done";
-            const why = failureReasonText(result.failedReasons, result.failedCount);
-            row.note = `完成 · 下载 ${result.downloadedCount || 0} 篇 · ${result.failedCount} 篇失败${why ? `（${why}）` : ""}`;
-          } else {
-            row.status = "done";
-            row.note = `完成 · 下载 ${result.downloadedCount || 0} 篇`;
+        let thisAdded = 0;
+        let cancelledHere = false;
+        let throttledHere = false;
+        try {
+          const result = await invoke("sync_pixiv_novels", { authorId: author.id, startDate: "", endDate: "", novelUrl: "", candidates, fetchMode: "serial" });
+          downloaded += result.downloadedCount || 0;
+          authorDownloads.set(author.id, (authorDownloads.get(author.id) || 0) + (result.downloadedCount || 0));
+          thisAdded = (result.downloadedCount || 0) + (result.reusedPreviewCount || 0);
+          if (result.failedCount) noteAuthorFailure(author, result.failedCount, failureReasonText(result.failedReasons, result.failedCount));
+          cancelledHere = Boolean(result.cancelled);
+          throttledHere = Boolean(result.throttled);
+          if (cancelledHere) stopped = true;
+          if (throttledHere) {
+            stopped = true;
+            throttledHit = true;
+            addFailure(`${author.name}（疑似限流已停止）`);
           }
+          if (row) {
+            if (cancelledHere) { row.status = "cancelled"; row.note = "已终止"; }
+            else if (throttledHere) { row.status = "throttled"; row.note = "疑似被限流，已提前停止"; }
+            else {
+              row.status = "done";
+              row.note = `完成 · 下载 ${result.downloadedCount || 0} 篇${result.failedCount ? ` · ${result.failedCount} 篇失败` : ""}`;
+            }
+          }
+        } catch (error) {
+          noteAuthorFailure(author, 1, String(error));
+          if (row) { row.status = "failed"; row.note = String(error); }
         }
-        if (result.cancelled) { stopped = true; updateSyncFloater(); break; }
-        if (result.throttled) {
-          stopped = true;
-          failures.push(`${author.name}（疑似限流已停止）`);
-          updateSyncFloater();
-          break;
-        }
-        doneAuthors += 1;
-        if (result.failedCount) failures.push(`${author.name}（${result.failedCount} 篇失败${failureReasonText(result.failedReasons, result.failedCount) ? `：${failureReasonText(result.failedReasons, result.failedCount)}` : ""}）`);
-      } catch (error) {
-        doneAuthors += 1;
-        if (row) { row.status = "failed"; row.note = String(error); }
-        failures.push(`${author.name}（${error}）`);
-        thisAuthorAdded = 0;
+        if (!cancelledHere && !throttledHere) fetchBase += candidates.length;
+        else fetchBase = Math.min(state.syncTask.fetchDone || fetchBase, state.syncTask.fetchTotal || fetchBase);
+        state.syncTask.fetchDone = fetchBase;
+        if (!cancelledHere && !throttledHere) doneAuthors += 1;
+        if (thisAdded > 0) anyAdded = true;
+        syncActiveRemove(state.syncTask, author.name);
+        updateSyncFloater();
+        if (stopped) break;
       }
-      updateSyncFloater();
-      // 这位作者确实下进来新作品才补算（v1.2.95）：后端落库时正文在手，绝大多数字数
-      // 已经直接写好了，这里只兜「复用本地文件 + 拿不到接口字数」剩下的那几篇。
-      // 没下东西就不去空转那轮扫描 —— 库里若有大量历史未算作品，每作者跑一遍代价不小。
-      if (thisAuthorAdded > 0) fillWordCountsInBackground();
+    } else if (fetchMode === "concurrent" && !stopped) {
+      // 一篇一个任务，六个 worker 从同一个队列取 —— 所有作者的作品合成一个整体，
+      // 固定 6 路，不再按作者数分名额。每篇结束前端 +1，进度就是作品数。
+      try { await invoke("clear_pixiv_preview_cache"); } catch { /* 预览版 */ }
+      const items = [];
+      for (const { author, candidates } of scanResults) {
+        for (const novelId of candidates) items.push({ author, novelId });
+      }
+      state.syncTask.fetchTotal = items.length;
+      const pendingByAuthor = new Map();
+      scanResults.forEach(({ author, candidates }) => {
+        if (candidates.length) pendingByAuthor.set(author.id, candidates.length);
+      });
+      const startedAuthors = new Set();
+      let cursor = 0;
+      const worker = async () => {
+        for (;;) {
+          if (!state.syncTask || state.syncTask.cancelling || stopped) return;
+          const index = cursor++;
+          if (index >= items.length) return;
+          const { author, novelId } = items[index];
+          const firstForAuthor = !startedAuthors.has(author.id);
+          startedAuthors.add(author.id);
+          const row = state.syncTask.authors.find((item) => item.authorId === author.id);
+          if (row) { row.status = "running"; row.note = ""; }
+          syncActiveAdd(state.syncTask, author.name);
+          updateSyncFloater();
+          let thisAdded = 0;
+          try {
+            const result = await invoke("sync_pixiv_novels", {
+              authorId: author.id,
+              startDate: "",
+              endDate: "",
+              novelUrl: "",
+              candidates: [novelId],
+              fetchMode: "concurrent",
+              maxConcurrency: 1,
+              resetCancel: firstForAuthor,
+            });
+            downloaded += result.downloadedCount || 0;
+            authorDownloads.set(author.id, (authorDownloads.get(author.id) || 0) + (result.downloadedCount || 0));
+            thisAdded = (result.downloadedCount || 0) + (result.reusedPreviewCount || 0);
+            if (result.failedCount) noteAuthorFailure(author, result.failedCount, failureReasonText(result.failedReasons, result.failedCount));
+            if (result.cancelled) stopped = true;
+            if (result.throttled) {
+              stopped = true;
+              throttledHit = true;
+              addFailure(`${author.name}（疑似限流已停止）`);
+            }
+          } catch (error) {
+            noteAuthorFailure(author, 1, String(error));
+          }
+          if (thisAdded > 0) anyAdded = true;
+          syncActiveRemove(state.syncTask, author.name);
+          state.syncTask.fetchDone = Math.min((state.syncTask.fetchDone || 0) + 1, state.syncTask.fetchTotal || 0);
+          const left = (pendingByAuthor.get(author.id) || 1) - 1;
+          pendingByAuthor.set(author.id, left);
+          if (left <= 0) {
+            doneAuthors += 1;
+            if (row) { row.status = "done"; row.note = `完成 · 下载 ${resultDownloadedForAuthor(author.id)} 篇`; }
+          }
+          updateSyncFloater();
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(6, items.length) }, () => worker()));
+      // 收尾时把进度补满再撤浮层：否则最后几篇同时结束时，进度会停在 6/12 这种半截数字上
+      if (state.syncTask) {
+        state.syncTask.fetchDone = state.syncTask.fetchTotal || 0;
+        updateSyncFloater();
+      }
+      try { await invoke("clear_pixiv_preview_cache"); } catch { /* 预览版 */ }
     }
   }
 
@@ -10143,20 +10249,20 @@ async function syncAllAuthors(targetsOverride) {
     await refreshWorks();
   }
   render();
-  // 收尾兜底：后端落库时已经算好绝大部分字数（v1.2.95），这里只处理极少数
-  // 「当时没算出来」的残留，顺带把列表里的字数补到卡片上。
   fillWordCountsInBackground(true);
 
+  for (const item of failedAuthors.values()) {
+    const why = failureReasonText([...item.reasons], item.count);
+    addFailure(`${item.name}（${item.count} 篇失败${why ? `：${why}` : ""}）`);
+  }
   const head = stopped ? `批量同步已终止（完成 ${doneAuthors} / ${targets.length} 位作者）` : `已同步 ${doneAuthors} / ${targets.length} 位作者，共下载 ${downloaded} 篇`;
   const missingNote = missingAuthors.length
     ? `${missingAuthors.length} 位作者的主页在 Pixiv 上已经打不开了（多半已销号或封号，已跳过同步、卡片标灰）：${missingAuthors.slice(0, 3).join("、")}${missingAuthors.length > 3 ? " 等" : ""}`
     : "";
   if (failures.length) {
     const detail = failures.slice(0, 3).join("；");
-    // 限流是「整轮别再点」的信号，单独提一句，跟个别作品的失败区分开
-    const limited = stopped && failures.some((text) => text.includes("疑似限流"));
-    const tail = limited ? "。疑似被 Pixiv 限流，建议过一会儿再同步，或把设置里的抓取间隔调大。" : "";
-    toast(`${head}；${failures.length} 位有失败：${detail}${failures.length > 3 ? " 等" : ""}${tail}${missingNote ? `；${missingNote}` : ""}`, limited ? "error" : "info");
+    const tail = throttledHit ? "。疑似被 Pixiv 限流，建议过一会儿再同步，或把设置里的抓取间隔调大。" : "";
+    toast(`${head}；${failures.length} 位有失败：${detail}${failures.length > 3 ? " 等" : ""}${tail}${missingNote ? `；${missingNote}` : ""}`, throttledHit ? "error" : "info");
   } else if (missingNote) {
     toast(`${head}；${missingNote}`, "info");
   } else {
