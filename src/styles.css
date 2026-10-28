@@ -1090,3 +1090,9 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .synonym-status.is-ok { color: #2f8f72; }
 .synonym-status.is-warn { color: #9a6a1f; }
 .synonym-status.is-error { color: #b44155; }
+
+
+/* 收藏页「更新后自动下载新增收藏」（v1.3.41） */
+.bookmark-auto-download { display: inline-flex; align-items: center; gap: 6px; color: #4b6b89; font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; user-select: none; }
+.bookmark-auto-download input { width: 14px; height: 14px; margin: 0; accent-color: #4b8bd6; cursor: pointer; }
+.bookmark-auto-download input:disabled { cursor: not-allowed; opacity: .6; }

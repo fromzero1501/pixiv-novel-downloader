@@ -841,6 +841,10 @@ fn db() -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|e| e.to_string())?;
+    // v1.3.41：收藏自动下载会并发跑多个同步；SQLite 同一时刻只允许一个写者，
+    // 没有等待时间的话，第二个 worker 一写就报 database is locked。
+    conn.busy_timeout(Duration::from_secs(15))
+        .map_err(|e| e.to_string())?;
     // 内置角色合并**留在门禁外面**：它自己按内容指纹把关（内置表没换过时只花一次查询），
     // 必须保证「发新版补了内置角色」时能立刻合进老库 —— 要是跟建表一起被跳过就永远补不上了。
     let _ = ensure_builtin_characters(&conn);
@@ -9663,6 +9667,22 @@ async fn list_pixiv_bookmarks() -> Result<PixivBookmarkList, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// 「更新后自动下载新增收藏」开关（v1.3.41）。默认开：没存过 = 开。
+const PIXIV_AUTO_DOWNLOAD_KEY: &str = "pixiv_auto_download_bookmarks";
+
+#[tauri::command]
+fn get_pixiv_auto_download() -> Result<bool, String> {
+    let conn = db()?;
+    Ok(setting(&conn, PIXIV_AUTO_DOWNLOAD_KEY)? != "0")
+}
+
+#[tauri::command]
+fn set_pixiv_auto_download(enabled: bool) -> Result<bool, String> {
+    let conn = db()?;
+    put_setting(&conn, PIXIV_AUTO_DOWNLOAD_KEY, if enabled { "1" } else { "0" })?;
+    Ok(enabled)
+}
+
 /* ---------- 按 Pixiv 收藏批量新增作者（v1.2.27） ---------- */
 
 #[derive(Debug, Serialize, Clone)]
@@ -10139,6 +10159,196 @@ async fn add_stray_from_url(
             .unwrap_or(0);
     }
     Ok(result)
+}
+
+
+/// 收藏页「更新后自动下载」要下的一篇：novel id + 收藏接口白给的作者信息。
+#[derive(Clone, Debug)]
+struct MissingBookmark {
+    novel_id: String,
+    user_id: String,
+    user_name: String,
+    title: String,
+}
+
+/// 收藏里本地还没有的作品，按收藏顺序（新收藏在前）。
+fn missing_pixiv_bookmarks(conn: &Connection) -> Result<Vec<MissingBookmark>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT b.novel_id, b.user_id, b.user_name, b.title
+             FROM pixiv_bookmarks b
+             LEFT JOIN works w ON w.pixiv_novel_id = b.novel_id
+             WHERE w.id IS NULL
+             ORDER BY b.sort_index ASC, b.novel_id ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(MissingBookmark {
+                novel_id: row.get(0)?,
+                user_id: row.get(1)?,
+                user_name: row.get(2)?,
+                title: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// 把单篇下载结果并进总统计。失败只留前几条，和同步那边的上限一致。
+fn note_bookmark_download(
+    result: &mut BookmarkDownloadResult,
+    item: &MissingBookmark,
+    outcome: Result<bool, String>,
+) {
+    match outcome {
+        Ok(true) => result.downloaded += 1,
+        Ok(false) => result.skipped += 1,
+        Err(error) => {
+            result.failed += 1;
+            if result.failed_names.len() < SYNC_MAX_FAILED_REASONS {
+                result.failed_names
+                    .push(format!("{}（{}）：{}", item.title, item.novel_id, error));
+            }
+        }
+    }
+}
+
+/// 并发度：和同步抓详情那条路保持一致（6）。
+const BOOKMARK_DOWNLOAD_CONCURRENCY: usize = 6;
+
+/// 收藏自动下载的主流程。
+///
+/// - 只下 `works.pixiv_novel_id` 对不上的（本地已有的一律跳过）；
+/// - 待下篇数超过设置里的抓取阈值、且间隔 > 0 时，按设置逐篇间隔（串行）；
+/// - 否则按**作者**分组并发：同一位作者的作品仍然一篇篇下，避免两个人同时给
+///   同一位作者建档、或同时写同一个目录时打架。
+/// - 取消键用 0（和整库同步共用）；当前篇下完才停。
+fn download_missing_pixiv_bookmarks_impl(
+    app: &AppHandle,
+) -> Result<BookmarkDownloadResult, String> {
+    let conn = db()?;
+    let cookie = setting(&conn, "pixiv_cookie")?;
+    let items = missing_pixiv_bookmarks(&conn)?;
+    let total = items.len();
+    let mut result = BookmarkDownloadResult {
+        total,
+        ..Default::default()
+    };
+    if total == 0 {
+        return Ok(result);
+    }
+    if cookie.trim().is_empty() {
+        return Err("还没填 Pixiv Cookie —— 自动下载新收藏需要它。".into());
+    }
+    let delay_threshold = setting(&conn, "pixiv_delay_threshold")?
+        .parse::<usize>()
+        .unwrap_or(150);
+    let delay_seconds = setting(&conn, "pixiv_delay_seconds")?
+        .parse::<u64>()
+        .unwrap_or(1);
+    drop(conn);
+    clear_pixiv_sync_cancel(0);
+    emit_pixiv_bookmark_progress(app, total, 0, "准备下载收藏里新增的作品".into());
+
+    if total > delay_threshold && delay_seconds > 0 {
+        for (index, item) in items.iter().enumerate() {
+            if pixiv_sync_cancelled(0) {
+                result.cancelled = true;
+                break;
+            }
+            if index > 0 {
+                std::thread::sleep(Duration::from_secs(delay_seconds));
+            }
+            emit_pixiv_bookmark_progress(
+                app,
+                total,
+                index + 1,
+                format!("正在下载：{}（{} / {}）", item.title, index + 1, total),
+            );
+            let outcome =
+                download_bookmark_novel_impl(app, &item.novel_id, &item.user_id, &item.user_name);
+            note_bookmark_download(&mut result, item, outcome);
+        }
+    } else {
+        let mut groups: Vec<Vec<MissingBookmark>> = Vec::new();
+        let mut group_of: HashMap<String, usize> = HashMap::new();
+        for item in items {
+            let key = format!("{}\u{1f}{}", item.user_id, item.user_name);
+            let index = *group_of.entry(key).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[index].push(item);
+        }
+        let workers = BOOKMARK_DOWNLOAD_CONCURRENCY.min(groups.len()).max(1);
+        let queue = Mutex::new(groups);
+        let finished: Mutex<Vec<(MissingBookmark, Result<bool, String>)>> = Mutex::new(Vec::new());
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    if pixiv_sync_cancelled(0) {
+                        break;
+                    }
+                    let next = match queue.lock() {
+                        Ok(mut pending) => pending.pop(),
+                        Err(_) => None,
+                    };
+                    let Some(group) = next else { break };
+                    for item in group {
+                        if pixiv_sync_cancelled(0) {
+                            break;
+                        }
+                        let outcome = download_bookmark_novel_impl(
+                            app,
+                            &item.novel_id,
+                            &item.user_id,
+                            &item.user_name,
+                        );
+                        let current =
+                            done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        emit_pixiv_bookmark_progress(
+                            app,
+                            total,
+                            current,
+                            format!("正在下载：{}（{} / {}）", item.title, current, total),
+                        );
+                        if let Ok(mut list) = finished.lock() {
+                            list.push((item, outcome));
+                        }
+                    }
+                });
+            }
+        });
+        let collected = finished.into_inner().unwrap_or_default();
+        result.cancelled = pixiv_sync_cancelled(0);
+        for (item, outcome) in collected {
+            note_bookmark_download(&mut result, &item, outcome);
+        }
+    }
+    clear_pixiv_sync_cancel(0);
+    emit_pixiv_bookmark_progress(
+        app,
+        total,
+        total,
+        format!(
+            "下载完成：新下 {} 篇，跳过 {} 篇，失败 {} 篇",
+            result.downloaded, result.skipped, result.failed
+        ),
+    );
+    Ok(result)
+}
+
+/// 收藏页「更新」之后调用：把新增（本地没有）的收藏并发下成散篇。
+#[tauri::command]
+async fn download_missing_pixiv_bookmarks(
+    app: AppHandle,
+) -> Result<BookmarkDownloadResult, String> {
+    tauri::async_runtime::spawn_blocking(move || download_missing_pixiv_bookmarks_impl(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// 「从 Pixiv 收藏新增作者」弹窗里的一行：收藏里的一位作者，可勾选。
@@ -19231,6 +19441,9 @@ pub fn run() {
             // v1.2.27：Pixiv 收藏页
             refresh_pixiv_bookmarks,
             list_pixiv_bookmarks,
+            get_pixiv_auto_download,
+            set_pixiv_auto_download,
+            download_missing_pixiv_bookmarks,
             import_authors_from_bookmarks,
             // v1.2.30：收藏作者勾选列表 + 散篇
             list_bookmark_author_options,
@@ -19334,6 +19547,7 @@ mod tests {
         list_watch_later_ids_impl,
         // v1.2.27：Pixiv 收藏页
         collect_bookmark_authors, list_pixiv_bookmarks_impl, refresh_pixiv_bookmarks_impl,
+        missing_pixiv_bookmarks,
         collect_bookmark_entries,
         // v1.2.30：收藏表新字段 + 散篇
         bookmark_tags_json, bookmark_tags_list,
@@ -25594,6 +25808,39 @@ mod tests {
             cleaned,
             vec![vec!["爱丽丝".to_string(), "艾丽丝".to_string()]]
         );
+    }
+
+    /// 自动下载只挑本地没有的收藏，已有作品一律跳过；顺序按收藏页的 sort_index。
+    #[test]
+    fn missing_bookmarks_only_returns_absent_novels() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pixiv_bookmarks (
+               novel_id TEXT PRIMARY KEY,
+               title TEXT NOT NULL DEFAULT '',
+               user_id TEXT NOT NULL DEFAULT '',
+               user_name TEXT NOT NULL DEFAULT '',
+               sort_index INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE works (
+               id INTEGER PRIMARY KEY,
+               pixiv_novel_id TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pixiv_bookmarks (novel_id,title,user_id,user_name,sort_index)
+             VALUES ('111','已有','9','作者甲',1),('333','缺的后一篇','8','作者乙',2),('222','缺的前一篇','8','作者乙',3)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO works (pixiv_novel_id) VALUES ('111')", [])
+            .unwrap();
+
+        let missing = missing_pixiv_bookmarks(&conn).unwrap();
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0].novel_id, "333");
+        assert_eq!(missing[1].novel_id, "222");
     }
 
 }

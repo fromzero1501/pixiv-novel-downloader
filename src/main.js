@@ -298,6 +298,8 @@ const state = {
   pixivBookmarksFetchedAt: "",
   /** 正在刷新收藏列表（防重复点击，页面上也要显示「更新中…」） */
   pixivBookmarksUpdating: false,
+  /** 「更新后自动下载新增收藏」（v1.3.41）：默认开；只在手动点「更新」时生效 */
+  pixivAutoDownload: true,
   /**
    * 更新的实时进度（来自后端的 `pixiv-bookmark-progress` 事件）。
    * `null` = 没在更新。形状 `{ total, current, title }`，`total` 为 0 表示还没数出总数。
@@ -1187,6 +1189,16 @@ async function invoke(command, args = {}) {
     const hold = Number(window.__previewBookmarkRefreshHold) || 0;
     if (hold > 0) return new Promise((resolve) => window.setTimeout(() => resolve(result), hold));
     return result;
+  }
+  // 收藏自动下载（v1.3.41）：预览里只记开关，不真下东西
+  if (command === "get_pixiv_auto_download") return window.__previewAutoDownload !== false;
+  if (command === "set_pixiv_auto_download") {
+    window.__previewAutoDownload = Boolean(args.enabled);
+    return window.__previewAutoDownload;
+  }
+  if (command === "download_missing_pixiv_bookmarks") {
+    if (typeof window.__previewMissingDownload === "function") return window.__previewMissingDownload();
+    return { total: 0, downloaded: 0, skipped: 0, failed: 0, failedNames: [], authorId: 0, cancelled: false };
   }
   if (command === "list_bookmark_author_options") {
     if (Array.isArray(window.__previewBookmarkAuthorOptions)) return window.__previewBookmarkAuthorOptions;
@@ -3693,8 +3705,15 @@ async function runBodySearchInPlace(query) {
     state.collectionQuery = query;
     await refreshCollectionWorks();
   } else {
-    state[state.homeView === "allWorks" && !state.activeAuthor ? "allWorksQuery" : "workQuery"] = query;
-    if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks();
+    const allWorksPage = state.homeView === "allWorks" && !state.activeAuthor;
+    state[allWorksPage ? "allWorksQuery" : "workQuery"] = query;
+    if (allWorksPage) {
+      // v1.3.41：全文搜索一律按命中从多到少；清空搜索词回到「加入时间由新到旧」
+      state.allWorksSort = String(query || "").trim() ? "hits_desc" : "added_desc";
+      await refreshAllWorks();
+    } else {
+      await refreshWorks();
+    }
   }
   await runTextSearch(query);
 }
@@ -4997,6 +5016,11 @@ async function refreshPixivBookmarks() {
   const result = await invoke("list_pixiv_bookmarks");
   state.pixivBookmarks = result?.items || [];
   state.pixivBookmarksFetchedAt = result?.fetchedAt || "";
+  try {
+    state.pixivAutoDownload = Boolean(await invoke("get_pixiv_auto_download"));
+  } catch {
+    // 老库 / 老后端没这条命令时按默认「开」走，别让收藏页打不开
+  }
 }
 
 /**
@@ -5016,9 +5040,33 @@ async function updatePixivBookmarks({ silent = false } = {}) {
     await invoke("refresh_pixiv_bookmarks");
     await refreshPixivBookmarks();
     state.pixivBookmarksError = "";
+    const missingCount = state.pixivBookmarks.filter((item) => !item.work).length;
+    let downloaded = 0;
+    let skipped = 0;
+    let failed = 0;
+    // 只认手动更新（silent = false）；启动时那次静默更新永远只刷列表。
+    if (!silent && state.pixivAutoDownload && missingCount > 0) {
+      state.pixivBookmarksProgress = { total: missingCount, current: 0, title: "准备下载新增收藏" };
+      if (state.homeView === "pixivBookmarks" && !state.activeAuthor) render();
+      try {
+        const result = await invoke("download_missing_pixiv_bookmarks");
+        downloaded = Number(result?.downloaded) || 0;
+        skipped = Number(result?.skipped) || 0;
+        failed = Number(result?.failed) || 0;
+        // 下完再读一次，灰卡才会变成正常作品卡
+        await refreshPixivBookmarks();
+        state.pixivBookmarksError = "";
+      } catch (error) {
+        // 列表已经更新成功；下载失败单独说，不能把整轮更新判成失败
+        toast(`收藏已更新，但自动下载失败：${String(error).slice(0, 160)}`, "error");
+      }
+    }
     if (!silent) {
       const localCount = state.pixivBookmarks.filter((item) => item.work).length;
-      toast(`收藏已更新：共 ${state.pixivBookmarks.length} 篇，本地已有 ${localCount} 篇`, "success");
+      const downloadNote = missingCount > 0 && state.pixivAutoDownload
+        ? `；自动下载：新下 ${downloaded} 篇${skipped ? `、跳过 ${skipped} 篇` : ""}${failed ? `、失败 ${failed} 篇` : ""}`
+        : "";
+      toast(`收藏已更新：共 ${state.pixivBookmarks.length} 篇，本地已有 ${localCount} 篇${downloadNote}`, failed ? "error" : "success");
     }
   } catch (error) {
     // 失败**必须留痕**：自动更新是静默的，不留的话用户只会看到「收藏页空着」，
@@ -5171,6 +5219,10 @@ function renderPixivBookmarks() {
       <div><p class="section-kicker">来自 Pixiv 账号的收藏</p><h1>Pixiv 收藏</h1></div>
       <div class="topbar-actions">
         <span class="bookmark-status">${bookmarkFetchedLabel()}${total ? ` · ${total} 篇，本地已有 ${localCount} 篇` : ""}</span>
+        <label class="bookmark-auto-download" title="只在手动点「更新」时生效；启动时的后台更新只刷新列表">
+          <input type="checkbox" id="bookmark-auto-download" ${state.pixivAutoDownload ? "checked" : ""} ${state.pixivBookmarksUpdating ? "disabled" : ""}>
+          <span>更新后自动下载新增收藏</span>
+        </label>
         <button class="primary-button" data-action="refresh-pixiv-bookmarks" ${state.pixivBookmarksUpdating ? "disabled" : ""}>${icon("sync", 18)}<span>${state.pixivBookmarksUpdating ? "更新中…" : "更新"}</span></button>
       </div>
     </section>
@@ -5181,7 +5233,7 @@ function renderPixivBookmarks() {
         <label class="search-field"><span>${icon("search", 19)}</span><input id="bookmark-search" type="search" placeholder="搜索标题或作者名" value="${escapeHtml(state.pixivBookmarksQuery)}" autocomplete="off"></label>
         <div class="filter-group" role="group" aria-label="本地库状态">${[["all", "全部"], ["inLibrary", "本地已有"], ["missing", "本地没有"]].map(([value, label]) => `<button class="filter-button ${state.pixivBookmarksFilter === value ? "is-active" : ""}" data-action="bookmark-filter" data-filter="${value}">${label}</button>`).join("")}</div>
       </div>
-      <div class="read-only-note">这一页只是<strong>对照表</strong>：本地库已经有的显示成作品卡，打开来和别处一样用；本地没有的带一枚小圆点，只显示封面、标题、作者名、标签、投稿日期、系列名和字符数（都是这一趟收藏请求白给的，不会为它多发一个请求），不会自动下载。Pixiv 上已经删掉的收藏里，只有本地还留着的那几篇才列出来。每次进这一页都会重新核对一遍本地库。</div>
+      <div class="read-only-note">这一页只是<strong>对照表</strong>：本地库已经有的显示成作品卡，打开来和别处一样用；本地没有的带一枚小圆点，只显示封面、标题、作者名、标签、投稿日期、系列名和字符数（都是这一趟收藏请求白给的，不会为它多发一个请求），只有点「更新」并且勾着下面那项时，才会把本地没有的收藏下载成散篇；启动时的后台更新只刷新列表。Pixiv 上已经删掉的收藏里，只有本地还留着的那几篇才列出来。每次进这一页都会重新核对一遍本地库。</div>
       <div class="works-grid">${cards || empty}</div>
     </section>`);
 }
@@ -6768,6 +6820,21 @@ async function bindEvents() {
       commitBookmarkSearch(event.target.value);
     };
   }
+  // 收藏页「更新后自动下载新增收藏」（v1.3.41）
+  const autoDownloadToggle = app.querySelector("#bookmark-auto-download");
+  if (autoDownloadToggle) autoDownloadToggle.onchange = async (event) => {
+    const next = event.target.checked;
+    const previous = state.pixivAutoDownload;
+    state.pixivAutoDownload = next;
+    try {
+      await invoke("set_pixiv_auto_download", { enabled: next });
+      toast(next ? "以后点「更新」会下载新增收藏" : "以后点「更新」只刷新收藏列表", "success");
+    } catch (error) {
+      state.pixivAutoDownload = previous;
+      event.target.checked = previous;
+      toast(`设置没保存：${error}`, "error");
+    }
+  };
   // 点历史项时别让输入框先失焦 —— 一失焦 onblur 就把面板收走，click 根本落不到按钮上
   const textSearchHistoryPanelElement = app.querySelector("#text-search-history");
   if (textSearchHistoryPanelElement) textSearchHistoryPanelElement.onpointerdown = (event) => event.preventDefault();
