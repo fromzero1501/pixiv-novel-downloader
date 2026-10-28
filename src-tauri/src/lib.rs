@@ -3369,6 +3369,7 @@ fn text_hit_total(counts: &[usize]) -> usize {
 
 /// `text_search_matches` 的本体：`lowered` 是 `text` 的小写副本（扫描一遍库时
 /// 由调用方提前算好、两种用途共用，省掉重复转换）。
+#[cfg(test)]
 fn text_search_matches_lowered(
     text: &str,
     lowered: &str,
@@ -3618,6 +3619,7 @@ fn search_full_text_impl(query: &str, limit: Option<usize>) -> Result<TextSearch
 /// 扫描本体：只认「一篇作品 = 一个 id + 名字 + 几条候选路径」，
 /// 跟数据库脱开 —— 单测拿一批临时文件就能把整条读取链路跑通，
 /// 不用去碰真的库文件。
+#[cfg(test)]
 fn search_full_text_over(
     rows: &[(i64, String, String, String)],
     query: &str,
@@ -3900,6 +3902,8 @@ fn list_all_works(
         // 配图从多到少（v1.3.16）：直接走 image_count 列
         "images_desc" => " ORDER BY w.image_count DESC, w.release_date DESC, w.id DESC",
         "rating_desc" => " ORDER BY w.rating DESC, w.release_date DESC, w.id DESC",
+        // v1.3.40：加入时间由新到旧。works.id 自增，id 倒序即入库倒序。
+        "added_desc" => " ORDER BY w.id DESC",
         _ => " ORDER BY w.release_date DESC, w.id DESC",
     });
     let raw_query = query.trim();
@@ -25591,4 +25595,5 @@ mod tests {
             vec![vec!["爱丽丝".to_string(), "艾丽丝".to_string()]]
         );
     }
+
 }

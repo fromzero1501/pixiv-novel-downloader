@@ -1,7 +1,7 @@
 {
   "name": "local-collection-library",
   "private": true,
-  "version": "1.3.39",
+  "version": "1.3.40",
   "type": "module",
   "scripts": {
     "predev": "node scripts/sync-version.mjs",

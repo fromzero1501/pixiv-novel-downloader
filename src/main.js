@@ -54,6 +54,8 @@ const state = {
   imagesFilter: "all",
   serialLatestOnly: false,
   sort: "date_desc",
+  /** 「所有作品」自己的排序（v1.3.40）：默认加入时间由新到旧；作者库/散篇仍用 sort。 */
+  allWorksSort: "added_desc",
   bulkMode: false,
   selectedWorkIds: new Set(),
   /**
@@ -575,7 +577,11 @@ async function invoke(command, args = {}) {
   if (command === "list_works") {
     return previewWorkPool().filter((work) => (!args.query || mockSearchText(work, args.searchField).includes(args.query)) && (args.status === "all" || (args.status === "purchased") === Boolean(work.purchasedPath)) && (!args.favoritesOnly || work.favorite) && mockFilterPass(work, args.collectionId, args.imagesFilter));
   }
-  if (command === "list_all_works") return previewWorkPool().filter((work) => (!args.query || mockSearchText(work, args.searchField).includes(args.query)) && (args.status === "all" || (args.status === "purchased") === Boolean(work.purchasedPath)) && (!args.favoritesOnly || work.favorite) && mockFilterPass(work, args.collectionId, args.imagesFilter));
+  if (command === "list_all_works") {
+    const rows = previewWorkPool().filter((work) => (!args.query || mockSearchText(work, args.searchField).includes(args.query)) && (args.status === "all" || (args.status === "purchased") === Boolean(work.purchasedPath)) && (!args.favoritesOnly || work.favorite) && mockFilterPass(work, args.collectionId, args.imagesFilter));
+    if (args.sort === "added_desc") rows.sort((left, right) => right.id - left.id);
+    return rows;
+  }
   if (command === "list_series_works") return previewWorkPool().filter((work) => work.seriesId === args.seriesId);
   if (command === "search_full_text") {
     // 预览里没有真的本地正文文件可扫，拿 synopsis 当「正文」占位 ——
@@ -1585,7 +1591,7 @@ async function refreshAllWorks() {
     favoritesOnly: state.allWorksFavoritesOnly,
     imagesFilter: state.imagesFilter,
     collectionId: state.collectionFilter,
-    sort: state.sort,
+    sort: state.allWorksSort,
   });
   // 重新查过一遍就把瀑布流退回第一屏 —— 换了筛选条件还留着「已展开 600 张」很怪
   state.allWorksShown = ALL_WORKS_PAGE;
@@ -3109,7 +3115,8 @@ function filterFieldSlots() {
     // 收藏夹没有「仅看收藏」开关（列出来的本来就都在夹子里），那一档不映射
     return { allWorksQuery: "collectionQuery", sort: "collectionSort" };
   }
-  return {};
+  // 所有作品（以及从模板页套用后落到所有作品）的排序读自己那份，别写到作者库的 sort 上
+  return { sort: "allWorksSort" };
 }
 
 /** 当前这套筛选条件序列化成 JSON */
@@ -3434,6 +3441,7 @@ function bodySearchHeader(ctx, shownCount) {
   // v1.3.34：后端不再截断 200 篇，命中多少都全返回（分批渲染在这页做）。
   // 这句留着只当兜底 —— 万一以后又给后端加回上限，这里还能如实说明，不至于让人以为没命中。
   if (ctx.meta.missingCount) notes.push(`${ctx.meta.missingCount} 篇没有可读的正文（没绑阅读版、或者文件不在原处），已跳过`);
+  if (terms.some((term) => synonymGroupOf(term))) notes.push("同义词已启用：命中数已合并同义词");
   const filteredNote = ctx.hitCount && shownCount !== ctx.hitCount ? `（当前筛选下 ${shownCount} 篇）` : "";
   return `<div class="text-search-heading"><h2>正文里命中 <em>${ctx.hitCount}</em> 篇${filteredNote}</h2><span class="text-search-stats">扫过 ${ctx.meta.scannedCount} 篇正文 · 用时 ${ctx.meta.elapsedMs} 毫秒</span></div>${notes.length ? `<div class="read-only-note">${notes.map((note) => escapeHtml(note)).join("　")}</div>` : ""}`;
 }
@@ -3464,13 +3472,21 @@ function bodySearchSnippet(ctx, workId) {
  * 多词时底部把**每个词各命中多少处**一并写清楚（v1.3.35）——
  * 顺序照后端给的词表；计数对不上（老数据 / 假后端没给）就只报总数，不硬凑。
  */
+/// 这个词当前是否落在启用的同义词组里（只影响界面上的「含同义词」标注，不参与命中判定）
+function synonymGroupOf(term) {
+  if (!state.synonyms.enabled) return null;
+  const key = String(term).toLowerCase();
+  return (state.synonyms.groups || []).find((group) => group.some((item) => String(item).toLowerCase() === key)) || null;
+}
+
 function textHitSnippets(hit, terms = []) {
   const rows = (hit.snippets || [])
     .map((snippet) => `<p class="text-snippet">${snippet.before ? `<span>…${escapeHtml(snippet.before)}</span>` : ""}<mark>${escapeHtml(snippet.hit)}</mark>${snippet.after ? `<span>${escapeHtml(snippet.after)}…</span>` : ""}</p>`)
     .join("");
   const counts = Array.isArray(hit.termCounts) ? hit.termCounts : [];
-  const detail = terms.length > 1 && counts.length === terms.length
-    ? ` · ${terms.map((term, index) => `「${escapeHtml(term)}」${counts[index]} 处`).join("、")}`
+  const merged = terms.map((term) => Boolean(synonymGroupOf(term)));
+  const detail = counts.length === terms.length && (terms.length > 1 || merged.some(Boolean))
+    ? ` · ${terms.map((term, index) => `「${escapeHtml(term)}」${counts[index]} 处${merged[index] ? "（含同义词）" : ""}`).join("、")}`
     : "";
   return `<div class="text-hit-snippets">${rows}<span class="text-hit-count">正文里命中 ${hit.hitCount} 处${detail}</span></div>`;
 }
@@ -3654,6 +3670,14 @@ function bindSynonymPanel() {
       if (!(await persistSynonyms())) {
         state.synonyms = { ...state.synonyms, enabled: previous };
         enabled.checked = previous;
+        return;
+      }
+      // 开关一改就立刻按当前词重算（v1.3.40）：面板开着时列表在背后，同样能看到命中数变化，
+      // 不用等关面板。弹窗挂在 body 上，runBodySearchInPlace 里的 render() 不会把它冲掉。
+      if (state.searchField === "body" && state.textSearchQuery && state.homeView === "allWorks" && !state.activeAuthor) {
+        state.synonymsSearchStale = false;
+        setSynonymStatus("已保存，正在按新词库重算…", "ok");
+        runBodySearchInPlace(state.textSearchQuery);
       }
     });
   }
@@ -3738,8 +3762,8 @@ function matchesAdvancedFilters(work) {
  * （散篇是"我贴一篇、它下一篇"的流水账，用户 2026-10-14 要求默认按添加时间倒序，
  * 所以散篇页把「最近添加」放在第一项并当作默认值）。作品库 / 所有作品不传，选项不变。
  */
-function sortSelect(current, withAdded = false, withHits = false) {
-  const added = withAdded ? `<option value="added_desc" ${current === "added_desc" ? "selected" : ""}>最近添加</option>` : "";
+function sortSelect(current, withAdded = false, withHits = false, addedLabel = "最近添加") {
+  const added = withAdded ? `<option value="added_desc" ${current === "added_desc" ? "selected" : ""}>${addedLabel}</option>` : "";
   // 「命中从多到少」（v1.3.16）：只在「所有作品」的正文搜索结果态下出现（withHits）；
   // 其它时候这个值既不在下拉里、也不生效 —— 选着它的期间离开正文搜索，下拉回落显示第一项，
   // 本次选择留在 state 里，下次正文搜索时它还会重新出现并保持勾选。
@@ -3790,7 +3814,7 @@ function renderAllWorks() {
   // 正文结果模式：再叠一层「正文命中」集合（正文只有这页能做全库搜）
   const visible = body ? filtered.filter((work) => body.hitMap.has(work.id)) : filtered;
   // 「命中从多到少」（v1.3.16）：只在正文结果模式下生效；命中数相同的保持原顺序（日期新→旧）
-  if (body && state.sort === "hits_desc") {
+  if (body && state.allWorksSort === "hits_desc") {
     visible.sort((left, right) => (Number(body.hitMap.get(right.id)?.hitCount) || 0) - (Number(body.hitMap.get(left.id)?.hitCount) || 0));
   }
   // 顶部「共 N 篇」：跟着筛选 / 正文搜索走（和底部「已显示 x / y 篇」的 y 同源）；
@@ -3816,7 +3840,7 @@ function renderAllWorks() {
         ${serialFilterButton(state.allWorks)}
         ${characterNameToggle()}
         ${filterButton()}
-        ${sortSelect(state.sort, false, Boolean(body))}
+        ${sortSelect(state.allWorksSort, true, Boolean(body), "加入时间由新到旧")}
       </div>
       ${filterPanel()}
       ${bodySearchHeader(body, visible.length) || '<div class="read-only-note">所有作品仅供搜索、筛选与打开查看。</div>'}
@@ -6748,7 +6772,16 @@ async function bindEvents() {
   const textSearchHistoryPanelElement = app.querySelector("#text-search-history");
   if (textSearchHistoryPanelElement) textSearchHistoryPanelElement.onpointerdown = (event) => event.preventDefault();
   const sortSelect = app.querySelector("#sort-select");
-  if (sortSelect) sortSelect.onchange = async (event) => { state.sort = event.target.value; if (state.homeView === "allWorks" && !state.activeAuthor) await refreshAllWorks(); else await refreshWorks(); render(); };
+  if (sortSelect) sortSelect.onchange = async (event) => {
+    if (state.homeView === "allWorks" && !state.activeAuthor) {
+      state.allWorksSort = event.target.value;
+      await refreshAllWorks();
+    } else {
+      state.sort = event.target.value;
+      await refreshWorks();
+    }
+    render();
+  };
   const searchField = app.querySelector("#search-field");
   if (searchField) searchField.onchange = async (event) => {
     state.searchField = event.target.value;
@@ -11331,6 +11364,7 @@ const VIEW_STATE_EXTRA_FIELDS = [
   ["serialLatestOnly", false],
   ["showCharacterNames", false],
   ["collectionSort", "added_desc"],
+  ["allWorksSort", "added_desc"],
   ["missingFullFilter", "todo"],
   ["filterPanelOpen", false],
   ["allWorksShown", ALL_WORKS_PAGE],
