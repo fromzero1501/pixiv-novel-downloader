@@ -3055,6 +3055,237 @@ const TEXT_SEARCH_MAX_SNIPPETS: usize = 3;
 /// 连正文都没找到的作品只报总数 + 前几个名字，列全了没地方放。
 const TEXT_SEARCH_LISTED_MISSING: usize = 12;
 
+/* ======================== 同义词（v1.3.39） ======================== */
+
+/// 同义词设置：每组里的词互相等价，搜索其中任何一个都按整组算命中。
+///
+/// 存 `app_settings` 的两条键，不进 `works` 表：它只是「搜索时怎么算」的规则，
+/// 跟作品数据无关，也就不动 `SCHEMA_VERSION`。
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct SynonymSettings {
+    enabled: bool,
+    groups: Vec<Vec<String>>,
+}
+
+const SYNONYM_GROUPS_KEY: &str = "synonym_groups";
+const SYNONYM_ENABLED_KEY: &str = "synonyms_enabled";
+/// 上限不是拍脑袋：每组每多一个写法，整库扫描就多一遍子串查找。
+const SYNONYM_MAX_GROUPS: usize = 300;
+const SYNONYM_MAX_GROUP_TERMS: usize = 20;
+const SYNONYM_MAX_TERM_CHARS: usize = 40;
+
+/// 读同义词设置。没存过、存坏了都按「关闭 + 空词库」处理 ——
+/// 一份坏掉的设置不能让正文搜索整个打不开。
+fn read_synonyms(conn: &Connection) -> SynonymSettings {
+    SynonymSettings {
+        enabled: setting(conn, SYNONYM_ENABLED_KEY)
+            .map(|value| value == "1")
+            .unwrap_or(false),
+        groups: setting(conn, SYNONYM_GROUPS_KEY)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<Vec<String>>>(&raw).ok())
+            .unwrap_or_default(),
+    }
+}
+
+/// 清洗 + 校验用户填的词组：去空白项、组内去重（英文不分大小写）、
+/// 一个词只能属于一组、每组 2–20 个词、单词不超过 40 字。
+fn normalize_synonym_groups(groups: &[Vec<String>]) -> Result<Vec<Vec<String>>, String> {
+    if groups.len() > SYNONYM_MAX_GROUPS {
+        return Err(format!("同义词最多 {SYNONYM_MAX_GROUPS} 组"));
+    }
+    let mut cleaned: Vec<Vec<String>> = Vec::new();
+    // (小写, 原文)：报错时能说清是哪个词重复了
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let mut terms: Vec<String> = Vec::new();
+        let mut keys: Vec<String> = Vec::new();
+        for raw in group {
+            let term = raw.trim();
+            if term.is_empty() {
+                continue;
+            }
+            if term.chars().any(char::is_whitespace) {
+                return Err(format!(
+                    "第 {} 组的「{}」里有空白：一条同义词只能是一个词",
+                    index + 1,
+                    term
+                ));
+            }
+            if term.chars().count() > SYNONYM_MAX_TERM_CHARS {
+                return Err(format!(
+                    "「{}」太长了：一条同义词最多 {} 个字",
+                    term, SYNONYM_MAX_TERM_CHARS
+                ));
+            }
+            let key = term.to_lowercase();
+            if keys.iter().any(|existing| existing == &key) {
+                continue; // 同一组里重复写了两遍，留一份就行
+            }
+            if let Some((_, owner)) = seen.iter().find(|(existing, _)| existing == &key) {
+                return Err(format!(
+                    "「{}」已经在「{}」那一组里了，一个词只能属于一组",
+                    term, owner
+                ));
+            }
+            keys.push(key);
+            terms.push(term.to_string());
+        }
+        if terms.is_empty() {
+            continue;
+        }
+        if terms.len() < 2 {
+            return Err(format!("第 {} 组只有一个词，至少要两个词才算同义词", index + 1));
+        }
+        if terms.len() > SYNONYM_MAX_GROUP_TERMS {
+            return Err(format!(
+                "第 {} 组有 {} 个词，最多 {} 个",
+                index + 1,
+                terms.len(),
+                SYNONYM_MAX_GROUP_TERMS
+            ));
+        }
+        for (key, term) in keys.into_iter().zip(terms.iter()) {
+            seen.push((key, term.clone()));
+        }
+        cleaned.push(terms);
+    }
+    Ok(cleaned)
+}
+
+fn save_synonyms_impl(settings: SynonymSettings) -> Result<SynonymSettings, String> {
+    let groups = normalize_synonym_groups(&settings.groups)?;
+    let raw = serde_json::to_string(&groups).map_err(|error| error.to_string())?;
+    let mut conn = db()?;
+    let transaction = conn.transaction().map_err(|error| error.to_string())?;
+    put_setting(&transaction, SYNONYM_GROUPS_KEY, &raw)?;
+    put_setting(
+        &transaction,
+        SYNONYM_ENABLED_KEY,
+        if settings.enabled { "1" } else { "0" },
+    )?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(SynonymSettings {
+        enabled: settings.enabled,
+        groups,
+    })
+}
+
+/// 一个搜索词在本次搜索里的展开结果：`display` 是用户输入的原词（结果里只显示它），
+/// `variants` 是参与匹配的所有写法（自己 + 同义词）。
+struct SearchTermGroup {
+    display: String,
+    variants: Vec<String>,
+}
+
+/// 把用户输入的词按同义词表摊开。
+///
+/// - 双向：输入组里任何一个词，整组都参与匹配；
+/// - 两个输入词落在同一组时只留先出现的那个（否则同一处会被算两遍）；
+/// - 不在任何组里的词照原样匹配。
+fn expand_search_terms(terms: &[String], synonym_groups: &[Vec<String>]) -> Vec<SearchTermGroup> {
+    let mut groups: Vec<SearchTermGroup> = Vec::with_capacity(terms.len());
+    let mut used_groups: Vec<usize> = Vec::new();
+    for term in terms {
+        let key = term.to_lowercase();
+        let owner = synonym_groups
+            .iter()
+            .position(|group| group.iter().any(|word| word.to_lowercase() == key));
+        let Some(index) = owner else {
+            groups.push(SearchTermGroup {
+                display: term.clone(),
+                variants: vec![term.clone()],
+            });
+            continue;
+        };
+        if used_groups.contains(&index) {
+            continue;
+        }
+        used_groups.push(index);
+        let mut variants = vec![term.clone()];
+        for word in &synonym_groups[index] {
+            let word_key = word.to_lowercase();
+            if variants
+                .iter()
+                .any(|existing| existing.to_lowercase() == word_key)
+            {
+                continue;
+            }
+            variants.push(word.clone());
+        }
+        groups.push(SearchTermGroup {
+            display: term.clone(),
+            variants,
+        });
+    }
+    groups
+}
+
+/// 按「词组」做匹配：一组的计数是组内所有写法命中处去重后的总数。
+///
+/// 同一处可能被组里两个写法同时命中（比如一个词是另一个的前缀），
+/// 所以先把区间按起点排序、同起点长的优先，再丢掉与上一段重叠的 ——
+/// 计数和片段都按去重后的区间来，跟卡片上「合并到搜索词」的口径一致。
+fn text_search_matches_grouped(
+    text: &str,
+    lowered: &str,
+    groups: &[SearchTermGroup],
+) -> (Vec<usize>, Vec<TextSnippet>) {
+    if groups.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut counts: Vec<usize> = Vec::with_capacity(groups.len());
+    let mut pending: Vec<std::vec::IntoIter<(usize, usize)>> = Vec::new();
+    for group in groups {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for variant in &group.variants {
+            let needle = variant.to_lowercase();
+            if needle.is_empty() {
+                continue;
+            }
+            for (start, matched) in lowered.match_indices(&needle) {
+                ranges.push((start, matched.len()));
+            }
+        }
+        ranges.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+        let mut unique: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        let mut last_end = 0usize;
+        for (start, len) in ranges {
+            if start < last_end {
+                continue;
+            }
+            last_end = start + len;
+            unique.push((start, len));
+        }
+        // 多词取交集：任何一组一处都没有，这篇整篇不算命中
+        if unique.is_empty() {
+            return (vec![0; groups.len()], Vec::new());
+        }
+        counts.push(unique.len());
+        pending.push(unique.into_iter());
+    }
+    let mut snippets = Vec::new();
+    'outer: loop {
+        let mut taken = false;
+        for starts in pending.iter_mut() {
+            let Some((start, len)) = starts.next() else {
+                continue;
+            };
+            taken = true;
+            snippets.push(text_snippet_at(text, start, start + len));
+            if snippets.len() >= TEXT_SEARCH_MAX_SNIPPETS {
+                break 'outer;
+            }
+        }
+        if !taken {
+            break;
+        }
+    }
+    (counts, snippets)
+}
+
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TextSnippet {
@@ -3147,41 +3378,7 @@ fn text_search_matches_lowered(
     if terms.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    // 每个词一份计数（与 terms 同序）+ 一份待取的命中起点，片段名额在词之间轮流分
-    let mut counts: Vec<usize> = Vec::with_capacity(terms.len());
-    let mut pending: Vec<std::vec::IntoIter<(usize, usize)>> = Vec::new();
-    for term in &terms {
-        let needle = term.to_lowercase();
-        let mut starts: Vec<(usize, usize)> = Vec::new();
-        for (start, matched) in lowered.match_indices(&needle) {
-            // 小写只改 ASCII 字母的字节值、不改长度，所以偏移和长度都能直接切原文
-            starts.push((start, matched.len()));
-        }
-        // 多词取交集：任何一个词一处都没有，这篇整篇不算命中
-        if starts.is_empty() {
-            return (vec![0; terms.len()], Vec::new());
-        }
-        counts.push(starts.len());
-        pending.push(starts.into_iter());
-    }
-    let mut snippets = Vec::new();
-    'outer: loop {
-        let mut taken = false;
-        for starts in pending.iter_mut() {
-            let Some((start, len)) = starts.next() else {
-                continue;
-            };
-            taken = true;
-            snippets.push(text_snippet_at(text, start, start + len));
-            if snippets.len() >= TEXT_SEARCH_MAX_SNIPPETS {
-                break 'outer;
-            }
-        }
-        if !taken {
-            break;
-        }
-    }
-    (counts, snippets)
+    text_search_matches_grouped(text, lowered, &expand_search_terms(&terms, &[]))
 }
 
 /// 抠出命中处前后各 N 个**字符**。
@@ -3390,8 +3587,11 @@ fn text_search_document(path: &Path) -> Option<String> {
 }
 
 fn search_full_text_impl(query: &str, limit: Option<usize>) -> Result<TextSearchResult, String> {
+    let conn = db()?;
+    // 同义词是「搜索时怎么算命中」的规则，不是作品数据：只在这里读一次，
+    // 关着的时候下面的扫描跟原来一模一样。
+    let synonyms = read_synonyms(&conn);
     let rows: Vec<(i64, String, String, String)> = {
-        let conn = db()?;
         let mut statement = conn
             .prepare(
                 "SELECT id, COALESCE(title,''), COALESCE(purchased_path,''), COALESCE(preview_path,'')
@@ -3407,7 +3607,12 @@ fn search_full_text_impl(query: &str, limit: Option<usize>) -> Result<TextSearch
             .map_err(|error| error.to_string())?;
         collected
     };
-    search_full_text_over(&rows, query, limit)
+    let groups: &[Vec<String>] = if synonyms.enabled {
+        &synonyms.groups
+    } else {
+        &[]
+    };
+    search_full_text_over_with_synonyms(&rows, query, limit, groups)
 }
 
 /// 扫描本体：只认「一篇作品 = 一个 id + 名字 + 几条候选路径」，
@@ -3418,11 +3623,26 @@ fn search_full_text_over(
     query: &str,
     limit: Option<usize>,
 ) -> Result<TextSearchResult, String> {
+    search_full_text_over_with_synonyms(rows, query, limit, &[])
+}
+
+/// 带同义词的扫描本体（v1.3.39）。`synonym_groups` 为空时跟原来完全一样；
+/// 每组词先在 `expand_search_terms` 里摊成「显示词 + 全部写法」，
+/// 命中判定按组做，`term_counts` / 卡片上的计数都按组的合并值算。
+fn search_full_text_over_with_synonyms(
+    rows: &[(i64, String, String, String)],
+    query: &str,
+    limit: Option<usize>,
+    synonym_groups: &[Vec<String>],
+) -> Result<TextSearchResult, String> {
     let needle = query.trim();
+    let terms = text_search_terms(needle);
     // 只剩空白（或全是空格分隔符）就当没填 —— 别让一次全库扫描白跑
-    if text_search_terms(needle).is_empty() {
+    if terms.is_empty() {
         return Err("先输入要搜的内容".into());
     }
+    // 同义词只在「启用」时由调用方传进来；空表时这里就是每个词各自一组
+    let term_groups = expand_search_terms(&terms, synonym_groups);
     // v1.3.34：不再按 200 篇截断，命中多少全返回（分批渲染在前端做）。
     // `limit` 还留着：传了正数才截断，单测和「只想要前 N 篇」的调用点照样能用。
     let cap = limit.filter(|value| *value > 0);
@@ -3436,6 +3656,8 @@ fn search_full_text_over(
         .clamp(1, 6);
     let chunk = rows.len().div_ceil(workers).max(1);
 
+    // 线程闭包是 move：先把词表借出去，别把整份词表搬进第一个线程
+    let term_groups = &term_groups;
     let mut collected: Vec<(i64, Vec<usize>, Vec<TextSnippet>)> = Vec::new();
     let mut scanned_count = 0usize;
     let mut missing: Vec<String> = Vec::new();
@@ -3473,7 +3695,7 @@ fn search_full_text_over(
                         // 小写只做一次，交集判断和抠片段共用（v1.3.33）
                         let lowered_document = document.to_lowercase();
                         let (term_counts, snippets) =
-                            text_search_matches_lowered(&document, &lowered_document, needle);
+                            text_search_matches_grouped(&document, &lowered_document, &term_groups);
                         // 交集下要么每个词都有、要么全 0，所以总数 > 0 就代表整篇命中
                         if text_hit_total(&term_counts) > 0 {
                             hits.push((*work_id, term_counts, snippets));
@@ -3518,7 +3740,10 @@ fn search_full_text_over(
                 snippets,
             })
             .collect(),
-        terms: text_search_terms(needle),
+        terms: term_groups
+            .iter()
+            .map(|group| group.display.clone())
+            .collect(),
         scanned_count,
         missing,
         missing_count,
@@ -3534,6 +3759,21 @@ fn search_full_text_over(
 #[tauri::command]
 async fn search_full_text(query: String, limit: Option<usize>) -> Result<TextSearchResult, String> {
     tauri::async_runtime::spawn_blocking(move || search_full_text_impl(&query, limit))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+/// 同义词设置：给「所有作品」页那个按钮读的。
+#[tauri::command]
+fn get_synonyms() -> Result<SynonymSettings, String> {
+    let conn = db()?;
+    Ok(read_synonyms(&conn))
+}
+
+/// 保存同义词设置。返回清洗后的结果 —— 前端拿它刷新状态，看到的就是真正落盘的内容。
+#[tauri::command]
+async fn save_synonyms(settings: SynonymSettings) -> Result<SynonymSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || save_synonyms_impl(settings))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -18925,6 +19165,8 @@ pub fn run() {
             ensure_default_collection,
             list_filter_views,
             search_full_text,
+            get_synonyms,
+            save_synonyms,
             save_filter_view,
             rename_filter_view,
             update_filter_view,
@@ -19100,6 +19342,8 @@ mod tests {
         anthology_image_slots, clean_filter_view_name, FILTER_VIEW_MAX_NAME,
         document_text, is_epub_text_entry, single_line, strip_element_block,
         search_full_text_over, text_search_document, text_search_matches, text_search_terms,
+        search_full_text_over_with_synonyms, expand_search_terms, text_search_matches_grouped,
+        normalize_synonym_groups,
         text_search_matches_lowered, text_hit_total,
         TEXT_SEARCH_CONTEXT_CHARS, TEXT_SEARCH_MAX_SNIPPETS,
         mark_work_in_progress, read_state_label, split_tags, READ_DONE, READ_IN_PROGRESS,
@@ -25282,6 +25526,69 @@ mod tests {
             result.elapsed_ms < 3000,
             "整库扫描慢到 {} ms，超出「亚秒级」的预期",
             result.elapsed_ms
+        );
+    }
+
+    /// 同义词：一组词双向等价；两个输入词撞进同一组时只算一个词。
+    #[test]
+    fn synonym_groups_expand_both_ways() {
+        let groups = vec![vec!["爱丽丝".to_string(), "艾丽丝".to_string()]];
+        let expanded = expand_search_terms(&["艾丽丝".to_string(), "魔法".to_string()], &groups);
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(expanded[0].display, "艾丽丝");
+        assert_eq!(
+            expanded[0].variants,
+            vec!["艾丽丝".to_string(), "爱丽丝".to_string()]
+        );
+        assert_eq!(expanded[1].variants, vec!["魔法".to_string()]);
+
+        let merged = expand_search_terms(
+            &["爱丽丝".to_string(), "艾丽丝".to_string()],
+            &groups,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].display, "爱丽丝");
+    }
+
+    /// 同义词命中合并计数；同一处被组里两个写法命中只算一次。
+    #[test]
+    fn synonym_matches_merge_counts() {
+        let text = "爱丽丝说：艾丽丝来了。爱丽丝又走了。";
+        let groups = vec![vec!["爱丽丝".to_string(), "艾丽丝".to_string()]];
+        let expanded = expand_search_terms(&["艾丽丝".to_string()], &groups);
+        let (counts, snippets) =
+            text_search_matches_grouped(text, &text.to_lowercase(), &expanded);
+        assert_eq!(counts, vec![3]);
+        assert!(!snippets.is_empty());
+        // 片段仍按原文切，不把同义词改写成搜索词
+        assert!(snippets.iter().any(|snippet| snippet.hit == "艾丽丝"));
+
+        // 前缀重叠：同一个起点只留最长的那个，不重复计数
+        let overlap = vec![vec!["ab".to_string(), "abc".to_string()]];
+        let expanded = expand_search_terms(&["ab".to_string()], &overlap);
+        let (counts, _) = text_search_matches_grouped("abc", "abc", &expanded);
+        assert_eq!(counts, vec![1]);
+    }
+
+    /// 词库校验：单词组不合法、跨组重复不合法、组内重复自动去掉。
+    #[test]
+    fn synonym_groups_are_validated() {
+        assert!(normalize_synonym_groups(&[vec!["孤单".to_string()]]).is_err());
+        assert!(normalize_synonym_groups(&[
+            vec!["爱丽丝".to_string(), "艾丽丝".to_string()],
+            vec!["艾丽丝".to_string(), "丽丝".to_string()],
+        ])
+        .is_err());
+        let cleaned = normalize_synonym_groups(&[vec![
+            " 爱丽丝 ".to_string(),
+            "".to_string(),
+            "艾丽丝".to_string(),
+            "爱丽丝".to_string(),
+        ]])
+        .unwrap();
+        assert_eq!(
+            cleaned,
+            vec![vec!["爱丽丝".to_string(), "艾丽丝".to_string()]]
         );
     }
 }

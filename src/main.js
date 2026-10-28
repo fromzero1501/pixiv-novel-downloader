@@ -138,6 +138,15 @@ const state = {
    * 展开动作发生在输入框聚焦时，一 render 焦点和刚打的字就全没了。
    */
   textSearchHistoryOpen: false,
+  /**
+   * 同义词（v1.3.39）：给「正文内容」搜索用。`enabled` 是总开关，`groups` 是一组组等价词。
+   * 启动时从后端 app_settings 读一次；面板里改动即时落盘，随库备份走。
+   */
+  synonyms: { enabled: false, groups: [] },
+  /** 同义词面板打开期间的可编辑副本（含还没填完的行），关面板即弃 */
+  synonymDraft: [],
+  /** 词库改过、还没按新词库重扫正文 —— 关面板时据此决定要不要重搜 */
+  synonymsSearchStale: false,
   /** 还没算过字数的作品数（后台补算进行中时非 0，字数档那一行会提示） */
   wordCountPending: 0,
   syncTask: null,
@@ -578,9 +587,21 @@ async function invoke(command, args = {}) {
     for (const piece of needle.split(/\s+/)) {
       if (piece && !terms.includes(piece)) terms.push(piece);
     }
+    // v1.3.39：同义词 —— 开关开着时，每个词先找到它所属的组，整组所有写法都算这个词的命中；
+    // 同组两个输入词只算一次（用先出现的那个词显示），和后端同一套口径。
+    const synonymState = window.__previewSynonyms || { enabled: false, groups: [] };
+    const termGroups = [];
+    for (const term of terms) {
+      const key = term.toLowerCase();
+      const group = synonymState.enabled
+        ? (synonymState.groups || []).find((items) => items.some((item) => String(item).toLowerCase() === key))
+        : null;
+      if (group && termGroups.some((entry) => entry.group === group)) continue;
+      termGroups.push({ display: term, variants: group ? group.map(String) : [term], group: group || null });
+    }
     const matched = [];
     let scannedCount = 0;
-    if (terms.length) {
+    if (termGroups.length) {
       for (const work of previewWorkPool()) {
         const text = String(work.synopsis || "");
         if (!text) continue;
@@ -592,31 +613,42 @@ async function invoke(command, args = {}) {
         const termCounts = [];
         const queues = [];
         let missed = false;
-        for (const term of terms) {
-          const word = term.toLowerCase();
+        for (const entry of termGroups) {
+          // 每个写法各自找位置，再按起点排序去重叠：同一处被两个同义词命中只算一次
           const starts = [];
-          let from = 0;
-          for (;;) {
-            const at = lowered.indexOf(word, from);
-            if (at < 0) break;
-            starts.push(at);
-            from = at + word.length;
+          for (const variant of entry.variants) {
+            const word = variant.toLowerCase();
+            let from = 0;
+            for (;;) {
+              const at = lowered.indexOf(word, from);
+              if (at < 0) break;
+              starts.push({ at, length: variant.length });
+              from = at + word.length;
+            }
           }
-          if (!starts.length) { missed = true; break; }
-          hitCount += starts.length;
-          termCounts.push(starts.length);
-          queues.push({ starts, length: term.length });
+          starts.sort((left, right) => left.at - right.at || right.length - left.length);
+          const unique = [];
+          let lastEnd = -1;
+          for (const item of starts) {
+            if (item.at < lastEnd) continue;
+            lastEnd = item.at + item.length;
+            unique.push(item);
+          }
+          if (!unique.length) { missed = true; break; }
+          hitCount += unique.length;
+          termCounts.push(unique.length);
+          queues.push(unique);
         }
         if (missed) continue;
         for (let depth = 0; snippets.length < 3; depth += 1) {
           let taken = false;
           for (const queue of queues) {
             if (snippets.length >= 3) break;
-            const at = queue.starts[depth];
-            if (at === undefined) continue;
+            const item = queue[depth];
+            if (!item) continue;
             taken = true;
-            // 高亮取原文那几个字母（length 按字符算，中英文都对）
-            const length = queue.length;
+            const at = item.at;
+            const length = item.length;
             snippets.push({
               before: text.slice(Math.max(0, at - 36), at).replace(/\s+/g, " ").trim(),
               hit: text.slice(at, at + length),
@@ -965,6 +997,14 @@ async function invoke(command, args = {}) {
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
   if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "epub", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "尚香书苑", url: "https://sxsy45.com/search.php?mod=forum&orderby=dateline&ascdesc=desc&searchsubmit=yes&srchtxt=" }], ...(window.__mockAppSettings || {}) };
   if (command === "save_app_settings") return args.settings;
+  // 同义词（v1.3.39）：预览里存在内存上，刷新页面就回到默认
+  if (command === "get_synonyms") return window.__previewSynonyms || { enabled: false, groups: [] };
+  if (command === "save_synonyms") {
+    const settings = args.settings || { enabled: false, groups: [] };
+    const groups = (settings.groups || []).map((group) => group.map(String)).filter((group) => group.length >= 2);
+    window.__previewSynonyms = { enabled: Boolean(settings.enabled), groups };
+    return window.__previewSynonyms;
+  }
   // 浏览器预览默认当作「已是最新版」；要看更新界面就把 window.__mockUpdateCheck 塞进来
   // 预览环境没有 Tauri 后端：给个默认「没填过 Cookie」，验证脚本可以塞 window.__mockCookieProbe 覆盖
   if (command === "check_pixiv_cookie") return window.__mockCookieProbe || { ok: false, status: "missing", message: "预览环境里没有 Pixiv Cookie。", userName: null, checkedAtMs: Date.now() };
@@ -3436,6 +3476,191 @@ function textHitSnippets(hit, terms = []) {
 }
 
 /**
+ * 同义词（v1.3.39）：给「正文内容」这一档搜索用的等价词组。
+ * 词库存在后端 app_settings 里、随库备份走；这里只负责读、画面板、即时保存。
+ * 命中判定与合并计数都在后端，前端要认的只有「terms 是显示词」这一条。
+ */
+const SYNONYM_RENDER_LIMIT = 50;
+let synonymSaveChain = Promise.resolve();
+
+async function refreshSynonyms() {
+  try {
+    const value = await invoke("get_synonyms");
+    state.synonyms = {
+      enabled: Boolean(value?.enabled),
+      groups: Array.isArray(value?.groups)
+        ? value.groups.map((group) => (Array.isArray(group) ? group.map(String) : [])).filter((group) => group.length)
+        : [],
+    };
+  } catch (error) {
+    console.log("同义词读取失败:", error);
+    state.synonyms = { enabled: false, groups: [] };
+  }
+}
+
+/// 工具栏上的同义词入口：按钮打开面板，右边那颗小开关不打开面板也能直接开关
+function synonymControl() {
+  const count = (state.synonyms.groups || []).length;
+  const on = Boolean(state.synonyms.enabled);
+  return `<div class="synonym-control ${on ? "is-on" : ""}"><button class="icon-text-button synonym-button" data-action="open-synonyms" title="设置正文搜索的同义词${count ? `（${count} 组）` : ""}">${icon("tag", 17)}<span>同义词${count ? ` · ${count}` : ""}</span></button><label class="synonym-mini-switch" title="${on ? "同义词已启用" : "同义词未启用"}"><input id="synonyms-quick-toggle" type="checkbox" role="switch" aria-label="启用同义词" ${on ? "checked" : ""}><span class="synonym-mini-track" aria-hidden="true"></span></label></div>`;
+}
+
+async function openSynonymsPanel() {
+  await refreshSynonyms();
+  state.synonymDraft = (state.synonyms.groups || []).map((group) => group.slice());
+  state.synonymsSearchStale = false;
+  showModal(modal("同义词", synonymsPanelBody(), `<span class="synonym-status" id="synonym-status"></span><button class="quiet-button" data-action="close-modal">关闭</button>`, "is-roomy"));
+  bindSynonymPanel();
+}
+
+function synonymsPanelBody() {
+  return `<div class="synonym-panel" id="synonym-panel">
+    <label class="synonym-switch" for="synonyms-enabled"><input id="synonyms-enabled" type="checkbox" role="switch" ${state.synonyms.enabled ? "checked" : ""}><span class="synonym-switch-track" aria-hidden="true"></span><span class="synonym-switch-copy"><strong>启用同义词</strong><small>开启后，正文搜索输入组里任何一个词，都按整组算命中；结果里仍只显示你输入的那个词。</small></span></label>
+    <div class="synonym-toolbar"><input id="synonym-filter" type="search" placeholder="过滤词条" autocomplete="off"><button class="quiet-button" data-action="synonym-add">${icon("plus", 16)}<span>新增一组</span></button></div>
+    <p class="synonym-hint">一组一行，用顿号（、）分隔。同一组的词互相等价；一个词只能属于一组。改动即时保存。</p>
+    <div class="synonym-list" id="synonym-list"></div>
+    <p class="synonym-limit" id="synonym-limit"></p>
+  </div>`;
+}
+
+function synonymRowMarkup(group, index) {
+  return `<div class="synonym-row" data-synonym-index="${index}"><input class="synonym-input" type="text" value="${escapeHtml(group.join("、"))}" placeholder="例如：爱丽丝、艾莉丝" autocomplete="off" spellcheck="false"><button class="icon-button synonym-remove" type="button" title="删除这一组">${icon("trash", 16)}</button></div>`;
+}
+
+function renderSynonymRows(filter = "") {
+  const list = document.querySelector("#synonym-list");
+  if (!list) return;
+  const draft = state.synonymDraft || [];
+  const needle = String(filter || "").trim().toLowerCase();
+  const matched = [];
+  draft.forEach((group, index) => {
+    if (!needle || group.join("、").toLowerCase().includes(needle)) matched.push({ group, index });
+  });
+  const shown = matched.slice(0, SYNONYM_RENDER_LIMIT);
+  list.innerHTML = shown.length
+    ? shown.map(({ group, index }) => synonymRowMarkup(group, index)).join("")
+    : `<p class="synonym-empty">${draft.length ? "没有匹配的词条" : "还没有同义词。点「新增一组」开始。"}</p>`;
+  const limit = document.querySelector("#synonym-limit");
+  if (limit) limit.textContent = matched.length > shown.length ? `匹配 ${matched.length} 组，只显示前 ${SYNONYM_RENDER_LIMIT} 组；再输入几个字缩小范围。` : "";
+  bindSynonymRows();
+}
+
+function parseSynonymInput(value) {
+  return String(value || "").split(/[、,，;；\s]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function setSynonymStatus(text, kind = "") {
+  const status = document.querySelector("#synonym-status");
+  if (!status) return;
+  status.textContent = text;
+  status.className = `synonym-status${kind ? ` is-${kind}` : ""}`;
+}
+
+/// 面板里的每一行：输入即写进草稿，离开输入框（change）才落盘，避免每敲一个字发一次命令
+function bindSynonymRows() {
+  document.querySelectorAll("#synonym-list .synonym-row").forEach((row) => {
+    if (row.dataset.bound) return;
+    row.dataset.bound = "true";
+    const index = Number(row.dataset.synonymIndex);
+    const input = row.querySelector(".synonym-input");
+    const remove = row.querySelector(".synonym-remove");
+    input?.addEventListener("input", () => {
+      if (state.synonymDraft[index]) state.synonymDraft[index] = parseSynonymInput(input.value);
+    });
+    input?.addEventListener("change", () => { commitSynonymRow(index, input); });
+    input?.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); input.blur(); } });
+    // 删除按钮按下时别抢焦点：一抢就先触发 change 保存，删除和保存会互相覆盖
+    remove?.addEventListener("mousedown", (event) => event.preventDefault());
+    remove?.addEventListener("click", async () => {
+      if (!state.synonymDraft[index]) return;
+      state.synonymDraft.splice(index, 1);
+      renderSynonymRows(document.querySelector("#synonym-filter")?.value || "");
+      await persistSynonyms();
+    });
+  });
+}
+
+async function commitSynonymRow(index, input) {
+  if (!state.synonymDraft[index]) return;
+  const terms = parseSynonymInput(input.value);
+  state.synonymDraft[index] = terms;
+  if (!terms.length) {
+    // 清空整行 = 删掉这一组
+    state.synonymDraft.splice(index, 1);
+    renderSynonymRows(document.querySelector("#synonym-filter")?.value || "");
+    await persistSynonyms();
+    return;
+  }
+  if (terms.length === 1) {
+    setSynonymStatus(`「${terms[0]}」还缺同义词：一组至少两个词，补一个再离开输入框`, "warn");
+    return;
+  }
+  await persistSynonyms();
+}
+
+function addSynonymRow() {
+  if (!Array.isArray(state.synonymDraft)) state.synonymDraft = [];
+  // 加在最上面：组数超过渲染上限时，新加的空行也一定看得见
+  state.synonymDraft.unshift([]);
+  const filter = document.querySelector("#synonym-filter");
+  if (filter) filter.value = "";
+  renderSynonymRows("");
+  document.querySelector("#synonym-list .synonym-input")?.focus();
+}
+
+/// 串行保存：连点两下删除 / 一边失焦一边新增时，避免两个请求用不同快照互相覆盖
+function persistSynonyms() {
+  const run = async () => {
+    const panelOpen = Boolean(document.querySelector("#synonym-panel"));
+    const enabledInput = document.querySelector("#synonyms-enabled");
+    const enabled = enabledInput ? enabledInput.checked : Boolean(state.synonyms.enabled);
+    const source = panelOpen ? (state.synonymDraft || []) : (state.synonyms.groups || []);
+    const groups = source
+      .map((group) => (Array.isArray(group) ? group.map((item) => String(item).trim()).filter(Boolean) : []))
+      .filter((group) => group.length >= 2);
+    const waiting = source.filter((group) => Array.isArray(group) && group.length === 1).length;
+    try {
+      const saved = await invoke("save_synonyms", { settings: { enabled, groups } });
+      state.synonyms = {
+        enabled: Boolean(saved?.enabled),
+        groups: Array.isArray(saved?.groups) ? saved.groups.map((group) => group.map(String)) : [],
+      };
+      state.synonymsSearchStale = true;
+      if (panelOpen) setSynonymStatus(waiting ? `已保存；还有 ${waiting} 组只填了一个词，先不生效` : "已保存", "ok");
+      return true;
+    } catch (error) {
+      if (panelOpen) setSynonymStatus(String(error), "error");
+      else toast(`同义词没保存：${error}`, "error");
+      return false;
+    }
+  };
+  const next = synonymSaveChain.then(run, run);
+  synonymSaveChain = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+function bindSynonymPanel() {
+  const filter = document.querySelector("#synonym-filter");
+  if (filter && !filter.dataset.bound) {
+    filter.dataset.bound = "true";
+    filter.addEventListener("input", () => renderSynonymRows(filter.value));
+  }
+  const enabled = document.querySelector("#synonyms-enabled");
+  if (enabled && !enabled.dataset.bound) {
+    enabled.dataset.bound = "true";
+    enabled.addEventListener("change", async () => {
+      const previous = state.synonyms.enabled;
+      state.synonyms = { ...state.synonyms, enabled: enabled.checked };
+      if (!(await persistSynonyms())) {
+        state.synonyms = { ...state.synonyms, enabled: previous };
+        enabled.checked = previous;
+      }
+    });
+  }
+  renderSynonymRows(filter?.value || "");
+}
+
+/**
  * 正文「就地」搜索：先把当前列表换成「不带搜索词」的版本（筛选照旧），再扫盘。
  * 结果由各列表页自己渲染（见 `bodySearchContext`），不再有独立页面。
  */
@@ -3584,6 +3809,7 @@ function renderAllWorks() {
       <div class="library-tools">
         <div class="search-field-wrap"><label class="search-field"><span>${icon("search", 19)}</span><input id="work-search" type="search" placeholder="${searchPlaceholder()}" value="${escapeHtml(state.allWorksQuery)}" autocomplete="off"></label>${state.searchField === "body" ? textSearchHistoryPanel() : ""}</div>
         ${searchFieldSelect(state.searchField)}
+        ${synonymControl()}
         <div class="filter-group" role="group" aria-label="版本状态">${STATUS_FILTERS.map(([value, label]) => `<button class="filter-button ${state.status === value ? "is-active" : ""}" data-action="status" data-status="${value}">${label}</button>`).join("")}</div>
         <button class="icon-text-button favorite-filter ${state.allWorksFavoritesOnly ? "is-active" : ""}" data-action="favorites-only">${icon("heart", 17)}<span>仅看收藏</span></button>
         <button class="icon-text-button favorite-filter images-filter ${state.imagesFilter === "has" ? "is-active" : ""}" data-action="images-only" title="只看有配图的作品（等同高级筛选里的「配图 · 有图」）">${icon("image", 17)}<span>仅看带图版</span></button>
@@ -6019,9 +6245,24 @@ function closeModal() {
   }
   // 只关最上面那层：设置弹窗里再开确认框时，不能把设置一起关掉
   const layers = document.querySelectorAll(".modal-layer");
+  const synonymPanelOpen = layers.length === 1 && Boolean(document.querySelector("#synonym-panel"));
+  const synonymQuery = state.textSearchQuery;
+  const synonymRescanWanted = synonymPanelOpen && state.searchField === "body" && Boolean(synonymQuery) && state.homeView === "allWorks" && !state.activeAuthor;
   layers[layers.length - 1]?.remove();
   state.pendingConfirmation = null;
   state.pendingMatch = null;
+  // 同义词面板（v1.3.39）：词条是即时保存的，等保存链走完再决定要不要按新词库重扫 ——
+  // 否则刚改完就关面板，拿到的还是旧词库。没停正文搜索结果就只重绘一下，更新按钮上的组数/开关点。
+  if (synonymPanelOpen) {
+    synonymSaveChain.then(() => {
+      if (synonymRescanWanted && state.synonymsSearchStale) {
+        state.synonymsSearchStale = false;
+        runBodySearchInPlace(synonymQuery);
+      } else if (state.homeView === "allWorks" && !state.activeAuthor) {
+        render();
+      }
+    });
+  }
 }
 
 /** 匹配方式选择弹窗：真正要执行的动作先存进 state.pendingMatch，用户选完模式再执行。 */
@@ -6518,6 +6759,27 @@ async function bindEvents() {
     render();
   };
 
+  // 工具栏上的同义词小开关（v1.3.39）：不打开面板也能直接开关，状态即时落盘
+  const synonymToggle = app.querySelector("#synonyms-quick-toggle");
+  if (synonymToggle) synonymToggle.onchange = async (event) => {
+    const previous = state.synonyms.enabled;
+    state.synonyms = { ...state.synonyms, enabled: event.target.checked };
+    if (!(await persistSynonyms())) {
+      state.synonyms = { ...state.synonyms, enabled: previous };
+      event.target.checked = previous;
+      return;
+    }
+    render();
+    // 已经停在正文搜索结果上：开关一改就按当前词重算，别让人以为没生效
+    if (state.searchField === "body" && state.textSearchQuery && state.homeView === "allWorks" && !state.activeAuthor) {
+      state.synonymsSearchStale = false;
+      runBodySearchInPlace(state.textSearchQuery);
+      return;
+    }
+    // 开着却一组词都没有：直接把面板打开，省得点完开关什么都没发生
+    if (state.synonyms.enabled && !state.synonyms.groups.length) openSynonymsPanel();
+  };
+
   document.querySelectorAll("[data-action]").forEach((element) => {
     if (element.dataset.bound) return;
     element.dataset.bound = "true";
@@ -6537,6 +6799,8 @@ async function bindEvents() {
       if (action === "sync-author-profile") await syncAuthorProfile();
       if (action === "sync-all-authors") await syncAllAuthors();
       if (action === "close-modal") closeModal();
+      if (action === "open-synonyms") { await openSynonymsPanel(); return; }
+      if (action === "synonym-add") { addSynonymRow(); return; }
       // 版本 / 配图 / 收藏夹都是后端 SQL 条件（作者库、所有作品、收藏夹三处各一份），改完要重查当前列表。
       // 重查哪一份交给 refreshActiveList()，这里别自己按 homeView 分支 —— 漏一种组合会静默不刷新
       if (action === "status") { state.status = status; await refreshActiveList(); render(); }
@@ -11396,6 +11660,8 @@ async function bootstrap() {
     // 启动时只拉一份 id 集合，别每页都拉一遍完整条目
     state.watchLaterIds = new Set(await invoke("list_watch_later_ids"));
     await loadSearchSites();
+    // 同义词（v1.3.39）：启动读一次，工具栏按钮上的组数和开关状态先对上
+    await refreshSynonyms();
     // 封面角色名匹配用的索引：一次拉全，别每张卡片单独去查
     await loadCharacterIndex();
     // 接着上次那页看；还原不了（或压根没记过）就照老样子落在作者库
