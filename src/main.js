@@ -491,6 +491,12 @@ const previewWatchLater = [
   { workId: 2, addedAt: previewDayAt(0, 8, 10) },
   { workId: 4, addedAt: previewDayAt(-2, 20, 30) },
 ];
+// v1.3.43：标成已读 / 打分 > 0 时后端会删掉稍后再看记录，预览里也跟着删。
+const dropPreviewWatchLater = (workId) => {
+  const index = previewWatchLater.findIndex((entry) => entry.workId === workId);
+  if (index >= 0) previewWatchLater.splice(index, 1);
+};
+window.__previewWatchLater = previewWatchLater;
 previewWorks.forEach((work, index) => { work.seriesId = index < 2 ? "demo-series-1" : ""; work.seriesTitle = index < 2 ? "雾海档案短篇系列" : ""; });
 // v1.2.96：系列目录在预览里也要是**内存可变**的（新建 / 重命名 / 删除当场见效），
 // 所以不能再像以前那样把 list_series 写死成常量。
@@ -754,7 +760,11 @@ async function invoke(command, args = {}) {
     return removed;
   }
   if (command === "set_works_rating") {
-    args.workIds.forEach((id) => { const work = previewWorks.find((item) => item.id === id); if (work) work.rating = args.rating; });
+    args.workIds.forEach((id) => {
+      const work = previewWorks.find((item) => item.id === id);
+      if (work) work.rating = args.rating;
+      if (args.rating > 0) dropPreviewWatchLater(id);
+    });
     return args.workIds.length;
   }
   // 自动备份（v1.2.7）：浏览器预览里不落盘，只回一份假的记录
@@ -923,11 +933,18 @@ async function invoke(command, args = {}) {
       if (args.rating !== null && args.rating !== undefined) work.rating = args.rating;
       if (args.note !== null && args.note !== undefined) work.note = String(args.note).trim();
     }
+    if (args.readState === 2 || (args.rating !== null && args.rating !== undefined && args.rating > 0)) {
+      dropPreviewWatchLater(args.workId);
+    }
     return;
   }
   if (command === "set_works_read_state") {
     let changed = 0;
-    for (const workId of args.workIds || []) { const work = previewWorks.find((item) => item.id === workId); if (work) { work.readState = args.readState; changed += 1; } }
+    for (const workId of args.workIds || []) {
+      const work = previewWorks.find((item) => item.id === workId);
+      if (work) { work.readState = args.readState; changed += 1; }
+      if (args.readState === 2) dropPreviewWatchLater(workId);
+    }
     return changed;
   }
   if (command === "add_works_to_collections") {
@@ -1947,6 +1964,12 @@ function restoreSearchFocus(id) {
 
 function findWork(workId) {
   const target = Number(workId);
+  // v1.3.43：稍后再看页优先取本页这份对象。别的列表可能还留着同一 id 的旧对象，
+  // 之前评分 / 标已读改的是旧对象，页面看起来没反应，切走再回来才刷新。
+  if (state.homeView === "watchLater" && !state.activeAuthor) {
+    const entry = state.watchLater.find((item) => item.work && item.work.id === target);
+    if (entry) return entry.work;
+  }
   // 待补工作台和正文搜索结果也要算进来：那儿的卡片和别处长得一模一样，少了它点标题
   // 只会弹「没找到这篇作品」—— 明明就在眼前。（稍后再看页目前只走「打开文件」，
   // 用不到查对象，但一并留着，免得以后给它加个「开详情」就踩这个坑。）
@@ -4044,6 +4067,10 @@ async function setDetailMeta(patch) {
   try {
     await invoke("set_work_meta", { workId: state.workDetailId, readState: null, rating: null, note: null, ...patch });
     if (work) Object.assign(work, patch);
+    if ((Number(patch.readState) === 2 || Number(patch.rating) > 0) && state.homeView === "watchLater" && !state.activeAuthor) {
+      await refreshWatchLater();
+      render();
+    }
     refreshDetailDom();
   } catch (error) {
     toast(String(error), "error");
@@ -4057,6 +4084,12 @@ async function cycleReadState(workId) {
   const next = (Number(work.readState) + 1) % 3;
   try {
     await invoke("set_work_meta", { workId, readState: next, rating: null, note: null });
+    if (next === 2 && state.homeView === "watchLater" && !state.activeAuthor) {
+      await refreshWatchLater();
+      render();
+      toast("已标为已读，并移出稍后再看", "success");
+      return;
+    }
     work.readState = next;
     // 标成已读 ⇒ 顺手把封面上的 NEW 去掉（与后端一致：标过已读就不算「新」了，v1.2.40）
     if (next === 2) work.isNew = false;
@@ -4079,6 +4112,12 @@ async function toggleWorkRead(workId) {
   const next = read ? 0 : 2;
   try {
     await invoke("set_work_meta", { workId, readState: next, rating: null, note: null });
+    if (next === 2 && state.homeView === "watchLater" && !state.activeAuthor) {
+      await refreshWatchLater();
+      render();
+      toast("已标为已读，并移出稍后再看", "success");
+      return;
+    }
     work.readState = next;
     if (next === 2) work.isNew = false;
     // 就地改完重画，不重查列表 —— 重查会把「所有作品」的瀑布流退回第一屏
@@ -6085,6 +6124,13 @@ async function setCardRating(workId, value) {
   const next = current === value ? 0 : value;
   try {
     await invoke("set_work_meta", { workId, readState: null, rating: next, note: null });
+    // v1.3.43：评分 > 0 后端会标已读并移出稍后再看；本页立即重查，不能等切页才刷新
+    if (next > 0 && state.homeView === "watchLater" && !state.activeAuthor) {
+      await refreshWatchLater();
+      render();
+      toast(`已评 ${next} 星，并移出稍后再看`, "success");
+      return;
+    }
     // 后端在评分 > 0 时会顺手标已读，本地这份也得跟上，不然卡片上的状态点还是旧的
     if (work) {
       work.rating = next;

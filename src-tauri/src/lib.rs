@@ -15370,6 +15370,12 @@ fn mark_work_in_progress(conn: &Connection, work_id: i64) -> Result<(), String> 
     Ok(())
 }
 
+/// 标成已读或打分时，把这篇从「稍后再看」里撤掉（v1.3.43 用户要求）。
+fn clear_watch_later_for_work(conn: &Connection, work_id: i64) -> Result<usize, String> {
+    conn.execute("DELETE FROM work_watch_later WHERE work_id=?1", [work_id])
+        .map_err(|e| e.to_string())
+}
+
 /// 一次性写回评分 / 阅读状态 / 笔记。三个值都传 `None` 就什么都不改。
 /// 前端每次只改一项，另两项传当前值即可。
 #[tauri::command]
@@ -15379,7 +15385,16 @@ fn set_work_meta(
     rating: Option<i64>,
     note: Option<String>,
 ) -> Result<(), String> {
-    let conn = db()?;
+    set_work_meta_impl(&db()?, work_id, read_state, rating, note)
+}
+
+fn set_work_meta_impl(
+    conn: &Connection,
+    work_id: i64,
+    read_state: Option<i64>,
+    rating: Option<i64>,
+    note: Option<String>,
+) -> Result<(), String> {
     if let Some(state) = read_state {
         if !(READ_UNREAD..=READ_DONE).contains(&state) {
             return Err("阅读状态只能是 0 / 1 / 2".into());
@@ -15391,6 +15406,9 @@ fn set_work_meta(
             params![state, work_id, READ_DONE],
         )
         .map_err(|e| e.to_string())?;
+        if state == READ_DONE {
+            clear_watch_later_for_work(conn, work_id)?;
+        }
     }
     if let Some(value) = rating {
         if !(0..=5).contains(&value) {
@@ -15407,6 +15425,9 @@ fn set_work_meta(
             params![value, work_id, READ_DONE],
         )
         .map_err(|e| e.to_string())?;
+        if value > 0 {
+            clear_watch_later_for_work(conn, work_id)?;
+        }
     }
     if let Some(text) = note {
         let text = text.trim().to_string();
@@ -15440,6 +15461,10 @@ fn set_works_read_state(work_ids: Vec<i64>, read_state: i64) -> Result<usize, St
             params![read_state, work_id, READ_DONE],
         )
         .map_err(|e| e.to_string())?;
+        if read_state == READ_DONE {
+            tx.execute("DELETE FROM work_watch_later WHERE work_id=?1", [work_id])
+                .map_err(|e| e.to_string())?;
+        }
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(work_ids.len())
@@ -19210,6 +19235,10 @@ fn set_works_rating_impl(
                 params![rating, work_id, READ_DONE],
             )
             .map_err(|e| e.to_string())?;
+        if rating > 0 {
+            tx.execute("DELETE FROM work_watch_later WHERE work_id=?1", [work_id])
+                .map_err(|e| e.to_string())?;
+        }
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(changed)
@@ -19605,7 +19634,7 @@ mod tests {
         list_bookmark_author_options_impl, stray_summary_impl,
         migrate_word_counts_for_non_text_files, migrate_setting_defaults,
         add_works_to_collections_impl, update_works_tags_impl,
-        set_works_rating_impl, set_works_need_full_state_impl,
+        set_work_meta_impl, set_works_rating_impl, set_works_need_full_state_impl,
         remove_works_from_collections_impl, search_match_clause, list_missing_full_impl,
         list_series_impl, refresh_word_counts_impl, WORD_COUNT_TRIGGER_DDL,
         anthology_image_slots, clean_filter_view_name, FILTER_VIEW_MAX_NAME,
@@ -23595,15 +23624,63 @@ mod tests {
         create_collection_tables(&conn);
         conn.execute_batch("INSERT INTO works (id, title) VALUES (1, '甲'), (2, '乙');")
             .unwrap();
+        conn.execute_batch(
+            "INSERT INTO work_watch_later (work_id, added_at) VALUES (1, 'x'), (2, 'x');",
+        )
+        .unwrap();
         assert_eq!(set_works_rating_impl(&mut conn, &[1, 2], 4).unwrap(), 2);
         let value: i64 = conn
             .query_row("SELECT rating FROM works WHERE id=2", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, 4);
-        // 0 是「清除评分」，不是非法值
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM work_watch_later", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "批量打分 > 0 后应把作品移出稍后再看");
+        // 0 是「清除评分」，不是非法值，也不该清掉稍后再看
+        conn.execute(
+            "INSERT INTO work_watch_later (work_id, added_at) VALUES (2, 'x')",
+            [],
+        )
+        .unwrap();
         assert_eq!(set_works_rating_impl(&mut conn, &[2], 0).unwrap(), 1);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM work_watch_later WHERE work_id=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1);
         assert!(set_works_rating_impl(&mut conn, &[1], 6).is_err());
         assert!(set_works_rating_impl(&mut conn, &[1], -1).is_err());
+    }
+
+    #[test]
+    fn marking_read_or_rating_removes_work_from_watch_later() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_collection_tables(&conn);
+        conn.execute_batch(
+            "INSERT INTO works (id, title) VALUES (1, '甲'), (2, '乙'), (3, '丙');
+             INSERT INTO work_watch_later (work_id, added_at) VALUES (1, 'x'), (2, 'x'), (3, 'x');",
+        )
+        .unwrap();
+        set_work_meta_impl(&conn, 1, Some(READ_DONE), None, None).unwrap();
+        assert_eq!(watch_later_count(&conn, 1), 0);
+        set_work_meta_impl(&conn, 2, None, Some(3), None).unwrap();
+        assert_eq!(watch_later_count(&conn, 2), 0);
+        set_work_meta_impl(&conn, 3, None, Some(0), None).unwrap();
+        set_work_meta_impl(&conn, 3, Some(READ_IN_PROGRESS), None, None).unwrap();
+        assert_eq!(watch_later_count(&conn, 3), 1);
+    }
+
+    fn watch_later_count(conn: &Connection, work_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM work_watch_later WHERE work_id=?1",
+            [work_id],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
