@@ -6227,14 +6227,24 @@ impl EpubImagePreset {
     }
 }
 
-/// 值 → 档位。不认识的值一律回 `off`（宁可不压，也不瞎压）。
+/// 值 → 档位。
+///
+/// 空串（老库还没存过这一项，`setting()` 读出来就是空的）和不认识的值，一律按默认档走：
+/// 界面上显示的就是默认档，这里再悄悄退回「不压」的话，就会出现「设置里明明写着 1200，
+/// 点下去却说设置为不压缩」。只有明确写着 `off` 才真的不压。
 fn epub_image_preset(value: &str) -> EpubImagePreset {
     let trimmed = value.trim();
     EPUB_IMAGE_PRESETS
         .iter()
         .find(|preset| preset.key == trimmed)
         .copied()
-        .unwrap_or(EPUB_IMAGE_PRESETS[0])
+        .unwrap_or_else(|| {
+            EPUB_IMAGE_PRESETS
+                .iter()
+                .find(|preset| preset.key == DEFAULT_EPUB_IMAGE_PRESET)
+                .copied()
+                .unwrap_or(EPUB_IMAGE_PRESETS[0])
+        })
 }
 
 fn epub_image_preset_key(value: &str) -> String {
@@ -26910,8 +26920,13 @@ mod epub_image_compress_tests {
         assert_eq!(epub_image_preset("1200").max_edge, 1200);
         assert_eq!(epub_image_preset(" 1600 ").quality, 85);
         assert!(!epub_image_preset("off").enabled());
-        // 不认识的值一律退回「不压」，不让脏值瞎压一遍
-        assert_eq!(epub_image_preset("乱七八糟").key, "off");
+        // 空串＝老库还没存过这一项：按默认档压（不能退回「不压」，否则界面写 1200、点下去却说不压缩）
+        assert_eq!(epub_image_preset("").key, "1200");
+        assert_eq!(epub_image_preset("   ").key, "1200");
+        // 脏值同样按默认档走
+        assert_eq!(epub_image_preset("乱七八糟").key, "1200");
+        // 显式选「不压」仍然不压
+        assert_eq!(epub_image_preset(" off ").key, "off");
     }
 
     #[test]
