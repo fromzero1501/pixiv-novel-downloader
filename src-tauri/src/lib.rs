@@ -5,6 +5,7 @@ use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -448,6 +449,14 @@ struct AppSettings {
     /// v1.2.33：散篇转正后，若这位作者有 Pixiv 主页，自动把他所有作品同步下来。
     #[serde(default)]
     sync_works_on_stray_promote: bool,
+    /// v1.3.44：EPUB 插图压缩档 —— `off` / `900` / `1200` / `1600`（长边像素）。
+    /// 生成阅读版时按它压一道，库里的存量 EPUB 也按它就地压；两路共用这一档。
+    #[serde(default = "default_epub_image_quality")]
+    epub_image_quality: String,
+}
+
+fn default_epub_image_quality() -> String {
+    DEFAULT_EPUB_IMAGE_PRESET.to_string()
 }
 
 #[derive(Serialize, Clone)]
@@ -936,6 +945,16 @@ fn db() -> Result<Connection, String> {
         CREATE TABLE IF NOT EXISTS app_settings (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL DEFAULT ''
+        );
+        -- v1.3.44：EPUB 插图压缩的记账本。**这张表的存在就是为了「不代际劣化」**：
+        -- JPEG 重编一轮就掉一次画质，同一张图被压两轮会明显糊掉。所以按
+        -- 「路径 + 文件大小 + 修改时间 + 参数」四件套记一笔，全都一样才跳过；
+        -- 文件被换过（大小或时间变了）或参数换到更狠的档，才允许再压一轮。
+        CREATE TABLE IF NOT EXISTS epub_image_compress_log (
+          path TEXT PRIMARY KEY,
+          size INTEGER NOT NULL DEFAULT 0,
+          mtime INTEGER NOT NULL DEFAULT 0,
+          preset TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS collections (
           id INTEGER PRIMARY KEY,
@@ -1918,6 +1937,15 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
         },
         sync_works_on_new_author: setting(conn, "sync_works_on_new_author")? == "1",
         sync_works_on_stray_promote: setting(conn, "sync_works_on_stray_promote")? == "1",
+        // 没存过（老库升上来）就走默认档；存了不认识的值退回「不压」，不让脏值瞎压一遍
+        epub_image_quality: {
+            let value = setting(conn, "epub_image_quality")?;
+            if value.trim().is_empty() {
+                default_epub_image_quality()
+            } else {
+                epub_image_preset_key(&value)
+            }
+        },
     })
 }
 
@@ -3020,6 +3048,11 @@ fn save_app_settings_impl(mut settings: AppSettings) -> Result<AppSettings, Stri
             } else {
                 "0".into()
             },
+        ),
+        (
+            // v1.3.44：四档之外的值一律落成 "off"，别把脏值写进库
+            "epub_image_quality",
+            epub_image_preset_key(&settings.epub_image_quality),
         ),
     ];
     // v1.3.8：全部写进**一个事务**提交 —— 25 条各自提交时每次 commit 都要落盘，
@@ -6138,6 +6171,607 @@ fn epub_image_media_type(file_name: &str) -> &'static str {
     }
 }
 
+// ======================== EPUB 插图压缩（v1.3.44） ========================
+//
+// 两条路共用一个**字节级改写**函数：
+//   A 路径 —— `build_novel_epub` / `build_anthology_epub` 产出的字节，落地前过一遍；
+//   B 路径 —— 存量 .epub 就地重写：读文件 → 同一函数 → 写 .part → 校验 → 替换。
+//
+// **为什么两路只写一套判据**：压多狠、压完要不要换、PNG 要不要转 JPEG，只在一个地方
+// 决定，A 与 B 才不会漂成两种结果（「全项目只有一处口径」这条纪律，和字数统计一样）。
+//
+// **为什么同参数只压一次**：JPEG 的劣化是累加的，同一张图重编两轮就糊了。所以按
+// 「路径 + 文件大小 + 修改时间 + 参数」记在 `epub_image_compress_log` 里，重跑直接
+// 跳过；只有文件被换过、或参数换到更狠的档，才允许再来一轮。
+//
+// **只换图片条目，其余原样搬**：靠 zip 的 `by_index_raw` + `raw_copy_file` 把其它条目
+// 按原压缩流逐个搬过去 —— 不重新压缩、不改时间戳、不改顺序，mimetype 仍在第一位且不压缩。
+
+/// 插图压缩档。`key` 既是设置里存的值，也是记账表里的参数指纹。
+#[derive(Clone, Copy)]
+struct EpubImagePreset {
+    key: &'static str,
+    max_edge: u32,
+    quality: u8,
+}
+
+const EPUB_IMAGE_PRESETS: [EpubImagePreset; 4] = [
+    EpubImagePreset {
+        key: "off",
+        max_edge: 0,
+        quality: 0,
+    },
+    EpubImagePreset {
+        key: "900",
+        max_edge: 900,
+        quality: 75,
+    },
+    EpubImagePreset {
+        key: "1200",
+        max_edge: 1200,
+        quality: 80,
+    },
+    EpubImagePreset {
+        key: "1600",
+        max_edge: 1600,
+        quality: 85,
+    },
+];
+
+/// 设置里没有这一项时的默认档（老库升上来即按这一档走）。
+const DEFAULT_EPUB_IMAGE_PRESET: &str = "1200";
+
+impl EpubImagePreset {
+    fn enabled(&self) -> bool {
+        self.max_edge > 0
+    }
+}
+
+/// 值 → 档位。不认识的值一律回 `off`（宁可不压，也不瞎压）。
+fn epub_image_preset(value: &str) -> EpubImagePreset {
+    let trimmed = value.trim();
+    EPUB_IMAGE_PRESETS
+        .iter()
+        .find(|preset| preset.key == trimmed)
+        .copied()
+        .unwrap_or(EPUB_IMAGE_PRESETS[0])
+}
+
+fn epub_image_preset_key(value: &str) -> String {
+    epub_image_preset(value).key.to_string()
+}
+
+/// 压一张图：返回 `(新字节, 新扩展名)`。不值得换就返回 `None`，调用方保留原图。
+///
+/// 判据（两条都是为了不白送劣化）：
+/// ① 压完不比原图小 —— 不换；
+/// ② 尺寸没缩小、又省不到 10% —— 不换（这种只会让画面更糊、文件更大）。
+fn compress_epub_image(
+    bytes: &[u8],
+    preset: &EpubImagePreset,
+    allow_format_change: bool,
+) -> Option<(Vec<u8>, &'static str)> {
+    if !preset.enabled() || bytes.is_empty() {
+        return None;
+    }
+    let format = image::guess_format(bytes).ok()?;
+    let is_png = matches!(format, image::ImageFormat::Png);
+    if !is_png && !matches!(format, image::ImageFormat::Jpeg) {
+        // GIF / WebP / BMP …… 只认这两种；其余原样留着（转了就丢帧或丢动画）
+        return None;
+    }
+    let decoded = image::load_from_memory_with_format(bytes, format).ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let shrank = width.max(height) > preset.max_edge;
+    let resized = if shrank {
+        decoded.resize(
+            preset.max_edge,
+            preset.max_edge,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+    let smaller_enough = |new_size: usize| -> bool {
+        new_size < bytes.len()
+            && (shrank || new_size.saturating_mul(100) <= bytes.len().saturating_mul(90))
+    };
+
+    // 集成了正文引用的包内文件名不能动，所以那条路只缩不转：PNG 仍然写回 PNG。
+    if is_png && !allow_format_change {
+        let mut png = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png);
+        resized.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+        if !smaller_enough(png.len()) {
+            return None;
+        }
+        return Some((png, "png"));
+    }
+
+    // PNG → JPEG 要铺白底：直接丢 alpha 会让透明区变黑（阅读器里一片脏点）。
+    let rgb = resized.to_rgb8();
+    let mut out = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, preset.quality);
+    encoder
+        .encode(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
+    if !smaller_enough(out.len()) {
+        return None;
+    }
+    Some((out, "jpg"))
+}
+
+/// 转格式时要**跟着一起改**的条目：正文页 + OPF / NCX。
+///
+/// `is_epub_text_entry` 只认 xhtml/html/htm/txt，不含 `.opf` —— 而图片改名后
+/// OPF 里的 `href` 与 `media-type` 必须一起改，否则阅读器直接找不到图。
+fn is_epub_rewritable_entry(name: &str) -> bool {
+    if is_epub_text_entry(name) {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".opf") || lower.ends_with(".ncx")
+}
+
+/// 一次改写的结果。`compressed_count` / `saved_bytes` 给测试与统计用 ——
+/// 生产路径记账用的是「文件前后大小差」（含正文条目重压的收益，比单看图片更准）。
+struct EpubImageRewrite {
+    bytes: Vec<u8>,
+    #[allow(dead_code)]
+    compressed_count: usize,
+    #[allow(dead_code)]
+    saved_bytes: u64,
+}
+
+/// 包内某张图被换名（转格式）时记下的三条信息：整体路径要换、正文引用换 basename、
+/// OPF 里那条 item 的 media-type 要跟着改。
+struct EpubImageRename {
+    old_name: String,
+    new_name: String,
+    old_base: String,
+    new_base: String,
+}
+
+/// 把一条 OPF `<item ...>` 段里的 `image/png` 改成 `image/jpeg`。
+///
+/// **只动命中这张图的那一条**：同一份 OPF 里可能还有别的 PNG（比如封面），
+/// 整篇 replace 会把它们的 media-type 一起改错。
+fn fix_opf_media_type(text: &str, base_name: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while let Some(start) = rest.find("<item") {
+        let (head, tail) = rest.split_at(start);
+        out.push_str(head);
+        let Some(end) = tail.find('>') else {
+            out.push_str(tail);
+            return out;
+        };
+        let (tag, after) = tail.split_at(end + 1);
+        if tag.contains(base_name) {
+            out.push_str(&tag.replace("image/png", "image/jpeg"));
+        } else {
+            out.push_str(tag);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 重写整个 EPUB：图片按档位压，其余条目原样搬。
+///
+/// 返回 `None` 表示「这本一个字节都没必要动」（没有可压的图 / 全都压不动），
+/// 调用方据此跳过写盘。
+fn rewrite_epub_images(
+    source: &[u8],
+    preset: &EpubImagePreset,
+    allow_format_change: bool,
+) -> Option<EpubImageRewrite> {
+    use std::collections::HashMap;
+    use std::io::Cursor;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    if !preset.enabled() || source.is_empty() {
+        return None;
+    }
+    let mut archive = ZipArchive::new(Cursor::new(source)).ok()?;
+    let mut names: Vec<String> = Vec::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        names.push(archive.by_index_raw(index).ok()?.name().to_string());
+    }
+
+    let read_entry = |archive: &mut ZipArchive<Cursor<&[u8]>>, index: usize| -> Option<Vec<u8>> {
+        let mut entry = archive.by_index(index).ok()?;
+        let mut raw = Vec::new();
+        entry.read_to_end(&mut raw).ok()?;
+        Some(raw)
+    };
+
+    // ① 先确认正文条目都能按 UTF-8 读：转格式要改引用，改不了就整本退回「不转格式」。
+    let mut allow_change = allow_format_change;
+    if allow_change {
+        for (index, name) in names.iter().enumerate() {
+            if !is_epub_rewritable_entry(name) {
+                continue;
+            }
+            let Some(raw) = read_entry(&mut archive, index) else {
+                return None;
+            };
+            if std::str::from_utf8(&raw).is_err() {
+                allow_change = false;
+                break;
+            }
+        }
+    }
+
+    // ② 逐张图压。转格式只改扩展名，包内目录不动。
+    let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut renames: Vec<EpubImageRename> = Vec::new();
+    let mut saved_bytes: u64 = 0;
+    for (index, name) in names.iter().enumerate() {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("meta-inf/") {
+            continue;
+        }
+        let is_jpeg = lower.ends_with(".jpg") || lower.ends_with(".jpeg");
+        let is_png = lower.ends_with(".png");
+        if !is_jpeg && !is_png {
+            continue;
+        }
+        let Some(original) = read_entry(&mut archive, index) else {
+            continue;
+        };
+        let Some((rewritten, extension)) = compress_epub_image(&original, preset, allow_change) else {
+            continue;
+        };
+        if rewritten.len() >= original.len() {
+            continue;
+        }
+        let stem = match name.rfind('.') {
+            Some(position) => &name[..position],
+            None => name.as_str(),
+        };
+        let new_name = format!("{stem}.{extension}");
+        if new_name != *name {
+            let old_base = name.rsplit('/').next().unwrap_or(name.as_str()).to_string();
+            let new_base = new_name.rsplit('/').next().unwrap_or(new_name.as_str()).to_string();
+            renames.push(EpubImageRename {
+                old_name: name.clone(),
+                new_name,
+                old_base,
+                new_base,
+            });
+        }
+        saved_bytes += (original.len() - rewritten.len()) as u64;
+        replaced.insert(name.clone(), rewritten);
+    }
+    if replaced.is_empty() {
+        return None;
+    }
+
+    // ③ 有换名的图：把正文里的 basename 全替换掉，OPF 的 media-type 跟着改。
+    let mut texts: HashMap<usize, String> = HashMap::new();
+    if !renames.is_empty() {
+        for (index, name) in names.iter().enumerate() {
+            if !is_epub_rewritable_entry(name) {
+                continue;
+            }
+            let Some(raw) = read_entry(&mut archive, index) else {
+                return None;
+            };
+            let Ok(decoded) = std::str::from_utf8(&raw) else {
+                return None;
+            };
+            let mut text = decoded.to_string();
+            for rename in &renames {
+                if text.contains(rename.old_base.as_str()) {
+                    text = text.replace(rename.old_base.as_str(), rename.new_base.as_str());
+                }
+            }
+            for rename in &renames {
+                text = fix_opf_media_type(&text, &rename.new_base);
+            }
+            texts.insert(index, text);
+        }
+    }
+
+    // ④ 写新包。mimetype 等非图片、非改名条目走 raw copy，原样不动。
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for (index, name) in names.iter().enumerate() {
+        if let Some(data) = replaced.get(name) {
+            let target = renames
+                .iter()
+                .find(|rename| &rename.old_name == name)
+                .map(|rename| rename.new_name.as_str())
+                .unwrap_or(name.as_str());
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer.start_file(target, options).ok()?;
+            writer.write_all(data).ok()?;
+            continue;
+        }
+        if let Some(text) = texts.get(&index) {
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            writer.start_file(name.as_str(), options).ok()?;
+            writer.write_all(text.as_bytes()).ok()?;
+            continue;
+        }
+        let entry = archive.by_index_raw(index).ok()?;
+        writer.raw_copy_file(entry).ok()?;
+    }
+    let cursor = writer.finish().ok()?;
+    Some(EpubImageRewrite {
+        bytes: cursor.into_inner(),
+        compressed_count: replaced.len(),
+        saved_bytes,
+    })
+}
+
+/// 替换前的校验：新包能重新打开、条目数与原包一致、mimetype 若原本在第一位就还得在第一位
+/// 且必须是不压缩的（这两条是 EPUB 的硬要求，坏一本比压不动一本糟得多）。
+fn verify_epub_bytes(temp: &Path, original: &Path) -> Result<(), String> {
+    let open = |path: &Path| -> Result<zip::ZipArchive<fs::File>, String> {
+        let file = fs::File::open(path).map_err(|error| error.to_string())?;
+        zip::ZipArchive::new(file).map_err(|error| error.to_string())
+    };
+    let mut fresh = open(temp)?;
+    let mut before = open(original)?;
+    if fresh.len() != before.len() {
+        return Err(format!(
+            "新包的条目数不对（{} ≠ {}）",
+            fresh.len(),
+            before.len()
+        ));
+    }
+    let first_before = before
+        .by_index(0)
+        .map(|entry| entry.name().to_string())
+        .unwrap_or_default();
+    if first_before == "mimetype" {
+        let entry = fresh.by_index(0).map_err(|error| error.to_string())?;
+        if entry.name() != "mimetype" {
+            return Err("mimetype 掉出第一位了".to_string());
+        }
+        if entry.compression() != zip::CompressionMethod::Stored {
+            return Err("mimetype 被压缩了".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// 文件的记账指纹：大小 + 修改时间。任何一项变了就说明文件被换过。
+fn epub_file_stamp(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Some((metadata.len(), mtime))
+}
+
+fn epub_compress_log(conn: &Connection, path: &str) -> Option<(u64, u64, String)> {
+    conn.query_row(
+        "SELECT size, mtime, preset FROM epub_image_compress_log WHERE path = ?1",
+        [path],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .ok()
+}
+
+/// 记一笔「这份文件在这个参数下已经处理过」。A 路径写盘后也调它，B 路径下次才会跳过。
+fn note_epub_compress_state(
+    conn: &Connection,
+    path: &str,
+    preset: &EpubImagePreset,
+) -> Result<(), String> {
+    let (size, mtime) = epub_file_stamp(Path::new(path)).unwrap_or((0, 0));
+    conn.execute(
+        "INSERT INTO epub_image_compress_log (path, size, mtime, preset) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, preset = excluded.preset",
+        params![path, size as i64, mtime as i64, preset.key],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// 当前设置里的插图压缩档。读不到设置就报错（宁可不干，也不按错档压一遍）。
+fn epub_image_preset_from_settings() -> Result<EpubImagePreset, String> {
+    let conn = db()?;
+    let value = setting(&conn, "epub_image_quality")?;
+    Ok(epub_image_preset(&value))
+}
+
+/// A 路径：`build_*_epub` 的产物落地前压一道。压不动 / 关着就原样返回。
+///
+/// `allow_format_change`：合集那条路传 `false` —— 它的包内图名由打包代码拼成
+/// `c01_001.jpg` 并被正文引用，改名会引出对不上的引用，所以只缩不转。
+fn compress_epub_for_output(bytes: Vec<u8>, allow_format_change: bool) -> Vec<u8> {
+    let Ok(preset) = epub_image_preset_from_settings() else {
+        return bytes;
+    };
+    if !preset.enabled() {
+        return bytes;
+    }
+    match rewrite_epub_images(&bytes, &preset, allow_format_change) {
+        Some(rewrite) => rewrite.bytes,
+        None => bytes,
+    }
+}
+
+/// A 路径压完顺手记一笔：同一份文件 B 路径下次就别再压了（防代际劣化）。
+fn record_epub_image_compress(path: &Path) {
+    let Ok(preset) = epub_image_preset_from_settings() else {
+        return;
+    };
+    if !preset.enabled() {
+        return;
+    }
+    if let Ok(conn) = db() {
+        let _ = note_epub_compress_state(&conn, &path.to_string_lossy(), &preset);
+    }
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct EpubImageCompressResult {
+    scanned_count: usize,
+    compressed_count: usize,
+    skipped_count: usize,
+    failed_count: usize,
+    saved_bytes: u64,
+    cancelled: bool,
+}
+
+const EPUB_IMAGE_COMPRESS_PROGRESS_EVENT: &str = "epub-image-compress-progress";
+
+static EPUB_IMAGE_COMPRESS_CANCEL: AtomicBool = AtomicBool::new(false);
+
+fn epub_image_compress_cancelled() -> bool {
+    EPUB_IMAGE_COMPRESS_CANCEL.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn cancel_epub_image_compress() {
+    EPUB_IMAGE_COMPRESS_CANCEL.store(true, Ordering::Relaxed);
+}
+
+fn emit_epub_compress_progress(
+    app: &AppHandle,
+    total: usize,
+    current: usize,
+    title: String,
+    done: bool,
+) {
+    let _ = app.emit(
+        EPUB_IMAGE_COMPRESS_PROGRESS_EVENT,
+        ReadingProgress {
+            total,
+            current,
+            title,
+            done,
+        },
+    );
+}
+
+/// 压一本。`Ok(Some(省下的字节))` 压过且换了盘上的文件 / `Ok(None)` 跳过 / `Err` 这本失败。
+fn compress_one_epub_file(
+    conn: &Connection,
+    path: &str,
+    preset: &EpubImagePreset,
+) -> Result<Option<u64>, String> {
+    let target = Path::new(path);
+    if !target.is_file() {
+        return Err("文件不在了".to_string());
+    }
+    let (size_before, mtime_before) = epub_file_stamp(target).ok_or("读不到文件信息")?;
+    // 同参数压过一次、文件又没换过 ⇒ 直接跳过
+    if let Some((size, mtime, recorded)) = epub_compress_log(conn, path) {
+        if recorded == preset.key && size == size_before && mtime == mtime_before {
+            return Ok(None);
+        }
+    }
+    let source = fs::read(target).map_err(|error| error.to_string())?;
+    let Some(rewrite) = rewrite_epub_images(&source, preset, true) else {
+        // 一张都压不动（图太小 / 全是不认识的格式）也算处理过了，别每次点都重读一遍
+        let _ = note_epub_compress_state(conn, path, preset);
+        return Ok(None);
+    };
+    let temp = target.with_extension("epub.part");
+    fs::write(&temp, &rewrite.bytes).map_err(|error| error.to_string())?;
+    if let Err(error) = verify_epub_bytes(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
+    let _ = note_epub_compress_state(conn, path, preset);
+    Ok(Some(source.len().saturating_sub(rewrite.bytes.len()) as u64))
+}
+
+fn compress_epub_images_impl(app: &AppHandle) -> Result<EpubImageCompressResult, String> {
+    EPUB_IMAGE_COMPRESS_CANCEL.store(false, Ordering::Relaxed);
+    let conn = db()?;
+    let preset = epub_image_preset_from_settings()?;
+    if !preset.enabled() {
+        return Err("插图压缩这一档是「不压」：先在设置里选一个画质再来。".to_string());
+    }
+    // 只碰作品绑定的 .epub；同一份文件可能被购买/预览两栏指到，去重后才不会压两遍
+    let mut paths: Vec<String> = Vec::new();
+    {
+        let mut statement = conn
+            .prepare("SELECT purchased_path, preview_path FROM works")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (purchased, preview) = row.map_err(|error| error.to_string())?;
+            for raw in [purchased, preview] {
+                let path = raw.trim().to_string();
+                if path.is_empty() || !path.to_ascii_lowercase().ends_with(".epub") {
+                    continue;
+                }
+                if !paths.iter().any(|existing| existing == &path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    let total = paths.len();
+    let mut result = EpubImageCompressResult::default();
+    for (index, path) in paths.iter().enumerate() {
+        if epub_image_compress_cancelled() {
+            result.cancelled = true;
+            break;
+        }
+        let title = Path::new(path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        emit_epub_compress_progress(app, total, index, title, false);
+        result.scanned_count += 1;
+        // 一本失败不停整轮：报错只记账，接着压下一本
+        match compress_one_epub_file(&conn, path, &preset) {
+            Ok(Some(saved)) => {
+                result.compressed_count += 1;
+                result.saved_bytes += saved;
+            }
+            Ok(None) => result.skipped_count += 1,
+            Err(_) => result.failed_count += 1,
+        }
+    }
+    emit_epub_compress_progress(app, total, total, String::new(), true);
+    Ok(result)
+}
+
+/// 压整个库里所有作品的 EPUB 插图（B 路径）。进度走浮层，可中途终止。
+#[tauri::command]
+async fn compress_epub_images(app: AppHandle) -> Result<EpubImageCompressResult, String> {
+    tauri::async_runtime::spawn_blocking(move || compress_epub_images_impl(&app))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 // ============================ PDF 阅读版（v1.3.6） ============================
 //
 // 用 krilla（纯 Rust，MIT / Apache-2.0）写 PDF；字体取系统黑体做**子集嵌入**
@@ -7363,22 +7997,27 @@ fn write_reading_output(
                 .as_deref()
                 .filter(|_| !cover_file.is_empty())
                 .map(|bytes| (cover_file.as_str(), bytes));
-            let epub = build_novel_epub(
-                meta.title,
-                meta.author_name,
-                meta.release_date,
-                meta.novel_id,
-                meta.tags,
-                meta.synopsis,
-                content,
-                slots,
-                &images,
-                cover,
+            // v1.3.44：落地前按设置把插图压一道（单篇允许 PNG → JPEG，引用一起改）
+            let epub = compress_epub_for_output(
+                build_novel_epub(
+                    meta.title,
+                    meta.author_name,
+                    meta.release_date,
+                    meta.novel_id,
+                    meta.tags,
+                    meta.synopsis,
+                    content,
+                    slots,
+                    &images,
+                    cover,
+                ),
+                true,
             );
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("无法创建 EPUB 目录：{e}"))?;
             }
             write_bytes_atomic(&target, &epub)?;
+            record_epub_image_compress(&target);
         }
         ReadingFormat::Pdf => {
             let images_dir = novel_images_dir(text_path);
@@ -13983,23 +14622,29 @@ fn download_reading_version_impl(
             let cover = cover_bytes
                 .as_deref()
                 .map(|bytes| (cover_file.as_str(), bytes));
-            let epub = build_novel_epub(
-                &assets.title,
-                &assets.author_name,
-                &assets.release_date,
-                &assets.novel_id,
-                &assets.tags,
-                &assets.synopsis,
-                &assets.content,
-                &assets.slots,
-                &images,
-                cover,
+            // v1.3.44：落地前按设置把插图压一道（单篇允许 PNG → JPEG，引用一起改）
+            let epub = compress_epub_for_output(
+                build_novel_epub(
+                    &assets.title,
+                    &assets.author_name,
+                    &assets.release_date,
+                    &assets.novel_id,
+                    &assets.tags,
+                    &assets.synopsis,
+                    &assets.content,
+                    &assets.slots,
+                    &images,
+                    cover,
+                ),
+                true,
             );
             let path = epub_target_path(&assets.text_path, "");
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| format!("无法创建 EPUB 目录：{e}"))?;
             }
             write_bytes_atomic(&path, &epub)?;
+            record_epub_image_compress(&path);
+            // 长度取压缩后的字节数：作品表里记的是盘上这份文件的大小
             (path, missing_count, epub.len() as u64)
         }
         ReadingFormat::Pdf => {
@@ -16173,18 +16818,23 @@ fn export_anthology_epub_impl(
     } else {
         None
     };
-    let epub = build_anthology_epub(
-        &book_title,
-        author_name.trim(),
-        series,
-        &chapters,
-        cover_ref,
+    // v1.3.44：合集只缩不转 —— 包内图名由打包代码拼成并被正文引用，改名会引出对不上的引用
+    let epub = compress_epub_for_output(
+        build_anthology_epub(
+            &book_title,
+            author_name.trim(),
+            series,
+            &chapters,
+            cover_ref,
+        ),
+        false,
     );
     let target = PathBuf::from(path);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("无法创建目录：{e}"))?;
     }
     write_bytes_atomic(&target, &epub)?;
+    record_epub_image_compress(&target);
     emit_anthology_progress(app, total, total, "合集已生成".into(), true);
     Ok(AnthologyResult {
         title: book_title,
@@ -19494,6 +20144,8 @@ pub fn run() {
             cleanup_redundant_previews,
             backfill_work_covers,
             refresh_reading_image_counts,
+            compress_epub_images,
+            cancel_epub_image_compress,
             list_characters,
             add_character,
             update_character,
@@ -25971,4 +26623,199 @@ mod tests {
         assert_eq!(missing[1].novel_id, "222");
     }
 
+}
+
+/// v1.3.44：EPUB 插图压缩的定向测试。
+///
+/// 单开一个模块、不复用上面那个巨长的 `use super::{...}` 清单 —— 只把关得上的人拉进来，
+/// 以后删这一个功能时能整块摘掉。
+#[cfg(test)]
+mod epub_image_compress_tests {
+    use super::{
+        compress_epub_image, epub_compress_log, epub_image_preset, note_epub_compress_state,
+        rewrite_epub_images, zip_finish, zip_push, ZipItem,
+    };
+    use std::io::{Cursor, Read};
+
+    /// 噪点图：像素越随机越难压 —— 只有它能量出「压完确实小很多」。
+    fn noisy_rgb(width: u32, height: u32) -> image::RgbImage {
+        let mut buffer = Vec::with_capacity((width * height * 3) as usize);
+        let mut seed: u32 = 12345;
+        for _ in 0..(width * height) {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            buffer.push((seed >> 16) as u8);
+            buffer.push((seed >> 8) as u8);
+            buffer.push(seed as u8);
+        }
+        image::RgbImage::from_raw(width, height, buffer).unwrap()
+    }
+
+    fn encode_jpeg(image: &image::RgbImage, quality: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .encode(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        out
+    }
+
+    fn encode_png(image: &image::RgbImage) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(image.clone())
+            .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    /// 拼一个结构合法的最小 EPUB：mimetype 第一，正文与 OPF 都引用那张图。
+    fn sample_epub(image_name: &str, media_type: &str, image_bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut items: Vec<ZipItem> = Vec::new();
+        zip_push(&mut out, &mut items, "mimetype", b"application/epub+zip");
+        zip_push(
+            &mut out,
+            &mut items,
+            "META-INF/container.xml",
+            br#"<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>"#,
+        );
+        let opf = format!(
+            r#"<?xml version="1.0"?><package version="3.0"><manifest><item id="pic" href="images/{image_name}" media-type="{media_type}"/></manifest></package>"#
+        );
+        zip_push(&mut out, &mut items, "OEBPS/content.opf", opf.as_bytes());
+        let body = format!(
+            r#"<?xml version="1.0"?><html><body><p>正文</p><img src="../images/{image_name}"/></body></html>"#
+        );
+        zip_push(
+            &mut out,
+            &mut items,
+            "OEBPS/text/novel.xhtml",
+            body.as_bytes(),
+        );
+        zip_push(
+            &mut out,
+            &mut items,
+            &format!("OEBPS/images/{image_name}"),
+            image_bytes,
+        );
+        zip_finish(&mut out, &items);
+        out
+    }
+
+    fn entry_names(bytes: &[u8]) -> Vec<String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect()
+    }
+
+    fn read_entry(bytes: &[u8], name: &str) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut entry = archive.by_name(name).unwrap();
+        let mut text = String::new();
+        entry.read_to_string(&mut text).unwrap();
+        text
+    }
+
+    #[test]
+    fn epub_image_compress_keeps_container_structure() {
+        let jpeg = encode_jpeg(&noisy_rgb(1600, 1200), 95);
+        let epub = sample_epub("pic1.jpg", "image/jpeg", &jpeg);
+        let preset = epub_image_preset("1200");
+        let rewrite = rewrite_epub_images(&epub, &preset, false).expect("这张图应当压得动");
+
+        assert_eq!(rewrite.compressed_count, 1);
+        assert!(rewrite.bytes.len() < epub.len(), "压完必须比原包小");
+        // 条目数、顺序、mimetype 位置与压缩方式都不能变
+        assert_eq!(entry_names(&rewrite.bytes), entry_names(&epub));
+        let mut archive = zip::ZipArchive::new(Cursor::new(&rewrite.bytes)).unwrap();
+        let first = archive.by_index(0).unwrap();
+        assert_eq!(first.name(), "mimetype");
+        assert_eq!(first.compression(), zip::CompressionMethod::Stored);
+        drop(first);
+        // 没换格式 ⇒ 正文与 OPF 一个字节都不该动
+        assert_eq!(
+            read_entry(&rewrite.bytes, "OEBPS/text/novel.xhtml"),
+            read_entry(&epub, "OEBPS/text/novel.xhtml")
+        );
+        assert_eq!(
+            read_entry(&rewrite.bytes, "OEBPS/content.opf"),
+            read_entry(&epub, "OEBPS/content.opf")
+        );
+    }
+
+    #[test]
+    fn epub_image_compress_second_pass_changes_nothing() {
+        // 已经是 q80、长边已到 1200 —— 再压一遍只省不到 10%，判据必须拒掉（防代际劣化）
+        let jpeg = encode_jpeg(&noisy_rgb(1200, 900), 80);
+        let preset = epub_image_preset("1200");
+        assert!(compress_epub_image(&jpeg, &preset, false).is_none());
+    }
+
+    #[test]
+    fn epub_image_compress_renames_png_and_fixes_refs() {
+        let png = encode_png(&noisy_rgb(900, 600));
+        let epub = sample_epub("pic1.png", "image/png", &png);
+        let preset = epub_image_preset("1200");
+        let rewrite = rewrite_epub_images(&epub, &preset, true).expect("PNG 应当能转成 JPEG");
+
+        let names = entry_names(&rewrite.bytes);
+        assert!(names.iter().any(|name| name == "OEBPS/images/pic1.jpg"));
+        assert!(!names.iter().any(|name| name == "OEBPS/images/pic1.png"));
+        // 换名必须同步到正文引用与 OPF 的 media-type
+        let body = read_entry(&rewrite.bytes, "OEBPS/text/novel.xhtml");
+        assert!(body.contains("../images/pic1.jpg"));
+        assert!(!body.contains("pic1.png"));
+        let opf = read_entry(&rewrite.bytes, "OEBPS/content.opf");
+        assert!(opf.contains(r#"href="images/pic1.jpg""#));
+        assert!(opf.contains(r#"media-type="image/jpeg""#));
+    }
+
+    #[test]
+    fn epub_image_compress_keeps_png_when_format_change_disallowed() {
+        // 合集那条路：只能缩、不能改名（包内图名被正文引用着）
+        let png = encode_png(&noisy_rgb(1600, 1200));
+        let epub = sample_epub("pic1.png", "image/png", &png);
+        let preset = epub_image_preset("1200");
+        let rewrite = rewrite_epub_images(&epub, &preset, false).expect("应当缩得动");
+
+        let names = entry_names(&rewrite.bytes);
+        assert!(names.iter().any(|name| name == "OEBPS/images/pic1.png"));
+        let body = read_entry(&rewrite.bytes, "OEBPS/text/novel.xhtml");
+        assert!(body.contains("../images/pic1.png"));
+    }
+
+    #[test]
+    fn epub_image_preset_parsing() {
+        assert_eq!(epub_image_preset("1200").max_edge, 1200);
+        assert_eq!(epub_image_preset(" 1600 ").quality, 85);
+        assert!(!epub_image_preset("off").enabled());
+        // 不认识的值一律退回「不压」，不让脏值瞎压一遍
+        assert_eq!(epub_image_preset("乱七八糟").key, "off");
+    }
+
+    #[test]
+    fn epub_image_compress_log_round_trip() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE epub_image_compress_log (
+               path TEXT PRIMARY KEY,
+               size INTEGER NOT NULL DEFAULT 0,
+               mtime INTEGER NOT NULL DEFAULT 0,
+               preset TEXT NOT NULL DEFAULT ''
+             );",
+        )
+        .unwrap();
+        let path = "Z:/not/a/real/book.epub";
+        assert!(epub_compress_log(&conn, path).is_none());
+        note_epub_compress_state(&conn, path, &epub_image_preset("1200")).unwrap();
+        let recorded = epub_compress_log(&conn, path).unwrap();
+        assert_eq!(recorded.2, "1200");
+        // 换更狠的档要能覆盖掉旧账（文件没换过也允许再压一轮）
+        note_epub_compress_state(&conn, path, &epub_image_preset("900")).unwrap();
+        assert_eq!(epub_compress_log(&conn, path).unwrap().2, "900");
+    }
 }

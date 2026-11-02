@@ -1020,8 +1020,12 @@ async function invoke(command, args = {}) {
     return;
   }
   // 搜索网站给了两条示例，方便在浏览器里直接看设置面板和右键菜单长什么样
-  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "epub", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "尚香书苑", url: "https://sxsy45.com/search.php?mod=forum&orderby=dateline&ascdesc=desc&searchsubmit=yes&srchtxt=" }], ...(window.__mockAppSettings || {}) };
+  if (command === "get_app_settings") return { pixivCookie: "", excludedTags: "", defaultPreviewDir: "", defaultPurchasedDir: "", autoGroupDir: "", autoCreateDirs: false, syncWorksOnNewAuthor: false, syncWorksOnStrayPromote: false, minimumTextCount: 0, pixivDelayThreshold: 150, pixivDelaySeconds: 1, similarityThreshold: 70, minSimilarityThreshold: 30, matchTitleLength: 0, imageQuality: "1200", syncImageFormat: "epub", epubImageQuality: "1200", autoCheckUpdate: true, recordHistory: true, fullVersionKeywords: ["全文放出"], previewVersionKeywords: ["购买", "全文", "fanbox.cc", "booth.pm", "fansky.co", "fansky.net", "aifans.fans", "allmylinks.com", "fantia.jp", "ci-en.net", "patreon.com", "afdian.net", "ifdian.net", "ko-fi.com", "buymeacoffee.com", "dlsite.com", "melonbooks.co.jp", "gumroad.com", "hmiko.com", "ifanso.com", "azz.net", "linktr.ee", "lit.link"], autoBackupEnabled: true, autoBackupKeep: 7, updateMirrors: ["https://ghproxy.net/", "https://gh-proxy.com/", "https://ghfast.top/", "https://gh.xxooo.cf/"], searchSites: [{ name: "尚香书苑", url: "https://sxsy45.com/search.php?mod=forum&orderby=dateline&ascdesc=desc&searchsubmit=yes&srchtxt=" }], ...(window.__mockAppSettings || {}) };
   if (command === "save_app_settings") return args.settings;
+  // EPUB 插图压缩（v1.3.44）：预览里没有真 EPUB 文件，进度事件也不会来，
+  // 给一个「一本都没扫到」的结果，只要界面不炸就算过。
+  if (command === "compress_epub_images") return { scannedCount: 0, compressedCount: 0, skippedCount: 0, failedCount: 0, savedBytes: 0, cancelled: false };
+  if (command === "cancel_epub_image_compress") return;
   // 同义词（v1.3.39）：预览里存在内存上，刷新页面就回到默认
   if (command === "get_synonyms") return window.__previewSynonyms || { enabled: false, groups: [] };
   if (command === "save_synonyms") {
@@ -7612,6 +7616,21 @@ async function bindEvents() {
       if (action === "confirm-auto-group-author") await confirmAutoGroupAuthor();
       if (action === "confirm-pixiv-sync") await syncPixivWorks();
       if (action === "cancel-pixiv-sync") await cancelPixivSync();
+      // v1.3.44：终止「压缩 EPUB 插图」。后端只认一个 AtomicBool，发完就立即返回，
+      // 正在写的那一本会写完再停（不会留半截包）。
+      if (action === "cancel-epub-image-compress") {
+        if (state.syncTask && !state.syncTask.cancelling) {
+          state.syncTask.cancelling = true;
+          state.syncTask.label = "正在停止（这本写完就停）";
+          updateSyncFloater();
+          try {
+            await invoke("cancel_epub_image_compress");
+          } catch (error) {
+            toast(String(error), "error");
+          }
+        }
+        return;
+      }
       // v1.3.7：收起＝换成右下角小球、展开＝换回卡片 —— 两个形态是两套 DOM，直接重渲染
       if (action === "toggle-sync-floater") {
         if (state.syncTask) {
@@ -7917,6 +7936,19 @@ async function bindEvents() {
         toast(scanned ? `已重算 ${scanned} 篇阅读版的图片数（其中 ${updated} 篇有变化）` : "没有作品绑定在 EPUB / HTML 上", "success");
       } catch (error) {
         toast(String(error), "error");
+      } finally {
+        button.disabled = false;
+      }
+    });
+    // 压缩 EPUB 插图（v1.3.44）：存量 EPUB 就地压一遍。档位不在这里选，
+    // 用「下载与图文 → EPUB 里的插图」那一档 —— 生成时压与事后压必须是同一档，
+    // 否则同一本书会按两个指纹各压一遍。
+    document.querySelector("#settings-slot-maintain")?.insertAdjacentHTML("beforeend", `<label>EPUB 插图压缩 <button type="button" class="quiet-button" data-action="compress-epub-images">开始压缩</button><small>把作品绑定的 EPUB 里的插图按「下载与图文 → EPUB 里的插图」那一档重新压一遍，原文件直接替换（不留备份）。压完不比原来小的图保留原图；同一档压过的书会跳过，点几次都不会反复压。</small></label>`);
+    document.querySelector("[data-action='compress-epub-images']")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await compressEpubImages();
       } finally {
         button.disabled = false;
       }
@@ -9325,6 +9357,79 @@ function formatMegabytes(bytes) {
   return `${value} B`;
 }
 
+// EPUB 插图压缩的进度事件（v1.3.44）。和 reading-download-progress 一样，
+// 浏览器预览里后端没有这条事件，listen 会抛，包一层给个空函数不打扰预览。
+async function listenEpubCompressProgress(handler) {
+  try {
+    return await listen("epub-image-compress-progress", handler);
+  } catch {
+    return () => {};
+  }
+}
+
+// 「压缩 EPUB 插图」（v1.3.44）：把库里绑定到作品上的 .epub 就地压一遍插图。
+// 档位与「生成 EPUB 时压」共用设置里那一档，所以这里不传参数；
+// 同参数压过的书后端会直接跳过（记账表），反复点不会一次次劣化。
+async function compressEpubImages() {
+  if (state.syncTask) {
+    toast("有任务正在进行，请等它结束或先停止它", "info");
+    return;
+  }
+  const preset = state.settings?.epubImageQuality || "1200";
+  if (preset === "off") {
+    toast("现在这一档是「不压」：先在设置「下载与图文」里选一个画质再来", "info");
+    return;
+  }
+  state.syncTask = {
+    kind: "epub-compress",
+    label: "正在压缩 EPUB 插图",
+    title: "正在准备…",
+    current: 0,
+    total: 0,
+    cancelAction: "cancel-epub-image-compress",
+    cancelText: "停止压缩",
+  };
+  render();
+  const unlisten = await listenEpubCompressProgress((event) => {
+    const { total = 0, current = 0, title = "", done = false } = event.payload || {};
+    if (done || !state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    state.syncTask.title = title;
+    updateSyncFloater();
+  });
+  let result;
+  try {
+    result = await invoke("compress_epub_images");
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(String(error), "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  // 文件换了、体积也变了：当前列表的体积和封面都得跟着刷
+  await refreshVisibleList();
+  render();
+  const scanned = Number(result?.scannedCount || 0);
+  if (!scanned) {
+    toast("没有找到绑定在作品上的 EPUB 文件", "info");
+    return;
+  }
+  const compressed = Number(result?.compressedCount || 0);
+  const skipped = Number(result?.skippedCount || 0);
+  const failed = Number(result?.failedCount || 0);
+  const saved = Number(result?.savedBytes || 0);
+  const parts = [`完成 ${compressed} 本`];
+  if (saved > 0) parts.push(`省了 ${formatMegabytes(saved)}`);
+  if (skipped) parts.push(`跳过 ${skipped} 本`);
+  if (failed) parts.push(`失败 ${failed} 本`);
+  const head = result?.cancelled ? "已停止：" : "";
+  toast(`${head}${parts.join(" / ")}`, failed ? "info" : "success");
+}
+
 // 批量：对勾选的作品「重新下载阅读版并绑定」，右下角带进度条。
 // format 传空串＝跟随设置里选的格式（批量操作里的「补下配图（N）」走的就是这条），
 // 传 "html" / "epub" 就是强制那种格式。
@@ -10397,6 +10502,8 @@ function collectSettings(form) {
   if (!Number.isInteger(values.matchTitleLength) || values.matchTitleLength < 0) throw new Error("匹配作品名长度请输入 0 或正整数（0 表示匹配完整作品名）");
   values.imageQuality = values.imageQuality === "original" ? "original" : "1200";
   values.syncImageFormat = values.syncImageFormat === "epub" ? "epub" : "html";
+  // EPUB 插图压缩档（v1.3.44）：四档之一，后端认不出的一律按「不压」处理
+  values.epubImageQuality = ["900", "1200", "1600"].includes(values.epubImageQuality) ? values.epubImageQuality : values.epubImageQuality === "off" ? "off" : "1200";
   // 搜索网站：编辑器那两列是同一个控件的两半，收成数组后把原始字段摘掉，别夹带进设置
   values.searchSites = collectSearchSites(form);
   delete values.searchSiteName;
@@ -10530,6 +10637,7 @@ async function settingsModal() {
     <div class="settings-fields is-single">
       <label>配图画质 <select name="imageQuality"><option value="1200" ${(settings.imageQuality || "1200") === "1200" ? "selected" : ""}>1200 宽（推荐，每张约 1 MB）</option><option value="original" ${settings.imageQuality === "original" ? "selected" : ""}>原始画质（作者上传的原图，可能每张几 MB）</option></select><small>图文小说同步时下载正文配图用这一档。原图更清晰，但一篇的配图可能要几十到上百 MB。</small></label>
       <label>同步作品时图文小说自动保存为 <select name="syncImageFormat"><option value="epub" ${(settings.syncImageFormat || "epub") === "epub" ? "selected" : ""}>EPUB（电子书阅读器）</option><option value="html" ${settings.syncImageFormat === "html" ? "selected" : ""}>HTML（浏览器直接打开）</option></select><small>同步图文小说时只保留这一种阅读版：EPUB 适合推到手机 / 阅读器，HTML 双击就能用浏览器看。不会两种都存。</small></label>
+      <label>EPUB 里的插图 <select name="epubImageQuality"><option value="1200" ${(settings.epubImageQuality || "1200") === "1200" ? "selected" : ""}>长边 1200 + 质量 80（推荐，每张约 0.2 至 0.6 MB）</option><option value="1600" ${settings.epubImageQuality === "1600" ? "selected" : ""}>长边 1600 + 质量 85（清晰些，存得多一点）</option><option value="900" ${settings.epubImageQuality === "900" ? "selected" : ""}>长边 900 + 质量 75（最省空间）</option><option value="off" ${settings.epubImageQuality === "off" ? "selected" : ""}>不压（保留作者原图）</option></select><small>生成 EPUB 时按这一档压一遍插图；PNG 会转成 JPEG（包内引用一并改好），压完不比原来小的图保留原图。已经压过的书不会重复压，存在「维护与数据」里的「压缩 EPUB 插图」用同一档。<b>这一档和上面的「配图画质」是两回事</b>：配图画质管的是下载时存下来的原图，这里管的是塞进 EPUB 的那一份。</small></label>
     </div>
   </section>
   <section class="settings-group is-search">

@@ -1,6 +1,6 @@
 [package]
 name = "collection-library"
-version = "1.3.43"
+version = "1.3.44"
 description = "Local collection library"
 authors = ["you"]
 edition = "2021"
@@ -17,11 +17,12 @@ calamine = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1.3"
 encoding_rs = "0.8"
-# 封面落盘前重压用（COVER_JPEG_QUALITY）。**只开 jpeg** —— 源就是 Pixiv 的 JPEG，
-# 解+重编都用不到别的格式，关掉 png/gif/webp/tiff 能少编一半依赖、也少占 exe 体积。
+# 两处用到：封面落盘前重压（COVER_JPEG_QUALITY），以及 EPUB 插图压缩（v1.3.44）。
+# **只开 jpeg + png** —— 前者是 Pixiv 封面/插图的原始格式，后者是 EPUB 里最常见的另一种；
+# gif/webp/tiff 一律不碰（转了会丢动画/丢透明），关掉能少编一半依赖、也少占 exe 体积。
 # 选纯 Rust 的 image 而不是 turbojpeg / mozjpeg（C 绑定），是为了用户零额外安装：
 # 静态链进 exe，不产生 DLL、不依赖 libjpeg 和 VC 运行库。
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 open = "5.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "system-proxy"] }
