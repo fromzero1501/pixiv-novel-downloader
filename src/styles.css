@@ -458,6 +458,19 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .settings-form .settings-actions button { display: flex; align-items: center; gap: 11px; min-height: 48px; padding: 0 13px; color: #354f6b; background: #fff; border: 1px solid var(--line, #dde5ef); border-radius: 8px; }
 .settings-form .settings-actions button:hover { color: var(--accent, #1764c5); background: var(--tint, #f4f7fb); border-color: var(--accent, #9dc6f4); }
 .settings-form .settings-actions button svg { flex: none; }
+/* v1.3.45：设置里的可折叠小节（更新加速镜像 / 自动备份）—— 默认收起，
+   不用原生三角，自己画一个 ▸，跟「角色分组」那套保持一致 */
+.settings-fold { min-width: 0; }
+.settings-fold-head { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; color: #405773; font-size: 13px; font-weight: 650; cursor: pointer; list-style: none; }
+.settings-fold-head::-webkit-details-marker { display: none; }
+.settings-fold-head::before { content: "▸"; flex: none; color: #8098b0; font-size: 11px; transition: transform .15s; }
+.settings-fold[open] > .settings-fold-head::before { transform: rotate(90deg); }
+.settings-fold-head .settings-group-hint { margin-left: auto; font-weight: 400; }
+.settings-fold-body { display: grid; gap: 8px; margin-top: 9px; padding: 11px 13px; background: #f8fbff; border: 1px solid #dce8f5; border-radius: 7px; }
+.settings-fold-body label:not([class]) { display: grid; gap: 6px; color: #405773; font-size: 13px; font-weight: 650; }
+.settings-fold-body small { color: #788aa0; font-weight: 400; }
+.settings-fold-body textarea, .settings-fold-body input:not([type="checkbox"]) { width: 100%; color: #263c57; background: #fff; border: 1px solid #d6e1ed; border-radius: 6px; padding: 9px 10px; outline: none; font-weight: 400; }
+.settings-fold-body .quiet-button { justify-self: start; }
 /* 说明文字放不下就换到第二行 —— 以前是 nowrap + 省略号，长一点的说明直接被截掉（v1.2.47 用户截图报的） */
 .settings-action-hint { margin-left: auto; flex: 1 1 340px; min-width: 0; color: #8fa2b6; font-size: 11px; font-weight: 500; line-height: 1.55; text-align: right; }
 

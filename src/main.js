@@ -7515,6 +7515,9 @@ async function bindEvents() {
         }
       }
       if (action === "scan-work-files") await scanWorkFiles();
+      // v1.3.45：这两条从「维护与数据」搬到了「批量维护」，跟着那一列走统一动作分发
+      if (action === "refresh-reading-image-counts") await refreshReadingImageCounts(element);
+      if (action === "compress-epub-images") await compressEpubImages(element);
       if (action === "clear-missing-bindings") await clearMissingBindings();
       if (action === "download-selected-reading") { await downloadSelectedReadings(element.dataset.format === "epub" ? "epub" : ""); return; }
       if (action === "backfill-images") { await downloadSelectedReadings(""); return; }
@@ -7921,38 +7924,8 @@ async function bindEvents() {
         button.disabled = false;
       }
     });
-    // 存量作品补角标：绑在 EPUB / HTML 上的作品，图片数可能在绑定之前就已经存在
-    document.querySelector("#settings-slot-maintain")?.insertAdjacentHTML("beforeend", `<label>阅读版图片数 <button type="button" class="quiet-button" data-action="refresh-reading-image-counts">立即重算</button><small>扫描全库里绑定在 EPUB / HTML 上的作品，重新统计作品卡上的图片角标（数的是文件里的插图，不含封面）。绑定普通 txt 的作品不受影响。</small></label>`);
-    document.querySelector("[data-action='refresh-reading-image-counts']")?.addEventListener("click", async (event) => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      try {
-        const result = await invoke("refresh_reading_image_counts");
-        const scanned = Number(result?.scannedCount || 0);
-        const updated = Number(result?.updatedCount || 0);
-        // 图片数变了，封面上的带图版角标也要跟着变 —— 一律刷「当前这个列表」
-        await refreshVisibleList();
-        render();
-        toast(scanned ? `已重算 ${scanned} 篇阅读版的图片数（其中 ${updated} 篇有变化）` : "没有作品绑定在 EPUB / HTML 上", "success");
-      } catch (error) {
-        toast(String(error), "error");
-      } finally {
-        button.disabled = false;
-      }
-    });
-    // 压缩 EPUB 插图（v1.3.44）：存量 EPUB 就地压一遍。档位不在这里选，
-    // 用「下载与图文 → EPUB 里的插图」那一档 —— 生成时压与事后压必须是同一档，
-    // 否则同一本书会按两个指纹各压一遍。
-    document.querySelector("#settings-slot-maintain")?.insertAdjacentHTML("beforeend", `<label>EPUB 插图压缩 <button type="button" class="quiet-button" data-action="compress-epub-images">开始压缩</button><small>把作品绑定的 EPUB 里的插图按「下载与图文 → EPUB 里的插图」那一档重新压一遍，原文件直接替换（不留备份）。压完不比原来小的图保留原图；同一档压过的书会跳过，点几次都不会反复压。</small></label>`);
-    document.querySelector("[data-action='compress-epub-images']")?.addEventListener("click", async (event) => {
-      const button = event.currentTarget;
-      button.disabled = true;
-      try {
-        await compressEpubImages();
-      } finally {
-        button.disabled = false;
-      }
-    });
+    // v1.3.45：原本挂在「维护与数据」末尾注入槽里的两个动作（重算阅读版图片数、Epub插图压缩）
+    // 已经搬进第 8 组「批量维护」的静态列表，改由统一的动作分发处理 —— 这里不再插 DOM、也不再单独绑监听。
     settingsForm.dataset.bound = "true";
     // 自动保存（v1.3.9 起**只在不编辑的时候存**，用户 2026-10-14 定）：打字期间一次库都不写，
     // 光标离开输入框（失焦）或编辑结束后统一落盘。老的「停手半秒就保存」在数字 / 关键词这类
@@ -9367,10 +9340,29 @@ async function listenEpubCompressProgress(handler) {
   }
 }
 
+// 「重算阅读版图片数」（v1.3.45 从「维护与数据」末尾的注入槽搬进「批量维护」）：
+// 绑在 EPUB / HTML 上的作品，图片数可能早于绑定就存在，扫一遍把作品卡上的角标补对。
+async function refreshReadingImageCounts(trigger) {
+  if (trigger) trigger.disabled = true;
+  try {
+    const result = await invoke("refresh_reading_image_counts");
+    const scanned = Number(result?.scannedCount || 0);
+    const updated = Number(result?.updatedCount || 0);
+    // 图片数变了，封面上的带图版角标也要跟着变 —— 一律刷「当前这个列表」
+    await refreshVisibleList();
+    render();
+    toast(scanned ? `已重算 ${scanned} 篇阅读版的图片数（其中 ${updated} 篇有变化）` : "没有作品绑定在 EPUB / HTML 上", "success");
+  } catch (error) {
+    toast(String(error), "error");
+  } finally {
+    if (trigger) trigger.disabled = false;
+  }
+}
+
 // 「压缩 EPUB 插图」（v1.3.44）：把库里绑定到作品上的 .epub 就地压一遍插图。
 // 档位与「生成 EPUB 时压」共用设置里那一档，所以这里不传参数；
 // 同参数压过的书后端会直接跳过（记账表），反复点不会一次次劣化。
-async function compressEpubImages() {
+async function compressEpubImages(trigger) {
   if (state.syncTask) {
     toast("有任务正在进行，请等它结束或先停止它", "info");
     return;
@@ -9380,6 +9372,8 @@ async function compressEpubImages() {
     toast("现在这一档是「不压」：先在设置「下载与图文」里选一个画质再来", "info");
     return;
   }
+  // v1.3.45：入口成了「批量维护」列表里的一行，跑的时候把那一行按住，防止连点
+  if (trigger) trigger.disabled = true;
   state.syncTask = {
     kind: "epub-compress",
     label: "正在压缩 EPUB 插图",
@@ -9405,6 +9399,7 @@ async function compressEpubImages() {
     unlisten();
     state.syncTask = null;
     render();
+    if (trigger) trigger.disabled = false;
     toast(String(error), "error");
     return;
   }
@@ -9413,6 +9408,7 @@ async function compressEpubImages() {
   // 文件换了、体积也变了：当前列表的体积和封面都得跟着刷
   await refreshVisibleList();
   render();
+  if (trigger) trigger.disabled = false;
   const scanned = Number(result?.scannedCount || 0);
   if (!scanned) {
     toast("没有找到绑定在作品上的 EPUB 文件", "info");
@@ -10637,7 +10633,7 @@ async function settingsModal() {
     <div class="settings-fields is-single">
       <label>配图画质 <select name="imageQuality"><option value="1200" ${(settings.imageQuality || "1200") === "1200" ? "selected" : ""}>1200 宽（推荐，每张约 1 MB）</option><option value="original" ${settings.imageQuality === "original" ? "selected" : ""}>原始画质（作者上传的原图，可能每张几 MB）</option></select><small>图文小说同步时下载正文配图用这一档。原图更清晰，但一篇的配图可能要几十到上百 MB。</small></label>
       <label>同步作品时图文小说自动保存为 <select name="syncImageFormat"><option value="epub" ${(settings.syncImageFormat || "epub") === "epub" ? "selected" : ""}>EPUB（电子书阅读器）</option><option value="html" ${settings.syncImageFormat === "html" ? "selected" : ""}>HTML（浏览器直接打开）</option></select><small>同步图文小说时只保留这一种阅读版：EPUB 适合推到手机 / 阅读器，HTML 双击就能用浏览器看。不会两种都存。</small></label>
-      <label>EPUB 里的插图 <select name="epubImageQuality"><option value="1200" ${(settings.epubImageQuality || "1200") === "1200" ? "selected" : ""}>长边 1200 + 质量 80（推荐，每张约 0.2 至 0.6 MB）</option><option value="1600" ${settings.epubImageQuality === "1600" ? "selected" : ""}>长边 1600 + 质量 85（清晰些，存得多一点）</option><option value="900" ${settings.epubImageQuality === "900" ? "selected" : ""}>长边 900 + 质量 75（最省空间）</option><option value="off" ${settings.epubImageQuality === "off" ? "selected" : ""}>不压（保留作者原图）</option></select><small>生成 EPUB 时按这一档压一遍插图；PNG 会转成 JPEG（包内引用一并改好），压完不比原来小的图保留原图。已经压过的书不会重复压，存在「维护与数据」里的「压缩 EPUB 插图」用同一档。<b>这一档和上面的「配图画质」是两回事</b>：配图画质管的是下载时存下来的原图，这里管的是塞进 EPUB 的那一份。</small></label>
+      <label>Epub插图压缩 <select name="epubImageQuality"><option value="1200" ${(settings.epubImageQuality || "1200") === "1200" ? "selected" : ""}>长边 1200 + 质量 80（推荐，每张约 0.2 至 0.6 MB）</option><option value="1600" ${settings.epubImageQuality === "1600" ? "selected" : ""}>长边 1600 + 质量 85（清晰些，存得多一点）</option><option value="900" ${settings.epubImageQuality === "900" ? "selected" : ""}>长边 900 + 质量 75（最省空间）</option><option value="off" ${settings.epubImageQuality === "off" ? "selected" : ""}>不压（保留作者原图）</option></select><small>生成 EPUB 时按这一档压一遍插图；PNG 会转成 JPEG（包内引用一并改好），压完不比原来小的图保留原图。已经压过的书不会重复压，存量书在「批量维护」里的「Epub插图压缩」用同一档。<b>这一档和上面的「配图画质」是两回事</b>：配图画质管的是下载时存下来的原图，这里管的是塞进 EPUB 的那一份。</small></label>
     </div>
   </section>
   <section class="settings-group is-search">
@@ -10660,7 +10656,12 @@ async function settingsModal() {
         <small>查到新版本会把新版 exe 下载到程序所在的文件夹，下完自动重启到新版本；旧的那个文件在下次启动时移入回收站（可以还原）。你的作品文件和数据库都在旁边，不受影响。GitHub 直连不上时会自动换下面的加速镜像重试。</small>
         <div class="settings-button-row"><button type="button" class="quiet-button" data-action="check-update">检查更新</button><button type="button" class="quiet-button" data-action="open-release-page">打开发布页</button></div>
         <label class="check-row"><input name="autoCheckUpdate" type="checkbox" ${settings.autoCheckUpdate === false ? "" : "checked"}><span>启动时自动检查新版本</span><small>关掉之后程序不会主动联网查版本，想更新时点上面的「检查更新」。</small></label>
-        <label>更新加速镜像 <textarea name="updateMirrors" rows="4" placeholder="https://ghproxy.net/">${escapeHtml((settings.updateMirrors || []).join("\n"))}</textarea><button type="button" class="quiet-button" data-action="reset-update-mirrors">恢复默认</button><small>一行一个。检查更新会同时问直连和这里所有镜像、取报出的最高版本，下载时按这个顺序挨个重试（地址直接接在 <code>https://github.com/...</code> 前面）。镜像失效时自己换一个即可，不用等新版。</small></label>
+        <details class="settings-fold">
+          <summary class="settings-fold-head"><span class="field-title">更新加速镜像</span><span class="settings-group-hint">直连不上时用</span></summary>
+          <div class="settings-fold-body">
+            <label>镜像地址<textarea name="updateMirrors" rows="4" placeholder="https://ghproxy.net/">${escapeHtml((settings.updateMirrors || []).join("\n"))}</textarea><button type="button" class="quiet-button" data-action="reset-update-mirrors">恢复默认</button><small>一行一个。检查更新会同时问直连和这里所有镜像、取报出的最高版本，下载时按这个顺序挨个重试（地址直接接在 <code>https://github.com/...</code> 前面）。镜像失效时自己换一个即可，不用等新版。</small></label>
+          </div>
+        </details>
       </div>
 
       <div class="form-field update-setting">
@@ -10670,12 +10671,16 @@ async function settingsModal() {
         <div class="settings-button-row"><button type="button" class="quiet-button" data-action="clear-history-settings">清空浏览历史</button></div>
       </div>
       <div class="form-field update-setting">
-        <div class="char-setting-head"><span class="field-title">自动备份</span><span class="settings-group-hint">每天首次启动备一份</span></div>
-        <small>每天第一次打开软件时，自动把数据库备份到程序目录的 <code>data/backup/auto</code> 下，只保留最近几份、更早的自动清掉（<b>只删这个目录里自己生成的备份</b>，你手动导出的备份不会被动）。备份文件可以直接拿来恢复。</small>
-        <label class="check-row"><input name="autoBackupEnabled" type="checkbox" ${settings.autoBackupEnabled === false ? "" : "checked"}><span>每天自动备份数据库</span></label>
-        <label>保留最近 <div class="threshold-input"><input name="autoBackupKeep" type="number" min="1" max="50" value="${settings.autoBackupKeep || 7}"><span>份</span></div><small>1 到 50 份。</small></label>
-        <div id="backup-list" class="backup-list"></div>
-        <div class="settings-button-row"><button type="button" class="quiet-button" data-action="backup-now">${icon("database", 16)}立即备份一份</button></div>
+        <details class="settings-fold">
+          <summary class="settings-fold-head"><span class="field-title">自动备份</span><span class="settings-group-hint">每天首次启动备一份</span></summary>
+          <div class="settings-fold-body">
+            <small>每天第一次打开软件时，自动把数据库备份到程序目录的 <code>data/backup/auto</code> 下，只保留最近几份、更早的自动清掉（<b>只删这个目录里自己生成的备份</b>，你手动导出的备份不会被动）。备份文件可以直接拿来恢复。</small>
+            <label class="check-row"><input name="autoBackupEnabled" type="checkbox" ${settings.autoBackupEnabled === false ? "" : "checked"}><span>每天自动备份数据库</span></label>
+            <label>保留最近 <div class="threshold-input"><input name="autoBackupKeep" type="number" min="1" max="50" value="${settings.autoBackupKeep || 7}"><span>份</span></div><small>1 到 50 份。</small></label>
+            <div id="backup-list" class="backup-list"></div>
+            <div class="settings-button-row"><button type="button" class="quiet-button" data-action="backup-now">${icon("database", 16)}立即备份一份</button></div>
+          </div>
+        </details>
       </div>
     </div>
     <div class="settings-fields is-single">
@@ -10693,6 +10698,8 @@ async function settingsModal() {
       <button type="button" data-action="relocate-lost-files">${icon("sync", 18)}重新定位丢失的文件<span class="settings-action-hint">换盘 / 搬过目录之后用：到您设置过的所有目录里按文件名找同名文件，找到唯一一个就重新绑上（先给预览，再动手）</span></button>
       <button type="button" data-action="clear-skipped-novels">${icon("archive", 18)}清空「太小跳过」记录<span class="settings-action-hint">同步时小于「最小文件大小」的作品会被记下来、下次直接跳过（省请求、也少招限流）。把最小文件大小调小之后点这里，让它们重新参与同步</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
+      <button type="button" data-action="refresh-reading-image-counts">${icon("image", 18)}重算阅读版图片数<span class="settings-action-hint">扫描全库里绑定在 EPUB / HTML 上的作品，重新统计作品卡上的图片角标（数的是文件里的插图，不含封面）。绑定普通 txt 的作品不受影响</span></button>
+      <button type="button" data-action="compress-epub-images">${icon("archive", 18)}Epub插图压缩<span class="settings-action-hint">把作品绑定的 EPUB 里的插图，按「下载与图文 → Epub插图压缩」那一档重新压一遍；原文件直接替换（不留备份），压完不比原来小的图保留原图，同一档压过的书会跳过，随时可以停止</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出设置和数据<span class="settings-action-hint">把整个资料库存成一个 .db 文件（作品记录、绑定关系、设置全在里面），换电脑或出问题时可回滚</span></button>
       <button type="button" data-action="import-data-pick">${icon("upload", 18)}导入设置和数据<span class="settings-action-hint">只吃你自己用「导出设置和数据」存下来的那个 .db 文件（覆盖式导入、需重启）。别人的作品分享包不在这里导 —— 拖到下面那块去</span></button>
     </div>
