@@ -6370,10 +6370,30 @@ fn fix_opf_media_type(text: &str, base_name: &str) -> String {
 ///
 /// 返回 `None` 表示「这本一个字节都没必要动」（没有可压的图 / 全都压不动），
 /// 调用方据此跳过写盘。
+/// 这份条目名是不是「我们要压的图」：包内 jpg / jpeg / png，且不在 META-INF 里。
+/// 分母（总数）和循环用同一个判据，免得报出来的进度和实际处理的张数对不上。
+fn is_epub_compress_candidate(lower_name: &str) -> bool {
+    if lower_name.starts_with("meta-inf/") {
+        return false;
+    }
+    lower_name.ends_with(".jpg") || lower_name.ends_with(".jpeg") || lower_name.ends_with(".png")
+}
+
 fn rewrite_epub_images(
     source: &[u8],
     preset: &EpubImagePreset,
     allow_format_change: bool,
+) -> Option<EpubImageRewrite> {
+    rewrite_epub_images_reported(source, preset, allow_format_change, &mut |_, _| {})
+}
+
+/// 同上，但每处理完一张图回一次「已处理 done 张 / 共 total 张」（v1.3.46）。
+/// 批量压缩靠这个上报逐张进度；A 路径与测试传空闭包，行为和原来一样。
+fn rewrite_epub_images_reported(
+    source: &[u8],
+    preset: &EpubImagePreset,
+    allow_format_change: bool,
+    on_image: &mut dyn FnMut(usize, usize),
 ) -> Option<EpubImageRewrite> {
     use std::collections::HashMap;
     use std::io::Cursor;
@@ -6417,42 +6437,46 @@ fn rewrite_epub_images(
     let mut replaced: HashMap<String, Vec<u8>> = HashMap::new();
     let mut renames: Vec<EpubImageRename> = Vec::new();
     let mut saved_bytes: u64 = 0;
+    // 分母：这本里「我们要处理的图」有几张。和下面循环用同一个判据（封面也算一张）。
+    let image_total = names
+        .iter()
+        .filter(|name| is_epub_compress_candidate(&name.to_ascii_lowercase()))
+        .count();
+    let mut image_done: usize = 0;
     for (index, name) in names.iter().enumerate() {
         let lower = name.to_ascii_lowercase();
-        if lower.starts_with("meta-inf/") {
+        if !is_epub_compress_candidate(&lower) {
             continue;
         }
-        let is_jpeg = lower.ends_with(".jpg") || lower.ends_with(".jpeg");
-        let is_png = lower.ends_with(".png");
-        if !is_jpeg && !is_png {
-            continue;
+        // 进度按「处理过的张数」算：读不出、压不动、压完不划算的那些也算处理过，
+        // 否则一本里全是不划算的图时，条永远走不满（会停在中途换下一本）。
+        image_done += 1;
+        if let Some(original) = read_entry(&mut archive, index) {
+            if let Some((rewritten, extension)) = compress_epub_image(&original, preset, allow_change)
+            {
+                if rewritten.len() < original.len() {
+                    let stem = match name.rfind('.') {
+                        Some(position) => &name[..position],
+                        None => name.as_str(),
+                    };
+                    let new_name = format!("{stem}.{extension}");
+                    if new_name != *name {
+                        let old_base = name.rsplit('/').next().unwrap_or(name.as_str()).to_string();
+                        let new_base =
+                            new_name.rsplit('/').next().unwrap_or(new_name.as_str()).to_string();
+                        renames.push(EpubImageRename {
+                            old_name: name.clone(),
+                            new_name,
+                            old_base,
+                            new_base,
+                        });
+                    }
+                    saved_bytes += (original.len() - rewritten.len()) as u64;
+                    replaced.insert(name.clone(), rewritten);
+                }
+            }
         }
-        let Some(original) = read_entry(&mut archive, index) else {
-            continue;
-        };
-        let Some((rewritten, extension)) = compress_epub_image(&original, preset, allow_change) else {
-            continue;
-        };
-        if rewritten.len() >= original.len() {
-            continue;
-        }
-        let stem = match name.rfind('.') {
-            Some(position) => &name[..position],
-            None => name.as_str(),
-        };
-        let new_name = format!("{stem}.{extension}");
-        if new_name != *name {
-            let old_base = name.rsplit('/').next().unwrap_or(name.as_str()).to_string();
-            let new_base = new_name.rsplit('/').next().unwrap_or(new_name.as_str()).to_string();
-            renames.push(EpubImageRename {
-                old_name: name.clone(),
-                new_name,
-                old_base,
-                new_base,
-            });
-        }
-        saved_bytes += (original.len() - rewritten.len()) as u64;
-        replaced.insert(name.clone(), rewritten);
+        on_image(image_done, image_total);
     }
     if replaced.is_empty() {
         return None;
@@ -6651,18 +6675,37 @@ fn cancel_epub_image_compress() {
     EPUB_IMAGE_COMPRESS_CANCEL.store(true, Ordering::Relaxed);
 }
 
+/// 插图压缩的进度载荷（v1.3.46）：比 `ReadingProgress` 多两格「第几本 / 共几本」，
+/// 前端据此把「本书内压到第几张」和「整轮走到哪一本」分开显示 ——
+/// 分母是张数（`total`），这本压完就走满一圈，下一本从 0 重新走。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EpubCompressProgress {
+    book_index: usize,
+    book_total: usize,
+    current: usize,
+    total: usize,
+    title: String,
+    done: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_epub_compress_progress(
     app: &AppHandle,
-    total: usize,
+    book_index: usize,
+    book_total: usize,
     current: usize,
+    total: usize,
     title: String,
     done: bool,
 ) {
     let _ = app.emit(
         EPUB_IMAGE_COMPRESS_PROGRESS_EVENT,
-        ReadingProgress {
-            total,
+        EpubCompressProgress {
+            book_index,
+            book_total,
             current,
+            total,
             title,
             done,
         },
@@ -6670,10 +6713,18 @@ fn emit_epub_compress_progress(
 }
 
 /// 压一本。`Ok(Some(省下的字节))` 压过且换了盘上的文件 / `Ok(None)` 跳过 / `Err` 这本失败。
+///
+/// `book_index` / `book_total` / `title` 只用来报进度：这本开压前报一次「0 / 共几张」，
+/// 每处理完一张报一次，要写盘校验时把条钉在满格并注明「正在校验」。
+#[allow(clippy::too_many_arguments)]
 fn compress_one_epub_file(
     conn: &Connection,
     path: &str,
     preset: &EpubImagePreset,
+    app: &AppHandle,
+    book_index: usize,
+    book_total: usize,
+    title: &str,
 ) -> Result<Option<u64>, String> {
     let target = Path::new(path);
     if !target.is_file() {
@@ -6687,11 +6738,50 @@ fn compress_one_epub_file(
         }
     }
     let source = fs::read(target).map_err(|error| error.to_string())?;
-    let Some(rewrite) = rewrite_epub_images(&source, preset, true) else {
+    // 这本开压：条先归零（总数还不知道，等第一张处理完就有分母了）
+    emit_epub_compress_progress(
+        app,
+        book_index,
+        book_total,
+        0,
+        0,
+        title.to_string(),
+        false,
+    );
+    let (rewrite, image_total) = {
+        let mut seen_total: usize = 0;
+        let mut report = |done: usize, total: usize| {
+            seen_total = total;
+            emit_epub_compress_progress(
+                app,
+                book_index,
+                book_total,
+                done,
+                total,
+                title.to_string(),
+                false,
+            );
+        };
+        let rewrite = rewrite_epub_images_reported(&source, preset, true, &mut report);
+        (rewrite, seen_total)
+    };
+    let Some(rewrite) = rewrite else {
         // 一张都压不动（图太小 / 全是不认识的格式）也算处理过了，别每次点都重读一遍
         let _ = note_epub_compress_state(conn, path, preset);
         return Ok(None);
     };
+    // 后面是写临时文件 + 校验，进度上没什么可走的：把条钉在满格并标明在干什么
+    if image_total > 0 {
+        emit_epub_compress_progress(
+            app,
+            book_index,
+            book_total,
+            image_total,
+            image_total,
+            format!("{title}（正在校验）"),
+            false,
+        );
+    }
     let temp = target.with_extension("epub.part");
     fs::write(&temp, &rewrite.bytes).map_err(|error| error.to_string())?;
     if let Err(error) = verify_epub_bytes(&temp, target) {
@@ -6748,10 +6838,11 @@ fn compress_epub_images_impl(app: &AppHandle) -> Result<EpubImageCompressResult,
             .file_stem()
             .map(|stem| stem.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
-        emit_epub_compress_progress(app, total, index, title, false);
+        // 报一次「轮到这个文件了」：已压过而直接跳过的那些也要把浮层往前推一格
+        emit_epub_compress_progress(app, index + 1, total, 0, 0, title.clone(), false);
         result.scanned_count += 1;
         // 一本失败不停整轮：报错只记账，接着压下一本
-        match compress_one_epub_file(&conn, path, &preset) {
+        match compress_one_epub_file(&conn, path, &preset, app, index + 1, total, &title) {
             Ok(Some(saved)) => {
                 result.compressed_count += 1;
                 result.saved_bytes += saved;
@@ -6760,7 +6851,7 @@ fn compress_epub_images_impl(app: &AppHandle) -> Result<EpubImageCompressResult,
             Err(_) => result.failed_count += 1,
         }
     }
-    emit_epub_compress_progress(app, total, total, String::new(), true);
+    emit_epub_compress_progress(app, total, total, 0, 0, String::new(), true);
     Ok(result)
 }
 
@@ -26633,7 +26724,7 @@ mod tests {
 mod epub_image_compress_tests {
     use super::{
         compress_epub_image, epub_compress_log, epub_image_preset, note_epub_compress_state,
-        rewrite_epub_images, zip_finish, zip_push, ZipItem,
+        rewrite_epub_images, rewrite_epub_images_reported, zip_finish, zip_push, ZipItem,
     };
     use std::io::{Cursor, Read};
 
@@ -26786,6 +26877,32 @@ mod epub_image_compress_tests {
         assert!(names.iter().any(|name| name == "OEBPS/images/pic1.png"));
         let body = read_entry(&rewrite.bytes, "OEBPS/text/novel.xhtml");
         assert!(body.contains("../images/pic1.png"));
+    }
+
+    #[test]
+    fn epub_image_compress_reports_per_image_progress() {
+        // 两张能进分母（大图 jpg + 小图 png），一张 gif 不算分母：进度必须按张数走。
+        let big = encode_jpeg(&noisy_rgb(1600, 1200), 95);
+        let small = encode_png(&noisy_rgb(200, 160));
+        let mut out = Vec::new();
+        let mut items: Vec<ZipItem> = Vec::new();
+        zip_push(&mut out, &mut items, "mimetype", b"application/epub+zip");
+        zip_push(&mut out, &mut items, "OEBPS/images/big.jpg", &big);
+        zip_push(&mut out, &mut items, "OEBPS/images/small.png", &small);
+        zip_push(&mut out, &mut items, "OEBPS/images/cover.gif", b"GIF89a");
+        zip_finish(&mut out, &items);
+
+        let preset = epub_image_preset("1200");
+        let mut calls: Vec<(usize, usize)> = Vec::new();
+        let rewrite =
+            rewrite_epub_images_reported(&out, &preset, true, &mut |done, total| {
+                calls.push((done, total))
+            })
+            .expect("大图应当压得动");
+
+        assert_eq!(calls, vec![(1, 2), (2, 2)], "分母只数 jpg/png，逐张递增");
+        // 噪点 PNG 转 JPEG 也一定变小，所以两张都真的换了
+        assert_eq!(rewrite.compressed_count, 2);
     }
 
     #[test]

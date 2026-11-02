@@ -2210,7 +2210,8 @@ function syncBallParts(task) {
     tip = [task.label || "处理中", isFetch ? `已抓取 ${current} / ${total} 篇` : `已盘点 ${current} / ${total} 位作者`].join(" · ");
   } else {
     ratio = total > 0 ? current / total : 0;
-    tip = [task.label || "处理中", total > 0 ? `${current}/${total}` : "", task.title || ""]
+    const counted = total > 0 ? `${current}/${total}${task.unit ? ` ${task.unit}` : ""}` : "";
+    tip = [task.label || "处理中", counted, task.title || ""]
       .filter(Boolean)
       .join(" · ");
   }
@@ -2290,7 +2291,9 @@ function syncCountText(task) {
   if (task.status === "cancelled") return "已终止";
   if (task.status === "missing") return "已销号或封号";
   if (task.status === "failed") return "失败";
-  return task.total ? `${task.current} / ${task.total}` : "核对中";
+  // v1.3.46：插图压缩的分母是「这本里的图有几张」，还没数出来时别显示成 0 / 0
+  if (task.kind === "epub-compress" && !task.total) return "正在读取插图…";
+  return task.total ? `${task.current} / ${task.total}${task.unit ? ` ${task.unit}` : ""}` : "核对中";
 }
 
 // 这一行跑完了没有。等待中 / 正在检查作者主页 / 正在同步 / 已盘点待抓取，都不算跑完 ——
@@ -2420,8 +2423,10 @@ function updateSyncFloater() {
   }
   const bar = box.querySelector("#sync-progress-bar");
   bar.max = Math.max(task.total, 1);
-  bar.value = task.current;
-  box.querySelector("#sync-progress-count").textContent = `${task.current} / ${task.total}`;
+  bar.value = Math.min(task.current, bar.max);
+  // 文案必须和整块重绘时同一份（v1.3.46 插图压缩要给「张」、还没数出张数时也不能显示 0 / 0）
+  const count = box.querySelector("#sync-progress-count");
+  if (count) count.textContent = syncCountText(task);
   const title = box.querySelector("#sync-progress-title");
   title.textContent = syncTaskTitle(task);
   title.title = task.title || "";
@@ -9380,23 +9385,50 @@ async function compressEpubImages(trigger) {
     title: "正在准备…",
     current: 0,
     total: 0,
+    unit: "",
     cancelAction: "cancel-epub-image-compress",
     cancelText: "停止压缩",
   };
   render();
-  const unlisten = await listenEpubCompressProgress((event) => {
-    const { total = 0, current = 0, title = "", done = false } = event.payload || {};
-    if (done || !state.syncTask) return;
-    state.syncTask.total = total;
-    state.syncTask.current = current;
-    state.syncTask.title = title;
+  // v1.3.46：进度改成「一本转一圈、圈内按已压张数 / 这本总张数」。
+  // 一本几百张图时事件会很密，重绘按 ~100ms 节流（最后一帧一定会补上）。
+  let lastFlush = 0;
+  let pendingFlush = 0;
+  const flushFloater = () => {
+    pendingFlush = 0;
+    lastFlush = Date.now();
     updateSyncFloater();
+  };
+  const scheduleFloater = () => {
+    if (pendingFlush) return;
+    const wait = 100 - (Date.now() - lastFlush);
+    if (wait <= 0) {
+      flushFloater();
+      return;
+    }
+    pendingFlush = window.setTimeout(flushFloater, wait);
+  };
+  const unlisten = await listenEpubCompressProgress((event) => {
+    const payload = event.payload || {};
+    const task = state.syncTask;
+    if (payload.done || !task) return;
+    const bookIndex = Number(payload.bookIndex || 0);
+    const bookTotal = Number(payload.bookTotal || 0);
+    if (bookIndex && bookTotal && !task.cancelling) {
+      task.label = `正在压缩 EPUB 插图 · 第 ${bookIndex} / ${bookTotal} 本`;
+    }
+    task.current = Number(payload.current || 0);
+    task.total = Number(payload.total || 0);
+    task.unit = task.total ? "张" : "";
+    if (payload.title) task.title = payload.title;
+    scheduleFloater();
   });
   let result;
   try {
     result = await invoke("compress_epub_images");
   } catch (error) {
     unlisten();
+    if (pendingFlush) window.clearTimeout(pendingFlush);
     state.syncTask = null;
     render();
     if (trigger) trigger.disabled = false;
@@ -9404,6 +9436,7 @@ async function compressEpubImages(trigger) {
     return;
   }
   unlisten();
+  if (pendingFlush) window.clearTimeout(pendingFlush);
   state.syncTask = null;
   // 文件换了、体积也变了：当前列表的体积和封面都得跟着刷
   await refreshVisibleList();
