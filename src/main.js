@@ -6460,7 +6460,7 @@ function authorModal(author = {}) {
     <form id="author-form" class="form-stack">
       <input type="hidden" name="id" value="${author.id || ""}">
       <input type="hidden" name="avatarManaged" value="${author.avatarManaged ? "true" : "false"}">
-      <label>作者名称 <input name="name" maxlength="80" value="${escapeHtml(author.name || "")}" placeholder="例如：某位作者"><small>可以留空 —— 填了下面的 Pixiv 主页时，保存会先同步回作者名再存。</small></label>
+      <label>作者名称 <input name="name" maxlength="80" value="${escapeHtml(author.name || "")}" placeholder="例如：某位作者"><small>留空也行 —— 留空时保存会靠下面的 Pixiv 主页取回作者名；填了名字就直接按你填的存，不再额外联网。</small></label>
       <div class="form-field">作者别名
         <div class="alias-editor" data-author-alias>
           <div class="tag-editor-list">${aliasChips(author.aliases)}</div>
@@ -7821,6 +7821,20 @@ async function bindEvents() {
     authorForm.dataset.bound = "true";
     authorForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      // v1.3.49：只在「不联网就存不下去」的时候才等网络；等的时候把按钮本身变成进度提示，
+      // 否则看上去就是点了一下没反应。空闲文案先存一份，收尾原样换回来。
+      const submitButton = event.submitter || null;
+      const setAuthorSaving = (text) => {
+        if (!submitButton) return;
+        if (text) {
+          if (!submitButton.dataset.idleText) submitButton.dataset.idleText = submitButton.textContent;
+          submitButton.textContent = text;
+          submitButton.disabled = true;
+          return;
+        }
+        submitButton.textContent = submitButton.dataset.idleText || "保存作者";
+        submitButton.disabled = false;
+      };
       try {
         const form = new FormData(event.currentTarget);
         const author = Object.fromEntries(form.entries());
@@ -7841,13 +7855,19 @@ async function bindEvents() {
           toast("请填作者名，或填 Pixiv 作者主页（保存时会自动同步名称）", "error");
           return;
         }
-        // 自动同步一次（v1.2.55）：以 Pixiv 上的为准 —— 你填的名字只是拿来找人的线索，
-        // 同步到了就用同步的覆盖它。v1.3.4 起**名字留空时也走**（编辑时清空名字靠主页补名同理）。
-        // 同步失败不拦着保存，但要让你知道（按你填的先存下来）——**除非名字也空着**，
-        // 那就没东西可存，必须当场拦住说清楚。
-        if (String(author.homepage || "").trim() && (isNewAuthor || !hasName)) {
+        // 保存时不再无脑联网（v1.3.49 用户报「不同步作者信息、直接点保存，弹窗卡 3 秒」）：
+        // 名字填好了就按你填的落库，Pixiv 上的名字和头像交给「同步作者信息」那个按钮；
+        // 只有这两种「不取就存不下去」的情况才当场走一次网络 ——
+        // ① 名字空着，必须靠主页取名；② 主页栏贴成了作品链接，必须反查成作者主页
+        //    （save_author 会直接拒收作品链接，存下去还会把作品 ID 当作者 UID）。
+        // 走网络时按钮上写明正在干什么，不再是一声不吭地卡住。
+        const homepage = String(author.homepage || "").trim();
+        const novelLink = homepage ? isPixivNovelUrl(homepage) : false;
+        if (homepage && (!hasName || novelLink)) {
+          setAuthorSaving(hasName ? "正在识别作者主页…" : "正在取作者名…");
+          let syncError = null;
           try {
-            const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage: author.homepage });
+            const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage });
             // 同步回来的 profile 带 id ⇒ 说明库里**已经有这位**（典型的：他还在「散篇」里，
             // 后端已经顺手转正并把那一行的 id 给了我们）。填上它，保存时就会走「更新」，
             // 而不是插一条新记录（v1.2.65 用户拍板：新增作者撞上散篇直接转正）
@@ -7859,20 +7879,24 @@ async function bindEvents() {
               author.avatarManaged = Boolean(profile.avatarManaged);
             }
           } catch (error) {
-            if (!String(author.name || "").trim()) {
-              toast(`作者信息同步失败：${error}。没填作者名，没法保存 —— 填个名字、或修正主页链接再试。`, "error");
+            syncError = error;
+          } finally {
+            setAuthorSaving("");
+          }
+          if (syncError) {
+            // 这两条路没有同步结果就存不下去，直接拦下来说清楚；名字已填、只是主页贴错形式的，
+            // 同样得拦住 —— 放过去也会被后端以「这是作品链接」拒掉，白弹一次错。
+            if (novelLink || !String(author.name || "").trim()) {
+              toast(
+                novelLink
+                  ? `作者信息同步失败：${syncError}。主页那栏填的是作品链接，认不出作者就没法保存 —— 换成作者主页链接再试。`
+                  : `作者信息同步失败：${syncError}。没填作者名，没法保存 —— 填个名字、或修正主页链接再试。`,
+                "error",
+              );
               return;
             }
-            toast(`作者信息同步失败：${error}（先按你填的保存）`, "error");
+            toast(`作者信息同步失败：${syncError}（先按你填的保存）`, "error");
           }
-        }
-        // 主页那栏贴成作品链接是很常见的误操作。作品详情接口是公开的、能读出 userId，
-        // 所以先反查成作者主页再保存 —— 不然存下去的会是作品 ID 冒充的作者 UID。
-        if (isPixivNovelUrl(author.homepage)) {
-          const profile = await invoke("sync_pixiv_author_profile", { authorId: author.id, homepage: author.homepage });
-          author.homepage = profile.homepage;
-          if (!String(author.name || "").trim()) author.name = profile.name;
-          if (!author.avatarPath) { author.avatarPath = profile.avatarPath || ""; author.avatarManaged = Boolean(profile.avatarManaged); }
         }
         // （isNewAuthor 在前面的"收完表单"处就算好了 —— 见 v1.2.66 的注释）
         // 新建作者要求先配好两个默认目录（v1.2.54）：目录现在是**自动创建**的，
@@ -7887,7 +7911,31 @@ async function bindEvents() {
             return;
           }
         }
-        const saved = await invoke("save_author", { author });
+        // 不联网的保存有可能撞上「这个主页已经在库里」—— 最常见的是他还在「散篇」里
+        // （那一行标着 stray，等你真去收藏这位）。这种时候后端的规矩是：先把散篇转正、
+        // 复用那一行，绝不新建第二条。前端不知道库里有没有，所以只在**撞上了**才补这一次
+        // 网络（v1.3.49）；没撞上的正常保存，一次都不联网。
+        let saved;
+        try {
+          saved = await invoke("save_author", { author });
+        } catch (error) {
+          if (!homepage || novelLink || !String(error || "").includes("作者主页已存在")) throw error;
+          setAuthorSaving("正在核对作者主页…");
+          try {
+            const profile = await invoke("sync_pixiv_author_profile", { authorId: null, homepage });
+            if (!profile?.id) throw error;
+            author.id = profile.id;
+            author.homepage = profile.homepage || author.homepage;
+            if (String(profile.name || "").trim()) author.name = profile.name;
+            if (!author.avatarPath) {
+              author.avatarPath = profile.avatarPath || "";
+              author.avatarManaged = Boolean(profile.avatarManaged);
+            }
+            saved = await invoke("save_author", { author });
+          } finally {
+            setAuthorSaving("");
+          }
+        }
         // 新作者排到作者库最后（v1.2.49 用户要求）—— 注意是"最后"不是"最前"：
         // 往里加人和"我收藏了这位"是两回事，后者才置顶
         // 换了作者目录 ⇒ **自动**重定位（v1.2.53）：把这些作品里还指着旧目录的路径按新目录
