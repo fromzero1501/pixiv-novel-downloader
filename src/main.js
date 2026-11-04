@@ -4471,6 +4471,49 @@ async function handleDropToBind(payload) {
 }
 
 /**
+ * 绑定完整版之后的后台压缩（v1.3.50）：后端在绑完之后另起一条线程压这一本，
+ * 绑定那条命令不等它。前端这里只做两件事 —— 把它显示成浮层（跟批量那头长一样），
+ * 收尾时弹一句省了多少。
+ *
+ * 抢不抢浮层有讲究：批量那边自己会先把 `state.syncTask` 立起来，本函数只在
+ * 「当前没有任务」或「当前这个任务本来就是我立的」时才动手，免得把别人的进度顶掉。
+ */
+function installAutoEpubCompressWatch() {
+  if (!window.__TAURI_INTERNALS__) return;
+  listen("epub-image-compress-progress", (event) => {
+    const payload = event?.payload || {};
+    if (payload.done) {
+      if (state.syncTask && state.syncTask.auto) {
+        state.syncTask = null;
+        render();
+      }
+      const saved = Number(payload.savedBytes) || 0;
+      if (saved > 0 && payload.title) {
+        toast(`《${payload.title}》的插图压好了，省了 ${formatMegabytes(saved)}`, "success");
+      }
+      return;
+    }
+    if (state.syncTask && !state.syncTask.auto) return;
+    const total = Number(payload.total) || 0;
+    const current = Number(payload.current) || 0;
+    const fresh = !state.syncTask;
+    state.syncTask = {
+      kind: "epub-compress",
+      auto: true,
+      label: "正在压缩 EPUB 插图",
+      title: payload.title || "",
+      current,
+      total,
+      unit: total ? "张" : "",
+      cancelAction: "cancel-epub-image-compress",
+      cancelText: "停止压缩",
+    };
+    if (fresh) render();
+    else updateSyncFloater();
+  }).catch(() => {});
+}
+
+/**
  * 装窗口级的拖放监听（只在桌面壳里有；浏览器预览里没有这套事件，直接不装 ——
  * 那块区域还在，只是个静态提示）。
  */
@@ -12179,6 +12222,9 @@ async function bootstrap() {
 
     // 详情里的「拖动到此绑定完整版」（v1.2.42）：窗口级监听，装一次就够
     installDropToBind();
+
+    // 绑定完整版之后的自动压缩（v1.3.50）：后端在后台压，这里把它的进度显示出来
+    installAutoEpubCompressWatch();
 
     // 更新下载进度（下载中才有事件）
     try {

@@ -6697,6 +6697,9 @@ struct EpubCompressProgress {
     total: usize,
     title: String,
     done: bool,
+    /// 只有 `done` 那一帧带值（v1.3.50）：绑定完整版后自动压的那一本，压完报省了多少字节，
+    /// 前端据此弹一句「这本省了 x MB」。批量那一轮不需要，一直是 0。
+    saved_bytes: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6718,6 +6721,23 @@ fn emit_epub_compress_progress(
             total,
             title,
             done,
+            saved_bytes: 0,
+        },
+    );
+}
+
+/// 单本自动压缩的收尾帧（v1.3.50）：带上省下的字节数，前端拿到就能弹「省了多少」。
+fn emit_epub_compress_done(app: &AppHandle, title: &str, saved_bytes: u64) {
+    let _ = app.emit(
+        EPUB_IMAGE_COMPRESS_PROGRESS_EVENT,
+        EpubCompressProgress {
+            book_index: 1,
+            book_total: 1,
+            current: 0,
+            total: 0,
+            title: title.to_string(),
+            done: true,
+            saved_bytes,
         },
     );
 }
@@ -6813,6 +6833,8 @@ fn compress_epub_images_impl(app: &AppHandle) -> Result<EpubImageCompressResult,
     if !preset.enabled() {
         return Err("插图压缩这一档是「不压」：先在设置里选一个画质再来。".to_string());
     }
+    // 这一轮跑着的时候，别再让「绑定完整版后的自动压」插进来（v1.3.50）
+    EPUB_COMPRESS_BUSY.store(true, Ordering::Relaxed);
     // 只碰作品绑定的 .epub；同一份文件可能被购买/预览两栏指到，去重后才不会压两遍
     let mut paths: Vec<String> = Vec::new();
     {
@@ -6862,7 +6884,28 @@ fn compress_epub_images_impl(app: &AppHandle) -> Result<EpubImageCompressResult,
         }
     }
     emit_epub_compress_progress(app, total, total, 0, 0, String::new(), true);
+    EPUB_COMPRESS_BUSY.store(false, Ordering::Relaxed);
     Ok(result)
+}
+
+/// 按作品号找它现在的完整版文件，是 EPUB 就后台压一遍（v1.3.50）。
+///
+/// 「扫描完整版 / 自动匹配 / 确认归组」那几条路都是先搬文件再写库，路径可能是改名后的，
+/// 所以不自己拼路径，直接回查库里刚写进去的那一条 —— 拼错就是压了个不存在的文件。
+fn spawn_auto_compress_for_work(app: &AppHandle, conn: &Connection, work_id: i64) {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT ifnull(purchased_path,''), title FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    if let Some((path, title)) = row {
+        let path = path.trim().to_string();
+        if !path.is_empty() {
+            spawn_auto_compress_epub(app, path, title);
+        }
+    }
 }
 
 /// 压整个库里所有作品的 EPUB 插图（B 路径）。进度走浮层，可中途终止。
@@ -6871,6 +6914,49 @@ async fn compress_epub_images(app: AppHandle) -> Result<EpubImageCompressResult,
     tauri::async_runtime::spawn_blocking(move || compress_epub_images_impl(&app))
         .await
         .map_err(|error| error.to_string())?
+}
+
+/// 有没有一轮插图压缩正在跑（v1.3.50）：批量那一轮和「绑定完整版后自动压」共用这一个闸，
+/// 一个在跑时另一个直接让路 —— 同一本文件被两路同时改写，校验那关会白忙。
+static EPUB_COMPRESS_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn epub_compress_take_busy() -> bool {
+    !EPUB_COMPRESS_BUSY.swap(true, Ordering::Relaxed)
+}
+
+/// 绑定完整版之后顺手压这一本（v1.3.50 用户要求，选的是「后台压、绑定立刻生效」）。
+///
+/// 只认 `.epub`；档位跟「设置 → 下载与图文 → Epub插图压缩」同一个，`off` 时什么都不做；
+/// 同一档压过又没换过文件的话 `compress_one_epub_file` 自己会秒退。
+/// 全程在后台线程里跑：绑定那条命令不等它，失败也不回传 —— 压不动就当没这回事，
+/// 盘上还是原来那份文件（`compress_one_epub_file` 里校验不过就不替换）。
+fn spawn_auto_compress_epub(app: &AppHandle, path: String, title: String) {
+    let lower = path.to_ascii_lowercase();
+    if !lower.ends_with(".epub") {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if !epub_compress_take_busy() {
+            return;
+        }
+        let saved = (|| -> Option<u64> {
+            let preset = epub_image_preset_from_settings().ok()?;
+            if !preset.enabled() {
+                return None;
+            }
+            let conn = db().ok()?;
+            emit_epub_compress_progress(&app, 1, 1, 0, 0, title.clone(), false);
+            let saved = compress_one_epub_file(&conn, &path, &preset, &app, 1, 1, &title)
+                .ok()
+                .flatten();
+            Some(saved.unwrap_or(0))
+        })();
+        EPUB_COMPRESS_BUSY.store(false, Ordering::Relaxed);
+        if let Some(saved) = saved {
+            emit_epub_compress_done(&app, &title, saved);
+        }
+    });
 }
 
 // ============================ PDF 阅读版（v1.3.6） ============================
@@ -12228,7 +12314,7 @@ fn match_author_series(author: i64) -> Result<Vec<SeriesMatch>, String> {
 }
 
 #[tauri::command]
-fn bind_series_bundle(work_ids: Vec<i64>, path: String) -> Result<String, String> {
+fn bind_series_bundle(work_ids: Vec<i64>, path: String, app: AppHandle) -> Result<String, String> {
     let mut conn = db()?;
     if work_ids.is_empty() {
         return Err("先选要绑的作品".into());
@@ -12325,6 +12411,9 @@ fn bind_series_bundle(work_ids: Vec<i64>, path: String) -> Result<String, String
             params![count, work_id],
         );
     }
+    // v1.3.50：合集文件是 EPUB 的话，后台压一遍（一篇被多篇共用也只压这一个文件）
+    let bundle_title = series_title.clone();
+    spawn_auto_compress_epub(&app, final_path.clone(), bundle_title);
     Ok(final_path)
 }
 
@@ -12850,7 +12939,7 @@ fn bind_work_cover(work_id: i64, path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, String> {
+fn bind_work_moving_to_purchased(work_id: i64, path: String, app: AppHandle) -> Result<String, String> {
     let conn = db()?;
     if is_image_like_asset(Path::new(&path)) {
         return Err("封面图 / 配图文件夹不能当作作品文件绑定，请选择文本、电子书或 HTML 文件".into());
@@ -12899,6 +12988,8 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String) -> Result<String, S
     mark_has_images_if_illustrated(&conn, work_id, &target);
     // v1.3.7：拿到完整版后，旧预览版文件自动清（回收站）＋封面搬进完整版目录
     clear_redundant_preview_for_bound_work(&conn, work_id, &target);
+    // v1.3.50：绑上来的若是 EPUB，后台顺手压一遍插图（绑定不等它，压不动不影响绑定）
+    spawn_auto_compress_epub(&app, target.to_string_lossy().to_string(), title.clone());
     Ok(target.to_string_lossy().to_string())
 }
 
@@ -13190,7 +13281,11 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), S
 const STRAY_SCOPE_AUTHOR_ID: i64 = -1;
 
 #[tauri::command]
-fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<AutoGroupResult, String> {
+fn auto_group_purchased_files(
+    author_id: Option<i64>,
+    mode: String,
+    app: AppHandle,
+) -> Result<AutoGroupResult, String> {
     let mode = resolve_match_mode(&mode)?;
     let conn = db()?;
     let settings = read_settings(&conn)?;
@@ -13426,6 +13521,8 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
                             ) {
                                 if outcome.bound_count > 0 {
                                     auto_moved_count += 1;
+                                    // v1.3.50：自动认领进完整版目录的 EPUB，后台压一遍
+                                    spawn_auto_compress_for_work(&app, &conn, candidate.work_id);
                                     continue;
                                 }
                             }
@@ -13461,7 +13558,10 @@ fn auto_group_purchased_files(author_id: Option<i64>, mode: String) -> Result<Au
 }
 
 #[tauri::command]
-fn confirm_manual_group(choices: Vec<ManualGroupChoice>) -> Result<ManualGroupResult, String> {
+fn confirm_manual_group(
+    choices: Vec<ManualGroupChoice>,
+    app: AppHandle,
+) -> Result<ManualGroupResult, String> {
     let conn = db()?;
     let mut bound_count = 0;
     let mut skipped_count = 0;
@@ -13524,6 +13624,12 @@ fn confirm_manual_group(choices: Vec<ManualGroupChoice>) -> Result<ManualGroupRe
                 skipped_count += outcome.skipped_count;
                 if duplicated && outcome.bound_count > 1 {
                     duplicated_count += 1;
+                }
+                // v1.3.50：手动归组搬过去的 EPUB，后台压一遍（同一份文件被多篇共用只压一次）
+                if outcome.bound_count > 0 {
+                    for work_id in &choice.work_ids {
+                        spawn_auto_compress_for_work(&app, &conn, *work_id);
+                    }
                 }
             }
             Err(error) => failed.push(format!("{}（{error}）", choice.file_path)),
@@ -18433,6 +18539,7 @@ fn author_works_for_match(conn: &Connection, author_id: i64) -> Result<Vec<(i64,
 fn commit_import(
     author_id: i64,
     selections: Vec<ImportSelection>,
+    app: AppHandle,
 ) -> Result<ImportResult, String> {
     let mut conn = db()?;
     let author_id = resolve_import_author(&conn, author_id)?;
@@ -18479,7 +18586,7 @@ fn commit_import(
     // 出错也只记数、不回滚（作品已经建好了，文件还能事后手动绑）
     let mut failed = 0;
     for (work_id, path) in pending {
-        match bind_work_moving_to_purchased(work_id, path) {
+        match bind_work_moving_to_purchased(work_id, path, app.clone()) {
             Ok(target) => {
                 // v1.2.98：**只有新建作品这条路**顺手把 epub 的首图提出来当封面
                 // （用户 2026-10-14 拍板：正常作品是同步来的、自带封面，不必走这一步）。
@@ -27038,5 +27145,45 @@ mod epub_image_compress_tests {
         // 换更狠的档要能覆盖掉旧账（文件没换过也允许再压一轮）
         note_epub_compress_state(&conn, path, &epub_image_preset("900")).unwrap();
         assert_eq!(epub_compress_log(&conn, path).unwrap().2, "900");
+    }
+
+    /// v1.3.50：收尾帧要带上省下的字节数 —— 前端就靠这一格弹「这本省了 x MB」。
+    #[test]
+    fn epub_compress_done_payload_carries_saved_bytes() {
+        let payload = super::EpubCompressProgress {
+            book_index: 1,
+            book_total: 1,
+            current: 0,
+            total: 0,
+            title: "某本".to_string(),
+            done: true,
+            saved_bytes: 12345,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"done\":true"), "{json}");
+        assert!(json.contains("\"savedBytes\":12345"), "{json}");
+        // 批量那一轮的普通帧也必须带这一格（缺了前端会当成 undefined）
+        let normal = super::EpubCompressProgress {
+            book_index: 2,
+            book_total: 5,
+            current: 3,
+            total: 9,
+            title: "另一本".to_string(),
+            done: false,
+            saved_bytes: 0,
+        };
+        let json = serde_json::to_string(&normal).unwrap();
+        assert!(json.contains("\"savedBytes\":0"), "{json}");
+    }
+
+    /// v1.3.50：闸是独占的 —— 批量那一轮在跑时，绑定后的自动压要让路。
+    #[test]
+    fn epub_compress_busy_gate_is_exclusive() {
+        use super::{epub_compress_take_busy, EPUB_COMPRESS_BUSY};
+        use std::sync::atomic::Ordering;
+        EPUB_COMPRESS_BUSY.store(false, Ordering::Relaxed);
+        assert!(epub_compress_take_busy());
+        assert!(!epub_compress_take_busy());
+        EPUB_COMPRESS_BUSY.store(false, Ordering::Relaxed);
     }
 }
