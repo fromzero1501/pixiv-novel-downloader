@@ -1264,6 +1264,11 @@ async function invoke(command, args = {}) {
     return [];
   }
   if (command === "read_import_file") return Array.isArray(window.__previewImportLines) ? window.__previewImportLines : [];
+  // v1.3.48：「文件」方式 —— 一次一个，脚本要验就预置 window.__previewImportSingle（一个路径数组）
+  if (command === "read_import_single_file") {
+    if (Array.isArray(window.__previewImportSingle)) return window.__previewImportSingle;
+    return [];
+  }
   if (command === "preview_import_bytes") {
     if (window.__previewImportResult) return window.__previewImportResult;
     return {
@@ -4380,11 +4385,11 @@ function dropZoneAt(position) {
   // 详情里的「拖动到此绑定完整版」和系列页的「拖动绑定合集文件」都是拖放区（v1.2.68）
   // 详情页三个绑定区 + 系列页那个合集区（v1.2.83 起详情页有三个）
   // 设置页那块导入区（v1.3.18）也是拖放区，但它收文件夹，见 handleDropToBind 里的分流
-  return hit && hit.closest ? hit.closest("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone, #import-drop-zone") : null;
+  return hit && hit.closest ? hit.closest("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone, #import-drop-zone, #single-drop-zone") : null;
 }
 
 function highlightDropZone(zone) {
-  document.querySelectorAll("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone, #import-drop-zone").forEach((el) => {
+  document.querySelectorAll("#bind-drop-zone, #preview-drop-zone, #cover-drop-zone, #bundle-drop-zone, #import-drop-zone, #single-drop-zone").forEach((el) => {
     el.classList.toggle("is-drop-active", el === zone);
   });
 }
@@ -4401,6 +4406,21 @@ async function handleDropToBind(payload) {
   if (zone.id === "import-drop-zone") {
     if (paths.length > 1) toast("一次只导入一个分享包，这次只用了第一个", "info");
     await runImportData(paths[0]);
+    return;
+  }
+  // 「新建作品 → 文件」的拖放区（v1.3.48）：只把路径填进去，不替用户点「预览新建结果」——
+  // 和「选择文件」按钮保持同一个节奏，勾选与确认交给弹窗自己那两步。
+  if (zone.id === "single-drop-zone") {
+    if (paths.length > 1) toast("「文件」方式一次只收一个，这次只用了第一个", "info");
+    const one = String(paths[0]);
+    if (!/\.[A-Za-z0-9]{1,8}$/.test(one)) {
+      toast("这是一个文件夹 —— 整批导入请切到「文件夹」方式", "error");
+      return;
+    }
+    const input = document.querySelector('#single-import-form [name="singlePath"]');
+    if (!input) return;
+    input.value = one;
+    toast(`已选：${one.split(/[\\/]/).pop()}`, "success");
     return;
   }
   if (paths.length > 1) toast("一次只能绑一个文件，这次只用了第一个", "info");
@@ -6456,7 +6476,7 @@ function authorModal(author = {}) {
 
 function importModal() {
   showModal(modal("新建作品", `
-    <div class="import-tabs"><button class="filter-button is-active" data-tab="paste">粘贴文本</button><button class="filter-button" data-tab="file">Excel / CSV</button><button class="filter-button" data-tab="folder">文件夹</button></div>
+    <div class="import-tabs"><button class="filter-button is-active" data-tab="paste">粘贴文本</button><button class="filter-button" data-tab="file">Excel / CSV</button><button class="filter-button" data-tab="folder">文件夹</button><button class="filter-button" data-tab="single">文件</button></div>
     <form id="paste-import-form" class="form-stack import-panel" data-panel="paste">
       <label>固定开头 <input name="prefix" placeholder="例如：2025-"><small>只导入以该字符串开头的整行；行首日期会被提取。</small></label>
       <label>网页文本 <textarea name="text" rows="11" placeholder="每行一条作品名称，例如：\n2025-10-05（插画附+改编图文）～希儿&布洛妮娅.txt"></textarea></label>
@@ -6467,6 +6487,10 @@ function importModal() {
     </form>
     <form id="folder-import-form" class="form-stack import-panel is-hidden" data-panel="folder">
       <label>选择作品文件夹 <div class="path-input"><input name="folderPath" readonly placeholder="尚未选择文件夹"><button type="button" class="quiet-button" data-action="pick-import-folder">选择文件夹</button></div><small>会递归找出文件夹里所有的 <strong>TXT、EPUB、HTML、PDF、Word</strong> 文件（以及自定义分组用的文件夹），文件名里的发布日期会自动提取。勾中新建的会顺手<strong>绑成完整版并搬进这位作者的完整版目录</strong>。最小作品字数可在设置中调整。</small></label>
+    </form>
+    <form id="single-import-form" class="form-stack import-panel is-hidden" data-panel="single">
+      <label>选择作品文件 <div class="path-input"><input name="singlePath" readonly placeholder="尚未选择文件"><button type="button" class="quiet-button" data-action="pick-import-single">选择文件</button></div><small>只收<strong>一个</strong> <strong>TXT、EPUB、HTML、PDF、Word</strong> 文件，文件名里的发布日期会自动提取。新建时会顺手<strong>绑成完整版并搬进这位作者的完整版目录</strong>。整批导入请用「文件夹」方式。</small></label>
+      <div class="bind-drop-zone is-wide" id="single-drop-zone" title="把作品文件从资源管理器拖到这里也行">${icon("upload", 16)}<span>也可以把文件拖到这里</span></div>
     </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="submit-import">预览新建结果</button>`));
 }
 
@@ -7531,6 +7555,8 @@ async function bindEvents() {
       // 目录现在一律按「设置 → 文件与目录」的默认目录 + 「作者名(别名)」自动创建
       if (action === "pick-import-file") await pickPath("filePath", false, ["csv", "xlsx", "xls"]);
       if (action === "pick-import-folder") await pickPath("folderPath", true);
+      // v1.3.48：「文件」方式 —— 只能挑一个，筛选器与后端白名单对齐
+      if (action === "pick-import-single") await pickPath("singlePath", false, ["txt", "epub", "html", "htm", "pdf", "docx", "doc"]);
       if (action === "submit-import") await submitImport();
       if (action === "import-toggle-all") {
         document.querySelectorAll("[data-import-pick]").forEach((box) => { box.checked = element.dataset.checked === "true"; });
@@ -9866,17 +9892,31 @@ function importTargetAuthor() {
 async function runImportPreview() {
   const pastePanel = document.querySelector('[data-panel="paste"]');
   const folderPanel = document.querySelector('[data-panel="folder"]');
+  const singlePanel = document.querySelector('[data-panel="single"]');
   const usingPaste = !pastePanel.classList.contains("is-hidden");
   const usingFolder = !folderPanel.classList.contains("is-hidden");
+  // v1.3.48：「文件」方式 —— 只收一个文件，后续链路与文件夹方式完全相同
+  const usingSingle = !singlePanel.classList.contains("is-hidden");
   // 文件夹方式给的是**完整路径**（后端要拿它把文件绑成完整版）
   let lines = [];
   // 文件夹方式的目录：预览页顶部只显示一次（v1.2.99 用户要求 —— 每行都重复同一个
   // 目录没有信息量，还把那行挤得看不全文件名）
   let folderPath = "";
+  // v1.3.48：「文件」方式选中的那一个文件（同样是完整路径）
+  let singleFilePath = "";
   if (usingPaste) {
     const form = new FormData(document.querySelector("#paste-import-form"));
     const prefix = form.get("prefix").trim();
     lines = form.get("text").split(/\r?\n/).filter((line) => line.trim() && line.trim().startsWith(prefix));
+  } else if (usingSingle) {
+    // v1.3.48：只一个文件；白名单、大小门槛都交给后端，前端只负责把路径递过去
+    const form = new FormData(document.querySelector("#single-import-form"));
+    const path = form.get("singlePath");
+    if (!path) throw new Error("请先选择一个作品文件");
+    singleFilePath = String(path);
+    const settings = await invoke("get_app_settings");
+    const minimumSizeBytes = Number(settings.minimumTextCount || 0);
+    lines = await invoke("read_import_single_file", { path: singleFilePath, minimumSizeBytes });
   } else if (usingFolder) {
     const form = new FormData(document.querySelector("#folder-import-form"));
     const path = form.get("folderPath");
@@ -9920,8 +9960,17 @@ async function runImportPreview() {
     const shown = middleEllipsis(label);
     return `<label class="import-row" data-index="${index}"><input type="checkbox" data-import-pick${checked}><span class="import-row-main"><strong title="${escapeHtml(label)}">${escapeHtml(shown)}</strong></span>${badge}</label>`;
   }).join("");
-  const folderLine = folderPath ? `<p class="import-folder">${icon("folder", 15)}<span>${escapeHtml(folderPath)}</span></p>` : "";
-  const body = `${folderLine}<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品相近（达到最小相似度），已经自动取消勾选。勾上的才会新建${usingFolder ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）" : ""}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
+  const folderLine = folderPath
+    ? `<p class="import-folder">${icon("folder", 15)}<span>${escapeHtml(folderPath)}</span></p>`
+    : singleFilePath
+      ? `<p class="import-folder">${icon("upload", 15)}<span>${escapeHtml(singleFilePath)}</span></p>`
+      : "";
+  const bindNote = usingFolder
+    ? "（文件夹方式还会把对应文件绑成完整版、搬进完整版目录）"
+    : usingSingle
+      ? "（会把选中的那个文件绑成完整版、搬进完整版目录）"
+      : "";
+  const body = `${folderLine}<p class="import-summary">共 <strong>${candidates.length}</strong> 条：其中 <strong>${matchedCount}</strong> 条和本地已有作品相近（达到最小相似度），已经自动取消勾选。勾上的才会新建${bindNote}。</p><div class="import-rows">${rows}</div>${invalidBlock}`;
   closeModal();
   // v1.3.2：弹窗加宽到 960 档（和「选择要关联的作品」「选择要分组到的作品」一致）——文件名一长这里太挤
   showModal(modal("预览新建结果", body, `<button class="quiet-button" data-action="close-modal">取消</button><span class="footer-spacer"></span><button class="quiet-button" data-action="import-toggle-all" data-checked="true">全选</button><button class="quiet-button" data-action="import-toggle-all" data-checked="false">全不选</button><button class="primary-button" data-action="import-confirm">确认新建</button>`, "is-wide"));

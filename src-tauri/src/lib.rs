@@ -18966,6 +18966,45 @@ fn read_import_folder(path: String, minimum_size_bytes: u64) -> Result<Vec<Strin
     Ok(found)
 }
 
+/// 读「文件」方式选中的那**一个**文件（v1.3.48）：扩展名与文件夹方式共用同一份白名单。
+///
+/// 回的是完整路径 —— 前端把它当一行喂给预览，`build_import_preview` 认路径就会顺手带上
+/// sourcePath，勾中新建后照旧「绑成完整版 + 搬进完整版目录」，与文件夹方式走同一条路。
+///
+/// 文件夹塞进这里要拦住：那是「文件夹」方式的活，在这儿静默递归会让人以为只导了一篇。
+fn read_import_single_file_impl(path: &str, minimum_size_bytes: u64) -> Result<Vec<String>, String> {
+    let target = PathBuf::from(path);
+    if target.is_dir() {
+        return Err("这是一个文件夹 —— 要整批导入请切到「文件夹」方式".into());
+    }
+    if !target.is_file() {
+        return Err("这个文件不在了，请重新选择".into());
+    }
+    let extension = target
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if !import_folder_extension_allowed(extension) {
+        return Err(format!(
+            "这种文件（.{}）收不了：只收 TXT、EPUB、HTML、PDF、Word",
+            extension
+        ));
+    }
+    let size = target.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if size < minimum_size_bytes {
+        return Err(format!(
+            "这个文件只有 {} 字节，小于设置里的最小作品字数 {} —— 真要收它，先把那一项调小",
+            size, minimum_size_bytes
+        ));
+    }
+    Ok(vec![target.to_string_lossy().to_string()])
+}
+
+#[tauri::command]
+fn read_import_single_file(path: String, minimum_size_bytes: u64) -> Result<Vec<String>, String> {
+    read_import_single_file_impl(&path, minimum_size_bytes)
+}
+
 fn collect_import_folder_entries(
     dir: &Path,
     minimum_size_bytes: u64,
@@ -20264,6 +20303,7 @@ pub fn run() {
             commit_import,
             read_import_file,
             read_import_folder,
+            read_import_single_file,
             sync_pixiv_novels,
             clear_pixiv_preview_cache,
             check_pixiv_author,
@@ -26722,6 +26762,55 @@ mod tests {
         assert_eq!(missing.len(), 2);
         assert_eq!(missing[0].novel_id, "333");
         assert_eq!(missing[1].novel_id, "222");
+    }
+
+    /// v1.3.48：新建作品的「文件」方式 —— 只收一个、只认白名单、文件夹与过小的都拦下。
+    #[test]
+    fn import_single_file_accepts_one_work_and_rejects_the_rest() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-import-single-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let good = root.join("2025-10-05 某篇作品.txt");
+        fs::write(&good, "正文占位，够长就行".repeat(20)).unwrap();
+        let bad = root.join("封面.png");
+        fs::write(&bad, [0u8; 64]).unwrap();
+
+        // 正常一个作品文件：原样回一条完整路径
+        let picked =
+            super::read_import_single_file_impl(good.to_string_lossy().as_ref(), 0).unwrap();
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0], good.to_string_lossy().to_string());
+
+        // 扩展名不在白名单
+        let error = super::read_import_single_file_impl(bad.to_string_lossy().as_ref(), 0)
+            .unwrap_err();
+        assert!(error.contains("收不了"), "实际报错：{error}");
+
+        // 文件夹要走「文件夹」方式
+        let error =
+            super::read_import_single_file_impl(root.to_string_lossy().as_ref(), 0).unwrap_err();
+        assert!(error.contains("文件夹"), "实际报错：{error}");
+
+        // 小于设置里的最小作品字数
+        let size = fs::metadata(&good).map(|meta| meta.len()).unwrap_or(0);
+        let error =
+            super::read_import_single_file_impl(good.to_string_lossy().as_ref(), size + 1)
+                .unwrap_err();
+        assert!(error.contains("最小作品字数"), "实际报错：{error}");
+
+        // 文件不在
+        let gone = root.join("没有这个文件.txt");
+        let error =
+            super::read_import_single_file_impl(gone.to_string_lossy().as_ref(), 0).unwrap_err();
+        assert!(error.contains("不在了"), "实际报错：{error}");
+
+        fs::remove_dir_all(&root).ok();
     }
 
 }
