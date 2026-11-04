@@ -11944,10 +11944,12 @@ fn spawn_pixiv_login_watch(app: AppHandle) {
 /// 我们直接从窗口里把 PHPSESSID 读出来存进设置 —— 不用教人开 F12 复制 Cookie，
 /// 下次打开也还是登录着的。手动粘贴那条老路照旧保留。
 ///
-/// 窗口必须在主线程上建，所以这里把 builder 丢进 `run_on_main_thread`，
-/// 再用一条 channel 把结果收回来（失败了要把原因原样交给前端）。
+/// **必须是 async 命令**：同步命令在主线程上执行，而 Windows 上建 webview 要等 WebView2 的
+/// 异步创建回调 —— 主线程被占住、消息泵停了，窗口就只建一半：一片白，整个软件跟着不响应。
+/// （`tauri-runtime-wry` 的 `send_user_message` 在主线程时是**就地执行**，`run_on_main_thread`
+/// 救不了这件事；同理，读 cookie 也不能在同步命令里做，会死锁。）
 #[tauri::command]
-fn open_pixiv_login(app: AppHandle) -> Result<(), String> {
+async fn open_pixiv_login(app: AppHandle) -> Result<(), String> {
     if let Some(existing) = app.get_webview_window(PIXIV_LOGIN_WINDOW_LABEL) {
         let _ = existing.set_focus();
         return Ok(());
@@ -11955,28 +11957,22 @@ fn open_pixiv_login(app: AppHandle) -> Result<(), String> {
     let url = PIXIV_LOGIN_PAGE
         .parse::<tauri::Url>()
         .map_err(|e| format!("登录页地址不对：{e}"))?;
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let builder_app = app.clone();
-    app.run_on_main_thread(move || {
-        let result = tauri::WebviewWindowBuilder::new(
-            &builder_app,
-            PIXIV_LOGIN_WINDOW_LABEL,
-            tauri::WebviewUrl::External(url),
-        )
-        .title("登录 Pixiv")
-        .inner_size(480.0, 760.0)
-        .min_inner_size(360.0, 480.0)
-        .center()
-        .build()
-        .map(|_| ())
-        .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    })
-    .map_err(|e| e.to_string())?;
-    match rx.recv_timeout(Duration::from_secs(20)) {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(format!("登录窗没打开：{error}")),
-        Err(_) => return Err("登录窗没打开（等主线程超时）".into()),
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        PIXIV_LOGIN_WINDOW_LABEL,
+        tauri::WebviewUrl::External(url),
+    )
+    .title("登录 Pixiv")
+    .min_inner_size(360.0, 480.0)
+    .center()
+    .build()
+    .map_err(|e| format!("登录窗没打开：{e}"))?;
+    // 尺寸单独再设一遍：builder 上的 inner_size 在高 DPI 下会被当成物理像素，
+    // 缩放 200% 的机器上页面只剩一半大。建完按逻辑像素设，才跟系统缩放无关。
+    if let Some(window) = app.get_webview_window(PIXIV_LOGIN_WINDOW_LABEL) {
+        let _ = window.set_size(tauri::LogicalSize::new(520.0, 780.0));
+        let _ = window.center();
+        let _ = window.set_focus();
     }
     emit_pixiv_login_state(
         &app,
@@ -11992,8 +11988,11 @@ fn open_pixiv_login(app: AppHandle) -> Result<(), String> {
 }
 
 /// 手动收掉登录窗。盯窗的那个线程会发现窗口没了、回一句 closed。
+///
+/// 和开窗一样是 async：`close()` 在 Windows 上同样要等 WebView2 走完销毁回调，
+/// 放在同步命令里会把主线程卡住。
 #[tauri::command]
-fn close_pixiv_login(app: AppHandle) -> Result<(), String> {
+async fn close_pixiv_login(app: AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(PIXIV_LOGIN_WINDOW_LABEL) {
         window.close().map_err(|e| e.to_string())?;
     }

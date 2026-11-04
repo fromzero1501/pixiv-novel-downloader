@@ -7670,6 +7670,7 @@ async function bindEvents() {
         applySettingsValue(document.querySelector('#settings-form [name="updateMirrors"]'), (list || []).join("\n"));
       }
       if (action === "open-pixiv-login") await openPixivLogin(element);
+      if (action === "close-pixiv-login") await closePixivLogin(element);
       if (action === "pick-pixiv-cookie") await importPixivCookie();
       if (action === "pick-default-preview") await pickPath("defaultPreviewDir", true);
       if (action === "pick-default-purchased") await pickPath("defaultPurchasedDir", true);
@@ -10659,6 +10660,7 @@ async function importPixivCookie() {
  */
 async function openPixivLogin(trigger) {
   const status = document.querySelector("#pixiv-login-state");
+  const closeButton = document.querySelector('[data-action="close-pixiv-login"]');
   const idleText = trigger ? trigger.textContent : "";
   const setStatus = (text, tone) => {
     if (!status) return;
@@ -10682,6 +10684,12 @@ async function openPixivLogin(trigger) {
       const payload = event.payload || {};
       const state = String(payload.state || "");
       setStatus(payload.message || "", state === "ok" ? "ok" : state === "waiting" ? "" : "warn");
+      // 窗口开着的时候才留一个「关掉登录窗」的出口：万一窗子自己不听话，用户也走得掉
+      if (closeButton) {
+        const open = state === "waiting" || state === "opening";
+        closeButton.hidden = !open;
+        closeButton.disabled = !open;
+      }
       if (state === "waiting") return;
       if (unlisten) {
         unlisten();
@@ -10701,6 +10709,26 @@ async function openPixivLogin(trigger) {
     setStatus(text, "warn");
     toast(text, "error");
     restoreTrigger();
+    if (closeButton) {
+      closeButton.hidden = true;
+      closeButton.disabled = true;
+    }
+  }
+}
+
+/** 手动关掉登录窗（v1.3.52）：窗口关掉之后盯窗线程会回一句 closed，状态行自己会更新。 */
+async function closePixivLogin(trigger) {
+  if (trigger) trigger.disabled = true;
+  try {
+    await invoke("close_pixiv_login");
+    toast("登录窗关掉了", "info");
+  } catch (error) {
+    toast(String(error || "没能关掉登录窗"), "error");
+  } finally {
+    if (trigger) {
+      trigger.disabled = false;
+      trigger.hidden = true;
+    }
   }
 }
 
@@ -10814,7 +10842,7 @@ async function settingsModal() {
   <section class="settings-group is-account">
     <h3 class="settings-group-head"><span class="settings-group-no">1</span>Pixiv 账号</h3>
     <div class="settings-fields is-single">
-      <label>Pixiv Cookie <textarea name="pixivCookie" rows="3" placeholder="直接粘贴 Cookie，或从文件导入">${escapeHtml(settings.pixivCookie || "")}</textarea><span class="cookie-actions"><button type="button" class="quiet-button" data-action="open-pixiv-login">打开登录窗</button><button type="button" class="quiet-button" data-action="pick-pixiv-cookie">从文件导入</button></span><small class="pixiv-login-state" id="pixiv-login-state" hidden></small><small>仅保存 Pixiv 接口需要的 PHPSESSID 到数据库。不想自己找 Cookie 就点「打开登录窗」：在里面登一次账号，软件会把登录态接住并填到这里（登录态也留在本机，下次不用再登）。</small></label>
+      <label>Pixiv Cookie <textarea name="pixivCookie" rows="3" placeholder="直接粘贴 Cookie，或从文件导入">${escapeHtml(settings.pixivCookie || "")}</textarea><span class="cookie-actions"><button type="button" class="quiet-button" data-action="open-pixiv-login">打开登录窗</button><button type="button" class="quiet-button" data-action="close-pixiv-login" hidden>关掉登录窗</button><button type="button" class="quiet-button" data-action="pick-pixiv-cookie">从文件导入</button></span><small class="pixiv-login-state" id="pixiv-login-state" hidden></small><small>仅保存 Pixiv 接口需要的 PHPSESSID 到数据库。不想自己找 Cookie 就点「打开登录窗」：在里面登一次账号，软件会把登录态接住并填到这里（登录态也留在本机，下次不用再登）。</small></label>
       <label>排除标签 <input name="excludedTags" value="${escapeHtml(settings.excludedTags || "")}" placeholder="标签A, 标签B"><small>用中英文逗号分隔。包含这些文字的 Pixiv 标签不会记录。</small></label>
       <div class="settings-slot" id="settings-slot-pixiv"></div>
     </div>
