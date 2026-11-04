@@ -1059,6 +1059,9 @@ async function invoke(command, args = {}) {
   // 预览里"读文件"给一份像样的假 Cookie：真机读到的是一整行，回空串的话
   // 「导入 Cookie 文件」这条链在无头校验里验不出东西（框被清空，看着像没生效）
   if (command === "read_pixiv_cookie_file") return "PHPSESSID=12345678_preview_cookie;";
+  // 浏览器预览里没有真窗口：开/关登录窗都当成功，回话靠无头脚本手动发 pixiv-login-state
+  if (command === "open_pixiv_login") return;
+  if (command === "close_pixiv_login") return;
   if (command === "sync_pixiv_author_profile") {
     // 无头脚本要验"同步失败且没填名字就拦住保存"：塞 window.__mockSyncProfileError 让它抛
     if (window.__mockSyncProfileError) throw new Error(String(window.__mockSyncProfileError));
@@ -7666,6 +7669,7 @@ async function bindEvents() {
         // 同一类改法，统一走助手（顺手补上原来漏标的 dirty）
         applySettingsValue(document.querySelector('#settings-form [name="updateMirrors"]'), (list || []).join("\n"));
       }
+      if (action === "open-pixiv-login") await openPixivLogin(element);
       if (action === "pick-pixiv-cookie") await importPixivCookie();
       if (action === "pick-default-preview") await pickPath("defaultPreviewDir", true);
       if (action === "pick-default-purchased") await pickPath("defaultPurchasedDir", true);
@@ -10647,6 +10651,59 @@ async function importPixivCookie() {
   applySettingsValue(document.querySelector('[name="pixivCookie"]'), await invoke("read_pixiv_cookie_file", { path }));
 }
 
+/** 软件内 Pixiv 登录窗（v1.3.51）。
+ *
+ * 开一扇窗让用户在里面登一次，后端盯着窗口里的 Cookie，抓到就能用的 PHPSESSID 就存好、
+ * 把窗口关掉、回一条 `pixiv-login-state`。这里只负责开窗、把回话写进状态行、成功后填进框。
+ * 手动粘贴那条老路一点都不动 —— 多一个入口，不多一条规矩。
+ */
+async function openPixivLogin(trigger) {
+  const status = document.querySelector("#pixiv-login-state");
+  const idleText = trigger ? trigger.textContent : "";
+  const setStatus = (text, tone) => {
+    if (!status) return;
+    status.hidden = !text;
+    status.textContent = text || "";
+    if (tone) status.dataset.tone = tone;
+    else delete status.dataset.tone;
+  };
+  const restoreTrigger = () => {
+    if (!trigger) return;
+    trigger.disabled = false;
+    trigger.textContent = idleText || "打开登录窗";
+  };
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.textContent = "正在打开登录窗…";
+  }
+  let unlisten = null;
+  try {
+    unlisten = await listen("pixiv-login-state", (event) => {
+      const payload = event.payload || {};
+      const state = String(payload.state || "");
+      setStatus(payload.message || "", state === "ok" ? "ok" : state === "waiting" ? "" : "warn");
+      if (state === "waiting") return;
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+      restoreTrigger();
+      if (state !== "ok") return;
+      const field = document.querySelector('[name="pixivCookie"]');
+      if (field && payload.cookie) applySettingsValue(field, payload.cookie);
+      window.localStorage.removeItem(PIXIV_COOKIE_WARNING_DAY_KEY);
+      toast(payload.message || "登录成功，Cookie 已经存好了。", "success");
+    });
+    await invoke("open_pixiv_login");
+  } catch (error) {
+    if (unlisten) unlisten();
+    const text = String(error || "登录窗没打开");
+    setStatus(text, "warn");
+    toast(text, "error");
+    restoreTrigger();
+  }
+}
+
 /** 设置表单 → 提交给后端的对象；校验不过就抛错（自动保存时把错误写到页脚，不弹 toast 打断输入） */
 function collectSettings(form) {
   const values = Object.fromEntries(new FormData(form).entries());
@@ -10757,7 +10814,7 @@ async function settingsModal() {
   <section class="settings-group is-account">
     <h3 class="settings-group-head"><span class="settings-group-no">1</span>Pixiv 账号</h3>
     <div class="settings-fields is-single">
-      <label>Pixiv Cookie <textarea name="pixivCookie" rows="3" placeholder="直接粘贴 Cookie，或从文件导入">${escapeHtml(settings.pixivCookie || "")}</textarea><button type="button" class="quiet-button" data-action="pick-pixiv-cookie">从文件导入</button><small>仅保存 Pixiv 接口需要的 PHPSESSID 到数据库。</small></label>
+      <label>Pixiv Cookie <textarea name="pixivCookie" rows="3" placeholder="直接粘贴 Cookie，或从文件导入">${escapeHtml(settings.pixivCookie || "")}</textarea><span class="cookie-actions"><button type="button" class="quiet-button" data-action="open-pixiv-login">打开登录窗</button><button type="button" class="quiet-button" data-action="pick-pixiv-cookie">从文件导入</button></span><small class="pixiv-login-state" id="pixiv-login-state" hidden></small><small>仅保存 Pixiv 接口需要的 PHPSESSID 到数据库。不想自己找 Cookie 就点「打开登录窗」：在里面登一次账号，软件会把登录态接住并填到这里（登录态也留在本机，下次不用再登）。</small></label>
       <label>排除标签 <input name="excludedTags" value="${escapeHtml(settings.excludedTags || "")}" placeholder="标签A, 标签B"><small>用中英文逗号分隔。包含这些文字的 Pixiv 标签不会记录。</small></label>
       <div class="settings-slot" id="settings-slot-pixiv"></div>
     </div>

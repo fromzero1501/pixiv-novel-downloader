@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 static PIXIV_SYNC_CANCELLATIONS: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
 
@@ -11794,6 +11794,212 @@ async fn check_pixiv_cookie(cookie: Option<String>) -> Result<PixivCookieProbe, 
     .map_err(|e| e.to_string())?
 }
 
+/// 软件内 Pixiv 登录窗的标签。同一个标签再开一次只是把已有那扇窗拉到前面。
+const PIXIV_LOGIN_WINDOW_LABEL: &str = "pixiv-login";
+/// 登录窗落地的页面。直接开在登录页，省得用户自己找入口。
+const PIXIV_LOGIN_PAGE: &str = "https://accounts.pixiv.net/login?lang=zh";
+/// 读 Cookie 时问的是这个域 —— PHPSESSID 挂在 `.pixiv.net` 下，用 www 子域问最稳。
+const PIXIV_COOKIE_SCOPE: &str = "https://www.pixiv.net";
+/// 登录窗最多等这么久，等不到就自己关掉并回一句「没等到」，不留一扇空窗挂着。
+const PIXIV_LOGIN_TIMEOUT_SECS: u64 = 600;
+/// 轮询间隔。登录成功后 Cookie 落地有延迟，1.2 秒一轮既够快也不吵。
+const PIXIV_LOGIN_POLL_MS: u64 = 1200;
+
+/// 登录窗 → 设置面板的一条消息。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PixivLoginState {
+    /// waiting / ok / failed / closed / timeout
+    state: String,
+    message: String,
+    user_name: Option<String>,
+    /// 成功时把抓到的 Cookie 一并带回去，前端顺手填进输入框
+    cookie: Option<String>,
+}
+
+fn emit_pixiv_login_state(app: &AppHandle, state: PixivLoginState) {
+    let _ = app.emit("pixiv-login-state", state);
+}
+
+/// 从一组 Cookie 里挑出登录态那一对。
+///
+/// **为什么单独抽出来**：真正读 webview cookie 那一步只能在真窗口里跑、写不了单测，
+/// 而「怎么从一堆 Cookie 里认出 PHPSESSID」是纯逻辑 —— 抽出来才测得到。
+fn pixiv_session_from_cookie_pairs(pairs: &[(String, String)]) -> Option<String> {
+    pairs
+        .iter()
+        .find(|(name, value)| name.eq_ignore_ascii_case("PHPSESSID") && !value.trim().is_empty())
+        .map(|(_, value)| format!("PHPSESSID={}", value.trim()))
+}
+
+/// 盯住登录窗，等它里面出现有效的 PHPSESSID 就存库并回话。
+///
+/// 只在 `open_pixiv_login` 真把窗子建起来之后调一次。三种收场：抓到 → ok；
+/// 用户自己关窗 → closed；等满十分钟 → 关窗 + timeout。
+fn spawn_pixiv_login_watch(app: AppHandle) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(PIXIV_LOGIN_TIMEOUT_SECS);
+        let scope = match PIXIV_COOKIE_SCOPE.parse::<tauri::Url>() {
+            Ok(url) => url,
+            Err(error) => {
+                emit_pixiv_login_state(
+                    &app,
+                    PixivLoginState {
+                        state: "failed".into(),
+                        message: format!("登录窗的 Cookie 域解析不了：{error}"),
+                        user_name: None,
+                        cookie: None,
+                    },
+                );
+                return;
+            }
+        };
+        loop {
+            std::thread::sleep(Duration::from_millis(PIXIV_LOGIN_POLL_MS));
+            let Some(window) = app.get_webview_window(PIXIV_LOGIN_WINDOW_LABEL) else {
+                emit_pixiv_login_state(
+                    &app,
+                    PixivLoginState {
+                        state: "closed".into(),
+                        message: "登录窗关掉了，没抓到登录态。".into(),
+                        user_name: None,
+                        cookie: None,
+                    },
+                );
+                return;
+            };
+            if Instant::now() > deadline {
+                let _ = window.close();
+                emit_pixiv_login_state(
+                    &app,
+                    PixivLoginState {
+                        state: "timeout".into(),
+                        message: "等了十分钟还没登录好，登录窗先关了。要弄再点一次。".into(),
+                        user_name: None,
+                        cookie: None,
+                    },
+                );
+                return;
+            }
+            let Ok(cookies) = window.cookies_for_url(scope.clone()) else {
+                continue;
+            };
+            let pairs: Vec<(String, String)> = cookies
+                .iter()
+                .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
+                .collect();
+            let Some(raw) = pixiv_session_from_cookie_pairs(&pairs) else {
+                continue;
+            };
+            // 光有 PHPSESSID 不算登录成功（可能是半截会话），还要问一次 Pixiv 才认。
+            let probe = probe_pixiv_cookie(&raw);
+            if !probe.ok {
+                continue;
+            }
+            let saved = (|| -> Result<String, String> {
+                let normalized = normalize_pixiv_cookie(&raw)?;
+                let conn = db()?;
+                put_setting(&conn, "pixiv_cookie", &normalized)?;
+                Ok(normalized)
+            })();
+            match saved {
+                Ok(normalized) => {
+                    let _ = window.close();
+                    let name = probe.user_name.clone();
+                    emit_pixiv_login_state(
+                        &app,
+                        PixivLoginState {
+                            state: "ok".into(),
+                            message: match &name {
+                                Some(value) => format!("登录成功：{value}，Cookie 已经存好了。"),
+                                None => "登录成功，Cookie 已经存好了。".into(),
+                            },
+                            user_name: name,
+                            cookie: Some(normalized),
+                        },
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _ = window.close();
+                    emit_pixiv_login_state(
+                        &app,
+                        PixivLoginState {
+                            state: "failed".into(),
+                            message: format!("抓到登录态了，但存不进去：{error}"),
+                            user_name: None,
+                            cookie: None,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// 开一扇软件内的 Pixiv 登录窗。
+///
+/// **为什么走这条路**：让用户在软件里登录一次，登录态留在本机 WebView2 的数据目录里，
+/// 我们直接从窗口里把 PHPSESSID 读出来存进设置 —— 不用教人开 F12 复制 Cookie，
+/// 下次打开也还是登录着的。手动粘贴那条老路照旧保留。
+///
+/// 窗口必须在主线程上建，所以这里把 builder 丢进 `run_on_main_thread`，
+/// 再用一条 channel 把结果收回来（失败了要把原因原样交给前端）。
+#[tauri::command]
+fn open_pixiv_login(app: AppHandle) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window(PIXIV_LOGIN_WINDOW_LABEL) {
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+    let url = PIXIV_LOGIN_PAGE
+        .parse::<tauri::Url>()
+        .map_err(|e| format!("登录页地址不对：{e}"))?;
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let builder_app = app.clone();
+    app.run_on_main_thread(move || {
+        let result = tauri::WebviewWindowBuilder::new(
+            &builder_app,
+            PIXIV_LOGIN_WINDOW_LABEL,
+            tauri::WebviewUrl::External(url),
+        )
+        .title("登录 Pixiv")
+        .inner_size(480.0, 760.0)
+        .min_inner_size(360.0, 480.0)
+        .center()
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    })
+    .map_err(|e| e.to_string())?;
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(format!("登录窗没打开：{error}")),
+        Err(_) => return Err("登录窗没打开（等主线程超时）".into()),
+    }
+    emit_pixiv_login_state(
+        &app,
+        PixivLoginState {
+            state: "waiting".into(),
+            message: "登录窗开好了：在里面登一次账号，登完这里会自动接住。".into(),
+            user_name: None,
+            cookie: None,
+        },
+    );
+    spawn_pixiv_login_watch(app);
+    Ok(())
+}
+
+/// 手动收掉登录窗。盯窗的那个线程会发现窗口没了、回一句 closed。
+#[tauri::command]
+fn close_pixiv_login(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(PIXIV_LOGIN_WINDOW_LABEL) {
+        window.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// 从 PHPSESSID 里抠出账号 UID。Pixiv 的格式是 `<uid>_<随机串>`，前缀那串数字就是账号自己的 UID。
 ///
 /// **只用来显示账号名**，不参与「Cookie 还有效吗」的判断 —— 抠不出来就当没有，
@@ -20442,6 +20648,8 @@ pub fn run() {
             list_author_collection_authors,
             promote_stray_authors,
             check_pixiv_cookie,
+            open_pixiv_login,
+            close_pixiv_login,
             update_work_tags,
             export_backup,
             export_works_package,
@@ -20488,6 +20696,7 @@ mod tests {
         needs_a_purchased_file,
         normalize_aliases, normalize_author_homepage, normalize_pixiv_cookie,
         pixiv_uid_from_cookie, probe_pixiv_cookie,
+        pixiv_session_from_cookie_pairs,
         novel_image_filename_extension, novel_image_refs, novel_image_url, novel_images_dir,
         count_reading_images, novel_text_path_beside,
         path_key,
@@ -26918,6 +27127,30 @@ mod tests {
         assert!(error.contains("不在了"), "实际报错：{error}");
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// v1.3.51：从一棵 Cookie 树里认出登录态那一对。
+    ///
+    /// 真窗口读 Cookie 那一步写不了单测，但「认名字」这一半必须测到 ——
+    /// 认错了就是把半截会话当登录态存进去，后面所有请求一起 401。
+    #[test]
+    fn pixiv_session_picks_phpsessid_out_of_a_cookie_jar() {
+        let pairs = vec![
+            ("_cid".to_string(), "abc".to_string()),
+            ("phpsessid".to_string(), " 22871380_9f0a".to_string()),
+            ("a_type".to_string(), "1".to_string()),
+        ];
+        assert_eq!(
+            pixiv_session_from_cookie_pairs(&pairs).as_deref(),
+            Some("PHPSESSID=22871380_9f0a")
+        );
+
+        // 空值 / 只剩空白的不算登录态：WebView 里常年留着这种过期占位。
+        let blank = vec![("PHPSESSID".to_string(), "   ".to_string())];
+        assert_eq!(pixiv_session_from_cookie_pairs(&blank), None);
+
+        // 一个都没有时不能瞎编一个出来。
+        assert_eq!(pixiv_session_from_cookie_pairs(&[]), None);
     }
 
 }

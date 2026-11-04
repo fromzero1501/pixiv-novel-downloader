@@ -485,6 +485,12 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .settings-group .delay-input span { flex: 0 0 auto; white-space: nowrap; }
 /* 「从文件导入」这类紧跟输入框的次要按钮按内容宽度走，不要撑满整行 */
 .settings-group label > .quiet-button { justify-self: start; width: auto; min-width: 0; }
+/* v1.3.51：Cookie 那两个按钮并排一行（打开登录窗 / 从文件导入） */
+.settings-group .cookie-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-self: start; }
+.settings-group .cookie-actions .quiet-button { width: auto; min-width: 0; }
+.settings-group .pixiv-login-state { color: #43648a; font-weight: 500; }
+.settings-group .pixiv-login-state[data-tone="ok"] { color: #2f7a4f; }
+.settings-group .pixiv-login-state[data-tone="warn"] { color: #a4571f; }
 .settings-group input[readonly] { background: #f7faff; }
 /* 窗口窄下来时两列自动回退成一列 */
 @media (max-width: 900px) {
