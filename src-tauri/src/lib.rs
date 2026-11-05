@@ -18382,6 +18382,10 @@ struct OldVersionCleanup {
     layout: String,
     /// 当前跑着的 exe 文件名，前端拿来提示用。
     exe_name: String,
+    /// 同目录里还留着的带版本号旧程序（`PixivNovelDownloader-v1.3.53.exe` 这种）。
+    /// **故意不删**：用户的桌面快捷方式可能正指着它们，删了就是当场打不开。
+    /// 新快捷方式确认能用之后，由用户自己删。
+    legacy_exe: Vec<String>,
 }
 
 /// 从一段文本里抠出 `X.Y.Z`：`v1.2.3`、`releases/tag/v1.2.3`、`1.2.3` 都认。
@@ -18581,9 +18585,11 @@ fn probe_latest_version(client: &Client, mirrors: &[String]) -> Result<(String, 
     }
 }
 
-/// 新版发布包叫什么。正常是裸 exe；历史上发过 zip，所以两个都当候选。
+/// 新版发布包叫什么。v1.3.54 起发布的是**固定名**（不带版本号），所以它排第一；
+/// 后面两个是历史命名，留着当回退（万一某个版本的 Release 还是按老规矩传的）。
 fn update_asset_names(version: &str) -> Vec<String> {
     vec![
+        PORTABLE_FILE_NAME.to_string(),
         format!("{PORTABLE_FILE_PREFIX}{version}.exe"),
         format!("{PORTABLE_FILE_PREFIX}{version}.zip"),
     ]
@@ -19315,10 +19321,8 @@ pub fn run_update_helper_if_requested(env: &[String]) -> bool {
 /// 老逻辑是「把自己版本低的带版本号 exe 全送回收站」—— 那正是快捷方式失效的元凶，
 /// 已经废掉。现在的规则：
 ///  1. `.new` / `.part` / `.tmp` 一律清掉（都是没做完的下载；成功的 `.new` 已经被换走了）；
-///  2. **只有程序已经是固定文件名时**，才把带版本号的历史 exe 清掉 —— 那时候它们纯属占地方；
-///  3. 还是带版本号形态时**什么都不删**：用户桌面上的快捷方式可能正指着这些文件，
-///     删了就是当场打不开，等他自己重钉一次再说；
-///  4. `.bak` 永远留着 —— 新版起不来时全靠它回滚。
+///  2. 带版本号的历史 exe **一个都不删**，只列出来交回前端 —— 桌面快捷方式可能正指着它们；
+///  3. `.bak` 永远留着 —— 新版起不来时全靠它回滚。
 #[tauri::command]
 fn cleanup_old_portable_builds() -> Result<OldVersionCleanup, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -19331,6 +19335,7 @@ fn cleanup_old_portable_builds() -> Result<OldVersionCleanup, String> {
     let fixed_layout = current_name == PORTABLE_FILE_NAME;
     let mut removed = Vec::new();
     let mut failed = Vec::new();
+    let mut legacy_exe = Vec::new();
     let entries = fs::read_dir(&directory).map_err(|e| e.to_string())?;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -19352,7 +19357,11 @@ fn cleanup_old_portable_builds() -> Result<OldVersionCleanup, String> {
         let is_old_versioned = fixed_layout
             && name.starts_with(PORTABLE_FILE_PREFIX)
             && lower.ends_with(".exe");
-        if !is_leftover && !is_old_versioned {
+        if is_old_versioned {
+            legacy_exe.push(name);
+            continue;
+        }
+        if !is_leftover {
             continue;
         }
         match recycle_to_bin(&path) {
@@ -19365,6 +19374,7 @@ fn cleanup_old_portable_builds() -> Result<OldVersionCleanup, String> {
         failed,
         layout: if fixed_layout { "fixed" } else { "versioned" }.to_string(),
         exe_name: current_name,
+        legacy_exe,
     })
 }
 

@@ -5,6 +5,11 @@
 //   只出裸 exe；只有 `npm run release --publish` 会设 `PORTABLE_WITH_ZIP=1`，那时才多打一个 zip。
 //   zip 解压出来是一层 `Pixiv小说下载管理器/` 文件夹，exe 在里面，数据首次运行落在同级 data/
 //   （数据目录规则见 lib.rs 的 resolve_data_dir_in：exe 所在文件夹名 == 软件名时不再套同名层）。
+// 用户要求（2026-11-05）：**发布出来的 exe 不带版本号** —— 固定叫 `PixivNovelDownloader.exe`，
+//   桌面快捷方式指向它一次就长期有效，升级只覆盖这个文件、不用重钉。版本号只留在 tag / Release 标题 / zip 名里。
+//   连带一条必须先做的事：发布目录里可能正跑着旧版（映像锁着 exe，覆盖会失败），
+//   所以每次出包前先按**完整路径**关掉这个目录下正在运行的进程，再等文件句柄释放。
+import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,19 +23,69 @@ if (!existsSync(src)) {
   process.exit(1);
 }
 
-const baseName = `PixivNovelDownloader-v${version}.exe`;
-// 压缩包**内部**的程序文件名固定（v1.3.54 起）：解压出来永远是同一个名字，
-// 桌面快捷方式指向它一次就长期有效，升级只覆盖文件、不用重钉。
-// 归档的裸 exe 仍然带版本号（Release 多版本共存要好区分，`update_asset_names()` 也靠它选资产）。
-const ZIP_PROGRAM_NAME = "PixivNovelDownloader.exe";
-const destinations = [join(root, "发布", "藏集", "PixivNovelDownloader", baseName)];
+/** 发布目录里那个固定的程序名；发布产物、zip 内条目、桌面快捷方式全部指向它。 */
+const PROGRAM_NAME = "PixivNovelDownloader.exe";
+const releaseDir = join(root, "发布", "藏集", "PixivNovelDownloader");
+const destinations = [join(releaseDir, PROGRAM_NAME)];
+
+/**
+ * 关掉发布目录里正在运行的旧版。
+ * 只按**完整路径**认（`$_.Path` 就在这个目录下），不按进程名 —— 别的地方装过同名程序也杀不到它。
+ * 正在跑的那个 exe 被映像锁着，Windows 不允许覆盖，不先关掉这一步就写不进去。
+ */
+function closeRunningCopies(directory) {
+  if (process.platform !== "win32" || !existsSync(directory)) return 0;
+  const quoted = directory.replace(/'/g, "''");
+  const script = [
+    `$dir = '${quoted}'`,
+    "$targets = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) -and $_.Path.ToLowerInvariant().EndsWith('.exe') })",
+    "foreach ($t in $targets) { Stop-Process -Id $t.Id -Force -ErrorAction SilentlyContinue }",
+    "'KILLED=' + $targets.Count",
+  ].join("; ");
+  let out = "";
+  try {
+    out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    // 关不掉不是致命错误：下面复制时会重试，真不行再报错，让用户自己关。
+    console.warn(`[portable] 关旧版进程失败：${error.message}`);
+    return 0;
+  }
+  const killed = Number((/KILLED=(\d+)/.exec(out) || [])[1] || 0);
+  if (killed > 0) console.log(`[portable] 已关掉 ${killed} 个正在运行的旧版进程`);
+  return killed;
+}
+
+/** 等一下再复制：进程被 Stop-Process 干掉之后，映像句柄不是同一刻放开的。 */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function copyWithRetry(source, target, attempts = 20, waitMs = 300) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      copyFileSync(source, target);
+      return attempt;
+    } catch (error) {
+      if (attempt === attempts) throw error;
+      if (attempt === 1) console.log(`[portable] 目标还占着，重试覆盖（最多 ${attempts} 次 × ${waitMs} ms）`);
+      sleepSync(waitMs);
+    }
+  }
+  return 0;
+}
+
+closeRunningCopies(releaseDir);
 
 for (const dest of destinations) {
   mkdirSync(dirname(dest), { recursive: true });
-  copyFileSync(src, dest);
+  copyWithRetry(src, dest);
   const mb = (statSync(dest).size / 1024 / 1024).toFixed(1);
   console.log(`[portable] ${dest}  (${mb} MB)`);
 }
+const ZIP_PROGRAM_NAME = PROGRAM_NAME;
 
 // ── zip 分发包（只在发布时产）─────────────────────────────────────────────────
 const ZIP_FOLDER = "Pixiv小说下载管理器";
@@ -131,8 +186,8 @@ if (process.env.PORTABLE_WITH_ZIP === "1") {
   // 字符一律替换成 `.`（实测 `Pixiv小说下载管理器-v1.2.38.zip` 在 Release 页面上变成
   // `Pixiv.-v1.2.38.zip`）。压缩包**内部**那一层目录名仍然是中文（ZIP 的 UTF-8 名不受影响），
   // 用户解压出来照样是 `Pixiv小说下载管理器/`。
-  // 顺带一个好处：这个名字正好在自动更新的候选清单里（`update_asset_names()`）。
-  const zipPath = join(root, "发布", "藏集", "PixivNovelDownloader", `PixivNovelDownloader-v${version}.zip`);
+  // zip 名**保留版本号**：它是给新用户手动下载的，下载页上看得出是哪一版；里面的 exe 仍是固定名。
+  const zipPath = join(releaseDir, `PixivNovelDownloader-v${version}.zip`);
   const count = writeZip(zipPath, [{ name: `${ZIP_FOLDER}/${ZIP_PROGRAM_NAME}`, source: src }]);
   console.log(`[portable] ${zipPath}  (${count} 个文件)`);
   console.log(`[portable] zip 解压即用：${ZIP_FOLDER}/${ZIP_PROGRAM_NAME}，数据落同级 data/；升级只覆盖这个文件。`);

@@ -86,7 +86,7 @@ const branch = read("git", ["rev-parse", "--abbrev-ref", "HEAD"]) || "master";
 log(`[release] ${current} → ${next}   (${kind})`);
 log(`[release] 提交说明：${commitMessage}`);
 log(`[release] 目标分支：${branch}`);
-log(`[release] 会打包便携 exe：发布/藏集/PixivNovelDownloader/PixivNovelDownloader-v${next}.exe`);
+log(`[release] 会打包便携 exe：发布/藏集/PixivNovelDownloader/PixivNovelDownloader.exe（固定名，不带版本号）`);
 if (withRelease) {
   log(`[release] --publish：会打 tag v${next}、建 Release，并上传 zip（压缩包版）与裸 exe`);
 } else {
@@ -129,12 +129,13 @@ try {
 
   // ── 5. tag + Release（只有 --publish 才做）─────────────
   //  用提交说明当 Release 正文：应用内「更新说明」读的就是这一段。
-  //  **两个资产**：裸 exe 是自动更新唯一认的名字（`update_asset_names()` 只找
-  //  `PixivNovelDownloader-vX.Y.Z.exe` / `.zip`），zip 是给新用户手动下载的 ——
-  //  解压出来一层 `Pixiv小说下载管理器/`，exe 和 data 都收在里面。zip 的名字不影响更新链路。
+  //  **两个资产**：裸 exe 现在叫固定的 `PixivNovelDownloader.exe`（`update_asset_names()` 先找它，
+  //  也兼容历史上带版本号的 `-vX.Y.Z.exe` 名字）；zip 是给新用户手动下载的 ——
+  //  解压出来一层 `Pixiv小说下载管理器/`，里面同样是固定名 exe，data 首次运行落同级。
+  //  ⚠️ 每个 tag 一个 Release，所以同名资产在不同版本之间不会打架。
   if (withRelease) {
     const dir = path.join(root, "发布", "藏集", "PixivNovelDownloader");
-    const exe = path.join(dir, `PixivNovelDownloader-v${next}.exe`);
+    const exe = path.join(dir, "PixivNovelDownloader.exe");
     // ⚠️ zip 的文件名必须是 ASCII：gh 上传时会把非 ASCII 一律替换成 `.`
     // （实测中文名在 Release 页面上变成 `Pixiv.-v1.2.38.zip`），详见 pack-portable.mjs。
     const zip = path.join(dir, `PixivNovelDownloader-v${next}.zip`);
@@ -158,5 +159,5 @@ if (!dryRun && !withRelease) {
   const dir = "发布/藏集/PixivNovelDownloader";
   log(`[release] 本次没建 Release（自动更新看不到 v${next}）。要对外发布时执行：`);
   log(`  git tag v${next} && git push origin v${next}`);
-  log(`  gh release create v${next} "${dir}/PixivNovelDownloader-v${next}.zip" "${dir}/PixivNovelDownloader-v${next}.exe" --title v${next} --notes "${commitMessage}"`);
+  log(`  gh release create v${next} "${dir}/PixivNovelDownloader-v${next}.zip" "${dir}/PixivNovelDownloader.exe" --title v${next} --notes "${commitMessage}"`);
 }

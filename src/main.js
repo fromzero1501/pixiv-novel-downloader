@@ -1059,7 +1059,7 @@ async function invoke(command, args = {}) {
       source: "直连 GitHub",
     };
   }
-  if (command === "cleanup_old_portable_builds") return { removed: [], failed: [], layout: "fixed", exeName: "PixivNovelDownloader.exe" };
+  if (command === "cleanup_old_portable_builds") return { removed: [], failed: [], layout: "fixed", exeName: "PixivNovelDownloader.exe", legacyExe: [] };
   if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh.monlor.com/", "https://ghfile.geekertao.top/", "https://gh-proxy.net/"];
   if (command === "refresh_reading_image_counts") return { scannedCount: 0, updatedCount: 0 };
   // 预览里"读文件"给一份像样的假 Cookie：真机读到的是一整行，回空串的话
@@ -11796,6 +11796,12 @@ async function cleanupOldPortableBuilds() {
       markLayoutChangeNoticed();
       toast("这一版起程序改用固定文件名，建议在「设置 → 维护与数据」里点「创建桌面快捷方式」重钉一次，之后升级不会再失效", "info", 8000);
     }
+    // 固定名之后，同目录里可能还留着已切过来的带版本号旧程序。**故意不自动删**：
+    // 桌面快捷方式可能还指着它。等用户确认新快捷方式能用，自己删掉就行，这里只提一次。
+    if (result?.legacyExe?.length && !hasNoticedLegacyExe()) {
+      markLegacyExeNoticed();
+      toast(`同目录还留着旧版程序 ${result.legacyExe.join("、")}，新的快捷方式能正常打开后可以自己删掉`, "info", 8000);
+    }
   } catch (error) {
     // 清理失败不影响使用，静默就好
     console.log("清理升级残留失败:", error);
@@ -11804,6 +11810,8 @@ async function cleanupOldPortableBuilds() {
 
 /** 固定文件名这个变化只提示一次，别每次启动都弹 */
 const UPDATE_LAYOUT_NOTICE_KEY = "collection-library.update-layout-notice";
+/** 「还留着旧版 exe」也只提示一次 */
+const LEGACY_EXE_NOTICE_KEY = "collection-library.legacy-exe-notice";
 
 function hasNoticedLayoutChange() {
   try { return localStorage.getItem(UPDATE_LAYOUT_NOTICE_KEY) === "1"; } catch { return true; }
@@ -11811,6 +11819,14 @@ function hasNoticedLayoutChange() {
 
 function markLayoutChangeNoticed() {
   try { localStorage.setItem(UPDATE_LAYOUT_NOTICE_KEY, "1"); } catch { /* 存不了就每次都提示，无所谓 */ }
+}
+
+function hasNoticedLegacyExe() {
+  try { return localStorage.getItem(LEGACY_EXE_NOTICE_KEY) === "1"; } catch { return true; }
+}
+
+function markLegacyExeNoticed() {
+  try { localStorage.setItem(LEGACY_EXE_NOTICE_KEY, "1"); } catch { /* 同上 */ }
 }
 
 /** 桌面快捷方式：固定文件名之后，这条 .lnk 指向的文件永远在原地 */
