@@ -453,6 +453,10 @@ struct AppSettings {
     /// 生成阅读版时按它压一道，库里的存量 EPUB 也按它就地压；两路共用这一档。
     #[serde(default = "default_epub_image_quality")]
     epub_image_quality: String,
+    /// v1.3.53：新绑进库的文件如果是 PDF / Word，自动转一份 EPUB 放在旁边。
+    /// 老库没有这个键 → 按「开」处理（`!= "0"`）。
+    #[serde(default = "default_true")]
+    auto_convert_epub: bool,
 }
 
 fn default_epub_image_quality() -> String {
@@ -1946,6 +1950,8 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
                 epub_image_preset_key(&value)
             }
         },
+        // v1.3.53：没存过（老库升上来）按「开」——只有明确存过 0 才关
+        auto_convert_epub: setting(conn, "auto_convert_epub")? != "0",
     })
 }
 
@@ -3053,6 +3059,15 @@ fn save_app_settings_impl(mut settings: AppSettings) -> Result<AppSettings, Stri
             // v1.3.44：四档之外的值一律落成 "off"，别把脏值写进库
             "epub_image_quality",
             epub_image_preset_key(&settings.epub_image_quality),
+        ),
+        (
+            // v1.3.53：PDF / Word 新绑进库时自动转 EPUB，默认开
+            "auto_convert_epub",
+            if settings.auto_convert_epub {
+                "1".into()
+            } else {
+                "0".into()
+            },
         ),
     ];
     // v1.3.8：全部写进**一个事务**提交 —— 25 条各自提交时每次 commit 都要落盘，
@@ -6959,6 +6974,60 @@ fn spawn_auto_compress_epub(app: &AppHandle, path: String, title: String) {
     });
 }
 
+/// 绑定之后如果绑的是 PDF / Word，按设置后台转一份 EPUB 放在旁边（v1.3.53）。
+///
+/// 跟「绑定后自动压插图」同一条思路：绑定本身不等它，失败就当没这回事，
+/// 盘上还是原来那份 PDF / DOCX。转过一次（同名 epub 已在）就不再动，
+/// 所以重复绑定不会反复覆盖用户手里那份 epub。
+fn spawn_auto_convert_for_work(app: &AppHandle, conn: &Connection, work_id: i64) {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT ifnull(purchased_path,''), title FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    let Some((path, title)) = row else {
+        return;
+    };
+    let path = path.trim().to_string();
+    if !epub_convert_source_allowed(Path::new(&path)) {
+        return;
+    }
+    let enabled = read_settings(conn)
+        .map(|settings| settings.auto_convert_epub)
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Ok(preset) = epub_image_preset_from_settings() else {
+            return;
+        };
+        let Ok(summary) = convert_source_to_epub(Path::new(&path), &preset) else {
+            return;
+        };
+        if summary.skipped {
+            return;
+        }
+        if let Ok(conn) = db() {
+            let _ = conn.execute(
+                "UPDATE works SET purchased_path=?1, word_count=-1 WHERE id=?2",
+                rusqlite::params![summary.output_path, work_id],
+            );
+            refresh_reading_image_count(&conn, work_id);
+        }
+        let _ = app.emit(
+            EPUB_CONVERT_DONE_EVENT,
+            EpubConvertDone {
+                title: title.clone(),
+                output_path: summary.output_path.clone(),
+            },
+        );
+    });
+}
+
 // ============================ PDF 阅读版（v1.3.6） ============================
 //
 // 用 krilla（纯 Rust，MIT / Apache-2.0）写 PDF；字体取系统黑体做**子集嵌入**
@@ -7602,6 +7671,592 @@ fn build_novel_epub(
 // 用户要的是「把已经躺在硬盘上的那批打成一本书」，不是重新抓一遍。
 // 联网重抓是「重新下载 EPUB 版」那条路，两者别混。
 // ---------------------------------------------------------------------------
+
+// ===================== 格式转换：PDF / DOCX → EPUB（v1.3.53） =====================
+
+/// 转换只认这两种源文件。`.doc`（老的二进制格式）、mobi/azw3（另一套容器）都不走这条路。
+fn epub_convert_source_allowed(path: &Path) -> bool {
+    matches!(extension_of(path).as_deref(), Some("pdf") | Some("docx"))
+}
+
+/// 从源文件里抽出来的东西：一段正文，或一张图（原始字节，后面统一转 JPEG）。
+enum ConvertBlock {
+    Paragraph(String),
+    Image(Vec<u8>),
+}
+
+/// 这一行像不像章节标题。跟排版无关 —— 很多文稿根本不用标题样式，只能靠「第 X 章」认；
+/// 认错只是多一个 h2，不影响文字本身。
+fn looks_like_chapter_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 60 {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    if chars.next() != Some('第') {
+        return false;
+    }
+    let mut saw_number = false;
+    for ch in chars {
+        if ch.is_ascii_digit() || "０１２３４５６７８９〇零一二三四五六七八九十百千两".contains(ch) {
+            saw_number = true;
+            continue;
+        }
+        return saw_number && "章回卷节篇集部".contains(ch);
+    }
+    false
+}
+
+/// 从 `<Tag attr="value">` 里取一个属性值。
+fn xml_attribute(tag: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// `word/_rels/document.xml.rels` → rId 到 media 相对路径的映射。
+fn docx_relationship_targets(xml: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Relationship") {
+        let Some(end) = rest[start..].find('>') else {
+            break;
+        };
+        let tag = &rest[start..start + end];
+        if let (Some(id), Some(target)) = (xml_attribute(tag, "Id"), xml_attribute(tag, "Target")) {
+            map.insert(id, target);
+        }
+        rest = &rest[start + end..];
+    }
+    map
+}
+
+/// 包内相对路径归一：`media/image1.png` 相对 `word/`，也见过 `/word/media/...` 和 `../media/...`。
+fn normalize_zip_target(base: &str, target: &str) -> String {
+    let trimmed = target.trim_start_matches('/');
+    if trimmed.to_ascii_lowercase().starts_with("word/") {
+        return trimmed.to_string();
+    }
+    let mut parts: Vec<&str> = base.split('/').filter(|part| !part.is_empty()).collect();
+    for piece in trimmed.split('/') {
+        match piece {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// DOCX 里按阅读顺序抽出来的一个片段。
+enum DocxPiece {
+    Text(String),
+    Image(String),
+}
+
+/// 走一遍 `word/document.xml`：`<w:t>` 是文字、`<w:p>`/`<w:br>` 断行、`<a:blip r:embed>` 是一张图。
+fn docx_document_pieces(xml: &str) -> Vec<DocxPiece> {
+    let source = strip_xml_comments(xml);
+    let mut pieces: Vec<DocxPiece> = Vec::new();
+    let mut paragraph = String::new();
+    let mut capturing = false;
+    let mut index = 0usize;
+    while index < source.len() {
+        if source.as_bytes()[index] == b'<' {
+            let Some(offset) = source[index..].find('>') else {
+                break;
+            };
+            let tag = &source[index + 1..index + offset];
+            let closing = tag.starts_with('/');
+            let name = tag
+                .trim_start_matches('/')
+                .split(|character: char| character.is_whitespace() || character == '/')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            match name.as_str() {
+                "w:t" => capturing = !closing,
+                "w:p" => {
+                    if !paragraph.trim().is_empty() {
+                        pieces.push(DocxPiece::Text(paragraph.trim().to_string()));
+                    }
+                    paragraph.clear();
+                }
+                "w:br" => paragraph.push('\n'),
+                "w:tab" => paragraph.push('\t'),
+                "a:blip" => {
+                    if let Some(id) = xml_attribute(tag, "r:embed") {
+                        if !paragraph.trim().is_empty() {
+                            pieces.push(DocxPiece::Text(paragraph.trim().to_string()));
+                            paragraph.clear();
+                        }
+                        pieces.push(DocxPiece::Image(id));
+                    }
+                }
+                _ => {}
+            }
+            index += offset + 1;
+            continue;
+        }
+        let character = source[index..].chars().next().unwrap_or(' ');
+        if capturing {
+            paragraph.push(character);
+        }
+        index += character.len_utf8();
+    }
+    if !paragraph.trim().is_empty() {
+        pieces.push(DocxPiece::Text(paragraph.trim().to_string()));
+    }
+    pieces
+}
+
+/// 按名字（忽略大小写）从 zip 里读一个条目。
+fn zip_read_by_name(
+    archive: &mut zip::ZipArchive<fs::File>,
+    names: &[String],
+    wanted: &str,
+) -> Option<Vec<u8>> {
+    let actual = names
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(wanted))?
+        .clone();
+    let mut entry = archive.by_name(&actual).ok()?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes).ok()?;
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// DOCX → 块序列。文字与图片按文档里的先后顺序混排；表格、脚注、批注、页眉页脚不进正文。
+fn docx_convert_blocks(path: &Path) -> Result<Vec<ConvertBlock>, String> {
+    let file = fs::File::open(path).map_err(|e| format!("打不开这个 Word：{e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("这个 Word 不是有效的 docx：{e}"))?;
+    let names: Vec<String> = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|entry| entry.name().to_string())
+        })
+        .collect();
+    let document = zip_read_by_name(&mut archive, &names, "word/document.xml")
+        .ok_or_else(|| "这个 Word 里找不到 word/document.xml".to_string())?;
+    let rels = zip_read_by_name(&mut archive, &names, "word/_rels/document.xml.rels")
+        .map(|bytes| docx_relationship_targets(&decode_text_bytes(&bytes)))
+        .unwrap_or_default();
+    let mut blocks: Vec<ConvertBlock> = Vec::new();
+    for piece in docx_document_pieces(&decode_text_bytes(&document)) {
+        match piece {
+            DocxPiece::Text(text) => blocks.push(ConvertBlock::Paragraph(text)),
+            DocxPiece::Image(id) => {
+                let Some(target) = rels.get(&id) else {
+                    continue;
+                };
+                let entry_name = normalize_zip_target("word", target);
+                if let Some(bytes) = zip_read_by_name(&mut archive, &names, &entry_name) {
+                    blocks.push(ConvertBlock::Image(bytes));
+                }
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+/// 一页文字按行拆段。行尾不是句末标点时接上下一行 —— PDF 的正文几乎总是硬换行断开的。
+fn push_pdf_page_text(blocks: &mut Vec<ConvertBlock>, page: &str) {
+    let mut buffer = String::new();
+    for raw in page.lines() {
+        let line = raw.trim_end();
+        if line.trim().is_empty() {
+            if !buffer.trim().is_empty() {
+                blocks.push(ConvertBlock::Paragraph(buffer.trim().to_string()));
+                buffer.clear();
+            }
+            continue;
+        }
+        let trimmed = line.trim();
+        if looks_like_chapter_line(trimmed) {
+            if !buffer.trim().is_empty() {
+                blocks.push(ConvertBlock::Paragraph(buffer.trim().to_string()));
+                buffer.clear();
+            }
+            blocks.push(ConvertBlock::Paragraph(trimmed.to_string()));
+            continue;
+        }
+        if !buffer.is_empty() {
+            buffer.push('\n');
+        }
+        buffer.push_str(trimmed);
+        let ends_sentence = trimmed
+            .chars()
+            .last()
+            .map(|ch| "。！？…”』」）】.?!".contains(ch))
+            .unwrap_or(false);
+        if ends_sentence {
+            blocks.push(ConvertBlock::Paragraph(buffer.trim().to_string()));
+            buffer.clear();
+        }
+    }
+    if !buffer.trim().is_empty() {
+        blocks.push(ConvertBlock::Paragraph(buffer.trim().to_string()));
+    }
+}
+
+/// PDF 的滤镜名（可能是单个 Name，也可能是数组）。
+fn pdf_filter_names(dict: &lopdf::Dictionary) -> Vec<String> {
+    let Ok(value) = dict.get(b"Filter") else {
+        return Vec::new();
+    };
+    match value {
+        lopdf::Object::Name(name) => vec![String::from_utf8_lossy(name).to_string()],
+        lopdf::Object::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                lopdf::Object::Name(name) => Some(String::from_utf8_lossy(name).to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// 一张 PDF 图片流 → 能塞进 EPUB 的图片字节。
+///
+/// 只认三类：DCTDecode（本身就是 JPEG，原样搬）、以及 8 位 DeviceRGB / DeviceGray 的
+/// FlateDecode 裸位图（自己编成 JPEG）。JPX / JBIG2 / CMYK 这些要么解不了、要么转出来颜色不对，
+/// 一律跳过 —— 少一张图比塞一张花屏好。
+fn pdf_stream_to_image(stream: &lopdf::Stream) -> Option<Vec<u8>> {
+    let dict = &stream.dict;
+    let subtype = match dict.get(b"Subtype") {
+        Ok(lopdf::Object::Name(name)) => String::from_utf8_lossy(name).to_string(),
+        _ => String::new(),
+    };
+    if subtype != "Image" {
+        return None;
+    }
+    if matches!(dict.get(b"ImageMask").ok(), Some(lopdf::Object::Boolean(true))) {
+        return None;
+    }
+    let filters = pdf_filter_names(dict);
+    if filters.iter().any(|name| name == "DCTDecode") {
+        return (!stream.content.is_empty()).then(|| stream.content.clone());
+    }
+    if filters
+        .iter()
+        .any(|name| name == "JPXDecode" || name == "JBIG2Decode" || name == "CCITTFaxDecode")
+    {
+        return None;
+    }
+    let width = dict.get(b"Width").ok().and_then(|v| v.as_i64().ok())?;
+    let height = dict.get(b"Height").ok().and_then(|v| v.as_i64().ok())?;
+    let bits = dict
+        .get(b"BitsPerComponent")
+        .ok()
+        .and_then(|v| v.as_i64().ok())
+        .unwrap_or(8);
+    if bits != 8 || width <= 0 || height <= 0 {
+        return None;
+    }
+    let raw = stream.decompressed_content().ok()?;
+    let pixels = (width as usize).checked_mul(height as usize)?;
+    let rgb = if raw.len() == pixels * 3 {
+        image::RgbImage::from_raw(width as u32, height as u32, raw)
+    } else if raw.len() == pixels {
+        image::GrayImage::from_raw(width as u32, height as u32, raw)
+            .map(|gray| image::DynamicImage::ImageLuma8(gray).to_rgb8())
+    } else {
+        None
+    }?;
+    let mut out = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut out);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 82);
+    encoder.encode_image(&rgb).ok()?;
+    Some(out)
+}
+
+/// 每页的图片（按页号顺序，和 `extract_text_by_pages` 对得上）。
+fn pdf_page_images(doc: &lopdf::Document) -> Vec<Vec<Vec<u8>>> {
+    let mut pages: Vec<Vec<Vec<u8>>> = Vec::new();
+    for (_number, page_id) in doc.get_pages() {
+        let mut page_images: Vec<Vec<u8>> = Vec::new();
+        if let Ok((Some(resources), _)) = doc.get_page_resources(page_id) {
+            if let Ok(xobjects) = resources.get(b"XObject") {
+                let resolved = match xobjects {
+                    lopdf::Object::Reference(id) => doc.get_object(*id).ok(),
+                    other => Some(other),
+                };
+                if let Some(lopdf::Object::Dictionary(dict)) = resolved {
+                    for (_name, value) in dict.iter() {
+                        let stream = match value {
+                            lopdf::Object::Reference(id) => {
+                                doc.get_object(*id).ok().and_then(|object| object.as_stream().ok())
+                            }
+                            other => other.as_stream().ok(),
+                        };
+                        if let Some(stream) = stream {
+                            if let Some(bytes) = pdf_stream_to_image(stream) {
+                                page_images.push(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pages.push(page_images);
+    }
+    pages
+}
+
+/// PDF → 块序列。文字按页抽，页末追加这一页的图 —— 没有版面解释器，图片落不到段落中间，
+/// 只能保证「在它那一页的正文后面」，这是这条路的已知上限。
+fn pdf_convert_blocks(path: &Path) -> Result<Vec<ConvertBlock>, String> {
+    let pages = pdf_extract::extract_text_by_pages(path)
+        .map_err(|error| format!("这份 PDF 的文字抽不出来：{error}"))?;
+    let images = lopdf::Document::load(path)
+        .map(|doc| pdf_page_images(&doc))
+        .unwrap_or_default();
+    let mut blocks: Vec<ConvertBlock> = Vec::new();
+    for (index, page) in pages.iter().enumerate() {
+        push_pdf_page_text(&mut blocks, page);
+        if let Some(page_images) = images.get(index) {
+            for bytes in page_images {
+                blocks.push(ConvertBlock::Image(bytes.clone()));
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+/// 图片统一转 JPEG：源里的 PNG / BMP / 原样 JPEG 都走这一条，长边按设置档位缩。
+fn convert_image_to_jpeg(bytes: &[u8], max_edge: u32, quality: u8) -> Option<Vec<u8>> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let resized = if decoded.width().max(decoded.height()) > max_edge {
+        decoded.resize(max_edge, max_edge, image::imageops::FilterType::Lanczos3)
+    } else {
+        decoded
+    };
+    let rgb = resized.to_rgb8();
+    let mut out = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut out);
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+    encoder.encode_image(&rgb).ok()?;
+    Some(out)
+}
+
+/// 块序列 → `build_novel_epub` 认的正文：空行分段、`[chapter:…]` 起 h2、`[img:N]` 落图。
+fn compose_convert_content(
+    blocks: &[ConvertBlock],
+    preset: &EpubImagePreset,
+    images: &mut Vec<(String, Vec<u8>)>,
+    slots: &mut Vec<NovelImageSlot>,
+) -> (String, usize) {
+    let max_edge = if preset.max_edge == 0 {
+        2000
+    } else {
+        preset.max_edge
+    };
+    let quality = if preset.quality == 0 { 80 } else { preset.quality };
+    let mut content = String::new();
+    let mut image_count = 0usize;
+    for block in blocks {
+        match block {
+            ConvertBlock::Paragraph(text) => {
+                if looks_like_chapter_line(text) {
+                    content.push_str(&format!("[chapter:{}]\n", text.trim()));
+                } else {
+                    content.push_str(text.trim());
+                    content.push_str("\n\n");
+                }
+            }
+            ConvertBlock::Image(bytes) => {
+                let Some(jpeg) = convert_image_to_jpeg(bytes, max_edge, quality) else {
+                    continue;
+                };
+                image_count += 1;
+                let file_name = format!("convert-{image_count:04}.jpg");
+                let order = image_count;
+                content.push_str(&format!("[img:{order}]\n\n"));
+                slots.push(NovelImageSlot {
+                    token: format!("[img:{order}]"),
+                    order,
+                    file_name: file_name.clone(),
+                    relative: String::new(),
+                    url: String::new(),
+                    external: false,
+                });
+                images.push((file_name, jpeg));
+            }
+        }
+    }
+    (content, image_count)
+}
+
+/// 文件名 → 书名：去掉开头的 `2025-10-05 ` 这类日期前缀，再收掉多余空白。
+fn convert_title_from_path(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "未命名".into());
+    let trimmed = stem.trim();
+    let bytes = trimmed.as_bytes();
+    let dated = bytes.len() > 11
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && matches!(bytes[10], b' ' | b'_' | b'-');
+    let title = if dated {
+        trimmed[11..].trim().to_string()
+    } else {
+        trimmed.to_string()
+    };
+    if title.is_empty() {
+        "未命名".into()
+    } else {
+        title
+    }
+}
+
+/// 转换结果：给前端报数用。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EpubConvertSummary {
+    output_path: String,
+    title: String,
+    paragraphs: usize,
+    images: usize,
+    chars: usize,
+    bytes: u64,
+    skipped: bool,
+}
+
+/// 自动转换收工的通知事件（v1.3.53）：绑定后后台转完，前端弹一句「已转成 EPUB」。
+const EPUB_CONVERT_DONE_EVENT: &str = "epub-convert-done";
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EpubConvertDone {
+    title: String,
+    output_path: String,
+}
+
+/// 转换一本：源文件不动，旁边写一个同主名的 `.epub`。
+///
+/// 已经有同名 epub 就当转过，直接回 skipped —— **不覆盖**，否则用户手改过的版本会被冲掉。
+fn convert_source_to_epub(path: &Path, preset: &EpubImagePreset) -> Result<EpubConvertSummary, String> {
+    if !epub_convert_source_allowed(path) {
+        let ext = extension_of(path).unwrap_or_default();
+        return Err(format!("只支持把 PDF 或 Word(.docx) 转成 EPUB，这个是 .{ext}"));
+    }
+    if !path.is_file() {
+        return Err("源文件不在了，先重新绑定一下。".into());
+    }
+    let title = convert_title_from_path(path);
+    let output = path.with_extension("epub");
+    if output.is_file() {
+        return Ok(EpubConvertSummary {
+            output_path: output.to_string_lossy().to_string(),
+            title,
+            paragraphs: 0,
+            images: 0,
+            chars: 0,
+            bytes: fs::metadata(&output).map(|meta| meta.len()).unwrap_or(0),
+            skipped: true,
+        });
+    }
+    let ext = extension_of(path).unwrap_or_default();
+    let blocks = if ext == "docx" {
+        docx_convert_blocks(path)?
+    } else {
+        pdf_convert_blocks(path)?
+    };
+    let mut images: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut slots: Vec<NovelImageSlot> = Vec::new();
+    let (content, image_count) = compose_convert_content(&blocks, preset, &mut images, &mut slots);
+    let chars = content
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count();
+    if chars < 200 {
+        return Err(format!(
+            "这份 .{ext} 里只抽出 {chars} 字 —— 多半是扫描件、加密文件或者整页都是图，没有可读的正文。"
+        ));
+    }
+    let paragraphs = content
+        .split('\n')
+        .filter(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with("[chapter:") && !line.starts_with("[img:")
+        })
+        .count();
+    let bytes = build_novel_epub(&title, "", "", "", "", "", &content, &slots, &images, None);
+    // 先写 .part 再改名：中途失败不会留下半截 epub 被当成「转过」。
+    let temp = output.with_extension("epub.part");
+    fs::write(&temp, &bytes).map_err(|error| format!("写不了临时文件：{error}"))?;
+    if let Err(error) = fs::rename(&temp, &output) {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("写不了 EPUB：{error}"));
+    }
+    Ok(EpubConvertSummary {
+        output_path: output.to_string_lossy().to_string(),
+        title,
+        paragraphs,
+        images: image_count,
+        chars,
+        bytes: bytes.len() as u64,
+        skipped: false,
+    })
+}
+
+/// 一本作品的绑定文件 → EPUB。转成功就把作品指向新的 epub（源文件留在原地）。
+fn convert_work_to_epub_impl(work_id: i64) -> Result<EpubConvertSummary, String> {
+    let conn = db()?;
+    let (purchased, preview): (String, String) = conn
+        .query_row(
+            "SELECT purchased_path, preview_path FROM works WHERE id=?1",
+            [work_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    let use_purchased = !purchased.trim().is_empty();
+    let source = if use_purchased {
+        purchased.clone()
+    } else {
+        preview.clone()
+    };
+    if source.trim().is_empty() {
+        return Err("这篇还没有绑定本地文件。".into());
+    }
+    let path = PathBuf::from(&source);
+    let preset = epub_image_preset(&setting(&conn, "epub_image_quality")?);
+    let summary = convert_source_to_epub(&path, &preset)?;
+    if summary.skipped {
+        return Ok(summary);
+    }
+    let column = if use_purchased {
+        "purchased_path"
+    } else {
+        "preview_path"
+    };
+    conn.execute(
+        &format!("UPDATE works SET {column}=?1, word_count=-1 WHERE id=?2"),
+        params![summary.output_path, work_id],
+    )
+    .map_err(|error| error.to_string())?;
+    let _ = refresh_reading_image_count(&conn, work_id);
+    Ok(summary)
+}
+
+/// 详情面板里的【转换为 EPUB】。
+#[tauri::command]
+async fn convert_work_to_epub(work_id: i64) -> Result<EpubConvertSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || convert_work_to_epub_impl(work_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
 
 /// 合集里的一章（＝一篇作品）。
 struct AnthologyChapter {
@@ -13195,6 +13850,8 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String, app: AppHandle) -> 
     clear_redundant_preview_for_bound_work(&conn, work_id, &target);
     // v1.3.50：绑上来的若是 EPUB，后台顺手压一遍插图（绑定不等它，压不动不影响绑定）
     spawn_auto_compress_epub(&app, target.to_string_lossy().to_string(), title.clone());
+    // v1.3.53：绑上来的是 PDF / Word 且设置里开着自动转换，后台转一份 EPUB 放在旁边
+    spawn_auto_convert_for_work(&app, &conn, work_id);
     Ok(target.to_string_lossy().to_string())
 }
 
@@ -13728,6 +14385,8 @@ fn auto_group_purchased_files(
                                     auto_moved_count += 1;
                                     // v1.3.50：自动认领进完整版目录的 EPUB，后台压一遍
                                     spawn_auto_compress_for_work(&app, &conn, candidate.work_id);
+                                    // v1.3.53：认领到的是 PDF / Word 就后台转一份 EPUB
+                                    spawn_auto_convert_for_work(&app, &conn, candidate.work_id);
                                     continue;
                                 }
                             }
@@ -13834,6 +14493,8 @@ fn confirm_manual_group(
                 if outcome.bound_count > 0 {
                     for work_id in &choice.work_ids {
                         spawn_auto_compress_for_work(&app, &conn, *work_id);
+                        // v1.3.53：搬过去的是 PDF / Word 就后台转一份 EPUB
+                        spawn_auto_convert_for_work(&app, &conn, *work_id);
                     }
                 }
             }
@@ -20598,6 +21259,7 @@ pub fn run() {
             refresh_reading_image_counts,
             compress_epub_images,
             cancel_epub_image_compress,
+            convert_work_to_epub,
             list_characters,
             add_character,
             update_character,

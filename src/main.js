@@ -1107,6 +1107,24 @@ async function invoke(command, args = {}) {
     }
     return { format, outputPath, totalCount: 4, savedCount: 4, failedCount: 0, missingCount: 0, sizeBytes: format === "html" ? 0 : 3355443 };
   }
+  if (command === "convert_work_to_epub") {
+    if (window.__mockConvertError) throw window.__mockConvertError;
+    const work = previewWorks.find((item) => item.id === args.workId);
+    const skipped = Boolean(window.__mockConvertSkipped);
+    const outputPath = "D:\\已购\\希儿.epub";
+    if (work && !skipped) {
+      if (work.purchasedPath) work.purchasedPath = outputPath; else work.previewPath = outputPath;
+    }
+    return {
+      outputPath,
+      title: work ? work.title : "希儿",
+      paragraphs: 12,
+      images: 2,
+      chars: 1032,
+      bytes: 2097152,
+      skipped,
+    };
+  }
   if (command === "download_reading_versions") {
     // format 传空串＝跟随设置，这里也照着设置里选的走，方便浏览器里试用
     const format = args.format || (await invoke("get_app_settings")).syncImageFormat || "html";
@@ -4514,6 +4532,12 @@ function installAutoEpubCompressWatch() {
     if (fresh) render();
     else updateSyncFloater();
   }).catch(() => {});
+  // 自动转换（v1.3.53）：绑进库的 PDF / Word 转好之后后端会发这一条，只提示一句。
+  listen("epub-convert-done", (event) => {
+    const payload = event?.payload || {};
+    if (!payload.title) return;
+    toast(`《${payload.title}》已自动转成 EPUB`, "success");
+  }).catch(() => {});
 }
 
 /**
@@ -4540,6 +4564,41 @@ async function detailToggleImages(workId) {
 async function detailDownload(workId, format) {
   if (format === "txt") { await redownloadNovelTxt(workId); return; }
   await downloadReadingVersion(workId, format === "epub" ? "epub" : format === "pdf" ? "pdf" : "html");
+}
+
+/**
+ * 详情里的「转换为 EPUB」（v1.3.53）。
+ *
+ * 把当前绑定的 PDF / Word **就地**转成同目录同名的 epub（后端负责），源文件不动；
+ * 旁边已经有同名 epub 的，后端回 `skipped` —— 这里只提示一句，绝不覆盖。
+ * 转完完整版指向新 epub，字数由 `refreshAfterDetailChange()` 里那一轮补算重新算。
+ */
+async function convertWorkToEpub(workId, trigger) {
+  const work = findWork(workId) || state.detailWorkSnapshot;
+  const label = work ? `《${work.title}》` : "这篇";
+  const idleText = trigger ? trigger.textContent : "";
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.textContent = "正在转换…";
+  }
+  try {
+    const summary = await invoke("convert_work_to_epub", { workId });
+    if (summary && summary.skipped) {
+      toast(`${label}旁边已经有同名 EPUB，没有覆盖`, "info");
+      return;
+    }
+    const size = summary && summary.bytes ? `、${(summary.bytes / 1048576).toFixed(1)} MB` : "";
+    const detail = summary ? `${summary.chars} 字、${summary.images} 张图${size}` : "";
+    toast(`转好了：${label}${detail ? `（${detail}）` : ""}`, "success");
+    await refreshAfterDetailChange();
+  } catch (error) {
+    toast(String(error || "转换失败"), "error");
+  } finally {
+    if (trigger) {
+      trigger.disabled = false;
+      trigger.textContent = idleText || "转换为 EPUB";
+    }
+  }
 }
 
 /** 详情里的删除作品。详情可以从任意页面打开，所以用 detailWork 找（列表里没有也靠快照兜住）。 */
@@ -4735,6 +4794,28 @@ function workDetailBody() {
         <button class="quiet-button" data-action="detail-open-pixiv" data-url="${escapeHtml(pixivUrl)}">${icon("link", 16)}在浏览器里打开原页</button>
       </div>` : '<p class="match-note">这篇没有记录 Pixiv 作品 ID。</p>'}
     </section>
+
+    ${(() => {
+      // v1.3.53：格式转换 —— 只认 PDF / Word，转出来是同目录同名的 .epub
+      const boundPath = String(work.purchasedPath || work.previewPath || "");
+      const fileName = boundPath ? boundPath.split(/[\\/]/).pop() : "";
+      const lower = boundPath.toLowerCase();
+      const convertible = lower.endsWith(".pdf") || lower.endsWith(".docx");
+      const note = !boundPath
+        ? "这篇还没有绑定文件。"
+        : convertible
+          ? `当前绑定：${escapeHtml(fileName)}。转出来的 EPUB 放在同一个目录、用同一个名字，源文件原地不动。`
+          : lower.endsWith(".epub")
+            ? `当前绑定：${escapeHtml(fileName)} —— 已经是 EPUB，不用再转。`
+            : `当前绑定：${escapeHtml(fileName)} —— 只有 PDF 和 Word（.docx）能转成 EPUB。`;
+      return `<section class="detail-block">
+      <h4>格式转换</h4>
+      <p class="detail-plain">${note}</p>
+      <div class="detail-actions">
+        <button class="quiet-button" data-action="convert-work-epub" data-work-id="${work.id}" ${convertible ? "" : "disabled"}>${icon("file", 16)}转换为 EPUB</button>
+      </div>
+    </section>`;
+    })()}
 
     <section class="detail-block">
       <h4>重新抓取</h4>
@@ -7154,6 +7235,7 @@ async function bindEvents() {
       if (action === "detail-bind-cover") await detailBindCover(Number(workId));
       if (action === "detail-toggle-images") await detailToggleImages(Number(workId));
       if (action === "detail-download") await detailDownload(Number(workId), element.dataset.format);
+      if (action === "convert-work-epub") await convertWorkToEpub(Number(workId), element);
       if (action === "detail-delete") detailDeleteWork(Number(workId));
       if (action === "detail-delete-files") detailDeleteWorkWithFiles(Number(workId));
       // 「我的收藏」上栏要列收藏作者，顺手把作者表刷新一次，别拿启动时那份旧的（v1.2.32）
@@ -10779,6 +10861,8 @@ function collectSettings(form) {
   values.recordHistory = Boolean(form.querySelector('[name="recordHistory"]')?.checked);
   // 自动备份：勾选框 + 保留份数（范围与后端一致：1 到 50）
   values.autoBackupEnabled = Boolean(form.querySelector('[name="autoBackupEnabled"]')?.checked);
+  // v1.3.53：PDF / Word 绑进库时自动转 EPUB（勾选框，FormData 拿不到未勾选状态）
+  values.autoConvertEpub = Boolean(form.querySelector('[name="autoConvertEpub"]')?.checked);
   values.autoBackupKeep = Number(values.autoBackupKeep || 7);
   if (!Number.isInteger(values.autoBackupKeep) || values.autoBackupKeep < 1 || values.autoBackupKeep > 50) throw new Error("自动备份保留份数请输入 1 到 50 的整数");
   return values;
@@ -10891,6 +10975,10 @@ async function settingsModal() {
     <div class="settings-fields is-single">
       <label>配图画质 <select name="imageQuality"><option value="1200" ${(settings.imageQuality || "1200") === "1200" ? "selected" : ""}>1200 宽（推荐，每张约 1 MB）</option><option value="original" ${settings.imageQuality === "original" ? "selected" : ""}>原始画质（作者上传的原图，可能每张几 MB）</option></select><small>图文小说同步时下载正文配图用这一档。原图更清晰，但一篇的配图可能要几十到上百 MB。</small></label>
       <label>同步作品时图文小说自动保存为 <select name="syncImageFormat"><option value="epub" ${(settings.syncImageFormat || "epub") === "epub" ? "selected" : ""}>EPUB（电子书阅读器）</option><option value="html" ${settings.syncImageFormat === "html" ? "selected" : ""}>HTML（浏览器直接打开）</option></select><small>同步图文小说时只保留这一种阅读版：EPUB 适合推到手机 / 阅读器，HTML 双击就能用浏览器看。不会两种都存。</small></label>
+      <div class="form-field">
+        <label class="check-row"><input name="autoConvertEpub" type="checkbox" ${settings.autoConvertEpub === false ? "" : "checked"}><span>添加 PDF / Word 文件时自动转成 EPUB</span></label>
+        <small>新绑进库的文件如果是 PDF 或 Word，就在旁边转一份同名的 EPUB，作品的完整版随即指向它（源文件不动，也不删）。只影响之后新加的；库里原有的那些，用作品详情里的「格式转换」手动转。</small>
+      </div>
       <label>Epub插图压缩 <select name="epubImageQuality"><option value="1200" ${(settings.epubImageQuality || "1200") === "1200" ? "selected" : ""}>长边 1200 + 质量 80（推荐，每张约 0.2 至 0.6 MB）</option><option value="1600" ${settings.epubImageQuality === "1600" ? "selected" : ""}>长边 1600 + 质量 85（清晰些，存得多一点）</option><option value="900" ${settings.epubImageQuality === "900" ? "selected" : ""}>长边 900 + 质量 75（最省空间）</option><option value="off" ${settings.epubImageQuality === "off" ? "selected" : ""}>不压（保留作者原图）</option></select><small>生成 EPUB 时按这一档压一遍插图；PNG 会转成 JPEG（包内引用一并改好），压完不比原来小的图保留原图。已经压过的书不会重复压，存量书在「批量维护」里的「Epub插图压缩」用同一档。<b>这一档和上面的「配图画质」是两回事</b>：配图画质管的是下载时存下来的原图，这里管的是塞进 EPUB 的那一份。</small></label>
     </div>
   </section>
