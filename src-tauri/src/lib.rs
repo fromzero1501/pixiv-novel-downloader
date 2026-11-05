@@ -18269,6 +18269,17 @@ const PORTABLE_FILE_PREFIX: &str = "PixivNovelDownloader-v";
 /// 升级包小于这个大小一律当成镜像的错误页丢掉（正常包 20 MB 上下）。
 const MIN_UPDATE_BYTES: u64 = 1_000_000;
 
+/// **本地落地的固定文件名**（v1.3.54）。发布侧的资产名仍然带版本号
+/// （`PixivNovelDownloader-vX.Y.Z.exe`，见 `update_asset_names`），只有存到程序目录时
+/// 一律叫这个名字 —— 桌面快捷方式指着它就不会因为换版本而失效。
+const PORTABLE_FILE_NAME: &str = "PixivNovelDownloader.exe";
+/// 下载完、还没换上去的新版：`PixivNovelDownloader.exe.new`
+const UPDATE_STAGING_SUFFIX: &str = ".new";
+/// 换上去之前把原来的留一份：`PixivNovelDownloader.exe.bak`（新版起不来时拿它回滚）
+const UPDATE_BACKUP_SUFFIX: &str = ".bak";
+/// 替换器自复制副本靠这个参数认路，见到它就直接做替换、不进界面
+const APPLY_UPDATE_FLAG: &str = "--apply-portable-update";
+
 /// 内置加速镜像。检查更新时直连和这里每一条**同时**探，下载时按这个顺序挨个重试。
 /// 用户可在「设置 → 维护与数据 → 软件更新」里增删。
 ///
@@ -18366,6 +18377,11 @@ struct UpdateDownloadProgress {
 struct OldVersionCleanup {
     removed: Vec<String>,
     failed: Vec<String>,
+    /// `fixed`：程序已经是固定文件名（v1.3.54 起）；`versioned`：还是老的带版本号形态，
+    /// 用户桌面上的快捷方式下次更新时还得重钉一次。
+    layout: String,
+    /// 当前跑着的 exe 文件名，前端拿来提示用。
+    exe_name: String,
 }
 
 /// 从一段文本里抠出 `X.Y.Z`：`v1.2.3`、`releases/tag/v1.2.3`、`1.2.3` 都认。
@@ -19092,7 +19108,8 @@ async fn download_update(
             .and_then(|name| name.to_str())
             .ok_or_else(|| "升级文件名无效".to_string())?
             .to_string();
-        let program_path = directory.join(format!("{PORTABLE_FILE_PREFIX}{version}.exe"));
+        // 新版先落在 `.new`：跑着的 exe 改不了，等替换器接手再把它换上去
+        let program_path = directory.join(format!("{PORTABLE_FILE_NAME}{UPDATE_STAGING_SUFFIX}"));
         let part_path = directory.join(format!("{asset_name}.part"));
         let client = update_client(Duration::from_secs(1800))?;
         let mut last_error = String::from("没有可用的下载地址");
@@ -19122,7 +19139,7 @@ async fn download_update(
         let _ = fs::remove_file(&part_path);
         if !finished {
             let _ = fs::remove_file(&program_path);
-            return Err(format!("所有下载源都失败了：{last_error}"));
+            return Err(format!("v{version} 的所有下载源都失败了：{last_error}"));
         }
         if !looks_like_windows_program(&program_path) {
             let _ = fs::remove_file(&program_path);
@@ -19134,35 +19151,174 @@ async fn download_update(
     .map_err(|e| e.to_string())?
 }
 
-/// 启动新版并退出自己。新旧两个进程只在这个瞬间并存，旧进程随后就没了。
+/// 把 `.new` 换上正式名，然后重启到自己。
+///
+/// **为什么不能就地覆盖**：Windows 锁定正在运行的 exe（映像文件不带 `FILE_SHARE_WRITE`），
+/// 本进程既写不了、也改名不了它。所以这里把自己**复制一份到临时目录**，带
+/// `--apply-portable-update` 参数拉起，由那个副本在本进程退出后接手替换。
 #[tauri::command]
 fn apply_update(app: AppHandle, path: String) -> Result<(), String> {
-    let program = PathBuf::from(&path);
+    let staging = PathBuf::from(&path);
     let directory = executable_directory()?;
-    // 只允许启动「程序目录里、自己命名的」那个 exe —— 别让一个错路径把别的程序拉起来
-    if program.parent() != Some(directory.as_path()) {
+    if staging.parent() != Some(directory.as_path()) {
         return Err("升级文件不在程序所在目录里".into());
     }
-    let name = program
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    if !name.starts_with(PORTABLE_FILE_PREFIX) || !name.to_ascii_lowercase().ends_with(".exe") {
+    let expected = format!("{PORTABLE_FILE_NAME}{UPDATE_STAGING_SUFFIX}");
+    if staging.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
         return Err("升级文件的名字不对".into());
     }
-    if !program.is_file() {
+    if !staging.is_file() {
         return Err("新版程序不见了，请重新下载".into());
     }
-    std::process::Command::new(&program)
+    let size = fs::metadata(&staging).map(|meta| meta.len()).unwrap_or(0);
+    if size < MIN_UPDATE_BYTES {
+        return Err(format!("新版文件只有 {size} 字节，不完整，请重新下载"));
+    }
+    if !looks_like_windows_program(&staging) {
+        return Err("下载回来的文件不是可执行程序，请到发布页手动下载".into());
+    }
+    let current = std::env::current_exe().map_err(|e| format!("无法定位当前程序：{e}"))?;
+    let helper = std::env::temp_dir().join(format!(
+        "pixiv-novel-updater-{}.exe",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&helper);
+    fs::copy(&current, &helper).map_err(|e| format!("无法准备升级助手：{e}"))?;
+    std::process::Command::new(&helper)
+        .arg(APPLY_UPDATE_FLAG)
+        .arg(directory.join(PORTABLE_FILE_NAME))
+        .arg(&staging)
+        .arg(std::process::id().to_string())
         .current_dir(&directory)
         .spawn()
-        .map_err(|e| format!("无法启动新版本：{e}"))?;
+        .map_err(|e| format!("无法启动升级助手：{e}"))?;
     app.exit(0);
     Ok(())
 }
 
-/// 更新完之后旧版本还躺在同一个文件夹里。启动时扫一遍把它们送进回收站：
-/// 只认自己的命名（`PixivNovelDownloader-vX.Y.Z.exe`）且版本比自己低，别的东西一律不碰。
+/// 目标 exe 是否已经被旧进程放手。
+///
+/// 判据是「能不能拿到写句柄」：Windows 上运行中的 exe 映像不带 `FILE_SHARE_WRITE`，
+/// 以写方式打开会拿到 ACCESS_DENIED；退了就成功。目标还不存在（第一次从旧的带版本号
+/// 命名迁过来）也算放开。
+fn portable_target_released(target: &Path) -> bool {
+    if !target.exists() {
+        return true;
+    }
+    match fs::OpenOptions::new().write(true).open(target) {
+        Ok(_) => true,
+        Err(error) => !matches!(error.kind(), std::io::ErrorKind::PermissionDenied),
+    }
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// 替换器本体（跑在自复制副本里）：等旧进程退出 → 备份 → 换上去 → 拉起 → 存活检查 → 失败回滚。
+///
+/// 三条边界，改这块之前先看一眼：
+///  1. 备份先用 `copy` 而不是 `rename` —— rename 期间目标会短暂消失，万一后面失败就成空目录；
+///  2. 新文件先写 `.tmp` 再 `rename` 覆盖，避免写到一半断电把正式文件截断；
+///  3. 拉起后 3 秒内自己退出了就当失败，把 `.bak` 换回去再把旧版拉起来 —— 用户至少还能用。
+fn apply_portable_update(target: &Path, staging: &Path, parent_pid: u32) -> Result<(), String> {
+    let directory = target.parent().map(Path::to_path_buf).unwrap_or_default();
+    // 1. 等旧进程放手。最长 90 秒，超时就算了（下回启动还能再升）
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !portable_target_released(target) {
+        if Instant::now() > deadline {
+            return Err(format!("旧进程 {parent_pid} 迟迟没退出"));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // 2. 备份当前文件，再写临时文件、改名覆盖
+    let backup = with_suffix(target, UPDATE_BACKUP_SUFFIX);
+    if target.exists() {
+        let _ = fs::remove_file(&backup);
+        fs::copy(target, &backup).map_err(|e| format!("无法备份当前程序：{e}"))?;
+    }
+    let temp = with_suffix(target, ".tmp");
+    let _ = fs::remove_file(&temp);
+    fs::copy(staging, &temp).map_err(|e| format!("无法写入新版程序：{e}"))?;
+    if let Err(error) = fs::rename(&temp, target) {
+        let _ = fs::remove_file(&temp);
+        fs::copy(staging, target).map_err(|e| format!("无法替换程序文件：{error} / {e}"))?;
+    }
+    let _ = fs::remove_file(staging);
+    // 3. 拉起新版，3 秒后看看它还活着没
+    let directory_owned = directory.clone();
+    let spawn_program = move |path: &Path| {
+        std::process::Command::new(path)
+            .current_dir(&directory_owned)
+            .spawn()
+    };
+    let mut child = match spawn_program(target) {
+        Ok(child) => child,
+        Err(error) => {
+            // 新版根本拉不起来（缺 DLL、映像损坏…）：这时候正式文件已经是坏的了，
+            // 必须把 `.bak` 放回去，否则用户直接没了能用的程序。
+            let _ = recovery_copy(&backup, target);
+            let _ = spawn_program(target);
+            return Err(format!("新版本启动失败，已回滚到上一版：{error}"));
+        }
+    };
+    std::thread::sleep(Duration::from_secs(3));
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        let _ = recovery_copy(&backup, target);
+        let _ = spawn_program(target);
+        return Err("新版本启动后就退出了，已回滚到上一版".into());
+    }
+    Ok(())
+}
+
+/// 回滚用的复制：目标可能正被那个刚退出的进程短暂占着，直接 copy 失败就等一下再试。
+fn recovery_copy(backup: &Path, target: &Path) -> std::io::Result<()> {
+    if !backup.is_file() {
+        return Ok(());
+    }
+    for _ in 0..10 {
+        match fs::copy(backup, target) {
+            Ok(_) => return Ok(()),
+            Err(_) => std::thread::sleep(Duration::from_millis(300)),
+        }
+    }
+    fs::copy(backup, target).map(|_| ())
+}
+
+/// 自复制副本带 `--apply-portable-update` 启动时走这里：做完替换直接退出，不进界面。
+/// 返回 true 表示「我是替换器，已经干完了」，调用方应当立刻 `exit`。
+pub fn run_update_helper_if_requested(env: &[String]) -> bool {
+    let Some(index) = env.iter().position(|arg| arg == APPLY_UPDATE_FLAG) else {
+        return false;
+    };
+    let target = env.get(index + 1).cloned().unwrap_or_default();
+    let staging = env.get(index + 2).cloned().unwrap_or_default();
+    let pid = env
+        .get(index + 3)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let _ = apply_portable_update(Path::new(&target), Path::new(&staging), pid);
+    // 自己删自己：跑着的时候删不掉，等两秒后由 cmd 动手
+    if let Some(self_path) = env.first() {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "ping", "-n", "3", "127.0.0.1", ">nul", "&", "del", "/f", "/q"])
+            .arg(self_path)
+            .spawn();
+    }
+    true
+}
+
+/// 启动时清一遍升级残留（v1.3.54 起重写）。
+///
+/// 老逻辑是「把自己版本低的带版本号 exe 全送回收站」—— 那正是快捷方式失效的元凶，
+/// 已经废掉。现在的规则：
+///  1. `.new` / `.part` / `.tmp` 一律清掉（都是没做完的下载；成功的 `.new` 已经被换走了）；
+///  2. **只有程序已经是固定文件名时**，才把带版本号的历史 exe 清掉 —— 那时候它们纯属占地方；
+///  3. 还是带版本号形态时**什么都不删**：用户桌面上的快捷方式可能正指着这些文件，
+///     删了就是当场打不开，等他自己重钉一次再说；
+///  4. `.bak` 永远留着 —— 新版起不来时全靠它回滚。
 #[tauri::command]
 fn cleanup_old_portable_builds() -> Result<OldVersionCleanup, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -19172,31 +19328,31 @@ fn cleanup_old_portable_builds() -> Result<OldVersionCleanup, String> {
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_string();
-    let current_version = parse_version(env!("CARGO_PKG_VERSION")).unwrap_or((0, 0, 0));
+    let fixed_layout = current_name == PORTABLE_FILE_NAME;
     let mut removed = Vec::new();
     let mut failed = Vec::new();
     let entries = fs::read_dir(&directory).map_err(|e| e.to_string())?;
     for entry in entries.flatten() {
         let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
         let name = match path.file_name().and_then(|name| name.to_str()) {
             Some(name) => name.to_string(),
             None => continue,
         };
-        // 正在跑的这个自己当然不能删；`path` 和 `current_exe()` 的写法可能不完全一致，
-        // 所以文件名也比一遍。
-        if path == executable || name == current_name || !path.is_file() {
+        // 正在跑的这个自己当然不能删
+        if path == executable || name == current_name {
             continue;
         }
-        let Some(rest) = name.strip_prefix(PORTABLE_FILE_PREFIX) else {
-            continue;
-        };
-        if !rest.to_ascii_lowercase().ends_with(".exe") {
-            continue;
-        }
-        let Some(version) = parse_version(rest) else {
-            continue;
-        };
-        if version >= current_version {
+        let lower = name.to_ascii_lowercase();
+        let is_leftover = lower.ends_with(UPDATE_STAGING_SUFFIX)
+            || lower.ends_with(".part")
+            || (lower.ends_with(".tmp") && lower.contains(PORTABLE_FILE_NAME));
+        let is_old_versioned = fixed_layout
+            && name.starts_with(PORTABLE_FILE_PREFIX)
+            && lower.ends_with(".exe");
+        if !is_leftover && !is_old_versioned {
             continue;
         }
         match recycle_to_bin(&path) {
@@ -19204,7 +19360,97 @@ fn cleanup_old_portable_builds() -> Result<OldVersionCleanup, String> {
             Err(_) => failed.push(name),
         }
     }
-    Ok(OldVersionCleanup { removed, failed })
+    Ok(OldVersionCleanup {
+        removed,
+        failed,
+        layout: if fixed_layout { "fixed" } else { "versioned" }.to_string(),
+        exe_name: current_name,
+    })
+}
+
+/// 桌面真实路径（被 OneDrive 重定向过也对）。只有 Windows 有。
+#[cfg(windows)]
+fn desktop_directory() -> Result<PathBuf, String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Desktop, KF_FLAG_DEFAULT};
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) }
+        .map_err(|e| format!("找不到桌面目录：{e}"))?;
+    let path = unsafe { raw.to_string() }.unwrap_or_default();
+    unsafe { CoTaskMemFree(Some(raw.0 as *const _)) };
+    if path.is_empty() {
+        return Err("找不到桌面目录".into());
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// 写一个 `.lnk` 指向 `target`。走 `IShellLinkW`（COM），不依赖 PowerShell 也不弹黑框。
+#[cfg(windows)]
+fn write_shortcut(link: &Path, target: &Path, workdir: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    // 主线程可能已经初始化过 COM（模式不同会返回 RPC_E_CHANGED_MODE），忽略返回值即可继续用
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let result = (|| -> Result<(), String> {
+        let shell_link: IShellLinkW =
+            unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|e| format!("创建快捷方式失败：{e}"))?;
+        let wide = |value: &Path| -> Vec<u16> {
+            value
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let target_wide = wide(target);
+        let workdir_wide = wide(workdir);
+        let desc: Vec<u16> = "收藏记录 · Pixiv 小说下载管理器\0".encode_utf16().collect();
+        unsafe {
+            shell_link
+                .SetPath(PCWSTR(target_wide.as_ptr()))
+                .map_err(|e| format!("设置快捷方式目标失败：{e}"))?;
+            shell_link
+                .SetWorkingDirectory(PCWSTR(workdir_wide.as_ptr()))
+                .map_err(|e| format!("设置工作目录失败：{e}"))?;
+            shell_link
+                .SetDescription(PCWSTR(desc.as_ptr()))
+                .map_err(|e| format!("设置说明失败：{e}"))?;
+        }
+        let persist: IPersistFile = shell_link
+            .cast()
+            .map_err(|e| format!("快捷方式不支持保存：{e}"))?;
+        let link_wide = wide(link);
+        unsafe { persist.Save(PCWSTR(link_wide.as_ptr()), true) }
+            .map_err(|e| format!("写入快捷方式失败：{e}"))?;
+        Ok(())
+    })();
+    unsafe { CoUninitialize() };
+    result
+}
+
+/// 在桌面建（或覆盖）一个指向当前程序的快捷方式。
+///
+/// 固定文件名之后这个入口才真正有用：无论更新多少次，`.lnk` 指向的那个文件都在原地。
+#[tauri::command]
+fn create_desktop_shortcut() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| format!("无法定位程序：{e}"))?;
+        let desktop = desktop_directory()?;
+        let link = desktop.join("收藏记录（Pixiv小说下载管理器）.lnk");
+        let workdir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+        write_shortcut(&link, &exe, &workdir)?;
+        Ok(link.to_string_lossy().to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("只有 Windows 才有桌面快捷方式".into())
+    }
 }
 
 /// 前端「恢复默认镜像」按钮用。
@@ -21170,6 +21416,11 @@ fn auto_backup_if_due() -> Result<Option<BackupEntry>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 自复制副本带 `--apply-portable-update` 起来时只做替换，不建窗口、不碰数据库
+    let argv: Vec<String> = std::env::args().collect();
+    if run_update_helper_if_requested(&argv) {
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -21331,6 +21582,7 @@ pub fn run() {
             download_update,
             apply_update,
             cleanup_old_portable_builds,
+            create_desktop_shortcut,
             default_update_mirror_list
         ])
         .run(tauri::generate_context!())

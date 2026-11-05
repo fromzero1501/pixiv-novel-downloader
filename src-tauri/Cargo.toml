@@ -43,4 +43,4 @@ pdf-extract = "0.12.1"
 # 送系统回收站要调 shell32 的 SHFileOperationW（资源管理器按 Delete 走的就是它）。
 # 只加特性、不引新 crate —— windows 0.61.3 本来就在依赖图里。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Storage_FileSystem", "Win32_System_Com"] }

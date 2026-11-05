@@ -1040,9 +1040,15 @@ async function invoke(command, args = {}) {
   if (command === "check_for_update") return window.__mockUpdateCheck || { currentVersion: APP_VERSION, latestVersion: APP_VERSION, hasUpdate: false, releaseUrl: "https://github.com/fromzero1501/pixiv-novel-downloader/releases", releaseMirrorUrl: "https://ghproxy.net/https://github.com/fromzero1501/pixiv-novel-downloader/releases", asset: null, source: "直连 GitHub" };
   if (command === "download_update") {
     window.__mockUpdateDownload = { version: args.version, assetName: args.assetName, urls: args.urls };
-    return `D:\\示例\\程序目录\\${String(args.assetName || "").replace(/\.zip$/i, ".exe")}`;
+    // 真实后端落盘一律是固定的 `PixivNovelDownloader.exe.new`（v1.3.54 起）
+    return "D:\\示例\\程序目录\\PixivNovelDownloader.exe.new";
   }
   if (command === "apply_update") { window.__mockUpdateApplied = args.path; return; }
+  if (command === "create_desktop_shortcut") {
+    const link = "C:\\Users\\预览用户\\Desktop\\收藏记录（Pixiv小说下载管理器）.lnk";
+    window.__mockShortcut = link;
+    return link;
+  }
   // 更新说明：默认给一段像样的示例；要看「取不到」的样子就设 window.__mockReleaseNotesError
   if (command === "fetch_release_notes") {
     if (window.__mockReleaseNotesError) throw new Error(window.__mockReleaseNotesError);
@@ -1053,7 +1059,7 @@ async function invoke(command, args = {}) {
       source: "直连 GitHub",
     };
   }
-  if (command === "cleanup_old_portable_builds") return { removed: [], failed: [] };
+  if (command === "cleanup_old_portable_builds") return { removed: [], failed: [], layout: "fixed", exeName: "PixivNovelDownloader.exe" };
   if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh.monlor.com/", "https://ghfile.geekertao.top/", "https://gh-proxy.net/"];
   if (command === "refresh_reading_image_counts") return { scannedCount: 0, updatedCount: 0 };
   // 预览里"读文件"给一份像样的假 Cookie：真机读到的是一整行，回空串的话
@@ -1540,12 +1546,12 @@ function initials(name) {
   return (name || "新作者").trim().slice(0, 2);
 }
 
-function toast(message, tone = "info") {
+function toast(message, tone = "info", duration = 3200) {
   const element = document.createElement("div");
   element.className = `toast toast-${tone}`;
   element.textContent = message;
   document.body.append(element);
-  window.setTimeout(() => element.remove(), 3200);
+  window.setTimeout(() => element.remove(), duration);
 }
 
 /**
@@ -7731,6 +7737,7 @@ async function bindEvents() {
           button.textContent = label;
         }
       }
+      if (action === "create-shortcut") { await createDesktopShortcut(); return; }
       if (action === "start-update") { await startUpdateDownload(); return; }
       if (action === "ignore-update") {
         ignoreUpdateVersion(element.dataset.version || "");
@@ -10999,8 +11006,8 @@ async function settingsModal() {
     <div class="settings-fields is-single">
       <div class="form-field update-setting">
         <div class="char-setting-head"><span class="field-title">软件更新</span><span class="settings-group-hint">当前 v${APP_VERSION}</span></div>
-        <small>查到新版本会把新版 exe 下载到程序所在的文件夹，下完自动重启到新版本；旧的那个文件在下次启动时移入回收站（可以还原）。你的作品文件和数据库都在旁边，不受影响。GitHub 直连不上时会自动换下面的加速镜像重试。</small>
-        <div class="settings-button-row"><button type="button" class="quiet-button" data-action="check-update">检查更新</button><button type="button" class="quiet-button" data-action="open-release-page">打开发布页</button></div>
+        <small>查到新版本会把新版下载到程序所在的文件夹，下完自动重启到新版本——新版<b>覆盖同一个程序文件</b>，所以桌面快捷方式一直有效，不用每次重建。替换前的旧版会留一份 <code>.bak</code> 备着，新版启动不起来会自动回滚。你的作品文件和数据库都在旁边，不受影响。GitHub 直连不上时会自动换下面的加速镜像重试。</small>
+        <div class="settings-button-row"><button type="button" class="quiet-button" data-action="check-update">检查更新</button><button type="button" class="quiet-button" data-action="open-release-page">打开发布页</button><button type="button" class="quiet-button" data-action="create-shortcut">创建桌面快捷方式</button></div>
         <label class="check-row"><input name="autoCheckUpdate" type="checkbox" ${settings.autoCheckUpdate === false ? "" : "checked"}><span>启动时自动检查新版本</span><small>关掉之后程序不会主动联网查版本，想更新时点上面的「检查更新」。</small></label>
         <details class="settings-fold">
           <summary class="settings-fold-head"><span class="field-title">更新加速镜像</span><span class="settings-group-hint">直连不上时用</span></summary>
@@ -11546,7 +11553,8 @@ async function renameCharacterGame(game, button) {
 
 /* ============================ 软件自动更新（v1.0.0） ============================
  * 便携版没有安装器，所以「更新」就是：问发布页要最新版本号 → 把新 exe 下到程序旁边
- * → 启动它 → 旧版本由新版本在启动时送进回收站。
+ * 落成固定的 `PixivNovelDownloader.exe.new` → 进程退出后由自复制出来的替换器覆盖正式文件
+ * （旧版留 `.bak`，新版起不来自动回滚）。文件名固定，桌面快捷方式一次钉好就长期有效。
  * 版本探测、镜像回退、下载、文件校验全在 Rust 侧，这里只负责把状态摆给用户看。
  */
 
@@ -11690,7 +11698,7 @@ function updateModal() {
     <div class="update-panel">
       <p class="update-versions">当前 <strong>v${escapeHtml(info.currentVersion || APP_VERSION)}</strong> → 最新 <strong>v${escapeHtml(info.latestVersion || "?")}</strong></p>
       <div id="update-notes-holder">${updateNotesSection()}</div>
-      <p class="update-note">升级包会下载到程序所在的文件夹，下载完自动重启到新版本；<strong>旧版本文件在下次启动时移入回收站</strong>（可还原）。你的作品文件和数据库都在旁边，不受影响。</p>
+      <p class="update-note">升级包会下载到程序所在的文件夹，下载完自动重启到新版本；<strong>新版覆盖同一个程序文件，桌面快捷方式不用重建</strong>。旧版会留一份 <code>.bak</code> 备着，新版启动不起来会自动回滚。你的作品文件和数据库都在旁边，不受影响。</p>
       ${asset ? `<p class="update-source">安装包：${escapeHtml(asset.name)}（${humanSize(asset.size)}）<br>下载顺序：直连 GitHub${asset.urls.length > 1 ? ` → ${asset.urls.length - 1} 个加速镜像` : ""}，一个失败自动换下一个<br>版本号探测来源：${escapeHtml(info.source || "未知")}</p>` : ""}
       ${missingAsset ? `<div class="note-warn">这次发布里没有找到可自动下载的安装包，请点下面的「打开发布页」手动下载。</div>` : ""}
       <div class="update-progress ${downloading ? "" : "is-hidden"}" id="update-progress-box">
@@ -11776,16 +11784,42 @@ async function startUpdateDownload() {
   state.updateProgress = null;
 }
 
-/** 更新完启动时会发现上一个版本的 exe 还在旁边，送进回收站并告诉用户一声 */
+/** 更新完启动时会发现升级残留（`.new`/`.part`）和老版本的 exe，清掉并告诉用户一声 */
 async function cleanupOldPortableBuilds() {
   try {
     const result = await invoke("cleanup_old_portable_builds");
     if (result?.removed?.length) {
-      toast(`已把旧版本文件移入回收站：${result.removed.join("、")}`, "success");
+      toast(`已清理升级残留：${result.removed.join("、")}`, "success");
+    }
+    // 还是老的带版本号命名（v1.3.53 及以前）：桌面快捷方式下次更新还会断，提醒一次重钉
+    if (result?.layout === "versioned" && !hasNoticedLayoutChange()) {
+      markLayoutChangeNoticed();
+      toast("这一版起程序改用固定文件名，建议在「设置 → 维护与数据」里点「创建桌面快捷方式」重钉一次，之后升级不会再失效", "info", 8000);
     }
   } catch (error) {
     // 清理失败不影响使用，静默就好
-    console.log("清理旧版本失败:", error);
+    console.log("清理升级残留失败:", error);
+  }
+}
+
+/** 固定文件名这个变化只提示一次，别每次启动都弹 */
+const UPDATE_LAYOUT_NOTICE_KEY = "collection-library.update-layout-notice";
+
+function hasNoticedLayoutChange() {
+  try { return localStorage.getItem(UPDATE_LAYOUT_NOTICE_KEY) === "1"; } catch { return true; }
+}
+
+function markLayoutChangeNoticed() {
+  try { localStorage.setItem(UPDATE_LAYOUT_NOTICE_KEY, "1"); } catch { /* 存不了就每次都提示，无所谓 */ }
+}
+
+/** 桌面快捷方式：固定文件名之后，这条 .lnk 指向的文件永远在原地 */
+async function createDesktopShortcut() {
+  try {
+    const path = await invoke("create_desktop_shortcut");
+    toast(`桌面快捷方式已创建：${path}`, "success");
+  } catch (error) {
+    toast(`创建快捷方式失败：${String(error)}`, "error");
   }
 }
 
@@ -12430,7 +12464,7 @@ async function bootstrap() {
     // 作者库那张「散篇」卡的两个数。纯本地查询，很便宜，不用等。
     refreshStray();
 
-    // 上一版更新完留下的旧 exe，扫一遍送回收站。
+    // 上一次更新可能留下 `.new` / `.part` 残留，扫一遍清掉；程序文件名固定后不再删旧 exe。
     // 等两秒再扫：新版是被旧版拉起来的，旧进程可能还没退干净，那时删不掉。
     window.setTimeout(() => { cleanupOldPortableBuilds(); }, 2000);
     // 有没有新版本：设置里关掉了就完全不发请求

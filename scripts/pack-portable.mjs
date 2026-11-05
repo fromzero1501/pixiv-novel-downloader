@@ -19,6 +19,10 @@ if (!existsSync(src)) {
 }
 
 const baseName = `PixivNovelDownloader-v${version}.exe`;
+// 压缩包**内部**的程序文件名固定（v1.3.54 起）：解压出来永远是同一个名字，
+// 桌面快捷方式指向它一次就长期有效，升级只覆盖文件、不用重钉。
+// 归档的裸 exe 仍然带版本号（Release 多版本共存要好区分，`update_asset_names()` 也靠它选资产）。
+const ZIP_PROGRAM_NAME = "PixivNovelDownloader.exe";
 const destinations = [join(root, "发布", "藏集", "PixivNovelDownloader", baseName)];
 
 for (const dest of destinations) {
@@ -129,9 +133,9 @@ if (process.env.PORTABLE_WITH_ZIP === "1") {
   // 用户解压出来照样是 `Pixiv小说下载管理器/`。
   // 顺带一个好处：这个名字正好在自动更新的候选清单里（`update_asset_names()`）。
   const zipPath = join(root, "发布", "藏集", "PixivNovelDownloader", `PixivNovelDownloader-v${version}.zip`);
-  const count = writeZip(zipPath, [{ name: `${ZIP_FOLDER}/${baseName}`, source: src }]);
+  const count = writeZip(zipPath, [{ name: `${ZIP_FOLDER}/${ZIP_PROGRAM_NAME}`, source: src }]);
   console.log(`[portable] ${zipPath}  (${count} 个文件)`);
-  console.log(`[portable] zip 解压即用：${ZIP_FOLDER}/ 里放 exe，数据落同级 data/。`);
+  console.log(`[portable] zip 解压即用：${ZIP_FOLDER}/${ZIP_PROGRAM_NAME}，数据落同级 data/；升级只覆盖这个文件。`);
 } else {
   console.log("[portable] 本次只出裸 exe（压缩包版只在发布时产）");
 }
