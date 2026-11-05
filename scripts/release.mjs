@@ -17,7 +17,7 @@
 //     （自动更新只认 releases/latest，漏建 Release 就等于更新链路断了，所以真正对外发布时必须带 --publish；忘了会在末尾打出补建命令。）
 //   - 帮助文档不碰。
 import { execFileSync, execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -157,7 +157,11 @@ try {
 log(`\n[release] 完成：v${next}${dryRun ? "（dry-run，什么都没改）" : ""}`);
 if (!dryRun && !withRelease) {
   const dir = "发布/藏集/PixivNovelDownloader";
+  // 平时（不带 --publish）只出裸 exe、不出 zip，提示里就别列一个并不存在的文件
+  const assets = [`${dir}/PixivNovelDownloader-v${next}.zip`, `${dir}/PixivNovelDownloader.exe`].filter(
+    (file) => existsSync(path.join(root, file)),
+  );
   log(`[release] 本次没建 Release（自动更新看不到 v${next}）。要对外发布时执行：`);
   log(`  git tag v${next} && git push origin v${next}`);
-  log(`  gh release create v${next} "${dir}/PixivNovelDownloader-v${next}.zip" "${dir}/PixivNovelDownloader.exe" --title v${next} --notes "${commitMessage}"`);
+  log(`  gh release create v${next} ${assets.map((file) => `"${file}"`).join(" ")} --title v${next} --notes "${commitMessage}"`);
 }
