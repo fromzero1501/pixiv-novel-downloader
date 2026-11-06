@@ -9604,6 +9604,12 @@ fn pixiv_sync_impl(
     }
     let cover_concurrency = if detail_concurrency == 1 { 1 } else { 4 };
     let download_total = downloads.len();
+    // v1.3.55：只有一篇时（「添加散篇」、收藏里点名下这一篇），进度按「篇数」算会在
+    // 详情抓完那一刻就满格 —— 之后下配图、生成阅读版那一两分钟界面毫无反馈，用户
+    // 2026-11-06 报的就是「进度条转满了，然后卡住快 2 分钟」。这种情况把分母换成
+    // 「配图张数 + 2」（抓取占一格、生成占一格），进度条才跟着真的走。
+    // 多篇同步仍按篇数推进（用户要求进度条不变），只把阶段文字写进标题。
+    let single_stage_mode = is_single_sync && download_total == 1;
     for (batch_index, batch) in downloads.chunks(cover_concurrency).enumerate() {
         if pixiv_sync_cancelled(author_id) {
             result.cancelled = true;
@@ -9627,7 +9633,7 @@ fn pixiv_sync_impl(
                 })
                 .collect::<Vec<_>>()
         });
-        for (work, cover) in batch.iter().zip(covers) {
+        for (offset, (work, cover)) in batch.iter().zip(covers).enumerate() {
             if pixiv_sync_cancelled(author_id) {
                 result.cancelled = true;
                 break;
@@ -9655,7 +9661,36 @@ fn pixiv_sync_impl(
                 &image_quality,
             );
             let images_dir = novel_images_dir(&text_path);
-            let (image_saved, _) = download_novel_images(&client, &slots, &images_dir, &mut |_, _| {});
+            // v1.3.55：配图逐张报进度。原来这里传的是空回调，一张都不报 —— 这是
+            // 「进度条满格后卡住」最长的一段（串行下载、几十张就一两分钟）。
+            // 单篇时并进同一条进度条（分母 = 配图张数 + 2），多篇时只换标题文字。
+            let stage_index = batch_index * cover_concurrency + offset;
+            let mut on_image = |done: usize, total: usize| {
+                let (current, total_steps, title) = if single_stage_mode {
+                    (1 + done, total + 2, format!("正在下载配图 {done}/{total}…"))
+                } else {
+                    (
+                        stage_index + 1,
+                        download_total,
+                        format!(
+                            "正在下载配图 {done}/{total}（第 {} / {} 篇）",
+                            stage_index + 1,
+                            download_total
+                        ),
+                    )
+                };
+                let _ = app.emit(
+                    "pixiv-sync-progress",
+                    PixivSyncProgress {
+                        author_id,
+                        total: total_steps,
+                        current,
+                        title,
+                    },
+                );
+            };
+            let (image_saved, _) =
+                download_novel_images(&client, &slots, &images_dir, &mut on_image);
             let text_body = rewrite_novel_txt(&work.content, &slots);
             let text_temp = text_path.with_extension("txt.part");
             let cover_temp = cover_path.with_extension("jpg.part");
@@ -9667,6 +9702,34 @@ fn pixiv_sync_impl(
             // 一张配图都没有的纯文字作品，txt 就是最终形态，别再套一层 html/epub
             //（用户 2026-10-14：「新建作者同步作品时，所有作品都是 epub，没图的 txt 就行了」）。
             // 判据用"真实配图槽位"（`slots`）：标题写着"插画"、正文里其实没图的作品也留 txt。
+            // v1.3.55：「生成阅读版」这一段原先也是静默的（EPUB 还要按档位逐张压图）。
+            // 单篇时推到倒数第二格，多篇时只换标题文字。
+            let stage_total_steps = slots.len() + 2;
+            let stage_title = if slots.is_empty() {
+                "正在写入正文与封面…".to_string()
+            } else if single_stage_mode {
+                format!("正在生成 {} 版…", reading_format.label())
+            } else {
+                format!(
+                    "正在生成 {} 版…（第 {} / {} 篇）",
+                    reading_format.label(),
+                    stage_index + 1,
+                    download_total
+                )
+            };
+            let _ = app.emit(
+                "pixiv-sync-progress",
+                PixivSyncProgress {
+                    author_id,
+                    total: if single_stage_mode { stage_total_steps } else { download_total },
+                    current: if single_stage_mode {
+                        stage_total_steps - 1
+                    } else {
+                        stage_index + 1
+                    },
+                    title: stage_title,
+                },
+            );
             let bound_path = if slots.is_empty() {
                 if write_result.is_err() {
                     let _ = fs::remove_file(&text_temp);
