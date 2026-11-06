@@ -20419,6 +20419,10 @@ struct SharePackageAuthor {
     /// `default` 是给旧包留的：v1.3.19 及更早的包没有这个字段，读的时候不能报错。
     #[serde(default)]
     avatar: String,
+    /// 这位作者是不是「散篇作者」（v1.3.59）：导入面板要把散篇汇总成单独一行。
+    /// 旧包没有这个字段，`default` 兜底成 false —— 按正式作者显示，不会报错。
+    #[serde(default)]
+    stray: bool,
 }
 
 /// 分享包清单里的一篇作品。路径一律是**包内相对路径**。
@@ -20589,6 +20593,16 @@ fn export_works_package_impl(
             series_title, series_order, synopsis, word_count, has_images, image_count, preview_path,
             purchased_path, cover_path, _row_id, avatar_path,
         ) = values;
+        // v1.3.59：清单里带「这位作者是不是散篇」，导入面板据此把散篇汇总成单独一行。
+        // 单独查而不是并进上面的 JOIN —— 老的库可能没有 stray 这一列，查不到就当不是散篇。
+        let author_stray = conn
+            .query_row(
+                "SELECT COALESCE(stray, 0) FROM authors WHERE name=?1 LIMIT 1",
+                [&author_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|flag| flag != 0)
+            .unwrap_or(false);
         let purchased_ok = !purchased_path.trim().is_empty() && Path::new(&purchased_path).is_file();
         let preview_ok = !preview_path.trim().is_empty() && Path::new(&preview_path).is_file();
         let cover_ok = !cover_path.trim().is_empty() && Path::new(&cover_path).is_file();
@@ -20642,6 +20656,7 @@ fn export_works_package_impl(
                 aliases: aliases,
                 homepage: homepage.clone(),
                 avatar: avatar_entry,
+                stray: author_stray,
             });
         }
         manifest.works.push(SharePackageWork {
@@ -20748,6 +20763,38 @@ struct ImportDataResult {
     works_skipped: usize,
     path: String,
     restarted_needed: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportPackageProgress {
+    current: usize,
+    total: usize,
+    title: String,
+}
+
+/// 导入面板要的一份「包里有什么」（v1.3.59）：只读清单、不写库，让用户先勾作者。
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SharePackageAuthorSummary {
+    name: String,
+    works: usize,
+    stray: bool,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SharePackageInspect {
+    /// 已解包（或就地读）的目录 —— 用户选完作者直接用这个目录导入，不再解第二遍
+    root: String,
+    /// 原来是 zip 还是文件夹，只用于界面上的说明
+    source: String,
+    /// true = 解包出来的临时目录，导入完要删；false = 用户自己的文件夹，碰都别碰
+    ephemeral: bool,
+    version: u32,
+    exported_at: String,
+    works: usize,
+    authors: Vec<SharePackageAuthorSummary>,
 }
 
 fn is_zip_file(path: &Path) -> bool {
@@ -20947,6 +20994,9 @@ fn import_works_package_impl(
     extract_root: &Path,
     move_files: bool,
     cleanup: bool,
+    // 只导这些作者（按名字）—— 导入面板勾选的结果；None = 整包都导（老的直接导入入口）
+    only_authors: Option<&[String]>,
+    app: Option<&tauri::AppHandle>,
 ) -> Result<ImportDataResult, String> {
     let settings = read_settings(conn)?;
     if settings.default_preview_dir.trim().is_empty() || settings.default_purchased_dir.trim().is_empty() {
@@ -20992,8 +21042,25 @@ fn import_works_package_impl(
     }
     let mut result = ImportDataResult { kind: "package".to_string(), ..Default::default() };
     let mut author_ids: Vec<(String, i64)> = Vec::new();
+    // 勾选过滤（v1.3.59）：面板只导选中的作者；None = 老入口，整包都导
+    let selected: Option<std::collections::HashSet<String>> = only_authors.map(|names| {
+        names
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect()
+    });
     for author in &manifest.authors {
+        if let Some(set) = &selected {
+            if !set.contains(author.name.trim()) {
+                continue;
+            }
+        }
         let (author_id, created) = upsert_share_author(conn, author)?;
+        // 新建出来的散篇作者要带上「散篇」标记，否则导入后他变成正式作者、散篇页里就找不到他了
+        if created && author.stray {
+            let _ = conn.execute("UPDATE authors SET stray=1 WHERE id=?1", [author_id]);
+        }
         // 头像（v1.3.20）：包里带了就落到本机（本地已经有可用头像的见下面的函数）
         apply_shared_avatar(conn, author_id, author, &root)?;
         if created {
@@ -21003,13 +21070,28 @@ fn import_works_package_impl(
         apply_default_dirs(conn, author_id)?;
         author_ids.push((author.name.trim().to_string(), author_id));
     }
-    for work in &manifest.works {
+    let total_works = manifest.works.len();
+    for (index, work) in manifest.works.iter().enumerate() {
+        // 导入进度（v1.3.59）：原来一次调用什么反馈都没有，几百篇的包看着像卡死
+        if let Some(app) = app {
+            let _ = app.emit(
+                "import-package-progress",
+                ImportPackageProgress {
+                    current: index + 1,
+                    total: total_works,
+                    title: work.title.clone(),
+                },
+            );
+        }
         let Some(author_id) = author_ids
             .iter()
             .find(|(name, _)| name == work.author.trim())
             .map(|(_, id)| *id)
         else {
-            result.works_skipped += 1;
+            // 作者没被选中（或清单里就没这位作者）：这是"没选"，不算"跳过"
+            if selected.is_none() {
+                result.works_skipped += 1;
+            }
             continue;
         };
         let body = root.join(&work.file);
@@ -21116,7 +21198,7 @@ async fn import_data(path: String) -> Result<ImportDataResult, String> {
         let source = given.clone();
         return tauri::async_runtime::spawn_blocking(move || {
             // 就地导入：文件复制到作者目录，源文件留在原地（那个文件夹是用户自己解压的）
-            import_works_package_impl(&db()?, &source, &source, false, false)
+            import_works_package_impl(&db()?, &source, &source, false, false, None, None)
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -21128,7 +21210,7 @@ async fn import_data(path: String) -> Result<ImportDataResult, String> {
         let extract_root =
             app_data_dir()?.join(format!("import-tmp-{}", Local::now().format("%Y%m%d%H%M%S")));
         return tauri::async_runtime::spawn_blocking(move || {
-            import_works_package_impl(&db()?, &given, &extract_root, true, true)
+            import_works_package_impl(&db()?, &given, &extract_root, true, true, None, None)
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -21142,6 +21224,149 @@ async fn import_data(path: String) -> Result<ImportDataResult, String> {
         restarted_needed: true,
         ..Default::default()
     })
+}
+
+/// 分享包解包/定位的公共前半段（v1.3.59 导入面板）：只解一次，返回「读的目录 + 是不是临时目录」。
+fn unpack_share_package(source: &Path) -> Result<(PathBuf, bool), String> {
+    if source.is_dir() {
+        return Ok((source.to_path_buf(), false));
+    }
+    let stamp = Local::now().format("%Y%m%d%H%M%S");
+    let root = app_data_dir()?.join(format!("import-tmp-{stamp}"));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).map_err(|e| format!("准备导入目录失败：{e}"))?;
+    // 解包用系统 tar（和 import_works_package_impl 同一套做法）
+    let status = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(source)
+        .arg("-C")
+        .arg(&root)
+        .status()
+        .map_err(|e| format!("系统里没有解压工具，请手动解压后再导入文件夹：{e}"))?;
+    if !status.success() {
+        let _ = fs::remove_dir_all(&root);
+        return Err("解压分享包失败（文件可能已损坏）".into());
+    }
+    Ok((root, true))
+}
+
+fn read_share_manifest(root: &Path) -> Result<SharePackageManifest, String> {
+    let bytes =
+        fs::read(root.join("作品清单.json")).map_err(|e| format!("这里没有 作品清单.json：{e}"))?;
+    let manifest: SharePackageManifest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("读不懂作品清单.json：{e}"))?;
+    if manifest.kind != "collection-library/share-package" {
+        return Err("这不是作品分享包（清单类型对不上）".into());
+    }
+    Ok(manifest)
+}
+
+/// 顺手清掉上次没删干净的解包目录（v1.3.59）：一个整库包解出来可能几十 GB。
+fn cleanup_stale_import_temp() {
+    let Ok(dir) = app_data_dir() else { return };
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("import-tmp-") {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// 看一眼包里有什么（导入面板用）：解包 + 读清单，**不写库**。
+#[tauri::command]
+async fn inspect_works_package(path: String) -> Result<SharePackageInspect, String> {
+    let given = PathBuf::from(path.trim().to_string());
+    if !given.is_dir() && !given.is_file() {
+        return Err("请选择作品分享包 zip 或已解压的文件夹".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, ephemeral) = unpack_share_package(&given)?;
+        let manifest = match read_share_manifest(&root) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if ephemeral {
+                    let _ = fs::remove_dir_all(&root);
+                }
+                return Err(error);
+            }
+        };
+        let mut counts: Vec<(String, usize, bool)> = manifest
+            .authors
+            .iter()
+            .map(|author| (author.name.trim().to_string(), 0usize, author.stray))
+            .collect();
+        for work in &manifest.works {
+            let name = work.author.trim();
+            match counts.iter_mut().find(|(author, _, _)| author == name) {
+                Some(entry) => entry.1 += 1,
+                None => counts.push((name.to_string(), 1, false)),
+            }
+        }
+        Ok(SharePackageInspect {
+            root: root.to_string_lossy().to_string(),
+            source: given.to_string_lossy().to_string(),
+            ephemeral,
+            version: manifest.version,
+            exported_at: manifest.exported_at.clone(),
+            works: manifest.works.len(),
+            authors: counts
+                .into_iter()
+                .filter(|(_, works, _)| *works > 0)
+                .map(|(name, works, stray)| SharePackageAuthorSummary { name, works, stray })
+                .collect(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 按面板里勾的作者导入（v1.3.59）：`root` 是上一步已经解好的目录，这里不再解第二遍。
+#[tauri::command]
+async fn import_works_package_selected(
+    root: String,
+    authors: Vec<String>,
+    cleanup: bool,
+    app: tauri::AppHandle,
+) -> Result<ImportDataResult, String> {
+    if authors.is_empty() {
+        return Err("没有选中任何作者".into());
+    }
+    let root_path = PathBuf::from(root.trim().to_string());
+    if !root_path.is_dir() {
+        return Err("导入目录已经不存在了，请重新选择分享包".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = import_works_package_impl(
+            &db()?,
+            &root_path,
+            &root_path,
+            cleanup,
+            false,
+            Some(&authors),
+            Some(&app),
+        );
+        if cleanup {
+            let _ = fs::remove_dir_all(&root_path);
+        }
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 面板上点了取消：把刚才为看清单解出来的临时目录删掉（只认 data 目录下的 import-tmp-*）。
+#[tauri::command]
+fn discard_import_root(root: String) -> Result<(), String> {
+    let path = PathBuf::from(root.trim().to_string());
+    let Some(name) = path.file_name().map(|name| name.to_string_lossy().to_string()) else {
+        return Ok(());
+    };
+    let Ok(data_dir) = app_data_dir() else { return Ok(()) };
+    if !name.starts_with("import-tmp-") || path.parent() != Some(data_dir.as_path()) {
+        return Ok(());
+    }
+    let _ = fs::remove_dir_all(&path);
+    Ok(())
 }
 
 #[tauri::command]
@@ -21561,6 +21786,8 @@ pub fn run() {
     if run_update_helper_if_requested(&argv) {
         return;
     }
+    // 上次导入分享包没删干净的解包目录可能有几十 GB，启动时顺手收掉
+    cleanup_stale_import_temp();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
@@ -21706,6 +21933,9 @@ pub fn run() {
             export_backup,
             export_works_package,
             import_data,
+            inspect_works_package,
+            import_works_package_selected,
+            discard_import_root,
             restore_backup,
             // v1.2.7：待补完整版工作台 / 批量补充 / 自动备份
             // v1.2.8：字数后台补算
@@ -26593,7 +26823,7 @@ mod tests {
         )
         .unwrap();
         let imported =
-            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap();
+            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true, None, None).unwrap();
         assert_eq!(imported.kind, "package");
         assert_eq!(imported.authors_created, 1);
         assert_eq!(imported.works_added, 2);
@@ -26671,7 +26901,7 @@ mod tests {
         )
         .unwrap();
         let imported =
-            import_works_package_impl(&dst, &unpacked, &unpacked, false, false).unwrap();
+            import_works_package_impl(&dst, &unpacked, &unpacked, false, false, None, None).unwrap();
         assert_eq!(imported.works_added, 1);
         let folder = author_folder_name("文件夹作者", "");
         let landed = dst_full.join(&folder).join("某篇.txt");
@@ -26708,12 +26938,93 @@ mod tests {
         )
         .unwrap();
         let error =
-            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap_err();
+            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true, None, None).unwrap_err();
         assert!(error.contains("默认"), "{}", error);
         let count: i64 = dst
             .query_row("SELECT COUNT(*) FROM works", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "校验没过就不该动任何数据");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_share_package_only_selected_authors() {
+        // 导入面板（v1.3.59）：用户在面板里只勾了一位作者，包里另一位就不该被建出来
+        let root = std::env::temp_dir().join(format!("share-pkg-pick-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src_full = root.join("src/已购");
+        fs::create_dir_all(&src_full).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute("INSERT INTO authors (id, name) VALUES (1, '甲'), (2, '乙')", [])
+            .unwrap();
+        for (id, author_id, title) in [(1, 1, "甲的一篇"), (2, 2, "乙的一篇")] {
+            let book = src_full.join(format!("{title}.txt"));
+            fs::write(&book, "一二三四五").unwrap();
+            conn.execute(
+                "INSERT INTO works (id, author_id, title, pixiv_novel_id) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, author_id, title, format!("{id}00")],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE works SET purchased_path=?1 WHERE id=?2",
+                rusqlite::params![book.to_string_lossy(), id],
+            )
+            .unwrap();
+        }
+        let zip_path = root.join("分享包.zip");
+        export_works_package_impl(&conn, &[], &[1, 2], &zip_path, None).unwrap();
+
+        let dst = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&dst);
+        dst.execute_batch(
+            "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');",
+        )
+        .unwrap();
+        let dst_full = root.join("dst/已购");
+        let dst_preview = root.join("dst/预览");
+        fs::create_dir_all(&dst_full).unwrap();
+        fs::create_dir_all(&dst_preview).unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_purchased_dir', ?1)",
+            [dst_full.to_string_lossy()],
+        )
+        .unwrap();
+        dst.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_preview_dir', ?1)",
+            [dst_preview.to_string_lossy()],
+        )
+        .unwrap();
+
+        let only = vec!["甲".to_string()];
+        let imported = import_works_package_impl(
+            &dst,
+            &zip_path,
+            &root.join("extract"),
+            true,
+            true,
+            Some(&only),
+            None,
+        )
+        .unwrap();
+        assert_eq!(imported.authors_created, 1, "只该建出「甲」");
+        assert_eq!(imported.works_added, 1, "只该导甲那一篇");
+        let titles: Vec<String> = dst
+            .prepare("SELECT title FROM works ORDER BY title")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(titles, vec!["甲的一篇".to_string()]);
+        let names: Vec<String> = dst
+            .prepare("SELECT name FROM authors ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert!(!names.contains(&"乙".to_string()), "没勾的作者不该被建出来：{names:?}");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -26785,7 +27096,7 @@ mod tests {
         .unwrap();
 
         let imported =
-            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap();
+            import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true, None, None).unwrap();
         assert_eq!(imported.authors_created, 0, "同一位作者不该重复建");
         assert_eq!(imported.works_added, 0);
         assert_eq!(imported.works_upgraded, 1, "本地只有预览版的那篇应被完整版顶替");
@@ -26880,7 +27191,7 @@ mod tests {
             )
             .unwrap();
         }
-        import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true).unwrap();
+        import_works_package_impl(&dst, &zip_path, &root.join("extract"), true, true, None, None).unwrap();
         let (avatar_path, managed): (String, i64) = dst
             .query_row(
                 "SELECT avatar_path, avatar_managed FROM authors WHERE name='带头像的作者'",

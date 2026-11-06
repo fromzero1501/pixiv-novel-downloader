@@ -699,6 +699,27 @@ async function invoke(command, args = {}) {
     const isLibrary = /\.db$/i.test(given);
     return { kind: isLibrary ? "library" : "package", authorsCreated: 1, worksAdded: 2, worksUpgraded: 1, worksSkipped: 1, path: given, restartedNeeded: isLibrary };
   }
+  // 导入分享包先看清单再挑作者（v1.3.59）：预览里给一份两作者 + 一行散篇，够验面板与计数
+  if (command === "inspect_works_package") {
+    const given = String(args.path || "");
+    return {
+      root: `D:\\预览\\import-tmp-${given.replace(/[\\/]/g, "-")}`,
+      source: given,
+      ephemeral: true,
+      version: 2,
+      exportedAt: "2026-11-07 01:00:00",
+      works: 6,
+      authors: [
+        { name: "预览作者甲", works: 3, stray: false },
+        { name: "预览作者乙", works: 2, stray: false },
+        { name: "散篇", works: 1, stray: true },
+      ],
+    };
+  }
+  if (command === "import_works_package_selected") {
+    const picked = (args.authors || []).length;
+    return { kind: "package", authorsCreated: picked, worksAdded: picked * 2, worksUpgraded: 0, worksSkipped: 0, path: String(args.root || ""), restartedNeeded: false };
+  }
   // 系列序号故意留一个空号（1、3，缺 2），好让「缺篇检测」在预览里也验得到。
   // v1.2.96：系列改成**内存可变**（新建 / 重命名 / 删除要能在预览里看得出效果）
   if (command === "list_series") return previewSeries.map((item) => ({ ...item }));
@@ -3891,7 +3912,7 @@ function renderWorks() {
   return renderShell(`
     <section class="topbar work-topbar">
       <div class="crumb-heading"><button class="back-button" title="${state.bulkMode ? "退出批量操作" : (state.authorReturnTo === "allWorks" ? "返回所有作品" : "返回作者库")}" data-action="${state.bulkMode ? "bulk-mode" : (state.authorReturnTo === "allWorks" ? "back-to-all-works" : "go-home")}">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库${author.homepage ? `<button class="homepage-link" title="打开作者主页：${escapeHtml(author.homepage)}" data-action="open-external-url" data-url="${escapeHtml(author.homepage)}">${icon("link", 13)}<span>作者主页</span></button>` : ""}</p><h1>${escapeHtml(author.name)}</h1></div></div>
-      <div class="topbar-actions">${state.bulkMode ? `<strong class="bulk-count">已选 ${state.selectedWorkIds.size} 篇</strong>` : `<button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button><button class="icon-text-button" data-action="edit-author" data-author-id="${author.id}">${icon("settings", 18)}<span>作者设置</span></button><button class="icon-text-button" data-action="import-works">${icon("plus", 18)}<span>导入作品</span></button><button class="primary-button" data-action="sync-pixiv">${icon("sync", 18)}<span>作品同步</span></button>`}</div>
+      <div class="topbar-actions">${state.bulkMode ? `<strong class="bulk-count">已选 ${state.selectedWorkIds.size} 篇</strong>` : `<button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button><button class="icon-text-button" data-action="edit-author" data-author-id="${author.id}">${icon("settings", 18)}<span>作者设置</span></button><button class="icon-text-button" data-action="export-author-package" title="把这位作者名下的全部作品打成一个 zip（含正文与封面，不含收藏 / 评分 / 笔记这些私人记录）">${icon("download", 18)}<span>导出分享包</span></button><button class="icon-text-button" data-action="import-works">${icon("plus", 18)}<span>导入作品</span></button><button class="primary-button" data-action="sync-pixiv">${icon("sync", 18)}<span>作品同步</span></button>`}</div>
     </section>
     ${state.bulkMode ? bulkBar(works) : ""}
     <section class="library-content">
@@ -7655,6 +7676,7 @@ async function bindEvents() {
       if (action === "author-select-all") toggleSelectAllAuthors();
       if (action === "toggle-author-select") toggleAuthorSelection(Number(authorId));
       if (action === "export-share-package") await exportSharePackage();
+      if (action === "export-author-package") await exportAuthorSharePackage();
       if (action === "import-data-pick") await pickImportDataFile();
       if (action === "copy-selected-full") await copySelectedToFull();
       if (action === "set-images-selected") await setSelectedHasImages();
@@ -7741,6 +7763,20 @@ async function bindEvents() {
         }
       }
       if (action === "import-confirm") confirmImportPreview();
+      if (action === "share-import-toggle-all") {
+        document.querySelectorAll("[data-share-pick]").forEach((box) => { box.checked = element.dataset.checked === "true"; });
+        syncShareImportCount();
+      }
+      if (action === "share-import-confirm") await confirmShareImport();
+      if (action === "share-import-cancel") {
+        // 取消就把刚才为看清单解出来的临时目录删掉（整库包可能有几十 GB）
+        const inspected = state.pendingShareImport;
+        state.pendingShareImport = null;
+        closeModal();
+        if (inspected?.ephemeral && inspected.root) {
+          invoke("discard_import_root", { root: inspected.root }).catch(() => {});
+        }
+      }
       if (action === "settings") await settingsModal();
       if (action === "open-update") openUpdateModal();
       // 左下角版本号 = 检查更新（v1.2.38）。**只是检查**：查到新版后由 openUpdateModal()
@@ -8564,6 +8600,35 @@ async function exportSharePackage() {
 }
 
 /**
+ * 作者作品库顶栏的「导出分享包」（v1.3.59 用户要求）：不用先勾选，直接导这位作者的全部作品。
+ *
+ * 后端 `author_ids` 那条通道本来就是「按作者展开成他名下所有作品」，所以这里只是把
+ * 「先勾作者再导」简化成「站在这页直接导」。
+ * 三处必须在文案里说清：导的是**全部**作品、和当前筛选无关、没绑定文件的会被跳过。
+ */
+async function exportAuthorSharePackage() {
+  const author = state.activeAuthor;
+  if (!author) return;
+  if (state.syncTask) {
+    toast("有任务正在进行，请等它结束或先终止", "info");
+    return;
+  }
+  const total = Number(author.workCount) || 0;
+  if (!total) {
+    toast("这位作者名下还没有作品", "info");
+    return;
+  }
+  confirmAction(
+    "确认导出分享包",
+    `将导出「${author.name}」名下的全部 ${total} 篇作品 —— 是这个作者的全部作品，和这页当前的搜索、筛选、排序、系列折叠都没有关系。`
+      + `打包成一个 zip 存到软件所在的文件夹（同名自动加序号），完成后自动打开那个目录；没有绑定文件的篇目会被跳过，结果里会报篇数。`
+      + `分享包只带正文和封面，不带收藏、评分、笔记这些私人记录。`,
+    "导出",
+    () => runExportSharePackage([], [author.id]),
+  );
+}
+
+/**
  * 真正干活的那半（确认之后才到这儿）。
  * 进来时两份 id 列表已经定死 —— 确认框开着的时候列表被遮住翻不了，
  * 不会出现「确认的和实际导出的是两批」。
@@ -8630,7 +8695,7 @@ async function listenExportPackageProgress(handler) {
  */
 async function runImportData(path) {
   if (!path) return;
-  // 整库备份是「覆盖」：先让用户点头再动手。分享包是合并，不用问。
+  // 整库备份是「覆盖」：先让用户点头再动手。分享包是合并，但要先挑作者（v1.3.59）。
   if (/\.db$/i.test(path)) {
     confirmAction(
       "确认导入整库备份",
@@ -8640,7 +8705,7 @@ async function runImportData(path) {
     );
     return;
   }
-  await doImportData(path);
+  await openShareImportPicker(path);
 }
 
 async function doImportData(path) {
@@ -8661,12 +8726,150 @@ async function doImportData(path) {
   await refreshAuthors();
   await refreshWorks().catch(() => {});
   render();
+  toast(`导入完成：${importResultText(result)}`, "success");
+}
+
+/** 散篇在导入面板里汇总成一行：勾这一行 = 勾上包里所有散篇作者。 */
+const SHARE_STRAY_KEY = "__stray__";
+
+/** 把导入结果翻成一句话（分享包与整库备份共用）。 */
+function importResultText(result) {
   const parts = [];
   if (result.authorsCreated) parts.push(`新增作者 ${result.authorsCreated} 位`);
   if (result.worksAdded) parts.push(`新增作品 ${result.worksAdded} 篇`);
   if (result.worksUpgraded) parts.push(`升级为完整版 ${result.worksUpgraded} 篇`);
   if (result.worksSkipped) parts.push(`跳过 ${result.worksSkipped} 篇`);
-  toast(parts.length ? `导入完成：${parts.join("，")}` : "导入完成：包里没有需要新增的作品", "success");
+  return parts.length ? parts.join("，") : "包里没有需要新增的作品";
+}
+
+/**
+ * 导入分享包第一步（v1.3.59）：先把包解开读清单，让用户挑作者 —— 这一步**不写库**。
+ * 解包目录随 inspect 一起返回，选完直接拿它导入，不会为了导一遍再解一遍。
+ */
+async function openShareImportPicker(path) {
+  let inspected;
+  try {
+    inspected = await invoke("inspect_works_package", { path });
+  } catch (error) {
+    toast(`读不了这个分享包：${error}`, "error");
+    return;
+  }
+  if (!inspected?.authors?.length) {
+    toast("这个包里没有任何作品，没什么可导入的", "info");
+    return;
+  }
+  state.pendingShareImport = inspected;
+  shareImportModal(inspected);
+}
+
+/** 作者选择面板：一行一位作者，散篇汇总成单独一行，默认全选。 */
+function shareImportModal(inspected) {
+  const strayAuthors = inspected.authors.filter((item) => item.stray);
+  const strayWorks = strayAuthors.reduce((sum, item) => sum + item.works, 0);
+  const rows = inspected.authors
+    .filter((item) => !item.stray)
+    .map((item) => `<label class="import-row"><input type="checkbox" data-share-pick data-share-key="${escapeHtml(item.name)}" data-share-works="${item.works}" checked><span class="import-row-main"><strong>${escapeHtml(item.name)}</strong></span><span class="import-faint">${item.works} 篇</span></label>`)
+    .join("");
+  // 散篇的作者名可能一堆（有的没有正式名字），逐个列会把面板撑爆 —— 汇总成一行，勾它就是全勾
+  const strayRow = strayAuthors.length
+    ? `<label class="import-row"><input type="checkbox" data-share-pick data-share-key="${SHARE_STRAY_KEY}" data-share-works="${strayWorks}" checked><span class="import-row-main"><strong>散篇</strong></span><span class="import-faint">${strayAuthors.length} 位作者 · ${strayWorks} 篇</span></label>`
+    : "";
+  const sourceName = String(inspected.source || "").split(/[\\/]/).pop() || "";
+  const summary = `包里共 <strong>${inspected.works}</strong> 篇作品、<strong>${inspected.authors.length}</strong> 位作者。只有勾上的作者才会导入；本地已有的作品会跳过或升级成完整版，不会重复。`;
+  showModal(modal(
+    "导入分享包",
+    `<p class="import-folder">${icon("folder", 15)}<span>${escapeHtml(sourceName)}</span></p><p class="import-summary">${summary}</p><div class="import-rows" id="share-import-rows">${strayRow}${rows}</div>`,
+    `<button class="quiet-button" data-action="share-import-cancel">取消</button><span class="footer-spacer"></span><button class="quiet-button" data-action="share-import-toggle-all" data-checked="true">全选</button><button class="quiet-button" data-action="share-import-toggle-all" data-checked="false">全不选</button><button class="primary-button" data-action="share-import-confirm">导入选中项</button>`,
+    "is-wide",
+  ));
+  document.querySelector("#share-import-rows")?.addEventListener("change", syncShareImportCount);
+  syncShareImportCount();
+}
+
+/** 面板底部的「导入选中项（N 篇）」跟着勾选实时变 —— 全不选时禁用。 */
+function syncShareImportCount() {
+  let picked = 0;
+  document.querySelectorAll("[data-share-pick]:checked").forEach((box) => {
+    picked += Number(box.dataset.shareWorks) || 0;
+  });
+  const confirmButton = document.querySelector('[data-action="share-import-confirm"]');
+  if (!confirmButton) return;
+  confirmButton.textContent = picked ? `导入选中项（${picked} 篇）` : "导入选中项";
+  confirmButton.disabled = !picked;
+}
+
+/** 面板里点「导入选中项」：把勾到的作者名收集起来交后端（散篇那行展开成多个名字）。 */
+async function confirmShareImport() {
+  const inspected = state.pendingShareImport;
+  if (!inspected) return;
+  const authors = [];
+  document.querySelectorAll("[data-share-pick]").forEach((box) => {
+    if (!box.checked) return;
+    const key = box.dataset.shareKey;
+    if (key === SHARE_STRAY_KEY) {
+      inspected.authors.filter((item) => item.stray).forEach((item) => authors.push(item.name));
+    } else if (key) {
+      authors.push(key);
+    }
+  });
+  if (!authors.length) {
+    toast("一位作者都没勾", "info");
+    return;
+  }
+  closeModal();
+  state.pendingShareImport = null;
+  await runShareImport(inspected, authors);
+}
+
+/** 真正导入：走 inspect 解好的那个目录，勾完不再解第二遍。 */
+async function runShareImport(inspected, authors) {
+  state.syncTask = {
+    kind: "import",
+    label: "正在导入分享包",
+    title: "正在准备…",
+    current: 0,
+    total: 0,
+    cancelAction: "hide-share-progress",
+    cancelText: "隐藏进度",
+  };
+  render();
+  const unlisten = await listenImportPackageProgress((event) => {
+    const { total = 0, current = 0, title = "" } = event.payload || {};
+    if (!state.syncTask) return;
+    state.syncTask.total = total;
+    state.syncTask.current = current;
+    state.syncTask.title = title;
+    updateSyncFloater();
+  });
+  let result;
+  try {
+    result = await invoke("import_works_package_selected", {
+      root: inspected.root,
+      authors,
+      cleanup: Boolean(inspected.ephemeral),
+    });
+  } catch (error) {
+    unlisten();
+    state.syncTask = null;
+    render();
+    toast(`导入失败：${error}`, "error");
+    return;
+  }
+  unlisten();
+  state.syncTask = null;
+  await refreshAuthors();
+  await refreshWorks().catch(() => {});
+  render();
+  toast(`导入完成：${importResultText(result)}`, "success");
+}
+
+/** 订阅导入进度；浏览器预览没有事件系统，退化成「没有进度」。 */
+async function listenImportPackageProgress(handler) {
+  try {
+    return await listen("import-package-progress", handler);
+  } catch {
+    return () => {};
+  }
 }
 
 /** 导入区点一下：选作品的分享包 .zip。
