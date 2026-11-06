@@ -5,7 +5,7 @@ use reqwest::blocking::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -5700,6 +5700,33 @@ fn plan_novel_images(
 ///
 /// `on_progress(done, total)` 每处理完一张（含本来就存在的）回调一次 —— 单篇生成阅读版
 /// 拿它更新右下角进度浮层；同步等不需要细进度的调用点传空闭包即可（v1.3.6）。
+/// 配图并发路数。Pixiv 配图走 i.pximg.net（CDN），4 路并发相当于浏览器开 4 个标签页，
+/// 不在详情 API 的限流敏感区；再往上收益递减 —— 单张 100–500 KB，瓶颈通常是首包延迟与带宽。
+const NOVEL_IMAGE_CONCURRENCY: usize = 4;
+
+/// 取一张配图并落盘；文件已存在直接算成功（重新生成阅读版时就靠这一步秒过）。
+/// 抽成独立函数才好在 worker 线程里跑 —— 原先这段逻辑直接写在下发循环内部。
+fn store_novel_image(client: &Client, slot: &NovelImageSlot, images_dir: &Path) -> bool {
+    let target = images_dir.join(&slot.file_name);
+    if target.exists() {
+        return true;
+    }
+    let Ok(bytes) = fetch_pixiv_cover(client, &slot.url) else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return false;
+    }
+    let temp = target.with_extension("part");
+    let written = fs::write(&temp, &bytes)
+        .and_then(|_| fs::rename(&temp, &target))
+        .is_ok();
+    if !written {
+        let _ = fs::remove_file(&temp);
+    }
+    written
+}
+
 fn download_novel_images(
     client: &Client,
     slots: &[NovelImageSlot],
@@ -5712,33 +5739,46 @@ fn download_novel_images(
     if fs::create_dir_all(images_dir).is_err() {
         return (0, slots.len());
     }
-    let mut saved = 0;
-    let mut failed = 0;
     let total = slots.len();
-    for (index, slot) in slots.iter().enumerate() {
-        let target = images_dir.join(&slot.file_name);
-        if target.exists() {
-            saved += 1;
-            on_progress(index + 1, total);
-            continue;
-        }
-        match fetch_pixiv_cover(client, &slot.url) {
-            Ok(bytes) if !bytes.is_empty() => {
-                let temp = target.with_extension("part");
-                let written = fs::write(&temp, &bytes)
-                    .and_then(|_| fs::rename(&temp, &target))
-                    .is_ok();
-                if written {
-                    saved += 1;
-                } else {
-                    let _ = fs::remove_file(&temp);
-                    failed += 1;
+    // v1.3.56：改并发。原先是纯 for 循环一张一张取 —— 几十张配图就要一分多钟，
+    // 单篇散篇「进度条满了还在等」主要就等在这里。做法：原子游标分发任务、单向通道
+    // 回传结果，主线程收一条回调一次。这样进度仍严格单调递增，且 `FnMut` 不必跨线程共享。
+    let workers = NOVEL_IMAGE_CONCURRENCY.min(total).max(1);
+    let cursor = AtomicUsize::new(0);
+    let (sender, receiver) = std::sync::mpsc::channel::<bool>();
+    let mut saved = 0usize;
+    let mut failed = 0usize;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let client = client.clone();
+            let cursor = &cursor;
+            let images_dir = images_dir.to_path_buf();
+            scope.spawn(move || loop {
+                let index = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(slot) = slots.get(index) else { break };
+                let ok = store_novel_image(&client, slot, &images_dir);
+                // 主线程已经不收了（提前退出）就别再干下去
+                if sender.send(ok).is_err() {
+                    break;
                 }
-            }
-            _ => failed += 1,
+            });
         }
-        on_progress(index + 1, total);
-    }
+        // 主线程手里这份发送端必须丢掉：否则接收端永远等不到「全部发送端已关闭」，
+        // 一旦某个 worker 提前 break 就会卡在 recv 上。
+        drop(sender);
+        let mut done = 0usize;
+        while done < total {
+            let Ok(ok) = receiver.recv() else { break };
+            done += 1;
+            if ok {
+                saved += 1;
+            } else {
+                failed += 1;
+            }
+            on_progress(done, total);
+        }
+    });
     (saved, failed)
 }
 
@@ -24760,6 +24800,77 @@ mod tests {
         // 80 个字符 + 一个省略号，别把整页 reqwest 内部信息塞进浮层
         assert_eq!(reasons[0].chars().count(), 81);
         assert!(reasons[0].ends_with('…'));
+    }
+
+    /// 配图下载应当是并发的 —— 这正是散篇「进度条满了还在等」的耗时来源。
+    /// 8 张图、服务端每张拖 200 ms：串行至少 1.6 s，4 路并发约 0.4–0.8 s，判据取 1.2 s。
+    /// 顺带钉住 worker 池最容易踩的两点：进度严格递增不丢计数、总数正确。
+    #[test]
+    fn novel_images_download_concurrently() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        const COUNT: usize = 8;
+        const DELAY_MS: u64 = 200;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let port = listener.local_addr().expect("取端口").port();
+        // 每个连接单独起线程处理 —— 若在同一线程里 sleep，服务端自己就串行了，
+        // 客户端再怎么并发也只能等到 8×200 ms，测不出东西来。
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(COUNT) {
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut head = [0u8; 1024];
+                    let _ = stream.read(&mut head);
+                    std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Type: image/png\r\nConnection: close\r\n\r\nIMG",
+                    );
+                    let _ = stream.flush();
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("novel-image-concurrency-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+
+        let slots: Vec<super::NovelImageSlot> = (0..COUNT)
+            .map(|index| super::NovelImageSlot {
+                token: format!("token-{index}"),
+                order: index,
+                file_name: format!("{index:03}.png"),
+                relative: format!("{index:03}.png"),
+                url: format!("http://127.0.0.1:{port}/{index:03}.png"),
+                external: false,
+            })
+            .collect();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("建 client");
+
+        let mut seen: Vec<usize> = Vec::new();
+        let started = std::time::Instant::now();
+        let (saved, failed) =
+            super::download_novel_images(&client, &slots, &dir, &mut |done, total| {
+                assert_eq!(total, COUNT, "总数不该变");
+                seen.push(done);
+            });
+        let elapsed = started.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!((saved, failed), (COUNT, 0), "8 张图都该成功");
+        assert_eq!(
+            seen,
+            (1..=COUNT).collect::<Vec<_>>(),
+            "进度必须严格递增且一张不漏"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "8 张 200 ms 的图用了 {elapsed:?}，说明没并发"
+        );
     }
 
     #[test]
