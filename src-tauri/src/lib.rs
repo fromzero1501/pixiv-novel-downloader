@@ -7072,10 +7072,15 @@ fn spawn_auto_convert_for_work(app: &AppHandle, conn: &Connection, work_id: i64)
                 rusqlite::params![summary.output_path, work_id],
             );
             refresh_reading_image_count(&conn, work_id);
+            // 转出来的 epub 里若真有插图，顺手补上「带图版」标记 —— 否则卡片上只有
+            // 图片角标、没有带图版的筛选归属，用户还得自己去点一次「设为带图版」。
+            // 只单向补标（原本没图就不动），口径与下载阅读版那边一致。
+            mark_has_images_if_illustrated(&conn, work_id, Path::new(&summary.output_path));
         }
         let _ = app.emit(
             EPUB_CONVERT_DONE_EVENT,
             EpubConvertDone {
+                work_id,
                 title: title.clone(),
                 output_path: summary.output_path.clone(),
             },
@@ -8194,6 +8199,7 @@ const EPUB_CONVERT_DONE_EVENT: &str = "epub-convert-done";
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct EpubConvertDone {
+    work_id: i64,
     title: String,
     output_path: String,
 }
@@ -8302,6 +8308,7 @@ fn convert_work_to_epub_impl(work_id: i64) -> Result<EpubConvertSummary, String>
     )
     .map_err(|error| error.to_string())?;
     let _ = refresh_reading_image_count(&conn, work_id);
+    mark_has_images_if_illustrated(&conn, work_id, Path::new(&summary.output_path));
     Ok(summary)
 }
 

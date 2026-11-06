@@ -4556,11 +4556,31 @@ function installAutoEpubCompressWatch() {
     if (fresh) render();
     else updateSyncFloater();
   }).catch(() => {});
-  // 自动转换（v1.3.53）：绑进库的 PDF / Word 转好之后后端会发这一条，只提示一句。
-  listen("epub-convert-done", (event) => {
+  // 自动转换（v1.3.53）：绑进库的 PDF / Word 转好之后后端会发这一条。
+  //
+  // 光弹提示不够（v1.3.58）：后端此时已经把 purchased_path 换成新 epub、字数标成 -1，
+  // 但页面上的数据还是旧的 —— 详情里「完整版」仍指着 docx，非得点「阅读」碰巧触发
+  // 重新拉数据才刷过来。所以这里跟手动【转换为 EPUB】一样补一次刷新：详情正开着
+  // 这篇就原地重画（不关弹窗），没开着就只更新列表与卡片。
+  listen("epub-convert-done", async (event) => {
     const payload = event?.payload || {};
     if (!payload.title) return;
     toast(`《${payload.title}》已自动转成 EPUB`, "success");
+    const workId = Number(payload.workId) || 0;
+    try {
+      const detailOpen =
+        workId > 0 &&
+        Number(state.workDetailId) === workId &&
+        document.querySelector("#work-detail-body");
+      if (detailOpen) {
+        await refreshAfterDetailChange();
+      } else {
+        await refreshVisibleList();
+        render();
+      }
+    } catch (error) {
+      console.log("EPUB 转换后刷新跳过:", error);
+    }
   }).catch(() => {});
 }
 
