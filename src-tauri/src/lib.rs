@@ -491,6 +491,17 @@ struct PixivSyncResult {
     /// 「只盘点」（v1.3.15 两段式批量同步的第一段）核对出的新作品清单。
     /// 只有 `scan_only` 调用会带值；普通同步恒为空数组。
     candidates: Vec<String>,
+    /// 上面清单里每篇的标题。批量同步浮层靠它显示「正在抓取：<作品名>」。
+    /// 标题来自列表接口（本来就取回来了，只是以前丢掉），所以不多发一次请求。
+    candidate_titles: Vec<PixivCandidateTitle>,
+}
+
+/// 盘点阶段带回的「作品 id + 标题」，与 `candidates` 一一对应。
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct PixivCandidateTitle {
+    id: String,
+    title: String,
 }
 
 /// 「同步前作者状态探测」的结果。
@@ -5319,6 +5330,9 @@ const PIXIV_LIST_IDS_LIMIT: usize = 100;
 /// 不在这个结构里）和「投稿时间在不在日期范围内」。标题、标签、系列详情接口
 /// 都会带回来，在这里再解一遍等于养两份会走岔的实现。
 struct PixivNovelListMeta {
+    /// 列表接口本来就返回标题 —— 以前没接，导致批量同步浮层只能显示作者名。
+    /// 这里存下来，盘点阶段就能把「正在抓取：<作品名>」带给前端，不额外发请求。
+    title: String,
     /// 列表接口的 description 直接就是简介，补简介时可以免掉一次详情请求
     description: String,
     /// Pixiv 的 createDate（**不是 uploadDate**），喂给 `is_within_date_range`
@@ -5331,6 +5345,7 @@ struct PixivNovelListMeta {
 impl PixivNovelListMeta {
     fn from_list_item(item: &Value) -> Self {
         Self {
+            title: json_string(item, "title"),
             description: json_string(item, "description"),
             published_at: json_string(item, "createDate"),
             text_count: item.get("textCount").and_then(Value::as_i64).unwrap_or(-1),
@@ -9086,6 +9101,7 @@ fn pixiv_sync_impl(
         failed_reasons: Vec::new(),
         throttled: false,
         candidates: Vec::new(),
+        candidate_titles: Vec::new(),
     };
     let mut candidates: Vec<String> = Vec::new();
     if let Some(provided) = candidates_override {
@@ -9250,6 +9266,10 @@ fn pixiv_sync_impl(
                 result.skipped_date_count += 1;
                 continue;
             }
+            result.candidate_titles.push(PixivCandidateTitle {
+                id: novel_id.clone(),
+                title: meta.title.clone(),
+            });
             candidates.push(novel_id);
         }
     }
