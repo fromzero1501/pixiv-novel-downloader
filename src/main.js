@@ -266,6 +266,12 @@ const state = {
   ratingFilter: [],
   /** 字数多选（v1.2.40）：空数组 = 不限。档位是互斥区间，多选就是并集 */
   wordsFilter: [],
+  /**
+   * 图片张数多选（v1.3.60）：空数组 = 不限。
+   * 跟「配图」那一行不是一回事 —— 那行看 `hasImages` 这个手动开关，这行看实际张数 `imageCount`。
+   * 档位之间重叠（15 张也满足「5 张以上」），多选＝命中任意一档。
+   */
+  imageCountFilter: [],
   collectionFilter: 0,
   filterPanelOpen: false,
   /** 「待补完整版」工作台：全量缺口（含作者名，前端按作者归并） / 当前按处理状态筛的档 */
@@ -1948,6 +1954,7 @@ function resetWorksListFilters() {
   state.readFilter = [];
   state.ratingFilter = [];
   state.wordsFilter = [];
+  state.imageCountFilter = [];
   state.collectionFilter = 0;
   state.filterPanelOpen = false;
 }
@@ -3062,6 +3069,19 @@ function wordsMatchRange(value, words) {
 }
 
 /**
+ * 图片张数档位匹配（v1.3.60）。和字数不同：张数 0 是**真值**（纯文字作品），
+ * 属于最小的「5 张以下」，不像字数 0 那样被判成「算不出来」而全档不收。
+ */
+function imageCountMatch(value, count) {
+  if (value === "lt5") return count < 5;
+  if (value === "gte5") return count >= 5;
+  if (value === "gte15") return count >= 15;
+  if (value === "gte25") return count >= 25;
+  if (value === "gte35") return count >= 35;
+  return true;
+}
+
+/**
  * 可多选的档位行（v1.2.40）。和单选的 `filterPanelRow` 只差两件事：
  * 「不限」那一档改成「一个都没选」时点亮；点任意档位＝加入 / 移出，不清别人。
  */
@@ -3107,6 +3127,14 @@ function searchPlaceholder() {
 const RATING_FILTERS = [["all", "不限"], ["none", "未评分"], ["1", "1 星"], ["2", "2 星"], ["3", "3 星"], ["4", "4 星"], ["5", "5 星"]];
 const WORDS_FILTERS = [["all", "不限"], ["lt5k", "5 千字以下"], ["5k-2w", "5 千 ~ 2 万字"], ["2w-8w", "2 万 ~ 8 万字"], ["gte8w", "8 万字以上"]];
 /**
+ * 图片张数档位（v1.3.60）。
+ *
+ * 「5 张以下」与「5 张以上」按**互补**切开：5 张本身只算「5 张以上」。
+ * 用户提的是「5以下 / 5以上」，若按字面理解（≤5 与 ≥5）会让 5 同时落进两档，
+ * 单选时看着像漏、多选时又说不清，所以这里取 <5 与 ≥5，正好铺满不留缝。
+ */
+const IMAGE_COUNT_FILTERS = [["all", "不限"], ["lt5", "5 张以下"], ["gte5", "5 张以上"], ["gte15", "15 张以上"], ["gte25", "25 张以上"], ["gte35", "35 张以上"]];
+/**
  * 版本状态与配图档位（v1.2.13 进面板）。
  * 版本这份**工具栏那排按钮读的是同一份** —— 一处定义、两处显示，加档位只改这里。
  */
@@ -3124,6 +3152,7 @@ function activeFilterCount() {
     state.imagesFilter !== "all",
     state.ratingFilter.length > 0,
     state.wordsFilter.length > 0,
+    state.imageCountFilter.length > 0,
     state.collectionFilter !== 0,
   ].filter(Boolean).length;
 }
@@ -3157,6 +3186,7 @@ function filterPanel() {
     ${filterPanelRowMulti("阅读状态", READ_FILTERS, state.readFilter, "read-filter", "data-read-filter")}
     ${filterPanelRow("版本", STATUS_FILTERS, state.status, "status", "data-status")}
     ${filterPanelRow("配图", IMAGES_FILTERS, state.imagesFilter, "images-filter", "data-images-filter")}
+    ${filterPanelRowMulti("图片数", IMAGE_COUNT_FILTERS, state.imageCountFilter, "image-count-filter", "data-image-count-filter")}
     ${filterPanelRowMulti("评分", RATING_FILTERS, state.ratingFilter, "rating-filter", "data-rating-filter")}
     ${filterPanelRowMulti("字数", WORDS_FILTERS, state.wordsFilter, "words-filter", "data-words-filter")}
     ${filterPanelRow("收藏夹", collections, state.collectionFilter, "collection-filter", "data-collection-filter")}
@@ -3192,6 +3222,7 @@ const FILTER_VIEW_FIELDS = [
   ["readFilter", []],
   ["ratingFilter", []],
   ["wordsFilter", []],
+  ["imageCountFilter", []],
   ["collectionFilter", 0],
   ["allWorksQuery", ""],
   ["searchField", "title"],
@@ -3277,6 +3308,9 @@ function filterTemplatePayload(view) {
   payload.readFilter = normalizeFilterList(payload.readFilter);
   payload.ratingFilter = normalizeFilterList(payload.ratingFilter);
   payload.wordsFilter = normalizeFilterList(payload.wordsFilter);
+  // v1.3.60 新增的「图片数」：老模板里没有这个字段，`undefined` 一律翻成空数组（＝不限），
+  // 否则下面各处 `.length` / `.some` 会直接抛错。
+  payload.imageCountFilter = normalizeFilterList(payload.imageCountFilter);
   return payload;
 }
 
@@ -3335,6 +3369,16 @@ function filterViewSummary(view) {
     const found = WORDS_FILTERS.find(([item]) => item === value);
     if (found) parts.push(found[1]);
   });
+  // 图片数这几档是重叠的：同时勾了「5 张以上」和「35 张以上」其实只剩 35 以上，
+  // 全列出来只会让人以为条件更多，所以只报那个最大的门槛。
+  if (payload.imageCountFilter.length) {
+    if (payload.imageCountFilter.includes("lt5")) parts.push("5 张以下");
+    const thresholds = payload.imageCountFilter
+      .filter((value) => value !== "lt5")
+      .map((value) => Number(String(value).replace("gte", "")))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (thresholds.length) parts.push(`${Math.max(...thresholds)} 张以上`);
+  }
   if (Number(payload.collectionFilter) === -1) {
     parts.push("任意收藏");
   } else if (Number(payload.collectionFilter) > 0) {
@@ -3379,6 +3423,10 @@ function filterViewCount(view) {
       const words = Number(work.wordCount || 0);
       if (words <= 0) return false;
       if (!payload.wordsFilter.some((value) => wordsMatchRange(value, words))) return false;
+    }
+    if (payload.imageCountFilter.length) {
+      const images = Number(work.imageCount || 0);
+      if (!payload.imageCountFilter.some((value) => imageCountMatch(value, images))) return false;
     }
     // 收藏夹那档要查库，前端算不了（「任意收藏」也一样：判不出它在哪个夹子里）——
     // 先不扣这一条，所以带收藏夹条件的模板这个数只是**上限**，摘要里会写明是哪个夹子
@@ -3880,6 +3928,11 @@ function matchesAdvancedFilters(work) {
     // 那是「不知道」，不是「0 个字」，所以任何字数档位都不收它。
     if (words <= 0) return false;
     if (!state.wordsFilter.some((value) => wordsMatchRange(value, words))) return false;
+  }
+  if (state.imageCountFilter.length) {
+    // 图片数没有「不知道」这种状态：没配图就是 0 张，归进最小的那一档。
+    const images = Number(work.imageCount || 0);
+    if (!state.imageCountFilter.some((value) => imageCountMatch(value, images))) return false;
   }
   return true;
 }
@@ -7356,6 +7409,7 @@ async function bindEvents() {
       }
       if (action === "rating-filter") { state.ratingFilter = toggleFilterValue(state.ratingFilter, element.dataset.ratingFilter); render(); }
       if (action === "words-filter") { state.wordsFilter = toggleFilterValue(state.wordsFilter, element.dataset.wordsFilter); render(); }
+      if (action === "image-count-filter") { state.imageCountFilter = toggleFilterValue(state.imageCountFilter, element.dataset.imageCountFilter); render(); }
       if (action === "collection-filter") {
         // 收藏夹是关系数据，前端筛不了 —— 改完要重新查库。-1 = 任意收藏夹
         const picked = Number(element.dataset.collectionFilter);
@@ -7363,7 +7417,7 @@ async function bindEvents() {
         await refreshActiveList();
         render();
       }
-      if (action === "clear-filters") { state.readFilter = []; state.ratingFilter = []; state.wordsFilter = []; state.collectionFilter = 0; state.imagesFilter = "all"; state.status = "all"; await refreshActiveList(); render(); }
+      if (action === "clear-filters") { state.readFilter = []; state.ratingFilter = []; state.wordsFilter = []; state.imageCountFilter = []; state.collectionFilter = 0; state.imagesFilter = "all"; state.status = "all"; await refreshActiveList(); render(); }
       if (action === "load-more-all-works") await loadMoreAllWorks();
       // v1.3.34：作者作品库 / 收藏夹也分批了
       if (action === "load-more-works") await loadMoreWorksPage();
@@ -12360,7 +12414,7 @@ const VIEW_STATE_VOLATILE_FIELDS = new Set([
   "workQuery", "allWorksQuery", "collectionQuery",
   "authorFavoritesOnly", "allWorksFavoritesOnly",
   "imagesFilter", "status", "readFilter",
-  "ratingFilter", "wordsFilter", "collectionFilter",
+  "ratingFilter", "wordsFilter", "imageCountFilter", "collectionFilter",
   "serialLatestOnly", "filterPanelOpen",
 ]);
 
