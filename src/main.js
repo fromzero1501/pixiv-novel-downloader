@@ -5698,7 +5698,7 @@ async function syncAuthorsAfterCreate(authorIds) {
   const ids = [...new Set((authorIds || []).map(Number).filter((id) => id > 0))];
   if (!ids.length) return;
   await refreshAuthors();
-  const targets = state.authors.filter((author) => ids.includes(author.id) && (author.homepage || author.accounts > 0) && author.previewDir && author.purchasedDir);
+  const targets = state.authors.filter((author) => ids.includes(author.id) && (author.homepage || author.accounts > 0) && ((author.previewDir && author.purchasedDir) || author.accounts > 0));
   if (!targets.length) {
     toast("新建的作者还没有 Pixiv 主页或还没绑目录，跳过自动同步", "info");
     return;
@@ -7767,8 +7767,6 @@ async function bindEvents() {
       if (action === "author-merge-start") startAuthorMerge();
       if (action === "author-merge") openAuthorMergeDialog();
       if (action === "author-merge-confirm") await confirmAuthorMerge();
-      if (action === "merge-pick-preview") await pickMergeDir("merge-preview-dir");
-      if (action === "merge-pick-purchased") await pickMergeDir("merge-purchased-dir");
       if (action === "author-unmerge") unmergeAuthorDialog();
       if (action === "dup-review") await openDuplicateReview();
       if (action === "dup-keep-all") await keepDuplicateGroup(Number(element.dataset.dupGroup));
@@ -8672,7 +8670,7 @@ function startAuthorMerge() {
   toast("勾选要合并成同一个人的几个账号，再点下面的「融合为一位作者」", "info", 6000);
 }
 
-/** 融合弹窗：新作者名字 + 之后下载落点的两个目录（预填第一个有值的成员）。 */
+/** 融合弹窗：只问新作者名字。下载落点按各账号自己的目录走，这里不再选（用户 2026-11-25）。 */
 function openAuthorMergeDialog() {
   const ids = [...state.selectedAuthorIds];
   if (ids.length < 2) {
@@ -8680,26 +8678,13 @@ function openAuthorMergeDialog() {
     return;
   }
   const members = state.authors.filter((author) => ids.includes(author.id));
-  const pick = (field, fallback) => members.map((author) => String(author[field] || "").trim()).find(Boolean) || fallback || "";
-  const preview = pick("previewDir", state.settings.defaultPreviewDir);
-  const purchased = pick("purchasedDir", state.settings.defaultPurchasedDir);
   const names = members.map((author) => escapeHtml(author.name)).join("、");
   const body = `
     <p class="confirm-copy">${names} 会合并成一位新作者：主页并排显示、作品合到一起。同名重复的自动隐藏（留完整版，其次留发布日期最新的那篇）。原来的账号不删，随时能在作者作品库里「撤销融合」。</p>
-    <label class="form-field"><span>新作者名称</span><input id="merge-author-name" type="text" value="${escapeHtml(members[0]?.name || "")}" autocomplete="off"></label>
-    <label class="form-field"><span>预览版目录</span><input id="merge-preview-dir" type="text" value="${escapeHtml(preview)}" readonly></label>
-    <div class="modal-inline-actions"><button class="quiet-button" data-action="merge-pick-preview">选择预览版目录</button></div>
-    <label class="form-field"><span>完整版目录</span><input id="merge-purchased-dir" type="text" value="${escapeHtml(purchased)}" readonly></label>
-    <div class="modal-inline-actions"><button class="quiet-button" data-action="merge-pick-purchased">选择完整版目录</button></div>
-    <p class="confirm-copy">已绑定作品的文件路径不会动，这两个目录只是以后下载新作品的落点。</p>`;
+    <div class="form-stack">
+      <label class="form-field"><span>新作者名称</span><input id="merge-author-name" type="text" value="${escapeHtml(members[0]?.name || "")}" autocomplete="off"></label>
+    </div>`;
   showModal(modal("融合为一位作者", body, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="author-merge-confirm">融合</button>`));
-}
-
-async function pickMergeDir(inputId) {
-  const picked = await open({ directory: true, multiple: false }).catch(() => null);
-  if (!picked) return;
-  const input = document.querySelector(`#${inputId}`);
-  if (input) input.value = String(picked);
 }
 
 async function confirmAuthorMerge() {
@@ -8708,11 +8693,9 @@ async function confirmAuthorMerge() {
     toast("先给新作者起个名字", "info");
     return;
   }
-  const previewDir = String(document.querySelector("#merge-preview-dir")?.value || "");
-  const purchasedDir = String(document.querySelector("#merge-purchased-dir")?.value || "");
   const memberIds = [...state.selectedAuthorIds];
   try {
-    const result = await invoke("merge_authors", { name, memberIds, previewDir, purchasedDir });
+    const result = await invoke("merge_authors", { name, memberIds });
     closeModal();
     state.authorBulkMode = false;
     state.selectedAuthorIds.clear();
@@ -10760,18 +10743,20 @@ function isPixivNovelUrl(value) {
 
 function pixivSyncModal() {
   const author = state.activeAuthor;
+  // 融合出来的作者自己没有目录：落点按组内各账号自己的目录走，所以有账号就算目录齐了。
+  const hasDirs = Boolean((author.previewDir && author.purchasedDir) || author.accounts > 0);
   showModal(modal("作品同步", `
     <form id="pixiv-sync-form" class="form-stack">
-      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : !author.purchasedDir ? "请先在作者设置中绑定完整版文件夹。" : !author.homepage && !(author.accounts > 0) ? "填写单篇小说地址可直接同步；批量同步则需先填写作者主页。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
+      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!hasDirs ? (!author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : "请先在作者设置中绑定完整版文件夹。") : author.accounts > 0 ? "按组内各个账号分别同步，作品统一归到这位作者名下。" : !author.homepage ? "填写单篇小说地址可直接同步；批量同步则需先填写作者主页。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
       <label>单篇小说地址 <input name="novelUrl" type="url" placeholder="https://www.pixiv.net/novel/show.php?id=28686066"><small>填写有效地址后只同步该作品，不更新上次成功同步时间，也不使用日期范围。</small></label>
       <div class="date-range"><label>开始日期 <input name="startDate" type="date"></label><label>结束日期 <input name="endDate" type="date"></label></div>
       <small>批量同步时，投稿时间以 Pixiv 原始投稿时间为准。不填日期时，会核对作者主页上的全部作品，已收藏的自动跳过；填写日期后，只检查投稿时间落在该范围内的作品。已有作品会先按 Pixiv 小说 ID、再按关联相似度跳过。</small>
       <p class="read-only-note">点击开始后同步会在后台进行，窗口关闭也不影响；进度显示在页面右下角，可随时终止。</p>
-    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="confirm-pixiv-sync" ${(author.homepage || author.accounts > 0) && author.previewDir && author.purchasedDir ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
+    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="confirm-pixiv-sync" ${hasDirs && (author.homepage || author.accounts > 0) ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
   const novelUrlInput = document.querySelector('[name="novelUrl"]');
   const syncButton = document.querySelector('[data-action="confirm-pixiv-sync"]');
   novelUrlInput?.addEventListener("input", () => {
-    const canSync = Boolean(author.previewDir && author.purchasedDir && (author.homepage || author.accounts > 0 || isPixivNovelUrl(novelUrlInput.value)));
+    const canSync = Boolean(hasDirs && (author.homepage || author.accounts > 0 || isPixivNovelUrl(novelUrlInput.value)));
     syncButton.disabled = !canSync;
   });
 }
@@ -10929,7 +10914,7 @@ async function syncAllAuthors(targetsOverride) {
   // targetsOverride：设置里开了「新建作者 / 散篇转正时同步其所有作品」时，只同步刚建档 / 转正的那几位。
   // 融合作者（v1.3.61）：自己那一行没有主页，主页在成员账号上 —— 有账号就算可同步，
   // 后端会按账号逐个拉；成员行本身跳过（它们已经被并进去了，再单独跑一遍是白跑）。
-  const targets = targetsOverride || state.authors.filter((author) => !author.stray && !author.mergedInto && author.previewDir && author.purchasedDir && (author.homepage || author.accounts > 0));
+  const targets = targetsOverride || state.authors.filter((author) => !author.stray && !author.mergedInto && ((author.previewDir && author.purchasedDir) || author.accounts > 0) && (author.homepage || author.accounts > 0));
   if (!targets.length) {
     toast("没有可同步的作者：请先填写作者主页，并绑定预览版与完整版文件夹", "info");
     return;

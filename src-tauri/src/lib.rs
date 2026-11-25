@@ -2727,27 +2727,55 @@ fn author_accounts(author_id: i64) -> Result<Vec<AuthorAccount>, String> {
     Ok(accounts)
 }
 
+/// 作者实际该用的两个落盘目录。
+///
+/// 融合出来的作者自己没有目录（落点按账号走），所以它自己那行是空的：这时候退一步，
+/// 从组内挑一个目录齐全的账号来用，别让「导入作品 / 绑定 / 生成阅读版」在融合作者上直接失败。
+fn author_landing_dirs(conn: &Connection, author_id: i64) -> (String, String) {
+    let (mut preview, mut purchased): (String, String) = conn
+        .query_row(
+            "SELECT COALESCE(preview_dir, ''), COALESCE(purchased_dir, '') FROM authors WHERE id=?1",
+            [author_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or_default();
+    if preview.trim().is_empty() || purchased.trim().is_empty() {
+        let fallback: (String, String) = conn
+            .query_row(
+                "SELECT COALESCE(preview_dir, ''), COALESCE(purchased_dir, '') FROM authors \
+                 WHERE merged_into=?1 AND preview_dir <> '' AND purchased_dir <> '' \
+                 ORDER BY COALESCE(NULLIF(sort_order,0),2147483647), id LIMIT 1",
+                [author_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or_default();
+        if preview.trim().is_empty() {
+            preview = fallback.0;
+        }
+        if purchased.trim().is_empty() {
+            purchased = fallback.1;
+        }
+    }
+    (preview, purchased)
+}
+
 /// 把几位作者融合成一位新作者。成员行保留、标 `merged_into`，作品迁挂到新作者并记来源账号。
 ///
 /// 已经是融合体的作者可以再参与融合（反复换号的场景）：它的成员会被一起卷进新组。
 #[tauri::command]
-fn merge_authors(
-    name: String,
-    member_ids: Vec<i64>,
-    preview_dir: String,
-    purchased_dir: String,
-) -> Result<MergeAuthorsResult, String> {
+fn merge_authors(name: String, member_ids: Vec<i64>) -> Result<MergeAuthorsResult, String> {
     let mut conn = db()?;
-    merge_authors_impl(&mut conn, name, member_ids, preview_dir, purchased_dir)
+    merge_authors_impl(&mut conn, name, member_ids)
 }
 
 /// 融合的实际动作。conn 由调用方给，测试里换成内存库。
+///
+/// 融合出来的作者不带自己的下载目录（用户 2026-11-25）：作品落盘一律按**账号**自己的
+/// 预览版 / 完整版目录走，所以这里先要求每个成员都已经绑好目录，缺一个就不许融合。
 fn merge_authors_impl(
     conn: &mut Connection,
     name: String,
     member_ids: Vec<i64>,
-    preview_dir: String,
-    purchased_dir: String,
 ) -> Result<MergeAuthorsResult, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -2765,13 +2793,19 @@ fn merge_authors_impl(
     // 展开：选中的作者如果本身是融合体，把它的成员也一起带上。
     let mut accounts: Vec<i64> = Vec::new();
     for id in &picked {
-        let stray: i64 = conn
-            .query_row("SELECT COALESCE(stray, 0) FROM authors WHERE id=?1", [id], |row| {
-                row.get(0)
-            })
+        let (stray, member_preview, member_purchased, member_name): (i64, String, String, String) =
+            conn.query_row(
+                "SELECT COALESCE(stray, 0), COALESCE(preview_dir, ''), COALESCE(purchased_dir, ''), name FROM authors WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
             .map_err(|_| "选中的作者里有的已经不在了，刷新一下再试。".to_string())?;
         if stray == 1 {
             return Err("散篇是一个兜底分类，不参与作者融合。".into());
+        }
+        // 账号必须自己绑好目录：融合后作品一律按账号落盘，缺目录就没地方放。
+        if member_preview.trim().is_empty() || member_purchased.trim().is_empty() {
+            return Err(format!("「{member_name}」还没绑定预览版或完整版目录，先补上再融合。"));
         }
         if !accounts.contains(id) {
             accounts.push(*id);
@@ -2799,11 +2833,9 @@ fn merge_authors_impl(
         return Err(format!("已经有一个叫「{name}」的作者了，换个名字。"));
     }
     let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    // 融合出来的这行只存名字：目录按账号走，不需要它自己再有一套。
     transaction
-        .execute(
-            "INSERT INTO authors (name, preview_dir, purchased_dir) VALUES (?1, ?2, ?3)",
-            params![name, preview_dir.trim(), purchased_dir.trim()],
-        )
+        .execute("INSERT INTO authors (name) VALUES (?1)", params![name])
         .map_err(|e| e.to_string())?;
     let author_id = transaction.last_insert_rowid();
     let mut works_moved = 0usize;
@@ -9626,13 +9658,24 @@ fn pixiv_sync_impl(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    let (preview_dir, purchased_dir, author_name): (String, String, String) = conn
+    // 落盘目录按**账号**走：融合出来的真身自己没有目录，作品一律写进账号那一套。
+    // 账号行没填（没融合的普通作者、老数据）就退回真身自己那一行，不让人卡在这。
+    let (account_preview, account_purchased): (String, String) = conn
         .query_row(
-            "SELECT a.preview_dir, a.purchased_dir, a.name FROM authors a WHERE a.id=?1",
+            "SELECT COALESCE(preview_dir, ''), COALESCE(purchased_dir, '') FROM authors WHERE id=?1",
+            [account_lookup],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or_default();
+    let (owner_preview, owner_purchased, author_name): (String, String, String) = conn
+        .query_row(
+            "SELECT COALESCE(preview_dir, ''), COALESCE(purchased_dir, ''), name FROM authors WHERE id=?1",
             [author_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| e.to_string())?;
+    let preview_dir = if account_preview.trim().is_empty() { owner_preview } else { account_preview };
+    let purchased_dir = if account_purchased.trim().is_empty() { owner_purchased } else { account_purchased };
     let cookie: String = conn
         .query_row(
             "SELECT COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), '')",
@@ -13576,13 +13619,7 @@ fn scan_preview_existing(author_id: i64) -> Result<ScanPreviewResult, String> {
     let threshold = settings.similarity_threshold;
     let _min_threshold = settings.min_similarity_threshold;
     let match_title_length = settings.match_title_length;
-    let dir: String = conn
-        .query_row(
-            "SELECT preview_dir FROM authors WHERE id=?1",
-            [author_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    let dir: String = author_landing_dirs(&conn, author_id).0;
     if dir.trim().is_empty() {
         return Err("请先绑定预览版文件夹".into());
     }
@@ -14019,13 +14056,7 @@ fn bind_series_bundle(work_ids: Vec<i64>, path: String, app: AppHandle) -> Resul
     let range = compress_series_orders(&orders);
 
     let author_id = rows[0].4;
-    let purchased_dir: String = conn
-        .query_row(
-            "SELECT purchased_dir FROM authors WHERE id=?1",
-            [author_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
+    let (_, purchased_dir) = author_landing_dirs(&conn, author_id);
     if purchased_dir.trim().is_empty() {
         return Err("这位作者还没绑定完整版文件夹 —— 先去作者设置里填上，再回来绑".into());
     }
@@ -14305,15 +14336,13 @@ fn set_work_author_impl(
     author_id: i64,
     include_bundle: bool,
 ) -> Result<SetWorkAuthorResult, String> {
-    let (author_name, preview_dir, purchased_dir): (String, String, String) = conn
-        .query_row(
-            "SELECT name, preview_dir, purchased_dir FROM authors WHERE id=?1",
-            [author_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+    let author_name: String = conn
+        .query_row("SELECT name FROM authors WHERE id=?1", [author_id], |row| row.get(0))
         .optional()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "找不到要归的那位作者".to_string())?;
+    // 改归到融合作者名下时，文件照样搬进账号那一套目录
+    let (preview_dir, purchased_dir) = author_landing_dirs(conn, author_id);
     let (title, purchased, preview, cover, current_author): (String, String, String, String, i64) =
         conn.query_row(
             "SELECT title, purchased_path, preview_path, cover_path, author_id FROM works WHERE id=?1",
@@ -14496,13 +14525,7 @@ fn bind_work_preview(work_id: i64, path: String) -> Result<String, String> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| format!("找不到这篇作品：{e}"))?;
-    let preview_dir: String = conn
-        .query_row(
-            "SELECT preview_dir FROM authors WHERE id=?1",
-            [author_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
+    let (preview_dir, _) = author_landing_dirs(&conn, author_id);
     let preview_dir = preview_dir.trim().to_string();
     if preview_dir.is_empty() {
         return Err("这位作者还没绑定预览版文件夹 —— 先去作者设置里填上，再回来绑定".into());
@@ -14605,13 +14628,7 @@ fn bind_work_moving_to_purchased(work_id: i64, path: String, app: AppHandle) -> 
             Ok((row.get(0)?, row.get(1)?))
         })
         .map_err(|e| format!("找不到作品：{e}"))?;
-    let purchased_dir: String = conn
-        .query_row(
-            "SELECT purchased_dir FROM authors WHERE id=?1",
-            [author_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
+    let (_, purchased_dir) = author_landing_dirs(&conn, author_id);
     if purchased_dir.trim().is_empty() {
         return Err("这位作者还没绑定完整版文件夹 —— 先去作者设置里填上，再回来绑定".into());
     }
@@ -15329,13 +15346,7 @@ fn copy_previews_to_purchased(
         });
     }
     let conn = db()?;
-    let purchased_dir: String = conn
-        .query_row(
-            "SELECT purchased_dir FROM authors WHERE id=?1",
-            [author_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    let (_, purchased_dir) = author_landing_dirs(&conn, author_id);
     if purchased_dir.trim().is_empty() {
         return Err("请先在作者设置中选择完整版文件夹。".into());
     }
@@ -21559,14 +21570,11 @@ fn bind_share_assets(
     images: Option<&Path>,
     move_files: bool,
 ) -> Result<(), String> {
-    let (preview_dir, purchased_dir): (String, String) = conn
-        .query_row(
-            "SELECT ifnull(a.preview_dir,''), ifnull(a.purchased_dir,'') \
-             FROM works w JOIN authors a ON a.id=w.author_id WHERE w.id=?1",
-            [work_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+    // 落点按作者实际能用的目录走：融合作者自己没有目录，会退回组内账号那一套
+    let author_id: i64 = conn
+        .query_row("SELECT author_id FROM works WHERE id=?1", [work_id], |row| row.get(0))
         .map_err(|e| e.to_string())?;
+    let (preview_dir, purchased_dir) = author_landing_dirs(conn, author_id);
     let full = slot == "purchased";
     let raw = if full { purchased_dir } else { preview_dir };
     if raw.trim().is_empty() {
@@ -27707,8 +27715,12 @@ mod tests {
         // 作者融合（v1.3.61）：作品挂到新作者、同名组留完整版、撤销能原路还回去
         let mut conn = Connection::open_in_memory().unwrap();
         create_full_work_tables(&conn);
-        conn.execute("INSERT INTO authors (id, name) VALUES (1, '甲'), (2, '乙')", [])
-            .unwrap();
+        // 融合要求每个账号自己绑好目录（融合体不再自带一套）
+        conn.execute(
+            "INSERT INTO authors (id, name, preview_dir, purchased_dir) VALUES (1, '甲', 'D:/px/甲', 'D:/pg/甲'), (2, '乙', 'D:/px/乙', 'D:/pg/乙')",
+            [],
+        )
+        .unwrap();
         // 甲有一篇预览版「同名作品」，乙有完整版「同名作品」+ 另一篇
         for (id, author_id, title, full) in [
             (1i64, 1i64, "同名作品", false),
@@ -27728,14 +27740,7 @@ mod tests {
                 .unwrap();
             }
         }
-        let merged = crate::merge_authors_impl(
-            &mut conn,
-            "合并后".into(),
-            vec![1, 2],
-            String::new(),
-            String::new(),
-        )
-        .unwrap();
+        let merged = crate::merge_authors_impl(&mut conn, "合并后".into(), vec![1, 2]).unwrap();
         assert_eq!(merged.accounts, 2);
         assert_eq!(merged.works_moved, 3);
         assert_eq!(merged.hidden_duplicates, 1);
