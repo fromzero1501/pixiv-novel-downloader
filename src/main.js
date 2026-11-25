@@ -1118,6 +1118,7 @@ async function invoke(command, args = {}) {
   if (command === "cleanup_old_portable_builds") return { removed: [], failed: [], layout: "fixed", exeName: "PixivNovelDownloader.exe", legacyExe: [] };
   if (command === "default_update_mirror_list") return ["https://ghproxy.net/", "https://gh.monlor.com/", "https://ghfile.geekertao.top/", "https://gh-proxy.net/"];
   if (command === "refresh_reading_image_counts") return { scannedCount: 0, updatedCount: 0 };
+  if (command === "rescan_has_images") return { scannedCount: 0, markedCount: 0 };
   // 预览里"读文件"给一份像样的假 Cookie：真机读到的是一整行，回空串的话
   // 「导入 Cookie 文件」这条链在无头校验里验不出东西（框被清空，看着像没生效）
   if (command === "read_pixiv_cookie_file") return "PHPSESSID=12345678_preview_cookie;";
@@ -6734,6 +6735,16 @@ async function runConfirmedAction() {
 }
 
 function authorModal(author = {}) {
+  // 融合出来的作者自己没有主页（主页都属于成员账号，用户 2026-11-25）：这里只读展示，
+  // 后端 save_author 也会把 homepage 锁成原值，前端改了也存不进去。
+  const merged = Number(author.accounts) > 0;
+  const homepageField = merged
+    ? `<div class="form-field">Pixiv 作者主页
+        <div class="account-links" id="merged-homepage-links"><span class="import-faint">读取中…</span></div>
+        <input type="hidden" name="homepage" value="${escapeHtml(author.homepage || "")}">
+        <small>这是融合出来的作者：主页属于各个账号，不能在这里改。要改请分别编辑原来的账号。</small>
+      </div>`
+    : `<label class="is-homepage-field">Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>这栏填作者主页或任意一篇作品链接都行 —— 贴的是作品链接时，保存会自动识别出真正的作者。点"同步作者信息"能顺便取回作者名称和头像；保存时只保留到作者 ID。</small></label>`;
   showModal(modal(author.id ? "编辑作者" : "新增作者", `
     <form id="author-form" class="form-stack">
       <input type="hidden" name="id" value="${author.id || ""}">
@@ -6746,10 +6757,32 @@ function authorModal(author = {}) {
         </div>
         <small>回车添加、点 × 删除；搜索作者时输入别名同样能搜到这位作者。</small>
       </div>
-      <label class="is-homepage-field">Pixiv 作者主页 <input name="homepage" type="url" value="${escapeHtml(author.homepage || "")}" placeholder="https://www.pixiv.net/users/123456"><small>这栏填作者主页或任意一篇作品链接都行 —— 贴的是作品链接时，保存会自动识别出真正的作者。点"同步作者信息"能顺便取回作者名称和头像；保存时只保留到作者 ID。</small></label>
+      ${homepageField}
       <label>头像文件 <div class="path-input"><input name="avatarPath" value="${escapeHtml(author.avatarPath || "")}" readonly placeholder="尚未选择"><button type="button" class="quiet-button" data-action="pick-avatar">选择图片</button></div></label>
       <label>备注 <textarea name="notes" rows="3" placeholder="可记录来源、说明等">${escapeHtml(author.notes || "")}</textarea></label>
     </form>`, `${author.id ? `<button class="danger-button" data-action="delete-author" data-author-id="${author.id}">删除作者</button>` : ""}<span class="footer-spacer"></span><button class="quiet-button" data-action="sync-author-profile">同步作者信息</button><button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" form="author-form" type="submit">保存作者</button>`));
+  if (merged) void fillMergedHomepages(author.id);
+}
+
+/** 编辑融合作者时，把各成员账号的主页列出来（只读，点一下能打开）。 */
+async function fillMergedHomepages(authorId) {
+  const holder = document.querySelector("#merged-homepage-links");
+  if (!holder) return;
+  let accounts = [];
+  try {
+    accounts = await invoke("author_accounts", { authorId });
+  } catch (error) {
+    accounts = [];
+  }
+  const links = (accounts || []).filter((account) => String(account.homepage || "").trim());
+  holder.innerHTML = links.length
+    ? links.map((account) => {
+      const missing = String(account.missingSince || "").trim() ? "（已销号）" : "";
+      const sync = account.lastSyncAt ? `同步于 ${syncLabel(account.lastSyncAt)}` : "还没同步过";
+      const tip = `${account.name} · ${sync}${missing ? " · Pixiv 上找不到这个主页" : ""}`;
+      return `<button class="homepage-link" title="${escapeHtml(tip)}" data-action="open-external-url" data-url="${escapeHtml(account.homepage)}">${icon("link", 13)}<span>${escapeHtml(account.name || "账号")}${missing}</span></button>`;
+    }).join("")
+    : `<span class="import-faint">组内账号都还没填主页</span>`;
 }
 
 function importModal() {
@@ -7835,6 +7868,7 @@ async function bindEvents() {
       if (action === "scan-work-files") await scanWorkFiles();
       // v1.3.45：这两条从「维护与数据」搬到了「批量维护」，跟着那一列走统一动作分发
       if (action === "refresh-reading-image-counts") await refreshReadingImageCounts(element);
+      if (action === "rescan-has-images") await rescanHasImages(element);
       if (action === "compress-epub-images") await compressEpubImages(element);
       if (action === "clear-missing-bindings") await clearMissingBindings();
       if (action === "download-selected-reading") { await downloadSelectedReadings(element.dataset.format === "epub" ? "epub" : ""); return; }
@@ -8759,10 +8793,10 @@ function renderDuplicateReview() {
     return;
   }
   const groupHtml = groups.map((group, index) => {
-    const kindLabel = group.kind === "exact" ? "完全同名" : `相似 ≥ ${report.threshold}%`;
-    const items = group.items.map((item, pos) => `
+    const kindLabel = group.kind === "exact" ? "完全同名 · 都是完整版" : `相似 ≥ ${report.threshold}%`;
+    const items = group.items.map((item) => `
       <label class="dup-item${item.hidden ? " is-hidden" : ""}">
-        <input type="radio" name="dup-group-${index}" value="${item.workId}" ${pos === 0 ? "checked" : ""}>
+        <input type="checkbox" name="dup-group-${index}" value="${item.workId}" ${item.hidden ? "" : "checked"}>
         <span class="dup-title" title="${escapeHtml(item.title || "")}">${escapeHtml(item.title || "（无标题）")}</span>
         <span class="dup-meta">${item.hasFull ? "完整版" : "预览版"}${item.releaseDate ? ` · ${escapeHtml(item.releaseDate)}` : ""}${item.imageCount ? ` · ${item.imageCount} 图` : ""}${item.originAuthorName ? ` · ${escapeHtml(item.originAuthorName)}` : ""}${item.hidden ? " · 已隐藏" : ""}</span>
       </label>`).join("");
@@ -8774,7 +8808,7 @@ function renderDuplicateReview() {
   }).join("");
   showModal(modal(
     "检查重复作品",
-    `<p class="confirm-copy">每组选一篇保留，其余隐藏 —— 隐藏的不出现在列表、搜索、计数和导出里。之后想找回来，去设置里打开「显示已隐藏的重复作品」。</p><div class="dup-list">${groupHtml}</div>`,
+    `<p class="confirm-copy">勾上要保留的篇目，可以多篇；没勾的会被隐藏 —— 隐藏的不出现在列表、搜索、计数和导出里。整组都不勾会跳过不动它。之后想找回来，去设置里打开「显示已隐藏的重复作品」。</p><div class="dup-list">${groupHtml}</div>`,
     `<button class="quiet-button" data-action="close-modal">关闭</button><button class="primary-button" data-action="dup-apply">应用选择</button>`,
     "is-wide",
   ));
@@ -8783,13 +8817,17 @@ function renderDuplicateReview() {
 async function applyDuplicateReview() {
   const groups = dupReviewGroups();
   let changed = 0;
+  let skipped = 0;
   for (let index = 0; index < groups.length; index += 1) {
-    const picked = document.querySelector(`input[name="dup-group-${index}"]:checked`);
-    if (!picked) continue;
+    const picked = Array.from(document.querySelectorAll(`input[name="dup-group-${index}"]:checked`)).map((input) => Number(input.value));
+    if (!picked.length) {
+      skipped += 1;
+      continue;
+    }
     try {
       await invoke("resolve_duplicate_pick", {
         workIds: groups[index].items.map((item) => item.workId),
-        keepWorkId: Number(picked.value),
+        keepWorkIds: picked,
       });
       changed += 1;
     } catch (error) {
@@ -8799,7 +8837,8 @@ async function applyDuplicateReview() {
   closeModal();
   await refreshWorks();
   render();
-  toast(changed ? `已处理 ${changed} 组` : "没有改动", changed ? "success" : "info");
+  const tail = skipped ? `（${skipped} 组没勾任何一篇，原样保留）` : "";
+  toast(changed ? `已处理 ${changed} 组${tail}` : "没有改动", changed ? "success" : "info");
 }
 
 /** 「这组都显示」：整组取消隐藏，顺手把那一段从面板里去掉，不重画整个弹窗。 */
@@ -8807,7 +8846,8 @@ async function keepDuplicateGroup(index) {
   const group = dupReviewGroups()[index];
   if (!group) return;
   try {
-    await invoke("resolve_duplicate_pick", { workIds: group.items.map((item) => item.workId), keepWorkId: 0 });
+    const workIds = group.items.map((item) => item.workId);
+    await invoke("resolve_duplicate_pick", { workIds, keepWorkIds: workIds });
     document.querySelector(`[data-dup-group="${index}"]`)?.remove();
     await refreshWorks();
   } catch (error) {
@@ -10088,7 +10128,28 @@ async function refreshReadingImageCounts(trigger) {
   }
 }
 
-// 「压缩 EPUB 插图」（v1.3.44）：把库里绑定到作品上的 .epub 就地压一遍插图。
+// 「重新识别带图标记」（v1.3.63）：老作品文件里有插图、带图标记却空着，逐篇看文件补上。
+// 只往「有图」一个方向补 —— 所以必须先确认一次，免得把用户手动关掉的标记又勾回来。
+async function rescanHasImages() {
+  if (state.syncTask) {
+    toast("有任务正在进行，请等它结束或先停止它", "info");
+    return;
+  }
+  confirmAction("重新识别带图标记", "会把文件里确实有插图、但「带图版」没勾上的作品补成带图版。只往「有图」方向补，不会取消已有的标记；你以前手动关掉的也会被重新勾上。要继续吗？", "开始识别", async () => {
+    try {
+      const result = await invoke("rescan_has_images");
+      const scanned = Number(result?.scannedCount || 0);
+      const marked = Number(result?.markedCount || 0);
+      await refreshVisibleList();
+      render();
+      toast(marked ? `看了一遍 ${scanned} 篇，补上带图标记 ${marked} 篇` : `看了一遍 ${scanned} 篇，没有需要补的`, "success");
+    } catch (error) {
+      toast(String(error), "error");
+    }
+  }, true);
+}
+
+
 // 档位与「生成 EPUB 时压」共用设置里那一档，所以这里不传参数；
 // 同参数压过的书后端会直接跳过（记账表），反复点不会一次次劣化。
 async function compressEpubImages(trigger) {
@@ -11576,6 +11637,7 @@ async function settingsModal() {
       <button type="button" data-action="clear-skipped-novels">${icon("archive", 18)}清空「太小跳过」记录<span class="settings-action-hint">同步时小于「最小文件大小」的作品会被记下来、下次直接跳过（省请求、也少招限流）。把最小文件大小调小之后点这里，让它们重新参与同步</span></button>
       <button type="button" data-action="clean-preview-versions">${icon("file", 18)}清理多余预览版<span class="settings-action-hint">已经有完整版的作品，预览版就不必留了；先给你看数量再动手</span></button>
       <button type="button" data-action="refresh-reading-image-counts">${icon("image", 18)}重算阅读版图片数<span class="settings-action-hint">扫描全库里绑定在 EPUB / HTML 上的作品，重新统计作品卡上的图片角标（数的是文件里的插图，不含封面）。绑定普通 txt 的作品不受影响</span></button>
+      <button type="button" data-action="rescan-has-images">${icon("image", 18)}重新识别带图标记<span class="settings-action-hint">有些老作品文件里明明有插图，「带图版」却没勾上（老版本转换时没标）。这里逐篇看一遍文件，有插图的补上带图标记。只会往「有图」方向补，不会把标记取消；你以前手动关掉的那些也会被重新勾上</span></button>
       <button type="button" data-action="compress-epub-images">${icon("archive", 18)}Epub插图压缩<span class="settings-action-hint">把作品绑定的 EPUB 里的插图，按「下载与图文 → Epub插图压缩」那一档重新压一遍；原文件直接替换（不留备份），压完不比原来小的图保留原图，同一档压过的书会跳过，随时可以停止</span></button>
       <button type="button" data-action="export-backup">${icon("database", 18)}导出设置和数据<span class="settings-action-hint">把整个资料库存成一个 .db 文件（作品记录、绑定关系、设置全在里面），换电脑或出问题时可回滚</span></button>
       <button type="button" data-action="import-data-pick">${icon("upload", 18)}导入设置和数据<span class="settings-action-hint">只吃你自己用「导出设置和数据」存下来的那个 .db 文件（覆盖式导入、需重启）。别人的作品分享包不在这里导 —— 拖到下面那块去</span></button>

@@ -2668,6 +2668,15 @@ fn hide_exact_duplicate_titles(conn: &Connection, author_id: i64) -> Result<usiz
         if items.len() < 2 {
             continue;
         }
+        // 两篇以上都是完整版 ⇒ 机器不该替人决定丢哪篇（用户 2026-11-25）：
+        // 整组放出来，等用户在「检查重复」面板里自己勾。
+        if items.iter().filter(|item| item.has_full).count() >= 2 {
+            for item in &items {
+                conn.execute("UPDATE works SET hidden_dup=0 WHERE id=?1", [item.id])
+                    .map_err(|e| e.to_string())?;
+            }
+            continue;
+        }
         items.sort_by(|left, right| {
             right
                 .has_full
@@ -2998,6 +3007,11 @@ fn scan_author_duplicates(author_id: i64) -> Result<DuplicateReport, String> {
         if indexes.len() < 2 {
             continue;
         }
+        // 只有「两篇以上都是完整版」的完全同名组才端给人选（用户 2026-11-25）：
+        // 其余的建库 / 融合时就按规则自动留一篇、隐藏其余，不必再摆到面板上。
+        if indexes.iter().filter(|index| all[**index].has_full).count() < 2 {
+            continue;
+        }
         let items: Vec<DuplicateGroupItem> = indexes.iter().map(|index| to_item(&all[*index])).collect();
         exact.push(DuplicateGroup {
             kind: "exact".into(),
@@ -3056,16 +3070,20 @@ fn scan_author_duplicates(author_id: i64) -> Result<DuplicateReport, String> {
     })
 }
 
-/// 用户裁决一组重复：`keep_work_id` 那篇留下，同组其他篇隐藏；`keep_work_id` 传 0 表示整组都显示。
+/// 用户裁决一组重复：勾中的篇目留下（可多篇），同组其余隐藏；勾选为空表示整组都藏起来。
+///
+/// v1.3.63 起从「只留一篇」改成多选（用户 2026-11-25）—— 多个完整版都是他自己要的，
+/// 硬要他挑一篇不现实；前端每一组给的是复选框。
 #[tauri::command]
-fn resolve_duplicate_pick(work_ids: Vec<i64>, keep_work_id: i64) -> Result<usize, String> {
+fn resolve_duplicate_pick(work_ids: Vec<i64>, keep_work_ids: Vec<i64>) -> Result<usize, String> {
     if work_ids.is_empty() {
         return Err("没有选中任何作品。".into());
     }
     let conn = db()?;
     let mut hidden = 0usize;
     for id in work_ids {
-        let flag = if keep_work_id != 0 && id == keep_work_id { 0 } else if keep_work_id == 0 { 0 } else { 1 };
+        let keep = keep_work_ids.contains(&id);
+        let flag = if keep { 0 } else { 1 };
         let changed = conn
             .execute("UPDATE works SET hidden_dup=?1 WHERE id=?2", params![flag, id])
             .map_err(|e| e.to_string())?;
@@ -3106,7 +3124,23 @@ fn save_author(author: AuthorInput) -> Result<AuthorSummary, String> {
     if pixiv_novel_id_from_url(&author.homepage).ok().flatten().is_some() {
         return Err("这是 Pixiv 作品链接，不是作者主页。点「同步作者信息」会自动识别出作者。".into());
     }
-    let homepage = normalize_author_homepage(&author.homepage);
+    let mut homepage = normalize_author_homepage(&author.homepage);
+    // 融合出来的作者：主页归属各个账号，这行自己的 homepage 只是历史残留，
+    // 不许在「编辑作者」里改（用户 2026-11-25）；要改请分别编辑原账号。
+    if let Some(id) = author.id {
+        let merged_accounts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM authors WHERE merged_into=?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        if merged_accounts > 0 {
+            homepage = conn
+                .query_row("SELECT COALESCE(homepage, '') FROM authors WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_default();
+        }
+    }
     let aliases = normalize_aliases(&author.aliases);
     if !homepage.is_empty() {
         let existing: Option<String> = conn
@@ -16749,6 +16783,60 @@ fn refresh_reading_image_counts() -> Result<RefreshImageCountResult, String> {
     Ok(result)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RescanHasImagesResult {
+    scanned_count: usize,
+    marked_count: usize,
+}
+
+/// 存量修正：绑定的文件里确实有插图、但带图标记还空着的，补成带图版（v1.3.63）。
+///
+/// 只往「有图」这一个方向改 —— 反方向（把标记清掉）风险大：图文 txt 旁边还有 `_images`
+/// 目录时图片数可能是 0，却本来就是带图版。用户以前手动关掉的也会被重新勾上，
+/// 所以前端把它放在设置「维护与数据」里、点了要二次确认。
+#[tauri::command]
+fn rescan_has_images() -> Result<RescanHasImagesResult, String> {
+    let conn = db()?;
+    let mut statement = conn
+        .prepare("SELECT id FROM works WHERE has_images = 0 AND (purchased_path <> '' OR preview_path <> '')")
+        .map_err(|e| e.to_string())?;
+    let candidates: Vec<i64> = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    drop(statement);
+
+    let mut result = RescanHasImagesResult {
+        scanned_count: 0,
+        marked_count: 0,
+    };
+    for work_id in candidates {
+        let before: i64 = conn
+            .query_row("SELECT image_count FROM works WHERE id=?1", [work_id], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        refresh_reading_image_count(&conn, work_id);
+        let after: i64 = conn
+            .query_row("SELECT image_count FROM works WHERE id=?1", [work_id], |row| {
+                row.get(0)
+            })
+            .unwrap_or(before);
+        result.scanned_count += 1;
+        if after > 0 {
+            let changed = conn
+                .execute("UPDATE works SET has_images=1 WHERE id=?1", [work_id])
+                .unwrap_or(0);
+            if changed > 0 {
+                result.marked_count += 1;
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// 作品当前绑定的文件：完整版优先，其次预览版。
 fn bound_path_of(work_id: i64) -> String {
     db()
@@ -22550,6 +22638,7 @@ pub fn run() {
             cleanup_redundant_previews,
             backfill_work_covers,
             refresh_reading_image_counts,
+            rescan_has_images,
             compress_epub_images,
             cancel_epub_image_compress,
             convert_work_to_epub,
