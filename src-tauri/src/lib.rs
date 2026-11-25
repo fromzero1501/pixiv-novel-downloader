@@ -96,6 +96,10 @@ struct AuthorSummary {
     /// 之所以在 SQL 里不过滤、而是留给前端：作品卡上的作者名跳转、详情面板的作者信息
     /// 都要能查到这些作者，后端一旦剔除它们，那些地方会突然「找不到作者」。
     stray: bool,
+    /// v1.3.61：融合（真人身下挂多个 Pixiv 账号）。`merged_into` 非 0 = 这是被融合掉的账号行，
+    /// 作者库同样交给前端过滤（理由同上）；`accounts` 是这位作者融合了几个账号（0 = 没融合过）。
+    merged_into: i64,
+    accounts: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -457,6 +461,10 @@ struct AppSettings {
     /// 老库没有这个键 → 按「开」处理（`!= "0"`）。
     #[serde(default = "default_true")]
     auto_convert_epub: bool,
+    /// v1.3.61：融合作者名下被判定为重复、已隐藏的作品，是否也照常显示。
+    /// 默认关——隐藏本来就是默认行为；给个口子是为了误判时能一眼看见、再手动改回来。
+    #[serde(default)]
+    show_hidden_duplicates: bool,
 }
 
 fn default_epub_image_quality() -> String {
@@ -880,7 +888,7 @@ fn migrate_docx_word_counts(conn: &Connection) -> Result<(), String> {
 /// 跨进程也对（进程内的静态标记做不到这点）。
 ///
 /// ⚠️ **以后只要改了 `db()` 里的建表 / ALTER 语句，就把这个数字加 1** —— 否则老库不会补上新列。
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 fn db() -> Result<Connection, String> {
     let path = app_data_dir()?.join("library.db");
@@ -1183,6 +1191,22 @@ fn db() -> Result<Connection, String> {
     // 之后哪次同步能读到作品列表就清空。空串 = 正常。
     let _ = conn.execute(
         "ALTER TABLE authors ADD COLUMN missing_since TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    // 作者融合（v1.3.61，真人身下挂多个 Pixiv 账号）：
+    // `merged_into` 指向融合后的新作者，非 0 的行在作者库列表里不再单独出卡（成员行本身不删，
+    // 撤销融合要靠它把作品还回去）；`works.origin_author_id` 记住这篇是从哪个账号抓来的，
+    // 同步与撤销都按它分流；`works.hidden_dup` 标记「同名重复被隐藏」，列表/搜索/导出都不出现。
+    let _ = conn.execute(
+        "ALTER TABLE authors ADD COLUMN merged_into INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN origin_author_id INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE works ADD COLUMN hidden_dup INTEGER NOT NULL DEFAULT 0",
         [],
     );
     let _ = conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS works_author_pixiv_novel_id ON works(author_id, pixiv_novel_id) WHERE pixiv_novel_id <> ''", []);
@@ -1963,6 +1987,8 @@ fn read_settings(conn: &Connection) -> Result<AppSettings, String> {
         },
         // v1.3.53：没存过（老库升上来）按「开」——只有明确存过 0 才关
         auto_convert_epub: setting(conn, "auto_convert_epub")? != "0",
+        // v1.3.61：重复作品默认隐藏，只有明确存过 1 才显示
+        show_hidden_duplicates: setting(conn, "show_hidden_duplicates")? == "1",
     })
 }
 
@@ -2122,17 +2148,19 @@ fn apply_default_dirs(conn: &Connection, author_id: i64) -> Result<(), String> {
 fn read_author(conn: &Connection, id: i64) -> Result<AuthorSummary, String> {
     conn.query_row(
         "SELECT a.id, a.name, a.homepage, a.avatar_path, a.notes, a.preview_dir, a.purchased_dir, a.match_threshold, a.pixiv_last_sync_at, a.avatar_managed,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id),
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.purchased_path <> ''),
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.hidden_dup = 0),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.purchased_path <> '' AND w.hidden_dup = 0),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1 AND w.hidden_dup = 0),
           a.aliases,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1 AND w.hidden_dup = 0),
           a.starred,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1),
-          a.stray
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1 AND w.hidden_dup = 0),
+          a.stray,
+          a.merged_into,
+          (SELECT COUNT(*) FROM authors m WHERE m.merged_into = a.id)
         FROM authors a WHERE a.id = ?1",
         [id],
-        |row| Ok(AuthorSummary { id: row.get(0)?, name: row.get(1)?, homepage: row.get(2)?, avatar_path: row.get(3)?, notes: row.get(4)?, preview_dir: row.get(5)?, purchased_dir: row.get(6)?, match_threshold: row.get(7)?, pixiv_last_sync_at: row.get(8)?, avatar_managed: row.get::<_, i64>(9)? == 1, work_count: row.get(10)?, purchased_count: row.get(11)?, favorite_count: row.get(12)?, aliases: row.get(13)?, images_count: row.get(14)?, starred: row.get::<_, i64>(15)? == 1, new_count: row.get(16)?, stray: row.get::<_, i64>(17)? == 1 })
+        |row| Ok(AuthorSummary { id: row.get(0)?, name: row.get(1)?, homepage: row.get(2)?, avatar_path: row.get(3)?, notes: row.get(4)?, preview_dir: row.get(5)?, purchased_dir: row.get(6)?, match_threshold: row.get(7)?, pixiv_last_sync_at: row.get(8)?, avatar_managed: row.get::<_, i64>(9)? == 1, work_count: row.get(10)?, purchased_count: row.get(11)?, favorite_count: row.get(12)?, aliases: row.get(13)?, images_count: row.get(14)?, starred: row.get::<_, i64>(15)? == 1, new_count: row.get(16)?, stray: row.get::<_, i64>(17)? == 1, merged_into: row.get(18)?, accounts: row.get(19)? })
     ).map_err(|e| e.to_string())
 }
 
@@ -2436,19 +2464,42 @@ fn list_missing_author_ids() -> Result<Vec<i64>, String> {
 const AUTHOR_ORDER_BY: &str =
     " ORDER BY CASE WHEN a.sort_order = 0 THEN 1 ELSE 0 END, a.sort_order, a.name COLLATE NOCASE";
 
+/// 「隐藏的同名重复作品」要不要一起显示（设置项，默认挡掉）。
+fn show_hidden_duplicates(conn: &Connection) -> bool {
+    matches!(
+        setting(conn, "show_hidden_duplicates")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+/// 作品可见性条件：默认只出没被隐藏的。拼在 WHERE 后面用，`prefix` 是表别名（如 `w.`）。
+fn hidden_dup_clause(conn: &Connection, prefix: &str) -> String {
+    if show_hidden_duplicates(conn) {
+        String::new()
+    } else {
+        format!(" AND {prefix}hidden_dup = 0")
+    }
+}
+
 #[tauri::command]
 fn list_authors() -> Result<Vec<AuthorSummary>, String> {
     let conn = db()?;
+    // 融合后的成员行不出卡：作者库里一张卡 = 一个真人。
+    let dup = hidden_dup_clause(&conn, "w.");
     let sql = format!(
         "SELECT a.id, a.name, a.homepage, a.avatar_path, a.notes, a.preview_dir, a.purchased_dir, a.match_threshold, a.pixiv_last_sync_at, a.avatar_managed,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id),
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.purchased_path <> ''),
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id{dup}),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.purchased_path <> ''{dup}),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1{dup}),
           a.aliases,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1{dup}),
           a.starred,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1),
-          a.stray
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1{dup}),
+          a.stray,
+          a.merged_into,
+          (SELECT COUNT(*) FROM authors m WHERE m.merged_into = a.id)
         FROM authors a{AUTHOR_ORDER_BY}"
     );
     let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -2473,11 +2524,524 @@ fn list_authors() -> Result<Vec<AuthorSummary>, String> {
                 starred: row.get::<_, i64>(15)? == 1,
                 new_count: row.get(16)?,
                 stray: row.get::<_, i64>(17)? == 1,
+                merged_into: row.get(18)?,
+                accounts: row.get(19)?,
             })
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+}
+
+// ==================== 作者融合（v1.3.61） ====================
+//
+// 数据模型是**两层**：
+//   账号层 = `authors` 的每一行（一个真实存在的 Pixiv 账号，带自己的主页、同步时间、目录、销号标记）；
+//   真人层 = 融合出来的那位新作者（成员行的 `merged_into` 指向它，作者库列表据此跳过成员行）。
+// 作品挂在真人层（`works.author_id` = 新作者），`works.origin_author_id` 记住它是从哪个账号抓来的：
+// 撤销融合、按账号同步、将来按号筛选都要靠这一列。
+//
+// 为什么不删成员行：撤销要能把作品原样还回去；而且哪个号被销了，标记还得留在那一行上。
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AuthorAccount {
+    id: i64,
+    name: String,
+    homepage: String,
+    last_sync_at: String,
+    missing_since: String,
+    work_count: i64,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MergeAuthorsResult {
+    author_id: i64,
+    accounts: usize,
+    works_moved: usize,
+    hidden_duplicates: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateGroupItem {
+    work_id: i64,
+    title: String,
+    release_date: String,
+    has_full: bool,
+    image_count: i64,
+    word_count: i64,
+    origin_author_id: i64,
+    origin_author_name: String,
+    hidden: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateGroup {
+    /// `exact`（标题逐字相同，已自动隐藏多余的那几篇）/ `similar`（相似度达到阈值，等用户裁决）。
+    kind: String,
+    title: String,
+    items: Vec<DuplicateGroupItem>,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DuplicateReport {
+    threshold: i64,
+    exact: Vec<DuplicateGroup>,
+    similar: Vec<DuplicateGroup>,
+}
+
+/// 「同名」判据用的标题键：去首尾空格、压连续空白成一个空格、全小写。
+/// 只用来分组，不写库（写库的永远是 work id）。
+fn duplicate_title_key(title: &str) -> String {
+    let mut key = String::with_capacity(title.len());
+    let mut last_space = false;
+    for character in title.trim().chars() {
+        if character.is_whitespace() {
+            if !last_space {
+                key.push(' ');
+            }
+            last_space = true;
+        } else {
+            key.extend(character.to_lowercase());
+            last_space = false;
+        }
+    }
+    key
+}
+
+/// 这位作者名下有几个「账号」：融合体 = 成员行；普通作者 = 自己。
+/// 拿不到成员时退回 `[author_id]`，所以没融合过的作者走这里行为完全不变。
+fn merged_account_ids(conn: &Connection, author_id: i64) -> Result<Vec<i64>, String> {
+    let mut statement = conn
+        .prepare("SELECT id FROM authors WHERE merged_into=?1 ORDER BY COALESCE(NULLIF(sort_order,0),2147483647), name COLLATE NOCASE")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([author_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    let mut ids = Vec::new();
+    for id in rows {
+        ids.push(id.map_err(|e| e.to_string())?);
+    }
+    if ids.is_empty() {
+        ids.push(author_id);
+    }
+    Ok(ids)
+}
+
+/// 标题逐字相同的重复：留完整版 → 否则留发布日期最新的 → 再否则留后导入的（id 大的），其余标隐藏。
+///
+/// 只处理「同名组内不止一篇」的情况：单篇不动、别的标题也不动，所以用户手工裁决过的相似组
+/// 不会被这趟重算顺手清掉。返回隐藏了几篇。
+fn hide_exact_duplicate_titles(conn: &Connection, author_id: i64) -> Result<usize, String> {
+    struct Row {
+        id: i64,
+        key: String,
+        release: String,
+        has_full: bool,
+        images: i64,
+    }
+    let mut statement = conn
+        .prepare("SELECT id, title, release_date, CASE WHEN purchased_path <> '' THEN 1 ELSE 0 END, image_count FROM works WHERE author_id=?1")
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([author_id], |row| {
+            Ok(Row {
+                id: row.get(0)?,
+                key: duplicate_title_key(&row.get::<_, String>(1)?),
+                release: row.get(2)?,
+                has_full: row.get::<_, i64>(3)? == 1,
+                images: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut groups: HashMap<String, Vec<Row>> = HashMap::new();
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        groups.entry(row.key.clone()).or_default().push(row);
+    }
+    let mut hidden = 0usize;
+    for mut items in groups.into_values() {
+        if items.len() < 2 {
+            continue;
+        }
+        items.sort_by(|left, right| {
+            right
+                .has_full
+                .cmp(&left.has_full)
+                .then_with(|| right.release.cmp(&left.release))
+                .then_with(|| right.images.cmp(&left.images))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        conn.execute("UPDATE works SET hidden_dup=0 WHERE id=?1", [items[0].id])
+            .map_err(|e| e.to_string())?;
+        for item in items.iter().skip(1) {
+            conn.execute("UPDATE works SET hidden_dup=1 WHERE id=?1", [item.id])
+                .map_err(|e| e.to_string())?;
+            hidden += 1;
+        }
+    }
+    Ok(hidden)
+}
+
+#[tauri::command]
+fn author_accounts(author_id: i64) -> Result<Vec<AuthorAccount>, String> {
+    let conn = db()?;
+    let ids = merged_account_ids(&conn, author_id)?;
+    let mut accounts = Vec::new();
+    for id in ids {
+        let (name, homepage, last_sync_at): (String, String, String) = conn
+            .query_row(
+                "SELECT name, homepage, pixiv_last_sync_at FROM authors WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        // 老库 / 测试库可能没有 missing_since 列，单独取、取不到就当没销号。
+        let missing_since: String = conn
+            .query_row(
+                "SELECT COALESCE(missing_since, '') FROM authors WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        let work_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM works WHERE author_id=?1",
+                [author_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        accounts.push(AuthorAccount {
+            id,
+            name,
+            homepage,
+            last_sync_at,
+            missing_since,
+            work_count,
+        });
+    }
+    Ok(accounts)
+}
+
+/// 把几位作者融合成一位新作者。成员行保留、标 `merged_into`，作品迁挂到新作者并记来源账号。
+///
+/// 已经是融合体的作者可以再参与融合（反复换号的场景）：它的成员会被一起卷进新组。
+#[tauri::command]
+fn merge_authors(
+    name: String,
+    member_ids: Vec<i64>,
+    preview_dir: String,
+    purchased_dir: String,
+) -> Result<MergeAuthorsResult, String> {
+    let mut conn = db()?;
+    merge_authors_impl(&mut conn, name, member_ids, preview_dir, purchased_dir)
+}
+
+/// 融合的实际动作。conn 由调用方给，测试里换成内存库。
+fn merge_authors_impl(
+    conn: &mut Connection,
+    name: String,
+    member_ids: Vec<i64>,
+    preview_dir: String,
+    purchased_dir: String,
+) -> Result<MergeAuthorsResult, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("给融合后的作者起个名字。".into());
+    }
+    let mut picked: Vec<i64> = Vec::new();
+    for id in member_ids {
+        if id > 0 && !picked.contains(&id) {
+            picked.push(id);
+        }
+    }
+    if picked.len() < 2 {
+        return Err("至少要选两个作者才能融合。".into());
+    }
+    // 展开：选中的作者如果本身是融合体，把它的成员也一起带上。
+    let mut accounts: Vec<i64> = Vec::new();
+    for id in &picked {
+        let stray: i64 = conn
+            .query_row("SELECT COALESCE(stray, 0) FROM authors WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .map_err(|_| "选中的作者里有的已经不在了，刷新一下再试。".to_string())?;
+        if stray == 1 {
+            return Err("散篇是一个兜底分类，不参与作者融合。".into());
+        }
+        if !accounts.contains(id) {
+            accounts.push(*id);
+        }
+        let mut statement = conn
+            .prepare("SELECT id FROM authors WHERE merged_into=?1")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([id], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        for child in rows {
+            let child = child.map_err(|e| e.to_string())?;
+            if !accounts.contains(&child) {
+                accounts.push(child);
+            }
+        }
+    }
+    if accounts.len() < 2 {
+        return Err("至少要选两个作者才能融合。".into());
+    }
+    let taken: Option<i64> = conn
+        .query_row("SELECT id FROM authors WHERE name=?1", [&name], |row| row.get(0))
+        .ok();
+    if taken.is_some() {
+        return Err(format!("已经有一个叫「{name}」的作者了，换个名字。"));
+    }
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO authors (name, preview_dir, purchased_dir) VALUES (?1, ?2, ?3)",
+            params![name, preview_dir.trim(), purchased_dir.trim()],
+        )
+        .map_err(|e| e.to_string())?;
+    let author_id = transaction.last_insert_rowid();
+    let mut works_moved = 0usize;
+    for id in &accounts {
+        works_moved += transaction
+            .execute(
+                "UPDATE works SET origin_author_id = CASE WHEN origin_author_id = 0 THEN author_id ELSE origin_author_id END, author_id = ?1 WHERE author_id = ?2",
+                params![author_id, id],
+            )
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute("UPDATE authors SET merged_into = ?1 WHERE id = ?2", params![author_id, id])
+            .map_err(|e| e.to_string())?;
+        // 旧融合体主行下的成员也一起转到新组。
+        transaction
+            .execute(
+                "UPDATE authors SET merged_into = ?1 WHERE merged_into = ?2",
+                params![author_id, id],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    transaction.commit().map_err(|e| e.to_string())?;
+    let hidden_duplicates = hide_exact_duplicate_titles(&conn, author_id)?;
+    Ok(MergeAuthorsResult {
+        author_id,
+        accounts: accounts.len(),
+        works_moved,
+        hidden_duplicates,
+    })
+}
+
+/// 撤销融合：作品按 `origin_author_id` 还回各自账号、成员行解除标记、删掉融合出来的那行。
+#[tauri::command]
+fn unmerge_author(author_id: i64) -> Result<(), String> {
+    let mut conn = db()?;
+    unmerge_author_impl(&mut conn, author_id)
+}
+
+/// 撤销的实际动作。conn 由调用方给，测试里换成内存库。
+fn unmerge_author_impl(conn: &mut Connection, author_id: i64) -> Result<(), String> {
+    let merged_into: i64 = conn
+        .query_row("SELECT merged_into FROM authors WHERE id=?1", [author_id], |row| {
+            row.get(0)
+        })
+        .map_err(|_| "这位作者已经不在了，刷新一下再试。".to_string())?;
+    if merged_into != 0 {
+        return Err("这是一位被融合的账号，请对它融合到的那位作者点撤销。".into());
+    }
+    let members: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM authors WHERE merged_into=?1",
+            [author_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if members == 0 {
+        return Err("这位作者没有融合过别的账号。".into());
+    }
+    let orphan: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM works WHERE author_id=?1 AND origin_author_id = 0",
+            [author_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if orphan > 0 {
+        return Err(format!(
+            "还有 {orphan} 篇作品找不到来源账号（可能是融合后新导入的），先把它们挪回某个账号再撤销。"
+        ));
+    }
+    let transaction = conn.transaction().map_err(|e| e.to_string())?;
+    // 撤销后这些作品各自还回原账号，之前因同名被自动隐藏的也一并放出来 ——
+    // 否则用户撤完会发现作品还是少几篇，又找不到哪里能恢复。
+    transaction
+        .execute("UPDATE works SET hidden_dup = 0 WHERE author_id = ?1", [author_id])
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute(
+            "UPDATE works SET author_id = origin_author_id, origin_author_id = 0 WHERE author_id = ?1",
+            [author_id],
+        )
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute("UPDATE authors SET merged_into = 0 WHERE merged_into = ?1", [author_id])
+        .map_err(|e| e.to_string())?;
+    transaction
+        .execute("DELETE FROM authors WHERE id = ?1", [author_id])
+        .map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 扫一位（融合后的）作者名下的重复作品，分两档：
+/// `exact` 标题逐字相同（已经自动隐藏了多余的）；`similar` 相似度够高但不是同名（等用户裁决）。
+#[tauri::command]
+fn scan_author_duplicates(author_id: i64) -> Result<DuplicateReport, String> {
+    struct Row {
+        id: i64,
+        title: String,
+        key: String,
+        release: String,
+        has_full: bool,
+        images: i64,
+        words: i64,
+        origin: i64,
+        origin_name: String,
+        hidden: bool,
+    }
+    let conn = db()?;
+    let threshold: i64 = setting(&conn, "similarity_threshold")?
+        .parse()
+        .unwrap_or(70);
+    let mut statement = conn
+        .prepare(
+            "SELECT w.id, w.title, w.release_date, CASE WHEN w.purchased_path <> '' THEN 1 ELSE 0 END, w.image_count, w.word_count, w.origin_author_id, COALESCE(a.name, ''), w.hidden_dup
+             FROM works w LEFT JOIN authors a ON a.id = w.origin_author_id
+             WHERE w.author_id = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([author_id], |row| {
+            let title: String = row.get(1)?;
+            Ok(Row {
+                id: row.get(0)?,
+                key: duplicate_title_key(&title),
+                title,
+                release: row.get(2)?,
+                has_full: row.get::<_, i64>(3)? == 1,
+                images: row.get(4)?,
+                words: row.get(5)?,
+                origin: row.get(6)?,
+                origin_name: row.get(7)?,
+                hidden: row.get::<_, i64>(8)? == 1,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut all: Vec<Row> = Vec::new();
+    for row in rows {
+        all.push(row.map_err(|e| e.to_string())?);
+    }
+    let to_item = |row: &Row| DuplicateGroupItem {
+        work_id: row.id,
+        title: row.title.clone(),
+        release_date: row.release.clone(),
+        has_full: row.has_full,
+        image_count: row.images,
+        word_count: row.words,
+        origin_author_id: row.origin,
+        origin_author_name: row.origin_name.clone(),
+        hidden: row.hidden,
+    };
+
+    // 第一档：标题逐字相同。
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, row) in all.iter().enumerate() {
+        by_key.entry(row.key.clone()).or_default().push(index);
+    }
+    let mut exact: Vec<DuplicateGroup> = Vec::new();
+    for indexes in by_key.values() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        let items: Vec<DuplicateGroupItem> = indexes.iter().map(|index| to_item(&all[*index])).collect();
+        exact.push(DuplicateGroup {
+            kind: "exact".into(),
+            title: items[0].title.clone(),
+            items,
+        });
+    }
+
+    // 第二档：标题不同但相似度达到阈值。并查集把互相相似的并成一组。
+    let mut parent: Vec<usize> = (0..all.len()).collect();
+    fn find(parent: &mut Vec<usize>, index: usize) -> usize {
+        let mut current = index;
+        while parent[current] != current {
+            parent[current] = parent[parent[current]];
+            current = parent[current];
+        }
+        current
+    }
+    for left in 0..all.len() {
+        for right in (left + 1)..all.len() {
+            if all[left].key == all[right].key {
+                continue;
+            }
+            if similarity_percent(&all[left].title, &all[right].title) >= threshold {
+                let left_root = find(&mut parent, left);
+                let right_root = find(&mut parent, right);
+                if left_root != right_root {
+                    parent[right_root] = left_root;
+                }
+            }
+        }
+    }
+    let mut by_root: HashMap<usize, Vec<usize>> = HashMap::new();
+    for index in 0..all.len() {
+        let root = find(&mut parent, index);
+        by_root.entry(root).or_default().push(index);
+    }
+    let mut similar: Vec<DuplicateGroup> = Vec::new();
+    for indexes in by_root.into_values() {
+        if indexes.len() < 2 {
+            continue;
+        }
+        let items: Vec<DuplicateGroupItem> = indexes.iter().map(|index| to_item(&all[*index])).collect();
+        similar.push(DuplicateGroup {
+            kind: "similar".into(),
+            title: items[0].title.clone(),
+            items,
+        });
+    }
+    exact.sort_by(|left, right| left.title.cmp(&right.title));
+    similar.sort_by(|left, right| left.title.cmp(&right.title));
+    Ok(DuplicateReport {
+        threshold,
+        exact,
+        similar,
+    })
+}
+
+/// 用户裁决一组重复：`keep_work_id` 那篇留下，同组其他篇隐藏；`keep_work_id` 传 0 表示整组都显示。
+#[tauri::command]
+fn resolve_duplicate_pick(work_ids: Vec<i64>, keep_work_id: i64) -> Result<usize, String> {
+    if work_ids.is_empty() {
+        return Err("没有选中任何作品。".into());
+    }
+    let conn = db()?;
+    let mut hidden = 0usize;
+    for id in work_ids {
+        let flag = if keep_work_id != 0 && id == keep_work_id { 0 } else if keep_work_id == 0 { 0 } else { 1 };
+        let changed = conn
+            .execute("UPDATE works SET hidden_dup=?1 WHERE id=?2", params![flag, id])
+            .map_err(|e| e.to_string())?;
+        if flag == 1 {
+            hidden += changed;
+        }
+    }
+    Ok(hidden)
 }
 
 /// 保存作者库的手动顺序（v0.3.69）。
@@ -3075,6 +3639,15 @@ fn save_app_settings_impl(mut settings: AppSettings) -> Result<AppSettings, Stri
             // v1.3.53：PDF / Word 新绑进库时自动转 EPUB，默认开
             "auto_convert_epub",
             if settings.auto_convert_epub {
+                "1".into()
+            } else {
+                "0".into()
+            },
+        ),
+        (
+            // v1.3.61：显示被判定为重复而隐藏的作品（默认关）
+            "show_hidden_duplicates",
+            if settings.show_hidden_duplicates {
                 "1".into()
             } else {
                 "0".into()
@@ -3909,7 +4482,8 @@ fn list_works(
 ) -> Result<Vec<Work>, String> {
     let conn = db()?;
     let condition = search_match_clause(&search_field, "", "?2", "?3");
-    let mut sql = format!("SELECT {WORK_COLUMNS} FROM works WHERE author_id = ?1 AND {condition}");
+    let dup = hidden_dup_clause(&conn, "");
+    let mut sql = format!("SELECT {WORK_COLUMNS} FROM works WHERE author_id = ?1 AND {condition}{dup}");
     match status.as_str() {
         "purchased" => sql.push_str(" AND purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND purchased_path = ''"),
@@ -3968,7 +4542,8 @@ fn list_all_works(
 ) -> Result<Vec<Work>, String> {
     let conn = db()?;
     let condition = search_match_clause(&search_field, "w.", "?1", "?2");
-    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id WHERE {condition}");
+    let dup = hidden_dup_clause(&conn, "w.");
+    let mut sql = format!("SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id=w.author_id WHERE {condition}{dup}");
     match status.as_str() {
         "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
         "unpurchased" => sql.push_str(" AND w.purchased_path = ''"),
@@ -9015,6 +9590,9 @@ fn pixiv_sync_impl(
     max_concurrency: Option<usize>,
     reset_cancel: bool,
     app: tauri::AppHandle,
+    // v1.3.61 作者融合：不为 None 时「主页 / 同步时间 / 已销号标记」按这个账号行来算，
+    // 作品仍然写到 `author_id`（融合后的真身）名下，并在 works.origin_author_id 记来源账号。
+    account_id: Option<i64>,
 ) -> Result<PixivSyncResult, String> {
     if reset_cancel {
         clear_pixiv_sync_cancel(author_id);
@@ -9038,12 +9616,30 @@ fn pixiv_sync_impl(
     let image_quality = sync_settings.image_quality.clone();
     // 同步时就按设置生成阅读版：html 单网页，或者直接产出 epub
     let reading_format = reading_format_of(&sync_settings.sync_image_format);
-    // `_threshold`（作者级的 match_threshold）在同步里已经不用了：复用本地预览版
-    // 只认文件名完全相同，不再比相似度。留在 SELECT 里只是为了不改 tuple 的取列顺序。
-    let (homepage, preview_dir, purchased_dir, _threshold, last_sync, cookie, author_name): (String, String, String, i64, String, String, String) = conn.query_row(
-        "SELECT a.homepage, a.preview_dir, a.purchased_dir, a.match_threshold, a.pixiv_last_sync_at, COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), ''), a.name FROM authors a WHERE a.id=?1",
-        [author_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
-    ).map_err(|e| e.to_string())?;
+    // v1.3.61 作者融合：主页 / 上次同步时间 / 已销号标记属于**账号**那一行，
+    // 预览与完整目录、名字属于**真身**（融合后的新作者）——两者可能不是同一行。
+    let account_lookup = account_id.unwrap_or(author_id);
+    let (homepage, last_sync): (String, String) = conn
+        .query_row(
+            "SELECT a.homepage, a.pixiv_last_sync_at FROM authors a WHERE a.id=?1",
+            [account_lookup],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let (preview_dir, purchased_dir, author_name): (String, String, String) = conn
+        .query_row(
+            "SELECT a.preview_dir, a.purchased_dir, a.name FROM authors a WHERE a.id=?1",
+            [author_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let cookie: String = conn
+        .query_row(
+            "SELECT COALESCE((SELECT value FROM app_settings WHERE key='pixiv_cookie'), '')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
     if preview_dir.trim().is_empty() {
         return Err("请先在作者设置中绑定预览版文件夹。".into());
     }
@@ -9175,11 +9771,11 @@ fn pixiv_sync_impl(
         // 只标记、不碰数据；下次同步能拉到作品会自动摘掉（下面的 else 分支）。
         let _ = conn.execute(
             "UPDATE authors SET missing_since=?1 WHERE id=?2",
-            params![Utc::now().to_rfc3339(), author_id],
+            params![Utc::now().to_rfc3339(), account_lookup],
         );
     } else {
         // 能拉到作品 ⇒ 之前若被标过，摘掉（自愈）
-        let _ = conn.execute("UPDATE authors SET missing_since='' WHERE id=?1", [author_id]);
+        let _ = conn.execute("UPDATE authors SET missing_since='' WHERE id=?1", [account_lookup]);
     }
     // profile/all intentionally only contains IDs for novels. Process newer IDs
     // first; the submission-time filter is applied after loading each detail.
@@ -9627,7 +10223,7 @@ fn pixiv_sync_impl(
                     _ => -1,
                 }
             };
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new, synopsis, word_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, (title_indicates_images(&title) || detail_has_embedded_images(body)) as i64, description, reused_word_count]).is_err() {
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, is_new, synopsis, word_count, origin_author_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)", params![author_id, title, date, preview_value, cover_value, purchased_value, tags, novel_id, series_id, series_title, series_order, (title_indicates_images(&title) || detail_has_embedded_images(body)) as i64, description, reused_word_count, account_lookup]).is_err() {
                 result.failed_count += 1;
                 continue;
             }
@@ -9868,7 +10464,7 @@ fn pixiv_sync_impl(
                 let counted = count_non_whitespace(&text_body) as i64;
                 if counted > 0 { counted } else { -1 }
             };
-            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis, word_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, has_images as i64, image_saved as i64, work.synopsis, stored_word_count]).is_err() {
+            if conn.execute("INSERT INTO works (author_id, title, release_date, preview_path, cover_path, purchased_path, tags, pixiv_novel_id, series_id, series_title, series_order, has_images, image_count, is_new, synopsis, word_count, origin_author_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15, ?16)", params![author_id, work.title, work.release_date, preview_value, cover_path.to_string_lossy(), purchased_value, work.tags, work.novel_id, work.series_id, work.series_title, work.series_order, has_images as i64, image_saved as i64, work.synopsis, stored_word_count, account_lookup]).is_err() {
             result.failed_count += 1;
             continue;
         }
@@ -9900,7 +10496,7 @@ fn pixiv_sync_impl(
         result.last_sync_at = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE authors SET pixiv_last_sync_at=?1 WHERE id=?2",
-            params![result.last_sync_at, author_id],
+            params![result.last_sync_at, account_lookup],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -9980,6 +10576,32 @@ fn check_pixiv_author_impl(
     }
 }
 
+/// 把「同一个人的多个账号」各自跑出来的同步结果合成一份（v1.3.61 作者融合）。
+///
+/// 前端只认一份结果：篇数相加，取消 / 限流任一命中就算命中，
+/// 上次同步时间取最后一次非空的，失败原因去重后累加。
+fn merge_sync_results(mut acc: PixivSyncResult, next: PixivSyncResult) -> PixivSyncResult {
+    acc.downloaded_count += next.downloaded_count;
+    acc.reused_preview_count += next.reused_preview_count;
+    acc.skipped_existing_count += next.skipped_existing_count;
+    acc.skipped_date_count += next.skipped_date_count;
+    acc.skipped_size_count += next.skipped_size_count;
+    acc.failed_count += next.failed_count;
+    acc.cancelled |= next.cancelled;
+    acc.throttled |= next.throttled;
+    if !next.last_sync_at.is_empty() {
+        acc.last_sync_at = next.last_sync_at.clone();
+    }
+    for reason in next.failed_reasons {
+        if !acc.failed_reasons.contains(&reason) {
+            acc.failed_reasons.push(reason);
+        }
+    }
+    acc.candidates.extend(next.candidates);
+    acc.candidate_titles.extend(next.candidate_titles);
+    acc
+}
+
 #[tauri::command]
 async fn sync_pixiv_novels(
     author_id: i64,
@@ -10005,27 +10627,62 @@ async fn sync_pixiv_novels(
     // scan_only / candidates / fetch_mode 是 v1.3.15 两段式批量同步的三个口子（见 syncAllAuthors）：
     // 第一段只盘点带 scan_only；第二段带 candidates + fetch_mode。普通调用都不传，行为不变。
     let scan_only = scan_only.unwrap_or(false);
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        pixiv_sync_impl(
-            author_id,
-            start_date,
-            end_date,
-            novel_url,
-            cursor_key,
-            scan_only,
-            candidates,
-            fetch_mode,
-            max_concurrency,
-            reset_cancel,
-            app,
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    // v1.3.61 作者融合：只有「这个人一整轮完整同步」才按账号逐个跑。
+    // 点名下载（novel_url 非空）、批量第二段（带 fetch_mode / candidates）、只盘点，
+    // 都仍然只走主账号一次 —— 它们的语义是「这一篇」而不是「这个人的所有账号」。
+    let expand_accounts =
+        !scan_only && candidates.is_none() && fetch_mode.is_none() && novel_url.trim().is_empty();
+    let accounts: Vec<i64> = if expand_accounts {
+        let conn = db()?;
+        let list = merged_account_ids(&conn, author_id)?;
+        if list.len() > 1 {
+            list
+        } else {
+            vec![author_id]
+        }
+    } else {
+        vec![author_id]
+    };
+    let mut merged: Option<PixivSyncResult> = None;
+    for account in accounts {
+        // 闭包是 move 的，共享变量只能每轮克隆一份带进去
+        let round_start = start_date.clone();
+        let round_end = end_date.clone();
+        let round_url = novel_url.clone();
+        let round_candidates = candidates.clone();
+        let round_mode = fetch_mode.clone();
+        let app_handle = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            pixiv_sync_impl(
+                author_id,
+                round_start,
+                round_end,
+                round_url,
+                cursor_key,
+                scan_only,
+                round_candidates,
+                round_mode,
+                max_concurrency,
+                // 取消标记在命令层开跑前已经清过一次；每轮都清会把用户中途点的「终止」冲掉
+                false,
+                app_handle,
+                Some(account),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        merged = Some(match merged {
+            None => result,
+            Some(acc) => merge_sync_results(acc, result),
+        });
+        if merged.as_ref().map(|r| r.cancelled).unwrap_or(false) {
+            break;
+        }
+    }
     if reset_cancel {
         clear_pixiv_sync_cancel(author_id);
     }
-    result
+    merged.ok_or_else(|| "没有可同步的账号".to_string())
 }
 
 /// 开一轮批量同步前清零累计游标。整库 / 批量同步用键 0（见 `PIXIV_SYNC_BATCH_CURSOR`）。
@@ -11738,7 +12395,7 @@ fn download_bookmark_novel_impl(
     drop(conn);
     let url = format!("https://www.pixiv.net/novel/show.php?id={novel_id}");
     // 「点名下载」只有一篇，不需要调流；游标键沿用作者 id 就行（不会被读）
-    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, author_id, false, None, None, None, true, app.clone())?;
+    let result = pixiv_sync_impl(author_id, String::new(), String::new(), url, author_id, false, None, None, None, true, app.clone(), None)?;
     if result.downloaded_count == 0 {
         if result.throttled {
             return Err("被 Pixiv 限流了，停一会儿再试".into());
@@ -12148,14 +12805,16 @@ fn map_author_collection(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorColl
 
 /// 作者库那套取列原样复用（作者收藏夹里的作者卡和作者库同一形状）。
 const AUTHOR_SELECT_COLUMNS: &str = "a.id, a.name, a.homepage, a.avatar_path, a.notes, a.preview_dir, a.purchased_dir, a.match_threshold, a.pixiv_last_sync_at, a.avatar_managed,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id),
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.purchased_path <> ''),
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.hidden_dup = 0),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.purchased_path <> '' AND w.hidden_dup = 0),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.favorite = 1 AND w.hidden_dup = 0),
           a.aliases,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1),
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.has_images = 1 AND w.hidden_dup = 0),
           a.starred,
-          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1),
-          a.stray";
+          (SELECT COUNT(*) FROM works w WHERE w.author_id = a.id AND w.is_new = 1 AND w.hidden_dup = 0),
+          a.stray,
+          a.merged_into,
+          (SELECT COUNT(*) FROM authors m WHERE m.merged_into = a.id)";
 
 fn map_author_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorSummary> {
     Ok(AuthorSummary {
@@ -12177,6 +12836,8 @@ fn map_author_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthorSummary
         starred: row.get::<_, i64>(15)? == 1,
         new_count: row.get(16)?,
         stray: row.get::<_, i64>(17)? == 1,
+        merged_into: row.get(18)?,
+        accounts: row.get(19)?,
     })
 }
 
@@ -12477,9 +13138,10 @@ fn list_stray_works(
 ) -> Result<Vec<Work>, String> {
     let conn = db()?;
     let condition = search_match_clause(&search_field, "w.", "?1", "?2");
+    let dup = hidden_dup_clause(&conn, "w.");
     let mut sql = format!(
         "SELECT {WORK_COLUMNS_W} FROM works w JOIN authors a ON a.id = w.author_id
-         WHERE a.stray = 1 AND {condition}"
+         WHERE a.stray = 1 AND {condition}{dup}"
     );
     match status.as_str() {
         "purchased" => sql.push_str(" AND w.purchased_path <> ''"),
@@ -20531,7 +21193,7 @@ fn export_works_package_impl(
     let mut ids: Vec<i64> = work_ids.to_vec();
     for author_id in author_ids {
         let mut statement = conn
-            .prepare("SELECT id FROM works WHERE author_id=?1 ORDER BY id")
+            .prepare("SELECT id FROM works WHERE author_id=?1 AND hidden_dup = 0 ORDER BY id")
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([author_id], |row| row.get::<_, i64>(0))
@@ -21794,6 +22456,11 @@ pub fn run() {
             list_authors,
             save_author,
             set_author_order,
+            author_accounts,
+            merge_authors,
+            unmerge_author,
+            scan_author_duplicates,
+            resolve_duplicate_pick,
             delete_author,
             update_author_path,
             relocate_author_works,
@@ -25824,8 +26491,10 @@ mod tests {
     #[test]
     fn update_asset_prefers_the_bare_exe() {
         let names = update_asset_names("1.0.1");
-        assert_eq!(names[0], "PixivNovelDownloader-v1.0.1.exe", "裸 exe 是首选");
-        assert_eq!(names[1], "PixivNovelDownloader-v1.0.1.zip", "历史发布过 zip，留作后备");
+        // v1.3.54 起发布的是固定名 exe（不带版本号），它必须排第一
+        assert_eq!(names[0], "PixivNovelDownloader.exe", "固定名 exe 是首选");
+        assert_eq!(names[1], "PixivNovelDownloader-v1.0.1.exe", "历史带版本号的 exe 留作后备");
+        assert_eq!(names[2], "PixivNovelDownloader-v1.0.1.zip", "历史发布过 zip，留作后备");
     }
 
     /// 真机联网验证版本探测与安装包探测（默认 `#[ignore]`，要手动跑：`cargo test -- --ignored`）。
@@ -25993,7 +26662,10 @@ mod tests {
                avatar_managed INTEGER NOT NULL DEFAULT 0,
                sort_order INTEGER NOT NULL DEFAULT 0,
                starred INTEGER NOT NULL DEFAULT 0,
-               aliases TEXT NOT NULL DEFAULT ''
+               aliases TEXT NOT NULL DEFAULT '',
+               stray INTEGER NOT NULL DEFAULT 0,
+               missing_since TEXT NOT NULL DEFAULT '',
+               merged_into INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE works (
                id INTEGER PRIMARY KEY,
@@ -26019,7 +26691,9 @@ mod tests {
                note TEXT NOT NULL DEFAULT '',
                need_full_state INTEGER NOT NULL DEFAULT 0,
                need_full_marked_at TEXT NOT NULL DEFAULT '',
-               word_count INTEGER NOT NULL DEFAULT -1
+               word_count INTEGER NOT NULL DEFAULT -1,
+               origin_author_id INTEGER NOT NULL DEFAULT 0,
+               hidden_dup INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS work_watch_later (
                work_id INTEGER PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
@@ -27026,6 +27700,88 @@ mod tests {
             .collect();
         assert!(!names.contains(&"乙".to_string()), "没勾的作者不该被建出来：{names:?}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_authors_moves_works_and_hides_duplicates() {
+        // 作者融合（v1.3.61）：作品挂到新作者、同名组留完整版、撤销能原路还回去
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_full_work_tables(&conn);
+        conn.execute("INSERT INTO authors (id, name) VALUES (1, '甲'), (2, '乙')", [])
+            .unwrap();
+        // 甲有一篇预览版「同名作品」，乙有完整版「同名作品」+ 另一篇
+        for (id, author_id, title, full) in [
+            (1i64, 1i64, "同名作品", false),
+            (2, 2, "同名作品", true),
+            (3, 2, "乙的另一篇", true),
+        ] {
+            conn.execute(
+                "INSERT INTO works (id, author_id, title, pixiv_novel_id) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, author_id, title, format!("{id}00")],
+            )
+            .unwrap();
+            if full {
+                conn.execute(
+                    "UPDATE works SET purchased_path=?1 WHERE id=?2",
+                    rusqlite::params![format!("D:/books/{id}.txt"), id],
+                )
+                .unwrap();
+            }
+        }
+        let merged = crate::merge_authors_impl(
+            &mut conn,
+            "合并后".into(),
+            vec![1, 2],
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(merged.accounts, 2);
+        assert_eq!(merged.works_moved, 3);
+        assert_eq!(merged.hidden_duplicates, 1);
+        let members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM authors WHERE merged_into=?1",
+                [merged.author_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 2);
+        // 同名组里完整版（id=2）留下，预览版（id=1）隐藏
+        let hidden: i64 = conn
+            .query_row("SELECT hidden_dup FROM works WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hidden, 1);
+        let kept: i64 = conn
+            .query_row("SELECT hidden_dup FROM works WHERE id=2", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kept, 0);
+        let moved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM works WHERE author_id=?1",
+                [merged.author_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 3);
+
+        // 撤销：作品按来源还回各自账号、隐藏标记清掉、融合出来的那行删掉
+        crate::unmerge_author_impl(&mut conn, merged.author_id).unwrap();        let back_a: i64 = conn
+            .query_row("SELECT author_id FROM works WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(back_a, 1);
+        let back_b: i64 = conn
+            .query_row("SELECT author_id FROM works WHERE id=3", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(back_b, 2);
+        let restored: i64 = conn
+            .query_row("SELECT hidden_dup FROM works WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored, 0);
+        let authors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM authors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(authors, 2);
     }
 
     #[test]

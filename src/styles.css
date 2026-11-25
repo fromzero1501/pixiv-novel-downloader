@@ -1115,3 +1115,17 @@ button:disabled { cursor: not-allowed; opacity: .55; box-shadow: none; }
 .bookmark-auto-download { display: inline-flex; align-items: center; gap: 6px; color: #4b6b89; font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; user-select: none; }
 .bookmark-auto-download input { width: 14px; height: 14px; margin: 0; accent-color: #4b8bd6; cursor: pointer; }
 .bookmark-auto-download input:disabled { cursor: not-allowed; opacity: .6; }
+
+/* 作者融合（v1.3.61）：卡片上的账号数、作品库的多主页、重复作品待裁决面板 */
+.author-merge-note { margin: 2px 0 0; font-size: 12px; color: #6b8fb0; }
+.account-links { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.dup-list { display: flex; flex-direction: column; gap: 14px; max-height: 58vh; overflow: auto; padding-right: 4px; }
+.dup-group { border: 1px solid #dbe6f0; border-radius: 10px; padding: 10px 12px; background: #fbfdff; }
+.dup-group header { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.dup-group header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dup-item { display: flex; align-items: baseline; gap: 8px; padding: 4px 0; }
+.dup-item.is-hidden { opacity: .55; }
+.dup-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dup-meta { color: #7a90a8; font-size: 12px; white-space: nowrap; }
+.dup-group footer { margin-top: 6px; }
+.modal-inline-actions { display: flex; gap: 8px; margin: -6px 0 10px; }

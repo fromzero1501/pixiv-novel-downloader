@@ -35,6 +35,9 @@ const state = {
   activeAuthor: null,
   works: [],
   authorQuery: "",
+  // 作者融合（v1.3.61）：当前作者组内的账号列表、最近一次重复扫描结果
+  authorAccounts: [],
+  dupReport: null,
   workQuery: "",
   /**
    * 「所有作品」自己那份搜索词（v0.3.68 从 workQuery 拆出来）：
@@ -726,6 +729,32 @@ async function invoke(command, args = {}) {
     const picked = (args.authors || []).length;
     return { kind: "package", authorsCreated: picked, worksAdded: picked * 2, worksUpgraded: 0, worksSkipped: 0, path: String(args.root || ""), restartedNeeded: false };
   }
+  // 作者融合（v1.3.61）：预览里给一点假数据，好让按钮点下去有反应
+  if (command === "author_accounts") {
+    const author = previewAuthors.find((item) => item.id === Number(args.authorId));
+    if (!author) return [];
+    const accounts = [{ id: author.id, name: author.name, homepage: author.homepage || "", lastSyncAt: author.pixivLastSyncAt || "", missingSince: "", workCount: author.workCount || 0 }];
+    if (Number(author.accounts) > 0) {
+      accounts.push({ id: author.id + 900, name: `${author.name}（小号）`, homepage: "https://www.pixiv.net/users/900001", lastSyncAt: "", missingSince: "2026-11-01", workCount: 0 });
+    }
+    return accounts;
+  }
+  if (command === "merge_authors") {
+    const ids = args.memberIds || [];
+    return { authorId: 999, accounts: ids.length, worksMoved: ids.length * 3, hiddenDuplicates: Math.max(0, ids.length - 1) };
+  }
+  if (command === "unmerge_author") return null;
+  if (command === "scan_author_duplicates") {
+    return {
+      threshold: 70,
+      exact: [{ kind: "exact", title: "预览重复篇（同名）", items: [
+        { workId: 1, title: "预览重复篇（同名）", releaseDate: "2026-10-01", hasFull: true, imageCount: 4, wordCount: 12000, originAuthorId: 1, originAuthorName: "预览作者甲", hidden: false },
+        { workId: 2, title: "预览重复篇（同名）", releaseDate: "2026-09-01", hasFull: false, imageCount: 0, wordCount: 9000, originAuthorId: 2, originAuthorName: "预览作者甲（小号）", hidden: true },
+      ] }],
+      similar: [],
+    };
+  }
+  if (command === "resolve_duplicate_pick") return (args.workIds || []).length;
   // 系列序号故意留一个空号（1、3，缺 2），好让「缺篇检测」在预览里也验得到。
   // v1.2.96：系列改成**内存可变**（新建 / 重命名 / 删除要能在预览里看得出效果）
   if (command === "list_series") return previewSeries.map((item) => ({ ...item }));
@@ -1658,6 +1687,8 @@ async function refreshWorks() {
     return;
   }
   if (!state.activeAuthor) return;
+  // 融合作者（v1.3.61）：作品库页要并排显示组内每个账号的主页与同步状态
+  state.authorAccounts = await invoke("author_accounts", { authorId: state.activeAuthor.id }).catch(() => []);
   // 「正文内容」档：列表不带搜索词（正文命中由前端按 hit 集合过滤），免得被当标题搜了
   const bodyMode = state.searchField === "body";
   state.works = await invoke("list_works", {
@@ -2739,7 +2770,7 @@ function renderAuthors() {
   const query = state.authorQuery.trim().toLowerCase();
   // 「散篇」作者不画卡（用户要求）：它们只是下作品时给陌生作者建的落脚点，
   // 统一归到列表末尾那张「散篇」卡里，别把作者库塞满一次性作者。
-  const authors = state.authors.filter((author) => !author.stray && (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
+  const authors = state.authors.filter((author) => !author.stray && !author.mergedInto && (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
   const cards = authors.map((author) => `
     <article class="author-card${author.starred ? " is-starred" : ""}${state.missingAuthorIds.has(author.id) ? " is-missing" : ""}" data-author-id="${author.id}" tabindex="0">
       <div class="author-avatar-wrap">
@@ -2752,6 +2783,7 @@ function renderAuthors() {
         ${authorAliasList(author.aliases)}
         <dl class="author-stats"><div><dt>作品</dt><dd>${author.workCount}</dd></div><div><dt>完整版</dt><dd>${author.purchasedCount}</dd></div><div><dt>带图版</dt><dd>${author.imagesCount || 0}</dd></div><div><dt>收藏</dt><dd>${author.favoriteCount}</dd></div></dl>
         <p class="author-sync-note" title="${author.pixivLastSyncAt ? escapeHtml(author.pixivLastSyncAt) : "还没有同步记录"}">Pixiv ${escapeHtml(syncLabel(author.pixivLastSyncAt))}</p>
+        ${author.accounts > 0 ? `<p class="author-merge-note" title="这位作者是由 ${author.accounts} 个账号融合成的：主页并排显示，同步按账号逐个跑">${author.accounts} 个账号融合</p>` : ""}
       </div>
       <div class="card-enter">${icon("arrow", 18)}</div>
     </article>`).join("");
@@ -2763,6 +2795,7 @@ function renderAuthors() {
         ${state.authorBulkMode
           ? `<button class="quiet-button" data-action="author-bulk-mode">退出批量选择</button>`
           : `<button class="icon-text-button" data-action="author-bulk-mode" title="进批量选择：勾选作者后，可以把他们名下的作品一起导出">${icon("more", 18)}<span>批量操作</span></button>
+        <button class="icon-text-button" data-action="author-merge-start" title="把同一个人的几个马甲账号合成一位作者（只需勾选、给它起个名字）">${icon("folder", 18)}<span>作者融合</span></button>
         <button class="icon-text-button" data-action="auto-group">${icon("upload", 18)}<span>完整版自动匹配</span></button>
         <button class="icon-text-button" data-action="auto-group-by-author">${icon("folder", 18)}<span>指定作者自动匹配</span></button>
         <button class="icon-text-button" data-action="sync-all-authors">${icon("sync", 18)}<span>同步所有作者</span></button>
@@ -3964,8 +3997,8 @@ function renderWorks() {
 
   return renderShell(`
     <section class="topbar work-topbar">
-      <div class="crumb-heading"><button class="back-button" title="${state.bulkMode ? "退出批量操作" : (state.authorReturnTo === "allWorks" ? "返回所有作品" : "返回作者库")}" data-action="${state.bulkMode ? "bulk-mode" : (state.authorReturnTo === "allWorks" ? "back-to-all-works" : "go-home")}">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库${author.homepage ? `<button class="homepage-link" title="打开作者主页：${escapeHtml(author.homepage)}" data-action="open-external-url" data-url="${escapeHtml(author.homepage)}">${icon("link", 13)}<span>作者主页</span></button>` : ""}</p><h1>${escapeHtml(author.name)}</h1></div></div>
-      <div class="topbar-actions">${state.bulkMode ? `<strong class="bulk-count">已选 ${state.selectedWorkIds.size} 篇</strong>` : `<button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button><button class="icon-text-button" data-action="edit-author" data-author-id="${author.id}">${icon("settings", 18)}<span>作者设置</span></button><button class="icon-text-button" data-action="export-author-package" title="把这位作者名下的全部作品打成一个 zip（含正文与封面，不含收藏 / 评分 / 笔记这些私人记录）">${icon("download", 18)}<span>导出分享包</span></button><button class="icon-text-button" data-action="import-works">${icon("plus", 18)}<span>导入作品</span></button><button class="primary-button" data-action="sync-pixiv">${icon("sync", 18)}<span>作品同步</span></button>`}</div>
+      <div class="crumb-heading"><button class="back-button" title="${state.bulkMode ? "退出批量操作" : (state.authorReturnTo === "allWorks" ? "返回所有作品" : "返回作者库")}" data-action="${state.bulkMode ? "bulk-mode" : (state.authorReturnTo === "allWorks" ? "back-to-all-works" : "go-home")}">${icon("back", 20)}</button><div><p class="section-kicker">作者作品库${authorHomepageLinks(author)}</p><h1>${escapeHtml(author.name)}</h1></div></div>
+      <div class="topbar-actions">${state.bulkMode ? `<strong class="bulk-count">已选 ${state.selectedWorkIds.size} 篇</strong>` : `<button class="icon-text-button" data-action="bulk-mode">${icon("more", 18)}<span>批量操作</span></button><button class="icon-text-button" data-action="edit-author" data-author-id="${author.id}">${icon("settings", 18)}<span>作者设置</span></button><button class="icon-text-button" data-action="dup-review" title="查同名 / 相似标题的作品，逐组决定留哪一篇；被隐藏的不出现在列表、搜索和计数里">${icon("search", 18)}<span>检查重复</span></button>${author.accounts > 0 ? `<button class="icon-text-button" data-action="author-unmerge" title="把这位融合作者拆回原来的各个账号，作品按来源还回去">${icon("back", 18)}<span>撤销融合</span></button>` : ""}<button class="icon-text-button" data-action="export-author-package" title="把这位作者名下的全部作品打成一个 zip（含正文与封面，不含收藏 / 评分 / 笔记这些私人记录）">${icon("download", 18)}<span>导出分享包</span></button><button class="icon-text-button" data-action="import-works">${icon("plus", 18)}<span>导入作品</span></button><button class="primary-button" data-action="sync-pixiv">${icon("sync", 18)}<span>作品同步</span></button>`}</div>
     </section>
     ${state.bulkMode ? bulkBar(works) : ""}
     <section class="library-content">
@@ -5665,7 +5698,7 @@ async function syncAuthorsAfterCreate(authorIds) {
   const ids = [...new Set((authorIds || []).map(Number).filter((id) => id > 0))];
   if (!ids.length) return;
   await refreshAuthors();
-  const targets = state.authors.filter((author) => ids.includes(author.id) && author.homepage && author.previewDir && author.purchasedDir);
+  const targets = state.authors.filter((author) => ids.includes(author.id) && (author.homepage || author.accounts > 0) && author.previewDir && author.purchasedDir);
   if (!targets.length) {
     toast("新建的作者还没有 Pixiv 主页或还没绑目录，跳过自动同步", "info");
     return;
@@ -7730,6 +7763,16 @@ async function bindEvents() {
       if (action === "author-select-all") toggleSelectAllAuthors();
       if (action === "toggle-author-select") toggleAuthorSelection(Number(authorId));
       if (action === "export-share-package") await exportSharePackage();
+      // 作者融合（v1.3.61）
+      if (action === "author-merge-start") startAuthorMerge();
+      if (action === "author-merge") openAuthorMergeDialog();
+      if (action === "author-merge-confirm") await confirmAuthorMerge();
+      if (action === "merge-pick-preview") await pickMergeDir("merge-preview-dir");
+      if (action === "merge-pick-purchased") await pickMergeDir("merge-purchased-dir");
+      if (action === "author-unmerge") unmergeAuthorDialog();
+      if (action === "dup-review") await openDuplicateReview();
+      if (action === "dup-keep-all") await keepDuplicateGroup(Number(element.dataset.dupGroup));
+      if (action === "dup-apply") await applyDuplicateReview();
       if (action === "export-author-package") await exportAuthorSharePackage();
       if (action === "import-data-pick") await pickImportDataFile();
       if (action === "copy-selected-full") await copySelectedToFull();
@@ -8597,10 +8640,202 @@ function authorBulkBar(authors) {
         <button class="quiet-button" data-action="author-bulk-mode">退出批量</button>
       </div>
       <div class="bulk-bar-group"><span class="bulk-bar-label">导出</span><button class="bulk-button" data-action="export-share-package" title="把勾选作者名下的全部作品打成一个 zip（含正文与封面，不含收藏 / 评分 / 笔记这些私人记录）" ${disabled}>导出分享包</button></div>
+      <div class="bulk-bar-group"><span class="bulk-bar-label">融合</span><button class="bulk-button" data-action="author-merge" title="把勾选的几个账号合成一位作者（至少 2 个）：主页并排显示，作品合到一起，重复的自动隐藏" ${count >= 2 ? "" : "disabled"}>融合为一位作者</button></div>
     </section>`;
 }
 
-/** 进 / 出作者库的批量选择。两头都清一次选择 —— 留着上次的勾选只会让人莫名导出多出来的作者。 */
+/**
+ * 融合作者的主页列（v1.3.61）：一个账号一个链接，并排显示，各自带同步状态与销号标记。
+ * 没融合过的作者走老样子，只显示那个单主页。
+ */
+function authorHomepageLinks(author) {
+  const accounts = (state.authorAccounts || []).filter((account) => String(account.homepage || "").trim());
+  if (!accounts.length) {
+    if (!author.homepage) return "";
+    return `<button class="homepage-link" title="打开作者主页：${escapeHtml(author.homepage)}" data-action="open-external-url" data-url="${escapeHtml(author.homepage)}">${icon("link", 13)}<span>作者主页</span></button>`;
+  }
+  const links = accounts.map((account, index) => {
+    const label = accounts.length > 1 ? `主页 ${index + 1}` : "作者主页";
+    const missing = String(account.missingSince || "").trim() ? "（已销号）" : "";
+    const sync = account.lastSyncAt ? `同步于 ${syncLabel(account.lastSyncAt)}` : "还没同步过";
+    const tip = `${account.name} · ${sync}${missing ? " · Pixiv 上找不到这个主页" : ""}`;
+    return `<button class="homepage-link" title="${escapeHtml(tip)}" data-action="open-external-url" data-url="${escapeHtml(account.homepage)}">${icon("link", 13)}<span>${label}${missing}</span></button>`;
+  }).join("");
+  return `<span class="account-links">${links}</span>`;
+}
+
+/** 作者库顶栏的「作者融合」：进批量选择态，让用户去勾要合并的账号。 */
+function startAuthorMerge() {
+  state.authorBulkMode = true;
+  state.selectedAuthorIds.clear();
+  render();
+  toast("勾选要合并成同一个人的几个账号，再点下面的「融合为一位作者」", "info", 6000);
+}
+
+/** 融合弹窗：新作者名字 + 之后下载落点的两个目录（预填第一个有值的成员）。 */
+function openAuthorMergeDialog() {
+  const ids = [...state.selectedAuthorIds];
+  if (ids.length < 2) {
+    toast("至少勾 2 个账号才能融合", "info");
+    return;
+  }
+  const members = state.authors.filter((author) => ids.includes(author.id));
+  const pick = (field, fallback) => members.map((author) => String(author[field] || "").trim()).find(Boolean) || fallback || "";
+  const preview = pick("previewDir", state.settings.defaultPreviewDir);
+  const purchased = pick("purchasedDir", state.settings.defaultPurchasedDir);
+  const names = members.map((author) => escapeHtml(author.name)).join("、");
+  const body = `
+    <p class="confirm-copy">${names} 会合并成一位新作者：主页并排显示、作品合到一起。同名重复的自动隐藏（留完整版，其次留发布日期最新的那篇）。原来的账号不删，随时能在作者作品库里「撤销融合」。</p>
+    <label class="form-field"><span>新作者名称</span><input id="merge-author-name" type="text" value="${escapeHtml(members[0]?.name || "")}" autocomplete="off"></label>
+    <label class="form-field"><span>预览版目录</span><input id="merge-preview-dir" type="text" value="${escapeHtml(preview)}" readonly></label>
+    <div class="modal-inline-actions"><button class="quiet-button" data-action="merge-pick-preview">选择预览版目录</button></div>
+    <label class="form-field"><span>完整版目录</span><input id="merge-purchased-dir" type="text" value="${escapeHtml(purchased)}" readonly></label>
+    <div class="modal-inline-actions"><button class="quiet-button" data-action="merge-pick-purchased">选择完整版目录</button></div>
+    <p class="confirm-copy">已绑定作品的文件路径不会动，这两个目录只是以后下载新作品的落点。</p>`;
+  showModal(modal("融合为一位作者", body, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="author-merge-confirm">融合</button>`));
+}
+
+async function pickMergeDir(inputId) {
+  const picked = await open({ directory: true, multiple: false }).catch(() => null);
+  if (!picked) return;
+  const input = document.querySelector(`#${inputId}`);
+  if (input) input.value = String(picked);
+}
+
+async function confirmAuthorMerge() {
+  const name = String(document.querySelector("#merge-author-name")?.value || "").trim();
+  if (!name) {
+    toast("先给新作者起个名字", "info");
+    return;
+  }
+  const previewDir = String(document.querySelector("#merge-preview-dir")?.value || "");
+  const purchasedDir = String(document.querySelector("#merge-purchased-dir")?.value || "");
+  const memberIds = [...state.selectedAuthorIds];
+  try {
+    const result = await invoke("merge_authors", { name, memberIds, previewDir, purchasedDir });
+    closeModal();
+    state.authorBulkMode = false;
+    state.selectedAuthorIds.clear();
+    state.authorQuery = "";
+    await refreshAuthors();
+    render();
+    const hidden = Number(result.hiddenDuplicates) || 0;
+    toast(`已融合为「${name}」：${result.accounts} 个账号、${result.worksMoved} 篇作品${hidden ? `，隐藏了 ${hidden} 篇重复` : ""}`, "success", 7000);
+  } catch (error) {
+    toast(`融合失败：${error}`, "error", 6000);
+  }
+}
+
+/** 撤销融合：作品按来源还回去、成员行解绑、这位新作者本身删掉。 */
+function unmergeAuthorDialog() {
+  const author = state.activeAuthor;
+  if (!author) return;
+  confirmAction(
+    "确认撤销融合",
+    `「${author.name}」会拆回原来的 ${author.accounts} 个账号：作品按来源还回去，这位新作者本身删掉，隐藏的重复作品一并恢复。`,
+    "撤销融合",
+    async () => {
+      try {
+        await invoke("unmerge_author", { authorId: author.id });
+        state.activeAuthor = null;
+        state.homeView = "authors";
+        state.authorAccounts = [];
+        await refreshAuthors();
+        render();
+        toast("已撤销融合", "success");
+      } catch (error) {
+        toast(`撤销失败：${error}`, "error", 6000);
+      }
+    },
+  );
+}
+
+/** 重复作品待裁决（v1.3.61）：同名 / 相似的分组，逐组选留哪一篇。 */
+async function openDuplicateReview() {
+  const author = state.activeAuthor;
+  if (!author) return;
+  try {
+    const report = await invoke("scan_author_duplicates", { authorId: author.id });
+    state.dupReport = report;
+    renderDuplicateReview();
+  } catch (error) {
+    toast(`检查失败：${error}`, "error", 6000);
+  }
+}
+
+function dupReviewGroups() {
+  const report = state.dupReport;
+  return [...(report?.exact || []), ...(report?.similar || [])];
+}
+
+function renderDuplicateReview() {
+  const report = state.dupReport;
+  const groups = dupReviewGroups();
+  if (!groups.length) {
+    toast("没有发现完全同名或高度相似的作品", "info");
+    return;
+  }
+  const groupHtml = groups.map((group, index) => {
+    const kindLabel = group.kind === "exact" ? "完全同名" : `相似 ≥ ${report.threshold}%`;
+    const items = group.items.map((item, pos) => `
+      <label class="dup-item${item.hidden ? " is-hidden" : ""}">
+        <input type="radio" name="dup-group-${index}" value="${item.workId}" ${pos === 0 ? "checked" : ""}>
+        <span class="dup-title" title="${escapeHtml(item.title || "")}">${escapeHtml(item.title || "（无标题）")}</span>
+        <span class="dup-meta">${item.hasFull ? "完整版" : "预览版"}${item.releaseDate ? ` · ${escapeHtml(item.releaseDate)}` : ""}${item.imageCount ? ` · ${item.imageCount} 图` : ""}${item.originAuthorName ? ` · ${escapeHtml(item.originAuthorName)}` : ""}${item.hidden ? " · 已隐藏" : ""}</span>
+      </label>`).join("");
+    return `<section class="dup-group" data-dup-group="${index}">
+      <header><strong title="${escapeHtml(group.title || "")}">${escapeHtml(group.title || "（无标题）")}</strong><span class="import-faint">${kindLabel} · ${group.items.length} 篇</span></header>
+      ${items}
+      <footer><button class="quiet-button" data-action="dup-keep-all" data-dup-group="${index}">这组都显示</button></footer>
+    </section>`;
+  }).join("");
+  showModal(modal(
+    "检查重复作品",
+    `<p class="confirm-copy">每组选一篇保留，其余隐藏 —— 隐藏的不出现在列表、搜索、计数和导出里。之后想找回来，去设置里打开「显示已隐藏的重复作品」。</p><div class="dup-list">${groupHtml}</div>`,
+    `<button class="quiet-button" data-action="close-modal">关闭</button><button class="primary-button" data-action="dup-apply">应用选择</button>`,
+    "is-wide",
+  ));
+}
+
+async function applyDuplicateReview() {
+  const groups = dupReviewGroups();
+  let changed = 0;
+  for (let index = 0; index < groups.length; index += 1) {
+    const picked = document.querySelector(`input[name="dup-group-${index}"]:checked`);
+    if (!picked) continue;
+    try {
+      await invoke("resolve_duplicate_pick", {
+        workIds: groups[index].items.map((item) => item.workId),
+        keepWorkId: Number(picked.value),
+      });
+      changed += 1;
+    } catch (error) {
+      toast(`第 ${index + 1} 组没存上：${error}`, "error");
+    }
+  }
+  closeModal();
+  await refreshWorks();
+  render();
+  toast(changed ? `已处理 ${changed} 组` : "没有改动", changed ? "success" : "info");
+}
+
+/** 「这组都显示」：整组取消隐藏，顺手把那一段从面板里去掉，不重画整个弹窗。 */
+async function keepDuplicateGroup(index) {
+  const group = dupReviewGroups()[index];
+  if (!group) return;
+  try {
+    await invoke("resolve_duplicate_pick", { workIds: group.items.map((item) => item.workId), keepWorkId: 0 });
+    document.querySelector(`[data-dup-group="${index}"]`)?.remove();
+    await refreshWorks();
+  } catch (error) {
+    toast(`操作失败：${error}`, "error");
+  }
+}
+
+/**
+ * 进 / 出作者库的批量选择。两头都清一次选择 ——
+ * 留着上次的勾选只会让人莫名导出多出来的作者。
+ */
 function toggleAuthorBulkMode() {
   state.authorBulkMode = !state.authorBulkMode;
   state.selectedAuthorIds.clear();
@@ -8616,7 +8851,7 @@ function toggleAuthorSelection(authorId) {
 /** 「全选本页」只勾当前可见的作者（搜索 / 只看收藏都算），和作品库那条同规矩。 */
 function toggleSelectAllAuthors() {
   const query = state.authorQuery.trim().toLowerCase();
-  const authors = state.authors.filter((author) => !author.stray && (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
+  const authors = state.authors.filter((author) => !author.stray && !author.mergedInto && (!state.authorsStarredOnly || author.starred) && authorMatchesQuery(author, query));
   const allSelected = authors.length > 0 && authors.every((author) => state.selectedAuthorIds.has(author.id));
   if (allSelected) state.selectedAuthorIds.clear();
   else authors.forEach((author) => state.selectedAuthorIds.add(author.id));
@@ -10527,16 +10762,16 @@ function pixivSyncModal() {
   const author = state.activeAuthor;
   showModal(modal("作品同步", `
     <form id="pixiv-sync-form" class="form-stack">
-      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : !author.purchasedDir ? "请先在作者设置中绑定完整版文件夹。" : !author.homepage ? "填写单篇小说地址可直接同步；批量同步则需先填写作者主页。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
+      <div class="sync-intro"><span class="sync-intro-icon">${icon("sync", 22)}</span><div><strong>同步 Pixiv 小说</strong><p>${!author.previewDir ? "请先在作者设置中绑定预览版文件夹。" : !author.purchasedDir ? "请先在作者设置中绑定完整版文件夹。" : !author.homepage && !(author.accounts > 0) ? "填写单篇小说地址可直接同步；批量同步则需先填写作者主页。" : "将下载新小说正文、封面与标签到预览版目录。"}</p></div></div>
       <label>单篇小说地址 <input name="novelUrl" type="url" placeholder="https://www.pixiv.net/novel/show.php?id=28686066"><small>填写有效地址后只同步该作品，不更新上次成功同步时间，也不使用日期范围。</small></label>
       <div class="date-range"><label>开始日期 <input name="startDate" type="date"></label><label>结束日期 <input name="endDate" type="date"></label></div>
       <small>批量同步时，投稿时间以 Pixiv 原始投稿时间为准。不填日期时，会核对作者主页上的全部作品，已收藏的自动跳过；填写日期后，只检查投稿时间落在该范围内的作品。已有作品会先按 Pixiv 小说 ID、再按关联相似度跳过。</small>
       <p class="read-only-note">点击开始后同步会在后台进行，窗口关闭也不影响；进度显示在页面右下角，可随时终止。</p>
-    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="confirm-pixiv-sync" ${author.homepage && author.previewDir && author.purchasedDir ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
+    </form>`, `<button class="quiet-button" data-action="close-modal">取消</button><button class="primary-button" data-action="confirm-pixiv-sync" ${(author.homepage || author.accounts > 0) && author.previewDir && author.purchasedDir ? "" : "disabled"}>${icon("sync", 17)}开始同步</button>`));
   const novelUrlInput = document.querySelector('[name="novelUrl"]');
   const syncButton = document.querySelector('[data-action="confirm-pixiv-sync"]');
   novelUrlInput?.addEventListener("input", () => {
-    const canSync = Boolean(author.previewDir && author.purchasedDir && (author.homepage || isPixivNovelUrl(novelUrlInput.value)));
+    const canSync = Boolean(author.previewDir && author.purchasedDir && (author.homepage || author.accounts > 0 || isPixivNovelUrl(novelUrlInput.value)));
     syncButton.disabled = !canSync;
   });
 }
@@ -10692,7 +10927,9 @@ async function syncAllAuthors(targetsOverride) {
   // 「散篇」作者不参与整库同步（用户要求）：它们只是下载时的落脚点，
   // 菜单里连卡都不显示，更不该去拉它们主页上的全部作品。
   // targetsOverride：设置里开了「新建作者 / 散篇转正时同步其所有作品」时，只同步刚建档 / 转正的那几位。
-  const targets = targetsOverride || state.authors.filter((author) => !author.stray && author.homepage && author.previewDir && author.purchasedDir);
+  // 融合作者（v1.3.61）：自己那一行没有主页，主页在成员账号上 —— 有账号就算可同步，
+  // 后端会按账号逐个拉；成员行本身跳过（它们已经被并进去了，再单独跑一遍是白跑）。
+  const targets = targetsOverride || state.authors.filter((author) => !author.stray && !author.mergedInto && author.previewDir && author.purchasedDir && (author.homepage || author.accounts > 0));
   if (!targets.length) {
     toast("没有可同步的作者：请先填写作者主页，并绑定预览版与完整版文件夹", "info");
     return;
@@ -11170,6 +11407,7 @@ function collectSettings(form) {
   values.autoBackupEnabled = Boolean(form.querySelector('[name="autoBackupEnabled"]')?.checked);
   // v1.3.53：PDF / Word 绑进库时自动转 EPUB（勾选框，FormData 拿不到未勾选状态）
   values.autoConvertEpub = Boolean(form.querySelector('[name="autoConvertEpub"]')?.checked);
+  values.showHiddenDuplicates = Boolean(form.querySelector('[name="showHiddenDuplicates"]')?.checked);
   values.autoBackupKeep = Number(values.autoBackupKeep || 7);
   if (!Number.isInteger(values.autoBackupKeep) || values.autoBackupKeep < 1 || values.autoBackupKeep > 50) throw new Error("自动备份保留份数请输入 1 到 50 的整数");
   return values;
@@ -11284,6 +11522,7 @@ async function settingsModal() {
       <label>同步作品时图文小说自动保存为 <select name="syncImageFormat"><option value="epub" ${(settings.syncImageFormat || "epub") === "epub" ? "selected" : ""}>EPUB（电子书阅读器）</option><option value="html" ${settings.syncImageFormat === "html" ? "selected" : ""}>HTML（浏览器直接打开）</option></select><small>同步图文小说时只保留这一种阅读版：EPUB 适合推到手机 / 阅读器，HTML 双击就能用浏览器看。不会两种都存。</small></label>
       <div class="form-field">
         <label class="check-row"><input name="autoConvertEpub" type="checkbox" ${settings.autoConvertEpub === false ? "" : "checked"}><span>添加 PDF / Word 文件时自动转成 EPUB</span></label>
+        <label class="check-row"><input name="showHiddenDuplicates" type="checkbox" ${settings.showHiddenDuplicates ? "checked" : ""}><span>显示已隐藏的重复作品（融合作者时自动隐藏的那些；勾上后列表和搜索里也会出现）</span></label>
         <small>新绑进库的文件如果是 PDF 或 Word，就在旁边转一份同名的 EPUB，作品的完整版随即指向它（源文件不动，也不删）。只影响之后新加的；库里原有的那些，用作品详情里的「格式转换」手动转。</small>
       </div>
       <label>Epub插图压缩 <select name="epubImageQuality"><option value="1200" ${(settings.epubImageQuality || "1200") === "1200" ? "selected" : ""}>长边 1200 + 质量 80（推荐，每张约 0.2 至 0.6 MB）</option><option value="1600" ${settings.epubImageQuality === "1600" ? "selected" : ""}>长边 1600 + 质量 85（清晰些，存得多一点）</option><option value="900" ${settings.epubImageQuality === "900" ? "selected" : ""}>长边 900 + 质量 75（最省空间）</option><option value="off" ${settings.epubImageQuality === "off" ? "selected" : ""}>不压（保留作者原图）</option></select><small>生成 EPUB 时按这一档压一遍插图；PNG 会转成 JPEG（包内引用一并改好），压完不比原来小的图保留原图。已经压过的书不会重复压，存量书在「批量维护」里的「Epub插图压缩」用同一档。<b>这一档和上面的「配图画质」是两回事</b>：配图画质管的是下载时存下来的原图，这里管的是塞进 EPUB 的那一份。</small></label>
