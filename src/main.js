@@ -7802,7 +7802,6 @@ async function bindEvents() {
       if (action === "author-merge-confirm") await confirmAuthorMerge();
       if (action === "author-unmerge") unmergeAuthorDialog();
       if (action === "dup-review") await openDuplicateReview();
-      if (action === "dup-keep-all") await keepDuplicateGroup(Number(element.dataset.dupGroup));
       if (action === "dup-apply") await applyDuplicateReview();
       if (action === "export-author-package") await exportAuthorSharePackage();
       if (action === "import-data-pick") await pickImportDataFile();
@@ -8613,16 +8612,21 @@ function autoGroupAuthorPicker() {
   const strayOption = strayWorks
     ? `<option value="-1">散篇（${strayAuthors} 位作者 · ${strayWorks} 篇作品）</option>`
     : "";
-  const options = strayOption + state.authors.map((author) => {
-    const usable = Boolean(author.purchasedDir);
+  // 融合出来的作者按组内账号的目录走（v1.3.63）：自己没有 purchasedDir 也算可用，
+  // 更不该再提示「未绑定完整版文件夹」。被并进去的账号不出现在这个下拉里 ——
+  // 它们的作品已经归到融合体名下，选它们只会匹配到空集合。
+  const candidates = state.authors.filter((author) => !author.mergedInto);
+  const canMatch = (author) => Boolean(author.purchasedDir) || Number(author.accounts) > 0;
+  const options = strayOption + candidates.map((author) => {
+    const usable = canMatch(author);
     return `<option value="${author.id}" ${usable ? "" : "disabled"}>${escapeHtml(author.name)}（${author.workCount} 个作品${usable ? "" : " · 未绑定完整版文件夹"}）</option>`;
   }).join("");
-  const usableCount = state.authors.filter((author) => author.purchasedDir).length;
+  const usableCount = candidates.filter(canMatch).length;
   showModal(modal("指定作者自动匹配",
     `<p class="match-note">只在选中的这位作者的作品里做文件名匹配，其他作者的作品一律不参与。适合"某位作者的书正好混在一起、想单独归档"的情况。</p>
      <label class="match-row"><span>搜索作者</span><input id="auto-group-author-search" type="search" placeholder="打几个字过滤，名字里含这几个字才留下" autocomplete="off"></label>
      <label class="match-row"><span>选择作者</span><select id="auto-group-author">${options}</select></label>
-     <p class="read-only-note">共 ${usableCount} 位作者已绑定完整版文件夹、可参与匹配；未绑定的作者在列表里是灰的。匹配范围仍是设置里的「完整版自动匹配文件夹」。</p>`,
+     <p class="read-only-note">共 ${usableCount} 位作者可参与匹配；融合出来的作者按组内账号的完整版目录走。匹配范围仍是设置里的「完整版自动匹配文件夹」。</p>`,
     `<button class="quiet-button" data-action="close-modal">取消</button>
      <button class="primary-button" data-action="confirm-auto-group-author" ${usableCount ? "" : "disabled"}>开始分组</button>`
   ));
@@ -8803,7 +8807,6 @@ function renderDuplicateReview() {
     return `<section class="dup-group" data-dup-group="${index}">
       <header><strong title="${escapeHtml(group.title || "")}">${escapeHtml(group.title || "（无标题）")}</strong><span class="import-faint">${kindLabel} · ${group.items.length} 篇</span></header>
       ${items}
-      <footer><button class="quiet-button" data-action="dup-keep-all" data-dup-group="${index}">这组都显示</button></footer>
     </section>`;
   }).join("");
   showModal(modal(
@@ -8839,20 +8842,6 @@ async function applyDuplicateReview() {
   render();
   const tail = skipped ? `（${skipped} 组没勾任何一篇，原样保留）` : "";
   toast(changed ? `已处理 ${changed} 组${tail}` : "没有改动", changed ? "success" : "info");
-}
-
-/** 「这组都显示」：整组取消隐藏，顺手把那一段从面板里去掉，不重画整个弹窗。 */
-async function keepDuplicateGroup(index) {
-  const group = dupReviewGroups()[index];
-  if (!group) return;
-  try {
-    const workIds = group.items.map((item) => item.workId);
-    await invoke("resolve_duplicate_pick", { workIds, keepWorkIds: workIds });
-    document.querySelector(`[data-dup-group="${index}"]`)?.remove();
-    await refreshWorks();
-  } catch (error) {
-    toast(`操作失败：${error}`, "error");
-  }
 }
 
 /**

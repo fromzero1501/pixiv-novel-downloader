@@ -2433,7 +2433,9 @@ fn preview_works_for_author(
     author_id: i64,
 ) -> Result<Vec<(i64, String, String)>, String> {
     let mut statement = conn
-        .prepare("SELECT id, title, release_date FROM works WHERE author_id=?1")
+        // 已隐藏的重复作品不参与文件名匹配（v1.3.63）：融合作者把同名重复自动藏掉之后，
+        // 这些篇目本来就不该再被「指定作者自动匹配」捞出来。
+        .prepare("SELECT id, title, release_date FROM works WHERE author_id=?1 AND hidden_dup = 0")
         .map_err(|e| e.to_string())?;
     let rows = statement
         .query_map([author_id], |row| {
@@ -15028,19 +15030,36 @@ fn auto_group_purchased_files(
         // 散篇范围：SQL 那边已经按 stray=1 收过了，这里不用再判一遍
         stray_scope || author_id.map_or(true, |only| only == id)
     };
-    let authors: Vec<(i64, String, String, String)> = conn
+    // 融合出来的作者自己没有 purchased_dir（v1.3.63）：它的落点按组内账号的目录走，
+    // 这里先按「有目录」筛，再把目录为空的融合体用 author_landing_dirs 补上 ——
+    // 否则它在「指定作者自动匹配」里选得中、却一篇也匹配不上。
+    // 被并进别人的账号（merged_into <> 0）不参与：它们的作品已经归到融合体名下。
+    let raw_authors: Vec<(i64, String, String, String)> = conn
         .prepare(if stray_scope {
-            "SELECT id, name, purchased_dir, aliases FROM authors WHERE purchased_dir != '' AND stray = 1"
+            "SELECT id, name, purchased_dir, aliases FROM authors WHERE stray = 1 AND COALESCE(merged_into, 0) = 0"
         } else {
-            "SELECT id, name, purchased_dir, aliases FROM authors WHERE purchased_dir != ''"
+            "SELECT id, name, purchased_dir, aliases FROM authors WHERE COALESCE(merged_into, 0) = 0"
         })
         .map_err(|e| e.to_string())?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    let authors: Vec<(i64, String, String, String)> = raw_authors
         .into_iter()
         .filter(|(id, _, _, _)| belongs_to_scope(*id))
+        .filter_map(|(id, name, purchased, aliases)| {
+            let dir = if purchased.trim().is_empty() {
+                author_landing_dirs(&conn, id).1
+            } else {
+                purchased
+            };
+            if dir.trim().is_empty() {
+                None
+            } else {
+                Some((id, name, dir, aliases))
+            }
+        })
         .collect();
 
     // 指定作者时先确认这位作者确实绑定了完整版目录，避免用户点了却"什么都没发生"
